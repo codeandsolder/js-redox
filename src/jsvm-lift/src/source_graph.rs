@@ -216,6 +216,145 @@ fn add_observed_callable_definition(
     Ok(())
 }
 
+fn reference_resolutions(reference: &Value) -> Vec<&Value> {
+    // The contextual inventory is authoritative, even when empty or malformed.
+    // Summary fields are only used when no contextual inventory exists.
+    match reference.get("resolution_candidates") {
+        None => vec![reference],
+        Some(Value::Array(choices)) => choices.iter().collect(),
+        Some(_) => Vec::new(),
+    }
+}
+
+fn is_blocked_resolution(value: &Value) -> bool {
+    string_field(value, "resolution").is_some_and(|status| {
+        status == "import_map_blocked" || status.ends_with("_import_map_blocked")
+    })
+}
+
+fn add_reference_edges(
+    graph: &mut GraphBuilder,
+    specifier_nodes: &mut BTreeMap<String, String>,
+    source: &str,
+    reference: &Value,
+) -> Result<()> {
+    let kind = format!(
+        "js_{}",
+        string_field(reference, "kind").unwrap_or("reference")
+    );
+    let choices = reference_resolutions(reference);
+    if choices.is_empty() {
+        return add_unresolved_reference(graph, specifier_nodes, source, reference, &kind, None);
+    }
+    for choice in choices {
+        let blocked = is_blocked_resolution(choice);
+        if blocked || nonempty_string_field(choice, "resolved_url").is_none() {
+            add_unresolved_reference(
+                graph,
+                specifier_nodes,
+                source,
+                reference,
+                &kind,
+                Some(choice),
+            )?;
+            continue;
+        }
+        let url = nonempty_string_field(choice, "resolved_url")
+            .context("checked nonempty candidate URL disappeared")?;
+        for target in graph.targets_for(url)? {
+            graph.add_edge(
+                source,
+                &target,
+                &kind,
+                json!({
+                    "specifier":field(reference,"specifier"),
+                    "glob":field(reference,"glob"),
+                    "glob_match_url":field(choice,"glob_match_url"),
+                    "resolved_url":url,
+                    "resolution":field(choice,"resolution"),
+                    "import_map_key":field(choice,"import_map_key"),
+                    "scope":field(choice,"scope"),
+                    "document_resource_id":field(choice,"document_resource_id"),
+                    "start":field(reference,"start"),
+                    "end":field(reference,"end"),
+                }),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn add_unresolved_reference(
+    graph: &mut GraphBuilder,
+    specifier_nodes: &mut BTreeMap<String, String>,
+    source: &str,
+    reference: &Value,
+    kind: &str,
+    context: Option<&Value>,
+) -> Result<()> {
+    let specifier = string_field(reference, "specifier").unwrap_or("");
+    let node_id = if let Some(existing) = specifier_nodes.get(specifier) {
+        existing.clone()
+    } else {
+        let node_id = digest_id("specifier:", specifier);
+        graph.add_node(
+            node_id.clone(),
+            json!({
+                "type":"module_specifier",
+                "specifier":specifier,
+                "bare":bool_field(reference,"bare_specifier"),
+                "captured":false,
+            }),
+        )?;
+        specifier_nodes.insert(specifier.to_owned(), node_id.clone());
+        node_id
+    };
+    let proof = context.unwrap_or(reference);
+    let blocked = is_blocked_resolution(proof);
+    graph.add_edge(
+        source,
+        &node_id,
+        kind,
+        json!({
+            "specifier":specifier,
+            "glob":field(reference,"glob"),
+            "resolved_url":Value::Null,
+            "resolution":if context.is_none()
+                && reference.get("resolution_candidates").is_some()
+                {json!("no_matching_contextual_resolution")}
+                else {field(proof,"resolution")},
+            "import_map_key":field(proof,"import_map_key"),
+            "scope":field(proof,"scope"),
+            "document_resource_id":field(proof,"document_resource_id"),
+            "blocked":blocked,
+            "start":field(reference,"start"),
+            "end":field(reference,"end"),
+        }),
+    )
+}
+
+fn add_js_reference_edges(
+    graph: &mut GraphBuilder,
+    jsrefs: &Value,
+    inline_node_by_raw: &BTreeMap<String, String>,
+    budget: &work_budget::WorkBudget,
+) -> Result<()> {
+    let mut specifier_nodes = BTreeMap::<String, String>::new();
+    for unit in array_field(jsrefs, "code_units") {
+        budget.checkpoint()?;
+        let Some(resource_id) = u64_field(unit, "resource_id") else {
+            continue;
+        };
+        let source = string_field(unit, "raw_path")
+            .and_then(|raw| inline_node_by_raw.get(raw).cloned())
+            .unwrap_or_else(|| format!("resource:{resource_id}"));
+        for reference in array_field(unit, "references") {
+            add_reference_edges(graph, &mut specifier_nodes, &source, reference)?;
+        }
+    }
+    Ok(())
+}
+
 /// Build the project source/provenance graph from indexed capture evidence.
 ///
 /// # Errors
@@ -1686,114 +1825,7 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
     }
 
     // AST-backed JavaScript module / worker references.
-    let mut specifier_nodes = BTreeMap::<String, String>::new();
-    for unit in array_field(&jsrefs, "code_units") {
-        budget.checkpoint()?;
-        let Some(resource_id) = u64_field(unit, "resource_id") else {
-            continue;
-        };
-        let src = string_field(unit, "raw_path")
-            .and_then(|raw| inline_node_by_raw.get(raw).cloned())
-            .unwrap_or_else(|| format!("resource:{resource_id}"));
-        for reference in array_field(unit, "references") {
-            let mut candidates = Vec::<Value>::new();
-            if let Some(resolved) = nonempty_string_field(reference, "resolved_url") {
-                let contexts = array_field(reference, "resolution_candidates");
-                if contexts.is_empty() {
-                    candidates.push(json!({
-                        "resolved_url":resolved,
-                        "document_resource_id":Value::Null,
-                        "resolution":field(reference,"resolution"),
-                        "import_map_key":field(reference,"import_map_key"),
-                        "scope":field(reference,"scope"),
-                    }));
-                } else {
-                    for context in contexts {
-                        candidates.push(json!({
-                            "resolved_url":resolved,
-                            "document_resource_id":field(context,"document_resource_id"),
-                            "resolution":field(reference,"resolution"),
-                            "import_map_key":field(reference,"import_map_key"),
-                            "scope":field(reference,"scope"),
-                        }));
-                    }
-                }
-            } else {
-                for context in array_field(reference, "resolution_candidates") {
-                    if nonempty_string_field(context, "resolved_url").is_some() {
-                        candidates.push(context.clone());
-                    }
-                }
-            }
-
-            if !candidates.is_empty() {
-                for candidate in candidates {
-                    let Some(candidate_url) = string_field(&candidate, "resolved_url") else {
-                        continue;
-                    };
-                    for dst in graph.targets_for(candidate_url)? {
-                        graph.add_edge(
-                            &src,
-                            &dst,
-                            &format!(
-                                "js_{}",
-                                string_field(reference, "kind").unwrap_or("reference")
-                            ),
-                            json!({
-                                "specifier":field(reference,"specifier"),
-                                "glob":field(reference,"glob"),
-                                "glob_match_url":field(&candidate,"glob_match_url"),
-                                "resolved_url":candidate_url,
-                                "resolution":field(&candidate,"resolution"),
-                                "import_map_key":field(&candidate,"import_map_key"),
-                                "scope":field(&candidate,"scope"),
-                                "document_resource_id":field(&candidate,"document_resource_id"),
-                                "start":field(reference,"start"),
-                                "end":field(reference,"end"),
-                            }),
-                        )?;
-                    }
-                }
-                continue;
-            }
-
-            let specifier = string_field(reference, "specifier").unwrap_or("");
-            let node_id = if let Some(node_id) = specifier_nodes.get(specifier) {
-                node_id.clone()
-            } else {
-                let node_id = digest_id("specifier:", specifier);
-                graph.add_node(
-                    node_id.clone(),
-                    json!({
-                        "type":"module_specifier",
-                        "specifier":specifier,
-                        "bare":bool_field(reference,"bare_specifier"),
-                        "captured":false,
-                    }),
-                )?;
-                specifier_nodes.insert(specifier.to_string(), node_id.clone());
-                node_id
-            };
-            graph.add_edge(
-                &src,
-                &node_id,
-                &format!(
-                    "js_{}",
-                    string_field(reference, "kind").unwrap_or("reference")
-                ),
-                json!({
-                    "specifier":specifier,
-                    "glob":field(reference,"glob"),
-                    "resolved_url":Value::Null,
-                    "resolution":field(reference,"resolution"),
-                    "import_map_key":field(reference,"import_map_key"),
-                    "scope":field(reference,"scope"),
-                    "start":field(reference,"start"),
-                    "end":field(reference,"end"),
-                }),
-            )?;
-        }
-    }
+    add_js_reference_edges(&mut graph, &jsrefs, &inline_node_by_raw, &budget)?;
 
     // Captured or statically recovered WebAssembly modules are first-class derived sources.
     for module in array_field(&wasm, "modules") {
@@ -1917,7 +1949,7 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
 mod tests {
     use super::*;
     use crate::{
-        analysis_artifacts::{load_artifact, SOURCE_GRAPH},
+        analysis_artifacts::{load_artifact, write_artifact, JS_REFERENCES, SOURCE_GRAPH},
         capture_project::{write_manifest, CaptureManifest, CaptureSource, MANIFEST_NAME},
     };
 
@@ -1996,6 +2028,146 @@ mod tests {
             json!({"metadata":{"items":[3]}}),
         )?;
         assert_eq!(graph.edges.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn source_graph_never_upgrades_contextual_summaries_or_blocked_imports() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project)?;
+        let source_url = "https://example.test/entry.js";
+        let exact_url = "https://example.test/exact.js";
+        let stale_url = "https://example.test/stale.js";
+        let manifest = CaptureManifest {
+            schema: "capture-project/v1".into(),
+            source: CaptureSource {
+                kind: "har".into(),
+                input: "context-fixture".into(),
+                salvaged: false,
+                extra: Map::new(),
+            },
+            pages: vec![],
+            resources: vec![
+                json!({"id":7,"url":source_url,"kind":"javascript"}),
+                json!({"id":42,"url":exact_url,"kind":"javascript"}),
+                json!({"id":99,"url":stale_url,"kind":"javascript"}),
+            ],
+            inline_scripts: vec![],
+            counts: BTreeMap::new(),
+            extra: Map::new(),
+        };
+        write_manifest(&project.join(MANIFEST_NAME), &manifest)?;
+        write_artifact(
+            &project,
+            JS_REFERENCES,
+            &json!({
+                "schema":JS_REFERENCES.schema,
+                "code_units":[{
+                    "resource_id":7,"raw_path":"resources/entry.js",
+                    "references":[
+                        {
+                            "kind":"import_static","specifier":"per_document",
+                            "resolved_url":stale_url,"resolution":"url",
+                            "resolution_candidates":[
+                                {"document_resource_id":3,"resolved_url":exact_url,
+                                 "resolution":"import_map","import_map_key":"per_document"},
+                                {"document_resource_id":4,"resolved_url":stale_url,
+                                 "resolution":"import_map_blocked"}
+                            ]
+                        },
+                        {
+                            "kind":"import_static","specifier":"empty_inventory",
+                            "resolved_url":stale_url,"resolution":"url",
+                            "resolution_candidates":[]
+                        },
+                        {
+                            "kind":"import_static","specifier":"malformed_inventory",
+                            "resolved_url":stale_url,"resolution":"url",
+                            "resolution_candidates":"malformed"
+                        },
+                        {
+                            "kind":"import_dynamic","specifier":"dynamic_blocked",
+                            "resolved_url":stale_url,"resolution":"url",
+                            "resolution_candidates":[{
+                                "document_resource_id":3,"resolved_url":stale_url,
+                                "resolution":"captured_dynamic_glob_import_map_blocked"
+                            }]
+                        },
+                        {
+                            "kind":"import_static","specifier":"legacy",
+                            "resolved_url":stale_url,"resolution":"url"
+                        }
+                    ]
+                }]
+            }),
+        )?;
+        build_source_graph(
+            &project,
+            &AnalysisBudgets::standard("source-graph-contextual-proof-test"),
+        )?;
+        let graph = load_artifact(&project, SOURCE_GRAPH, false)?.context("missing graph")?;
+        let edges = graph["edges"].as_array().context("missing graph edges")?;
+        let refs = edges
+            .iter()
+            .filter(|edge| {
+                edge["from"] == "resource:7"
+                    && edge["kind"]
+                        .as_str()
+                        .is_some_and(|kind| kind.starts_with("js_"))
+            })
+            .collect::<Vec<_>>();
+        let at = |specifier: &str| {
+            refs.iter()
+                .copied()
+                .filter(|edge| edge["specifier"] == specifier)
+                .collect::<Vec<_>>()
+        };
+        let exact = at("per_document");
+        assert_eq!(exact.len(), 2);
+        assert!(exact.iter().any(|edge| {
+            edge["to"] == "resource:42"
+                && edge["document_resource_id"] == 3
+                && edge["resolution"] == "import_map"
+                && edge["import_map_key"] == "per_document"
+        }));
+        assert!(exact.iter().any(|edge| {
+            edge["to"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("specifier:"))
+                && edge["document_resource_id"] == 4
+                && edge["resolution"] == "import_map_blocked"
+                && edge["blocked"] == true
+                && edge["resolved_url"].is_null()
+        }));
+        for specifier in ["empty_inventory", "malformed_inventory"] {
+            let unresolved = at(specifier);
+            assert_eq!(unresolved.len(), 1);
+            assert_eq!(
+                unresolved[0]["resolution"],
+                "no_matching_contextual_resolution"
+            );
+            assert!(unresolved[0]["resolved_url"].is_null());
+            assert!(unresolved[0]["to"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("specifier:")));
+        }
+        let blocked = at("dynamic_blocked");
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0]["blocked"], true);
+        assert_eq!(
+            blocked[0]["resolution"],
+            "captured_dynamic_glob_import_map_blocked"
+        );
+        assert_eq!(blocked[0]["document_resource_id"], 3);
+        assert!(blocked[0]["resolved_url"].is_null());
+        let legacy = at("legacy");
+        assert_eq!(legacy.len(), 1);
+        assert_eq!(legacy[0]["to"], "resource:99");
+        assert!(legacy[0]["document_resource_id"].is_null());
+        assert!(refs
+            .iter()
+            .all(|edge| { edge["to"] != "resource:99" || edge["specifier"] == "legacy" }));
         Ok(())
     }
 
