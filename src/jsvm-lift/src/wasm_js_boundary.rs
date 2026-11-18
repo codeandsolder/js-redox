@@ -963,7 +963,7 @@ struct FreshAlignmentInputs {
 
 impl FreshAlignmentInputs {
     /// Reject malformed allocator recipes and require one disjoint-effects
-    /// initializer source with the exact static Uint32Array argument length.
+    /// initializer source with the exact static `Uint32Array` argument length.
     fn verify(context: &CopiedInputProofContext<'_>, candidate: &Value) -> Option<Self> {
         let recipe = candidate
             .get("fresh_destination_base_recipe")?
@@ -2623,8 +2623,14 @@ mod tests {
                 {"memory_accesses":[{"memory":0,"addr":24,"len":4}]}
             ]
         });
-        let exact = FreshCleanupRange::verify(&candidate, 7, 16, 8, &evaluation)
-            .expect("adjacent and other-memory accesses are disjoint");
+        let exact = FreshCleanupRange::verify(&candidate, 7, 16, 8, &evaluation);
+        assert!(
+            exact.is_some(),
+            "adjacent and other-memory accesses are disjoint"
+        );
+        let Some(exact) = exact else {
+            return;
+        };
         assert_eq!(exact.target_memory, 0);
         assert_eq!((exact.range_start, exact.range_end), (16, 24));
         assert_eq!(exact.post_copy_accesses.len(), 3);
@@ -2679,8 +2685,11 @@ mod tests {
             "start_handler":{"exact_grow_deltas":[2]},
             "table_export":{"index":0}
         });
-        let sequence = FreshCleanupSequence::verify(&candidate, &proof, &setup)
-            .expect("complete exact cleanup recipe");
+        let sequence = FreshCleanupSequence::verify(&candidate, &proof, &setup);
+        assert!(sequence.is_some(), "complete exact cleanup recipe");
+        let Some(sequence) = sequence else {
+            return;
+        };
         assert_eq!(sequence.destination_base, 16);
         assert_eq!(sequence.byte_count, 8);
         assert_eq!(sequence.calls.len(), 7);
