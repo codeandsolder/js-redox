@@ -2004,6 +2004,35 @@ mod tests {
     };
 
     #[test]
+    fn shared_inline_bytes_require_exact_parent_and_ordinal() -> Result<()> {
+        let mut sources = InlineSourceIndex::default();
+        sources.insert("resources/shared.js", 7, 2, "inline:7:2".into())?;
+        sources.insert("resources/shared.js", 7, 3, "inline:7:3".into())?;
+        sources.insert("resources/shared.js", 8, 2, "inline:8:2".into())?;
+        for (parent, ordinal) in [(7, 2), (7, 3), (8, 2)] {
+            assert_eq!(
+                sources.exact("resources/shared.js", parent, ordinal),
+                Some(format!("inline:{parent}:{ordinal}"))
+            );
+            assert_eq!(
+                sources.for_record(&json!({
+                    "raw_path":"resources/shared.js",
+                    "resource_id":parent,"ordinal":ordinal
+                })),
+                Some(format!("inline:{parent}:{ordinal}"))
+            );
+        }
+        assert_eq!(
+            sources.for_record(&json!({"raw_path":"resources/shared.js"})),
+            None
+        );
+        assert!(sources
+            .insert("resources/shared.js", 7, 2, "other".into())
+            .is_err());
+        Ok(())
+    }
+
+    #[test]
     fn graph_builder_moves_evidence_without_overwriting_identity_or_existing_fields() -> Result<()>
     {
         let mut graph = GraphBuilder::default();
