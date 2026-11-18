@@ -110,7 +110,9 @@ fn recorder_runtime_provenance_flows_into_source_graph() -> Result<()> {
     }
     fs::write(bodies.join(digest(network)), network)?;
 
-    let initial_html = format!("<!doctype html><script>{inline}</script>");
+    // Identical inline script bytes in two distinct ordinal positions are
+    // separate capture candidates, not two observed executions.
+    let initial_html = format!("<!doctype html><script>{inline}</script><script>{inline}</script>");
     let har = json!({
         "log": {
             "version": "1.2",
@@ -273,10 +275,24 @@ fn recorder_runtime_provenance_flows_into_source_graph() -> Result<()> {
     assert_eq!(node_types.get("runtime_expression_family"), Some(&4));
     assert_eq!(node_types.get("dom_snapshot"), Some(&1));
     assert_eq!(node_types.get("dom_directive"), Some(&3));
-    assert_eq!(edge_kinds.get("runtime_execution"), Some(&1));
+    assert_eq!(edge_kinds.get("runtime_execution"), None);
     assert_eq!(edge_kinds.get("runtime_source_match"), Some(&1));
-    assert_eq!(edge_kinds.get("runtime_source_candidate"), Some(&2));
+    assert_eq!(edge_kinds.get("runtime_source_candidate"), Some(&4));
     assert_eq!(edge_kinds.get("runtime_generated_code"), Some(&2));
+    let inline_sha = digest(inline);
+    let inline_runtime = format!("runtime:{}", &inline_sha[..20]);
+    let inline_candidates = edges
+        .iter()
+        .filter(|edge| edge["to"] == inline_runtime && edge["kind"] == "runtime_source_candidate")
+        .collect::<Vec<_>>();
+    assert_eq!(inline_candidates.len(), 2);
+    assert_ne!(inline_candidates[0]["from"], inline_candidates[1]["from"]);
+    for candidate in inline_candidates {
+        assert_eq!(candidate["identity_basis"], "sha256_only_inline_script");
+        assert_eq!(candidate["candidate_count"], 2);
+        assert_eq!(candidate["exact_response_identity"], false);
+    }
+
     let manifest = read_json(&project.join("capture-manifest.json"))?;
     let resources = manifest["resources"]
         .as_array()
