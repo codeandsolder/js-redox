@@ -2,13 +2,18 @@ use anyhow::{Context, Result};
 use jsvm_lift::{
     analysis_budget::AnalysisBudgets,
     capture_import::{import_capture_project, CaptureImportOptions},
+    capture_project::{validate_manifest_value, write_manifest},
+    document_entrypoints::captured_document_entrypoints,
     project_js_refs::scan_project_references,
     project_readme::refresh_project_readme,
+    sha256_hex,
     source_graph::build_source_graph,
     source_materialize::materialize_capture_source,
+    static_module_graph::link_static_modules,
 };
 use serde_json::{json, Value};
 use std::{fs, path::Path};
+use work_budget::WorkBudget;
 
 #[derive(Debug)]
 struct ExpectedResolution {
@@ -660,5 +665,227 @@ fn shared_modules_keep_mapped_and_unmapped_document_contexts() -> Result<()> {
                 && edge["resolved_url"].is_null()
         }));
     }
+    Ok(())
+}
+
+fn shared_alias_capture_fixture(project: &Path) -> Result<()> {
+    fs::create_dir_all(project.join("resources"))?;
+    let html = "<script type=\"module\" src=\"./entry.js\"></script><script type=\"module\">import './next.js';</script>";
+    let external = "import './next.js';";
+    let inline = "import './next.js';";
+    let next_a = "export const a=1;";
+    let next_b = "export const b=2;";
+    for (name, bytes) in [
+        ("alpha.html", html),
+        ("beta.html", html),
+        ("shared.js", external),
+        ("shared-inline.js", inline),
+        ("alpha-next.js", next_a),
+        ("beta-next.js", next_b),
+    ] {
+        fs::write(project.join("resources").join(name), bytes)?;
+    }
+    let html_sha = sha256_hex(html.as_bytes());
+    let ext_sha = sha256_hex(external.as_bytes());
+    let inline_sha = sha256_hex(inline.as_bytes());
+    let manifest = validate_manifest_value(
+        &json!({
+            "schema":"capture-project/v1",
+            "source":{"kind":"synthetic","input":"shared-raw-capture-aliases","salvaged":false},
+            "pages":[],
+            "resources":[
+                {"id":10,"kind":"html","url":"https://fixture.invalid/alpha/page.html",
+                 "output_path":"resources/alpha.html","sha256":html_sha},
+                {"id":11,"kind":"html","url":"https://fixture.invalid/beta/page.html",
+                 "output_path":"resources/beta.html","sha256":html_sha},
+                {"id":20,"kind":"javascript","url":"https://fixture.invalid/alpha/entry.js",
+                 "output_path":"resources/shared.js","sha256":ext_sha},
+                {"id":21,"kind":"javascript","url":"https://fixture.invalid/beta/entry.js",
+                 "output_path":"resources/shared.js","sha256":ext_sha},
+                {"id":30,"kind":"javascript","url":"https://fixture.invalid/alpha/next.js",
+                 "output_path":"resources/alpha-next.js","sha256":sha256_hex(next_a.as_bytes())},
+                {"id":31,"kind":"javascript","url":"https://fixture.invalid/beta/next.js",
+                 "output_path":"resources/beta-next.js","sha256":sha256_hex(next_b.as_bytes())}
+            ],
+            "inline_scripts":[
+                {"parent_resource_id":10,"ordinal":1,"script_type":"module",
+                 "src":"./entry.js","resolved_src":"https://fixture.invalid/alpha/entry.js"},
+                {"parent_resource_id":10,"ordinal":2,"script_type":"module",
+                 "output_path":"resources/shared-inline.js","sha256":inline_sha},
+                {"parent_resource_id":11,"ordinal":1,"script_type":"module",
+                 "src":"./entry.js","resolved_src":"https://fixture.invalid/beta/entry.js"},
+                {"parent_resource_id":11,"ordinal":2,"script_type":"module",
+                 "output_path":"resources/shared-inline.js","sha256":inline_sha}
+            ],
+            "counts":{}
+        }),
+        "shared capture alias fixture",
+    )?;
+    write_manifest(&project.join("capture-manifest.json"), &manifest)?;
+    materialize_capture_source(
+        project,
+        Some(2),
+        &AnalysisBudgets::standard("shared-capture-alias-materialize"),
+    )?;
+    scan_project_references(
+        project,
+        Some(2),
+        &AnalysisBudgets::standard("shared-capture-alias-refs"),
+    )?;
+    build_source_graph(
+        project,
+        &AnalysisBudgets::standard("shared-capture-alias-graph"),
+    )?;
+    Ok(())
+}
+
+fn assert_alias_source_inventory(project: &Path) -> Result<()> {
+    let source_index = read_json(&project.join("analysis/source-index.json"))?;
+    let source_units = source_index["units"]
+        .as_array()
+        .context("missing source units")?;
+    let refs = read_json(&project.join("analysis/js-references.json"))?;
+    let rows = refs["code_units"]
+        .as_array()
+        .context("missing JS code units")?;
+    for (raw, origins) in [
+        ("resources/shared.js", [(20, "resource"), (21, "resource")]),
+        (
+            "resources/shared-inline.js",
+            [(10, "inline_script"), (11, "inline_script")],
+        ),
+    ] {
+        let aliases = source_units
+            .iter()
+            .filter(|unit| unit["raw_path"] == raw)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            aliases.len(),
+            2,
+            "source index lost a capture identity for {raw}"
+        );
+        assert_ne!(aliases[0]["source_path"], aliases[1]["source_path"]);
+        for (id, origin) in origins {
+            assert!(aliases
+                .iter()
+                .any(|unit| unit["resource_id"] == id && unit["origin"] == origin));
+        }
+    }
+    for (raw, resource_id, expected_url, document_id) in [
+        (
+            "resources/shared.js",
+            20,
+            "https://fixture.invalid/alpha/next.js",
+            10,
+        ),
+        (
+            "resources/shared.js",
+            21,
+            "https://fixture.invalid/beta/next.js",
+            11,
+        ),
+        (
+            "resources/shared-inline.js",
+            10,
+            "https://fixture.invalid/alpha/next.js",
+            10,
+        ),
+        (
+            "resources/shared-inline.js",
+            11,
+            "https://fixture.invalid/beta/next.js",
+            11,
+        ),
+    ] {
+        let row = rows
+            .iter()
+            .find(|row| row["raw_path"] == raw && row["resource_id"] == resource_id)
+            .with_context(|| format!("missing reference row for {raw} / {resource_id}"))?;
+        assert_eq!(row["document_resource_ids"], json!([document_id]));
+        let reference = reference(row, "./next.js")?;
+        assert_eq!(reference["resolved_url"], expected_url);
+        assert_eq!(
+            reference["resolution_candidates"][0]["document_resource_id"],
+            document_id
+        );
+    }
+    Ok(())
+}
+
+fn assert_alias_source_graph(project: &Path) -> Result<()> {
+    let graph = read_json(&project.join("analysis/source-graph.json"))?;
+    let edges = graph["edges"]
+        .as_array()
+        .context("missing source graph edges")?;
+    for (src, target, doc) in [
+        ("resource:20", "resource:30", 10),
+        ("resource:21", "resource:31", 11),
+        ("inline:10:2", "resource:30", 10),
+        ("inline:11:2", "resource:31", 11),
+    ] {
+        let from_source = edges
+            .iter()
+            .filter(|edge| edge["from"] == src && edge["kind"] == "js_import_static")
+            .collect::<Vec<_>>();
+        assert_eq!(from_source.len(), 1, "unexpected edges from {src}");
+        assert_eq!(from_source[0]["to"], target);
+        assert_eq!(from_source[0]["document_resource_id"], doc);
+    }
+
+    Ok(())
+}
+
+fn assert_alias_static_module_graph(project: &Path) -> Result<()> {
+    let manifest = jsvm_lift::capture_project::load_manifest(project)?;
+    let budget = WorkBudget::unlimited("shared-alias-static-module-test");
+    let documents = captured_document_entrypoints(project, &manifest, &budget)?;
+    let static_graph = link_static_modules(
+        project,
+        &documents,
+        &source_index,
+        &refs,
+        &manifest,
+        &budget,
+    )?;
+    assert_eq!(static_graph.roots.len(), 4);
+    assert!(static_graph.unmatched_module_roots.is_empty());
+    for (doc, raw, expected_id) in [
+        (10, "resources/shared.js", 20),
+        (11, "resources/shared.js", 21),
+    ] {
+        let root = static_graph
+            .roots
+            .iter()
+            .find(|root| root.document_resource_id == doc && root.source.raw_path == raw)
+            .context("missing exact captured script root")?;
+        assert_eq!(root.source.capture_manifest_resource_ids, vec![expected_id]);
+    }
+    for dep in static_graph
+        .dependencies
+        .iter()
+        .filter(|dep| dep.specifier == "./next.js")
+    {
+        let expected_id = if dep.document_resource_id == 10 {
+            30
+        } else {
+            31
+        };
+        assert_eq!(dep.target_candidates.len(), 1);
+        assert_eq!(
+            dep.target_candidates[0].capture_manifest_resource_ids,
+            vec![expected_id]
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn reused_capture_bytes_retain_each_exact_script_origin_and_url() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let project = root.path();
+    shared_alias_capture_fixture(project)?;
+    assert_alias_source_inventory(project)?;
+    assert_alias_source_graph(project)?;
+    assert_alias_static_module_graph(project)?;
     Ok(())
 }

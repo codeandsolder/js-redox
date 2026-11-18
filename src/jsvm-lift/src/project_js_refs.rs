@@ -610,7 +610,7 @@ pub fn scan_project_references(
     let mut failures = 0_usize;
     let mut total_refs = 0_usize;
     let mut units_by_url = BTreeMap::<String, Vec<usize>>::new();
-    let mut units_by_raw = BTreeMap::<String, usize>::new();
+    let mut units_by_raw = BTreeMap::<String, Vec<usize>>::new();
     let mut seen_per_digest = BTreeMap::<String, usize>::new();
     for item in &javascript_units {
         stage_budget.checkpoint()?;
@@ -622,6 +622,7 @@ pub fn scan_project_references(
         let mut row = json!({
             "resource_id": item.unit.get("resource_id").cloned().unwrap_or(Value::Null),
             "origin": item.unit.get("origin").cloned().unwrap_or(Value::Null),
+            "ordinal": item.unit.get("ordinal").cloned().unwrap_or(Value::Null),
             "url": item.unit.get("url").cloned().unwrap_or(Value::Null),
             "raw_path": item.unit.get("raw_path").cloned().unwrap_or(Value::Null),
             "source_path": item.source_path,
@@ -642,14 +643,20 @@ pub fn scan_project_references(
             total_refs += result.references.len();
         }
         let row_id = rows.len();
-        if let Some(url) = row.get("url").and_then(Value::as_str) {
-            if !url.is_empty() {
+        // Inline scripts share the parent document URL; runtime scripts can
+        // advertise a URL without being captured network response instances.
+        if row.get("origin").and_then(Value::as_str) == Some("resource") {
+            if let Some(url) = row
+                .get("url")
+                .and_then(Value::as_str)
+                .filter(|url| !url.is_empty())
+            {
                 units_by_url.entry(url.to_owned()).or_default().push(row_id);
             }
         }
         if let Some(raw) = row.get("raw_path").and_then(Value::as_str) {
             if !raw.is_empty() {
-                units_by_raw.insert(raw.to_owned(), row_id);
+                units_by_raw.entry(raw.to_owned()).or_default().push(row_id);
             }
         }
         rows.push(row);
@@ -735,7 +742,15 @@ pub fn scan_project_references(
         // an import map: a shared module must retain both mapped and unmapped
         // resolution outcomes rather than inheriting only the mapped one.
         if let Some(path) = script.get("output_path").and_then(Value::as_str) {
-            if let Some(&row_id) = units_by_raw.get(path) {
+            let script_ordinal = script.get("ordinal").and_then(Value::as_u64);
+            for &row_id in units_by_raw.get(path).into_iter().flatten() {
+                let unit = &rows[row_id];
+                if unit.get("origin").and_then(Value::as_str) != Some("inline_script")
+                    || unit.get("resource_id").and_then(Value::as_u64) != Some(document_id)
+                    || unit.get("ordinal").and_then(Value::as_u64) != script_ordinal
+                {
+                    continue;
+                }
                 if contexts[row_id].insert(document_id) {
                     queue.push_back((row_id, document_id));
                 }
