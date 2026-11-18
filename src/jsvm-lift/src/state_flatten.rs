@@ -960,6 +960,61 @@ fn prove_machine_event_unreachable_with_integer_bindings(
     false
 }
 
+// Locate the one already-identified machine regardless of whether it is
+// represented by a for or while statement. All three theorems differ only in
+// their event/state proof; they share the exact span and traversal contract.
+fn prove_detected_if_ladder_machine<'a>(
+    program: &Program<'a>,
+    machine: &IfLadderStateMachineCandidate,
+    prove: impl FnMut(&Statement<'a>) -> bool,
+) -> bool {
+    struct Harness<'m, F> {
+        machine: &'m IfLadderStateMachineCandidate,
+        prove: F,
+        result: Option<bool>,
+    }
+
+    impl<F> Harness<'_, F> {
+        fn try_prove<'a>(&mut self, span: Span, body: &Statement<'a>) -> bool
+        where
+            F: FnMut(&Statement<'a>) -> bool,
+        {
+            if self.result.is_some() {
+                return true;
+            }
+            if span.start == self.machine.start && span.end == self.machine.end {
+                self.result = Some((self.prove)(body));
+                return true;
+            }
+            false
+        }
+    }
+
+    impl<'a, F: FnMut(&Statement<'a>) -> bool> Visit<'a> for Harness<'_, F> {
+        fn visit_for_statement(&mut self, statement: &ForStatement<'a>) {
+            if self.try_prove(statement.span, &statement.body) {
+                return;
+            }
+            walk::walk_for_statement(self, statement);
+        }
+
+        fn visit_while_statement(&mut self, statement: &WhileStatement<'a>) {
+            if self.try_prove(statement.span, &statement.body) {
+                return;
+            }
+            walk::walk_while_statement(self, statement);
+        }
+    }
+
+    let mut harness = Harness {
+        machine,
+        prove,
+        result: None,
+    };
+    harness.visit_program(program);
+    harness.result.unwrap_or(false)
+}
+
 /// Prove that an event in a detected flattened if-ladder is unreachable when
 /// selected scalar identifiers have exact integer values at machine entry.
 ///
@@ -972,57 +1027,9 @@ pub fn prove_detected_if_ladder_event_unreachable_with_integer_bindings(
     event: Span,
     bindings: &BTreeMap<String, i64>,
 ) -> bool {
-    struct Harness<'m, 'b> {
-        machine: &'m IfLadderStateMachineCandidate,
-        event: Span,
-        bindings: &'b BTreeMap<String, i64>,
-        result: Option<bool>,
-    }
-
-    impl<'a> Visit<'a> for Harness<'_, '_> {
-        fn visit_for_statement(&mut self, statement: &ForStatement<'a>) {
-            if self.result.is_some() {
-                return;
-            }
-            if statement.span.start == self.machine.start && statement.span.end == self.machine.end
-            {
-                self.result = Some(prove_machine_event_unreachable_with_integer_bindings(
-                    self.machine,
-                    &statement.body,
-                    self.event,
-                    self.bindings,
-                ));
-                return;
-            }
-            walk::walk_for_statement(self, statement);
-        }
-
-        fn visit_while_statement(&mut self, statement: &WhileStatement<'a>) {
-            if self.result.is_some() {
-                return;
-            }
-            if statement.span.start == self.machine.start && statement.span.end == self.machine.end
-            {
-                self.result = Some(prove_machine_event_unreachable_with_integer_bindings(
-                    self.machine,
-                    &statement.body,
-                    self.event,
-                    self.bindings,
-                ));
-                return;
-            }
-            walk::walk_while_statement(self, statement);
-        }
-    }
-
-    let mut harness = Harness {
-        machine,
-        event,
-        bindings,
-        result: None,
-    };
-    harness.visit_program(program);
-    harness.result.unwrap_or(false)
+    prove_detected_if_ladder_machine(program, machine, |body| {
+        prove_machine_event_unreachable_with_integer_bindings(machine, body, event, bindings)
+    })
 }
 
 /// Prove a flattened if-ladder event unreachable for one exact function when
@@ -3361,57 +3368,9 @@ pub fn prove_detected_if_ladder_states_before_event(
     required_states: &[u64],
     event: Span,
 ) -> bool {
-    struct Harness<'m, 'r> {
-        machine: &'m IfLadderStateMachineCandidate,
-        required_states: &'r [u64],
-        event: Span,
-        result: Option<bool>,
-    }
-
-    impl<'a> Visit<'a> for Harness<'_, '_> {
-        fn visit_for_statement(&mut self, statement: &ForStatement<'a>) {
-            if self.result.is_some() {
-                return;
-            }
-            if statement.span.start == self.machine.start && statement.span.end == self.machine.end
-            {
-                self.result = Some(prove_machine_states_before_event(
-                    self.machine,
-                    &statement.body,
-                    self.required_states,
-                    self.event,
-                ));
-                return;
-            }
-            walk::walk_for_statement(self, statement);
-        }
-
-        fn visit_while_statement(&mut self, statement: &WhileStatement<'a>) {
-            if self.result.is_some() {
-                return;
-            }
-            if statement.span.start == self.machine.start && statement.span.end == self.machine.end
-            {
-                self.result = Some(prove_machine_states_before_event(
-                    self.machine,
-                    &statement.body,
-                    self.required_states,
-                    self.event,
-                ));
-                return;
-            }
-            walk::walk_while_statement(self, statement);
-        }
-    }
-
-    let mut harness = Harness {
-        machine,
-        required_states,
-        event,
-        result: None,
-    };
-    harness.visit_program(program);
-    harness.result.unwrap_or(false)
+    prove_detected_if_ladder_machine(program, machine, |body| {
+        prove_machine_states_before_event(machine, body, required_states, event)
+    })
 }
 
 pub fn prove_detected_if_ladder_event_before_barriers(
@@ -3420,57 +3379,9 @@ pub fn prove_detected_if_ladder_event_before_barriers(
     event: Span,
     barriers: &[Span],
 ) -> bool {
-    struct Harness<'m, 'b> {
-        machine: &'m IfLadderStateMachineCandidate,
-        event: Span,
-        barriers: &'b [Span],
-        result: Option<bool>,
-    }
-
-    impl<'a> Visit<'a> for Harness<'_, '_> {
-        fn visit_for_statement(&mut self, statement: &ForStatement<'a>) {
-            if self.result.is_some() {
-                return;
-            }
-            if statement.span.start == self.machine.start && statement.span.end == self.machine.end
-            {
-                self.result = Some(prove_machine_event_before_barriers(
-                    self.machine,
-                    &statement.body,
-                    self.event,
-                    self.barriers,
-                ));
-                return;
-            }
-            walk::walk_for_statement(self, statement);
-        }
-
-        fn visit_while_statement(&mut self, statement: &WhileStatement<'a>) {
-            if self.result.is_some() {
-                return;
-            }
-            if statement.span.start == self.machine.start && statement.span.end == self.machine.end
-            {
-                self.result = Some(prove_machine_event_before_barriers(
-                    self.machine,
-                    &statement.body,
-                    self.event,
-                    self.barriers,
-                ));
-                return;
-            }
-            walk::walk_while_statement(self, statement);
-        }
-    }
-
-    let mut harness = Harness {
-        machine,
-        event,
-        barriers,
-        result: None,
-    };
-    harness.visit_program(program);
-    harness.result.unwrap_or(false)
+    prove_detected_if_ladder_machine(program, machine, |body| {
+        prove_machine_event_before_barriers(machine, body, event, barriers)
+    })
 }
 
 /// Prove required state visitation inside the unique detected flattened
