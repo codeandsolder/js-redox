@@ -81,6 +81,8 @@ fn recorder_runtime_provenance_flows_into_source_graph() -> Result<()> {
     }
 
     let network = "globalThis.networkFixture = 1;";
+    let network_other = "globalThis.otherCapturedResponse = 2;";
+    let missed_other = "globalThis.missedResponse = 3;";
     let inline = "globalThis.inlineFixture = 1;";
     let exact = alpine("app.foo");
     let model = alpine("form.name = __placeholder");
@@ -117,7 +119,13 @@ fn recorder_runtime_provenance_flows_into_source_graph() -> Result<()> {
             "entries": [
                 har_entry("https://fixture.invalid/", "text/html", &initial_html),
                 har_entry("https://fixture.invalid/app.js", "application/javascript", network),
+                // Same URL, different source bytes: only the exact body can
+                // substantiate a source match with the captured runtime script.
+                har_entry("https://fixture.invalid/app.js", "application/javascript", network_other),
+                // Same bytes at a different URL must not borrow app.js identity.
+                har_entry("https://fixture.invalid/copy.js", "application/javascript", network),
                 har_entry("https://fixture.invalid/body-missed.js", "application/javascript", ""),
+                har_entry("https://fixture.invalid/body-missed.js", "application/javascript", missed_other),
             ],
         }
     });
@@ -265,8 +273,63 @@ fn recorder_runtime_provenance_flows_into_source_graph() -> Result<()> {
     assert_eq!(node_types.get("runtime_expression_family"), Some(&4));
     assert_eq!(node_types.get("dom_snapshot"), Some(&1));
     assert_eq!(node_types.get("dom_directive"), Some(&3));
-    assert_eq!(edge_kinds.get("runtime_execution"), Some(&3));
+    assert_eq!(edge_kinds.get("runtime_execution"), Some(&1));
+    assert_eq!(edge_kinds.get("runtime_source_match"), Some(&1));
+    assert_eq!(edge_kinds.get("runtime_source_candidate"), Some(&2));
     assert_eq!(edge_kinds.get("runtime_generated_code"), Some(&2));
+    let manifest = read_json(&project.join("capture-manifest.json"))?;
+    let resources = manifest["resources"]
+        .as_array()
+        .context("capture resources missing")?;
+    let network_sha = digest(network);
+    let network_runtime = format!("runtime:{}", &network_sha[..20]);
+    let network_edges = edges
+        .iter()
+        .filter(|edge| edge["to"] == network_runtime && edge["kind"] == "runtime_source_match")
+        .collect::<Vec<_>>();
+    assert_eq!(network_edges.len(), 1);
+    let exact_capture = resources
+        .iter()
+        .find(|resource| {
+            resource["url"] == "https://fixture.invalid/app.js" && resource["sha256"] == network_sha
+        })
+        .context("exact app.js capture missing")?;
+    assert_eq!(
+        network_edges[0]["from"],
+        format!(
+            "resource:{}",
+            exact_capture["id"].as_u64().context("capture ID missing")?
+        )
+    );
+    assert_eq!(network_edges[0]["identity_basis"], "sha256_and_url");
+    assert_eq!(network_edges[0]["candidate_count"], 1);
+    assert_eq!(network_edges[0]["exact_response_identity"], true);
+    assert_eq!(network_edges[0]["runtime_execution_observed"], false);
+    let observed_sha = digest(observed_network);
+    let observed_runtime = format!("runtime:{}", &observed_sha[..20]);
+    let url_only = edges
+        .iter()
+        .filter(|edge| edge["to"] == observed_runtime && edge["kind"] == "runtime_source_candidate")
+        .collect::<Vec<_>>();
+    assert_eq!(url_only.len(), 2);
+    for candidate in url_only {
+        assert_eq!(candidate["identity_basis"], "url_only");
+        assert_eq!(candidate["candidate_count"], 2);
+        assert_eq!(candidate["exact_response_identity"], false);
+        let response_id = candidate["from"]
+            .as_str()
+            .and_then(|value| value.strip_prefix("resource:"))
+            .and_then(|value| value.parse::<u64>().ok())
+            .context("missing candidate capture resource ID")?;
+        assert!(resources
+            .iter()
+            .any(|resource| resource["id"] == response_id
+                && resource["url"] == "https://fixture.invalid/body-missed.js"));
+    }
+    assert!(!edges
+        .iter()
+        .any(|edge| edge["to"] == network_runtime && edge["kind"] == "runtime_execution"));
+
     assert_eq!(edge_kinds.get("runtime_expression_family"), Some(&4));
     assert_eq!(edge_kinds.get("dom_directive"), Some(&3));
     assert_eq!(edge_kinds.get("runtime_alpine_compile"), Some(&3));
