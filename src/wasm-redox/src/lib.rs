@@ -1,5 +1,6 @@
 pub mod fresh_eval;
 pub mod state_machine;
+pub mod wax_view;
 
 use anyhow::{Context, Result};
 use serde::Serialize;

@@ -10,11 +10,10 @@ use serde_json::{json, Map, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::ErrorKind,
     path::{Path, PathBuf},
-    process::Command,
 };
-use work_budget::{run_command, CommandRunError, WorkBudget};
+use wasm_redox::wax_view::{write_wax_view, WaxViewOrigin};
+use work_budget::WorkBudget;
 
 const PARSE_REFUSAL: &str = "JavaScript did not parse as unambiguous or CommonJS source";
 
@@ -79,33 +78,6 @@ fn origin_with(
     Value::Object(origin)
 }
 
-fn write_wax(binary: &Path, output: &Path, wax: &Path, budget: &WorkBudget) -> Result<()> {
-    let mut command = Command::new(wax);
-    command.arg(binary);
-    let result = run_command(&mut command, budget);
-    let result = match result {
-        Ok(result) => result,
-        Err(CommandRunError::Spawn(error)) if error.kind() == ErrorKind::NotFound => {
-            eprintln!(
-                "wasm-materialize: Wax not found at {}; skipping high-level view",
-                wax.display()
-            );
-            return Ok(());
-        }
-        Err(error) => return Err(error).with_context(|| format!("running {}", wax.display())),
-    };
-    if !result.status.success() {
-        eprintln!(
-            "wasm-materialize: Wax failed for {} ({}); keeping folded WAT fallback\n{}",
-            binary.display(),
-            result.status,
-            String::from_utf8_lossy(&result.stderr)
-        );
-        return Ok(());
-    }
-    fs::write(output, result.stdout).with_context(|| format!("writing {}", output.display()))
-}
-
 fn analyze_module(
     binary: &Path,
     output_dir: &Path,
@@ -134,7 +106,13 @@ fn analyze_module(
     let wax_output = output_dir.join("module.readable.wax");
     if let Some(wax) = wax {
         budget.checkpoint()?;
-        write_wax(binary, &wax_output, wax, budget)?;
+        write_wax_view(
+            binary,
+            &wax_output,
+            wax,
+            budget,
+            WaxViewOrigin::ProjectMaterialization,
+        )?;
         budget.checkpoint()?;
     } else if wax_output.exists() {
         fs::remove_file(&wax_output)

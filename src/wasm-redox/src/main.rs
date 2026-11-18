@@ -1,13 +1,8 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use std::{
-    fs,
-    io::ErrorKind,
-    path::{Path, PathBuf},
-    process::Command,
-    time::Duration,
-};
-use work_budget::{run_command, BudgetLimits, CommandRunError, WorkBudget};
+use std::{fs, path::PathBuf, time::Duration};
+use wasm_redox::wax_view::{write_wax_view, WaxViewOrigin};
+use work_budget::{BudgetLimits, WorkBudget};
 
 #[derive(Debug, Parser)]
 #[command(about = "Recover readable, provenance-friendly views of WebAssembly modules")]
@@ -25,34 +20,6 @@ struct Args {
 
     #[arg(long)]
     skip_deep: bool,
-}
-
-fn write_wax(input: &Path, output: &Path, wax: &Path, budget: &WorkBudget) -> Result<()> {
-    let mut command = Command::new(wax);
-    command.arg(input);
-    let result = run_command(&mut command, budget);
-    let result = match result {
-        Ok(result) => result,
-        Err(CommandRunError::Spawn(error)) if error.kind() == ErrorKind::NotFound => {
-            eprintln!(
-                "wasm-redox: Wax not found at {}; skipping high-level view",
-                wax.display()
-            );
-            return Ok(());
-        }
-        Err(error) => return Err(error).with_context(|| format!("run {}", wax.display())),
-    };
-
-    if !result.status.success() {
-        eprintln!(
-            "wasm-redox: Wax failed for {} ({}); keeping folded WAT fallback\n{}",
-            input.display(),
-            result.status,
-            String::from_utf8_lossy(&result.stderr)
-        );
-        return Ok(());
-    }
-    fs::write(output, result.stdout).with_context(|| format!("write {}", output.display()))
 }
 
 fn main() -> Result<()> {
@@ -86,11 +53,12 @@ fn main() -> Result<()> {
             format!("wax:{}", args.input.display()),
             BudgetLimits::wall_time(Duration::from_secs(180)),
         );
-        write_wax(
+        write_wax_view(
             &args.input,
             &args.output_dir.join("module.readable.wax"),
             &args.wax,
             &wax_budget,
+            WaxViewOrigin::Standalone,
         )?;
     }
 
