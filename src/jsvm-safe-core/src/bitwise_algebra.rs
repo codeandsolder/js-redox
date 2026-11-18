@@ -6,7 +6,12 @@
 //! complete equivalence proof for every possible combination of 32-bit inputs,
 //! not a randomized equivalence test. The original JS arithmetic must also be
 //! exact, and all identifier reads must be primitive and free of effects.
-use crate::{fragment, numeric::exact_i64, statically_resolved_symbol};
+use crate::{
+    bitwise_ast::{integer_literal, unparen},
+    fragment,
+    numeric::exact_i64,
+    statically_resolved_symbol,
+};
 use oxc_ast::ast::{AssignmentTarget, Expression, Statement};
 use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::Scoping;
@@ -104,23 +109,6 @@ impl Form {
             value = value.checked_add(term)?;
         }
         Some(value)
-    }
-}
-
-fn unparen<'e, 'a>(mut expr: &'e Expression<'a>) -> &'e Expression<'a> {
-    while let Expression::ParenthesizedExpression(paren) = expr {
-        expr = &paren.expression;
-    }
-    expr
-}
-
-fn integer_literal(expr: &Expression<'_>) -> Option<i64> {
-    match unparen(expr) {
-        Expression::NumericLiteral(number) => exact_i64(number.value),
-        Expression::UnaryExpression(unary) if unary.operator.as_str() == "-" => {
-            integer_literal(&unary.argument)?.checked_neg()
-        }
-        _ => None,
     }
 }
 

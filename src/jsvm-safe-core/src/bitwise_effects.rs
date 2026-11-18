@@ -6,26 +6,12 @@
 //! A `BigInt`-valued `x` throws on XOR with a Number on either side; no
 //! successful `BigInt` path is changed. The other arithmetic operands must be
 //! established primitive numbers so `+` cannot be string concatenation.
-use crate::{fragment, numeric::exact_i64};
+use crate::{
+    bitwise_ast::{integer_literal, unparen},
+    fragment,
+};
 use oxc_ast::ast::{BinaryExpression, Expression};
 use oxc_span::GetSpan;
-
-fn unparen<'e, 'a>(mut expression: &'e Expression<'a>) -> &'e Expression<'a> {
-    while let Expression::ParenthesizedExpression(parenthesized) = expression {
-        expression = &parenthesized.expression;
-    }
-    expression
-}
-
-fn literal_int(expr: &Expression<'_>) -> Option<i64> {
-    match unparen(expr) {
-        Expression::NumericLiteral(n) => exact_i64(n.value),
-        Expression::UnaryExpression(unary) if unary.operator.as_str() == "-" => {
-            literal_int(&unary.argument)?.checked_neg()
-        }
-        _ => None,
-    }
-}
 
 /// Expression is known to yield a Number whenever its evaluation succeeds.
 /// The checked numeric literal rules out successful `BigInt`-bitwise results.
@@ -36,7 +22,7 @@ fn number_bitwise(expr: &Expression<'_>) -> bool {
     matches!(
         binary.operator.as_str(),
         "&" | "|" | "^" | "<<" | ">>" | ">>>"
-    ) && (literal_int(&binary.left).is_some() || literal_int(&binary.right).is_some())
+    ) && (integer_literal(&binary.left).is_some() || integer_literal(&binary.right).is_some())
 }
 
 pub fn normalize(expr: &BinaryExpression<'_>, source: &str) -> Option<String> {
@@ -49,7 +35,7 @@ pub fn normalize(expr: &BinaryExpression<'_>, source: &str) -> Option<String> {
     if lhs.operator.as_str() != "+" {
         return None;
     }
-    let constant = literal_int(&lhs.left)?;
+    let constant = integer_literal(&lhs.left)?;
     // The maximum of three int32 values and this constant must be a precisely
     // represented ECMAScript Number (including the left-associated sum).
     if !(-1_i64 << 42..=1_i64 << 42).contains(&constant) {
@@ -61,7 +47,7 @@ pub fn normalize(expr: &BinaryExpression<'_>, source: &str) -> Option<String> {
     let Expression::BinaryExpression(xor) = unparen(&expr.right) else {
         return None;
     };
-    if xor.operator.as_str() != "^" || literal_int(&xor.right).is_none() {
+    if xor.operator.as_str() != "^" || integer_literal(&xor.right).is_none() {
         return None;
     }
     let Expression::UnaryExpression(not) = unparen(&xor.left) else {

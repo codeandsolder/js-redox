@@ -2,6 +2,7 @@ mod base91;
 mod base91_recovery;
 mod binary_rhs_reflow;
 mod bitwise_algebra;
+mod bitwise_ast;
 mod bitwise_effects;
 mod browser_legacy;
 mod control_flow;
