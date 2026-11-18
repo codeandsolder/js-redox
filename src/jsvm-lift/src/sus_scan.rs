@@ -1415,6 +1415,45 @@ fn analyze_program(
     }
 }
 
+// This analysis-only recovery keeps the original source for reporting while
+// parsing the offset-preserving masked view. Script/module selection belongs
+// to the caller; only a fully parsed recovered view can relax parser fatality.
+fn analyze_browser_legacy_recovery(
+    source: &str,
+    input: &Path,
+    options: &SusScanOptions,
+    source_type: SourceType,
+) -> Option<SusFileReport> {
+    let recovery = recover_browser_legacy_call_assignments(source, source_type)?;
+    let allocator = Allocator::default();
+    let parsed = Parser::new(&allocator, &recovery.source, source_type).parse();
+    if parsed.fatal_error {
+        return None;
+    }
+    Some(analyze_program(
+        source,
+        input,
+        options,
+        &parsed.program,
+        ParseAnalysisState {
+            diagnostics: parsed.diagnostics.len(),
+            parser_fatal_error: true,
+            fatal_error: false,
+            analysis_complete: false,
+            parse_recovery: Some("browser-legacy-call-assignment".to_string()),
+            opaque_parse_spans: recovery
+                .opaque_spans
+                .into_iter()
+                .map(|span| SusOpaqueParseSpan {
+                    start: span.start,
+                    end: span.end,
+                    kind: "browser_legacy_call_assignment_target".to_string(),
+                })
+                .collect(),
+        },
+    ))
+}
+
 /// Analyze decoded JavaScript source using the supplied scan options.
 ///
 /// # Errors
@@ -1447,8 +1486,7 @@ pub fn analyze_source(
     }
 
     let initial_diagnostics = parsed.diagnostics.len();
-    let may_try_classic = path_allows_classic_fallback(input);
-    if may_try_classic {
+    let recovery_type = if path_allows_classic_fallback(input) {
         let classic_allocator = Allocator::default();
         let classic = Parser::new(&classic_allocator, source, SourceType::cjs()).parse();
         if !classic.fatal_error {
@@ -1467,62 +1505,12 @@ pub fn analyze_source(
                 },
             ));
         }
-        if let Some(recovery) = recover_browser_legacy_call_assignments(source, SourceType::cjs()) {
-            let recovery_allocator = Allocator::default();
-            let recovered =
-                Parser::new(&recovery_allocator, &recovery.source, SourceType::cjs()).parse();
-            if !recovered.fatal_error {
-                return Ok(analyze_program(
-                    source,
-                    input,
-                    options,
-                    &recovered.program,
-                    ParseAnalysisState {
-                        diagnostics: recovered.diagnostics.len(),
-                        parser_fatal_error: true,
-                        fatal_error: false,
-                        analysis_complete: false,
-                        parse_recovery: Some("browser-legacy-call-assignment".to_string()),
-                        opaque_parse_spans: recovery
-                            .opaque_spans
-                            .into_iter()
-                            .map(|span| SusOpaqueParseSpan {
-                                start: span.start,
-                                end: span.end,
-                                kind: "browser_legacy_call_assignment_target".to_string(),
-                            })
-                            .collect(),
-                    },
-                ));
-            }
-        }
-    } else if let Some(recovery) = recover_browser_legacy_call_assignments(source, source_type) {
-        let recovery_allocator = Allocator::default();
-        let recovered = Parser::new(&recovery_allocator, &recovery.source, source_type).parse();
-        if !recovered.fatal_error {
-            return Ok(analyze_program(
-                source,
-                input,
-                options,
-                &recovered.program,
-                ParseAnalysisState {
-                    diagnostics: recovered.diagnostics.len(),
-                    parser_fatal_error: true,
-                    fatal_error: false,
-                    analysis_complete: false,
-                    parse_recovery: Some("browser-legacy-call-assignment".to_string()),
-                    opaque_parse_spans: recovery
-                        .opaque_spans
-                        .into_iter()
-                        .map(|span| SusOpaqueParseSpan {
-                            start: span.start,
-                            end: span.end,
-                            kind: "browser_legacy_call_assignment_target".to_string(),
-                        })
-                        .collect(),
-                },
-            ));
-        }
+        SourceType::cjs()
+    } else {
+        source_type
+    };
+    if let Some(report) = analyze_browser_legacy_recovery(source, input, options, recovery_type) {
+        return Ok(report);
     }
 
     Ok(analyze_program(
@@ -1791,6 +1779,35 @@ mod tests {
             "browser_legacy_call_assignment_target"
         );
         assert!(kind_count(&legacy, "static_dynamic_code_call") >= 1);
+
+        // Module inputs never fall back to a classic-script parse. Their
+        // supported legacy assignment masking keeps the same opaque spans.
+        let module = analyze_source(
+            "function target() { return 1; }\ntarget() = 2;\neval('visible');\n",
+            PathBuf::from("legacy.mjs").as_path(),
+            &options,
+        )?;
+        assert!(module.parser_fatal_error);
+        assert!(!module.fatal_error);
+        assert!(!module.analysis_complete);
+        assert_eq!(
+            module.parse_recovery.as_deref(),
+            Some("browser-legacy-call-assignment")
+        );
+        assert_eq!(
+            module.opaque_parse_spans.len(),
+            legacy.opaque_parse_spans.len()
+        );
+        for (actual, expected) in module
+            .opaque_parse_spans
+            .iter()
+            .zip(&legacy.opaque_parse_spans)
+        {
+            assert_eq!(
+                (actual.start, actual.end, actual.kind.as_str()),
+                (expected.start, expected.end, expected.kind.as_str())
+            );
+        }
 
         let html_comment = analyze_source(
             "<!--\n$(document).ready(function() { $('#slideshow0').nivoSlider(); });\n-->",
