@@ -333,10 +333,49 @@ fn add_unresolved_reference(
     )
 }
 
+#[derive(Default)]
+struct InlineSourceIndex {
+    by_identity: BTreeMap<(String, u64, u64), String>,
+    by_unique_raw: BTreeMap<String, Option<String>>,
+}
+
+impl InlineSourceIndex {
+    fn insert(&mut self, raw: &str, parent: u64, ordinal: u64, node: String) -> Result<()> {
+        anyhow::ensure!(
+            self.by_identity
+                .insert((raw.to_owned(), parent, ordinal), node.clone())
+                .is_none(),
+            "duplicate inline script identity {raw} ({parent}, {ordinal})"
+        );
+        self.by_unique_raw
+            .entry(raw.to_owned())
+            .and_modify(|existing| *existing = None)
+            .or_insert(Some(node));
+        Ok(())
+    }
+
+    fn exact(&self, raw: &str, parent: u64, ordinal: u64) -> Option<String> {
+        self.by_identity
+            .get(&(raw.to_owned(), parent, ordinal))
+            .cloned()
+    }
+
+    fn for_record(&self, record: &Value) -> Option<String> {
+        let raw = string_field(record, "raw_path")?;
+        match (
+            u64_field(record, "resource_id"),
+            u64_field(record, "ordinal"),
+        ) {
+            (Some(parent), Some(ordinal)) => self.exact(raw, parent, ordinal),
+            _ => self.by_unique_raw.get(raw).and_then(Clone::clone),
+        }
+    }
+}
+
 fn add_js_reference_edges(
     graph: &mut GraphBuilder,
     jsrefs: &Value,
-    inline_node_by_raw: &BTreeMap<String, String>,
+    inline_nodes: &InlineSourceIndex,
     budget: &work_budget::WorkBudget,
 ) -> Result<()> {
     let mut specifier_nodes = BTreeMap::<String, String>::new();
@@ -345,9 +384,16 @@ fn add_js_reference_edges(
         let Some(resource_id) = u64_field(unit, "resource_id") else {
             continue;
         };
-        let source = string_field(unit, "raw_path")
-            .and_then(|raw| inline_node_by_raw.get(raw).cloned())
-            .unwrap_or_else(|| format!("resource:{resource_id}"));
+        let source = if string_field(unit, "origin") == Some("inline_script") {
+            let raw =
+                string_field(unit, "raw_path").context("inline reference missing raw path")?;
+            let ordinal = u64_field(unit, "ordinal").context("inline reference missing ordinal")?;
+            inline_nodes
+                .exact(raw, resource_id, ordinal)
+                .with_context(|| format!("inline reference has no exact captured source {raw} ({resource_id}, {ordinal})"))?
+        } else {
+            format!("resource:{resource_id}")
+        };
         for reference in array_field(unit, "references") {
             add_reference_edges(graph, &mut specifier_nodes, &source, reference)?;
         }
@@ -525,7 +571,7 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
     }
 
     // Inline scripts are generated source nodes owned by their HTML resource.
-    let mut inline_node_by_raw = BTreeMap::<String, String>::new();
+    let mut inline_nodes = InlineSourceIndex::default();
     let mut inline_nodes_by_sha = BTreeMap::<String, Vec<String>>::new();
     for (index, item) in manifest.inline_scripts.iter().enumerate() {
         budget.checkpoint()?;
@@ -561,7 +607,7 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
             "inline_script",
             json!({"ordinal":ordinal}),
         )?;
-        inline_node_by_raw.insert(output_path.to_string(), node_id.clone());
+        inline_nodes.insert(output_path, parent, ordinal, node_id.clone())?;
         if let Some(sha) = nonempty_string_field(item, "sha256") {
             inline_nodes_by_sha
                 .entry(sha.to_string())
@@ -1196,7 +1242,7 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
         )?;
         let parent = string_field(unit, "raw_path")
             .and_then(|raw| {
-                inline_node_by_raw.get(raw).cloned().or_else(|| {
+                inline_nodes.for_record(unit).or_else(|| {
                     // CDP runtime source bodies are not synthetic HTTP
                     // resources. Connect their deobfuscation result to the
                     // independently captured runtime-script node by exact
@@ -1261,8 +1307,7 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
         let mut parent = u64_field(row, "deobfuscation_ordinal")
             .and_then(|ordinal| deob_nodes.get(&ordinal).cloned());
         if parent.is_none() {
-            parent =
-                string_field(row, "raw_path").and_then(|raw| inline_node_by_raw.get(raw).cloned());
+            parent = inline_nodes.for_record(row);
         }
         if parent.is_none() {
             parent =
@@ -1773,9 +1818,14 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
         let Some(raw_path) = string_field(record, "raw_path") else {
             continue;
         };
-        let Some(src) = inline_node_by_raw.get(raw_path).cloned() else {
+        let Some(src) = (|| {
+            let parent = u64_field(record, "document_resource_id")?;
+            let ordinal = u64_field(record, "ordinal")?;
+            inline_nodes.exact(raw_path, parent, ordinal)
+        })() else {
             continue;
         };
+
         let document_resource_id = field(record, "document_resource_id");
         if let Some(imports) = object_field(record, "imports") {
             for (specifier, resolved) in imports {
@@ -1825,7 +1875,7 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
     }
 
     // AST-backed JavaScript module / worker references.
-    add_js_reference_edges(&mut graph, &jsrefs, &inline_node_by_raw, &budget)?;
+    add_js_reference_edges(&mut graph, &jsrefs, &inline_nodes, &budget)?;
 
     // Captured or statically recovered WebAssembly modules are first-class derived sources.
     for module in array_field(&wasm, "modules") {

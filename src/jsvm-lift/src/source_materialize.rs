@@ -299,9 +299,9 @@ pub fn materialize_capture_source(
         let Some(raw_path) = object_string(resource, "output_path") else {
             continue;
         };
-        if !seen.insert(raw_path.clone()) {
-            continue;
-        }
+        // Capture records may intentionally share one on-disk body. Each
+        // identity still needs an independent source-index row.
+        seen.insert(raw_path.clone());
         let kind = object_string(resource, "kind").context("resource.kind must be a string")?;
         if !matches!(
             kind.as_str(),
@@ -344,9 +344,9 @@ pub fn materialize_capture_source(
         let Some(raw_path) = object_string(script, "output_path") else {
             continue;
         };
-        if !seen.insert(raw_path.clone()) {
-            continue;
-        }
+        // Capture records may intentionally share one on-disk body. Each
+        // identity still needs an independent source-index row.
+        seen.insert(raw_path.clone());
         let parent_id = object_u64(script, "parent_resource_id")?;
         let parent = resources_by_id
             .get(&parent_id)
@@ -434,6 +434,13 @@ pub fn materialize_capture_source(
 
     let mut rows = Vec::<Value>::new();
     let mut groups = BTreeMap::<(String, Option<String>), Vec<JsTask>>::new();
+    // Sharing captured raw bytes must not merge provenance or charset. All
+    // non-alias output paths are reserved before assigning alias destinations.
+    let mut reserved_sources = units
+        .iter()
+        .map(|unit| src_path(&unit.raw_path))
+        .collect::<BTreeSet<_>>();
+    let mut materialized_raw = BTreeSet::<String>::new();
     for unit in units {
         if unit.kind == "incomplete" {
             rows.push(json!({
@@ -446,7 +453,22 @@ pub fn materialize_capture_source(
             continue;
         }
         let source = project.join(&unit.raw_path);
-        let dest_rel = src_path(&unit.raw_path);
+        let dest_rel = if materialized_raw.insert(unit.raw_path.clone()) {
+            src_path(&unit.raw_path)
+        } else {
+            let mut index = rows.len();
+            let source_suffix = unit
+                .raw_path
+                .strip_prefix("resources/")
+                .unwrap_or(&unit.raw_path);
+            loop {
+                let candidate = format!("src/_capture_aliases/{index:08}/{source_suffix}");
+                if reserved_sources.insert(candidate.clone()) {
+                    break candidate;
+                }
+                index += 1;
+            }
+        };
         let dest = project.join(&dest_rel);
         let mut row = json!({
             "kind": unit.kind, "captured_kind": unit.captured_kind,

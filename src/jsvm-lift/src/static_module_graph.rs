@@ -89,6 +89,8 @@ struct Unit<'a> {
 struct CapturedManifestBody<'a> {
     sha256: &'a str,
     resource_id: Option<u64>,
+    parent_resource_id: Option<u64>,
+    ordinal: Option<u64>,
     url: Option<&'a str>,
 }
 type ManifestBodies<'a> = BTreeMap<(&'a str, &'a str), Vec<CapturedManifestBody<'a>>>;
@@ -106,6 +108,8 @@ fn manifest_bodies(manifest: &CaptureManifest) -> ManifestBodies<'_> {
                     .push(CapturedManifestBody {
                         sha256: sha,
                         resource_id: row.get("id").and_then(Value::as_u64),
+                        parent_resource_id: row.get("parent_resource_id").and_then(Value::as_u64),
+                        ordinal: row.get("ordinal").and_then(Value::as_u64),
                         url: field(row, "url"),
                     });
             }
@@ -148,24 +152,46 @@ fn source_identity(
             )
         })?;
     let mut resource_ids = Vec::new();
+    let mut matched_identity = false;
+    let row_resource_id = unit.row.get("resource_id").and_then(Value::as_u64);
+    let row_ordinal = unit.row.get("ordinal").and_then(Value::as_u64);
+    let row_url = field(unit.row, "url");
     for body in captured {
+        // Different manifest entries can intentionally refer to identical
+        // captured bytes; all must agree on the physical raw digest.
         anyhow::ensure!(
             body.sha256 == raw_sha,
             "captured source differs from manifest SHA: {} ({})",
             unit.raw_path,
             unit.origin
         );
-        if let (Some(expected), Some(actual)) = (body.url, field(unit.row, "url")) {
-            anyhow::ensure!(
-                expected == actual,
-                "captured URL differs from indexed source URL: {}",
-                unit.raw_path
-            );
-        }
-        if let Some(id) = body.resource_id {
-            resource_ids.push(id);
+        let matches = match unit.origin {
+            "resource" => {
+                row_resource_id.is_some()
+                    && body.resource_id == row_resource_id
+                    && body.url == row_url
+            }
+            "inline_script" => {
+                row_resource_id.is_some()
+                    && row_ordinal.is_some()
+                    && body.parent_resource_id == row_resource_id
+                    && body.ordinal == row_ordinal
+            }
+            _ => false,
+        };
+        if matches {
+            matched_identity = true;
+            if let Some(id) = body.resource_id {
+                resource_ids.push(id);
+            }
         }
     }
+    anyhow::ensure!(
+        matched_identity,
+        "indexed module has no matching exact capture identity: {} ({})",
+        unit.raw_path,
+        unit.origin
+    );
     resource_ids.sort_unstable();
     resource_ids.dedup();
     anyhow::ensure!(
@@ -206,6 +232,8 @@ fn candidate_resolutions(reference: &Value, document_id: u64) -> Vec<&Value> {
 
 fn match_root(
     source: &CapturedScriptSource,
+    document_id: u64,
+    script_ordinal: usize,
     raw_index: &BTreeMap<String, Vec<usize>>,
     units: &[Unit<'_>],
     bodies: &ManifestBodies<'_>,
@@ -214,7 +242,21 @@ fn match_root(
 ) -> Result<Vec<(usize, ModuleSourceIdentity)>> {
     let mut out = Vec::new();
     for &idx in raw_index.get(&source.output_path).into_iter().flatten() {
-        let identity = source_identity(project, &units[idx], bodies, budget)?;
+        let unit = &units[idx];
+        let row_id = unit.row.get("resource_id").and_then(Value::as_u64);
+        let matched = match source.resource_id {
+            Some(resource_id) => unit.origin == "resource" && row_id == Some(resource_id),
+            None => {
+                unit.origin == "inline_script"
+                    && row_id == Some(document_id)
+                    && unit.row.get("ordinal").and_then(Value::as_u64)
+                        == u64::try_from(script_ordinal).ok()
+            }
+        };
+        if !matched {
+            continue;
+        }
+        let identity = source_identity(project, unit, bodies, budget)?;
         anyhow::ensure!(
             identity.raw_sha256 == source.sha256 && source.matches_manifest_sha256,
             "raw HTML root digest changed: {}",
@@ -334,6 +376,8 @@ fn discover_roots(
             for source in &script.captured_sources {
                 let resolved = match_root(
                     source,
+                    document.document_resource_id,
+                    script.ordinal,
                     &catalog.raw_index,
                     &catalog.units,
                     bodies,
@@ -736,10 +780,18 @@ mod tests {
         }]);
         let mut second_refs = second_refs;
         second_refs["url"] = json!("https://example.test/pkg.js");
-        let index =
+        let mut index =
             json!({"units":[main_unit,first_unit,second_unit,dep_unit,lazy_unit,inline_unit]});
-        let refs =
+        let mut refs =
             json!({"code_units":[main_refs,first_refs,second_refs,dep_refs,lazy_refs,inline_refs]});
+        for i in 0..5 {
+            index["units"][i]["resource_id"] = json!(i);
+            refs["code_units"][i]["resource_id"] = json!(i);
+        }
+        index["units"][5]["resource_id"] = json!(3);
+        index["units"][5]["ordinal"] = json!(99);
+        refs["code_units"][5]["resource_id"] = json!(3);
+        refs["code_units"][5]["ordinal"] = json!(99);
         let mut resources = Vec::new();
         let mut inline_scripts = Vec::new();
         for (i, unit) in index["units"].as_array().into_iter().flatten().enumerate() {
@@ -777,7 +829,7 @@ mod tests {
             extra: Default::default(),
         };
         let source = CapturedScriptSource {
-            resource_id: Some(8),
+            resource_id: Some(0),
             output_path: "resources/main.js".into(),
             sha256: main_sha,
             matches_manifest_sha256: true,
