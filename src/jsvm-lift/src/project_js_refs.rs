@@ -731,9 +731,9 @@ pub fn scan_project_references(
             .get("parent_resource_id")
             .and_then(Value::as_u64)
             .context("script parent_resource_id must be integer")?;
-        if !import_maps.contains_key(&document_id) {
-            continue;
-        }
+        // Every executable script seeds its document context, even without
+        // an import map: a shared module must retain both mapped and unmapped
+        // resolution outcomes rather than inheriting only the mapped one.
         if let Some(path) = script.get("output_path").and_then(Value::as_str) {
             if let Some(&row_id) = units_by_raw.get(path) {
                 if contexts[row_id].insert(document_id) {
