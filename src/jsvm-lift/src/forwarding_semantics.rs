@@ -1339,7 +1339,7 @@ impl<'a> Visit<'a> for HelperCollector<'_> {
     }
 }
 
-fn only_unconditional_statements_budgeted(
+pub(crate) fn only_unconditional_statements_budgeted(
     statements: &[Statement<'_>],
     budget: &WorkBudget,
 ) -> Result<bool, BudgetExceeded> {
