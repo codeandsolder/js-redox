@@ -467,6 +467,87 @@ impl InlineSourceIndex {
     }
 }
 
+fn captured_sourcemap_candidates(
+    graph: &mut GraphBuilder,
+    row: &Value,
+    url_field: &str,
+) -> Result<Vec<String>> {
+    let ids = array_field(row, "map_resource_ids")
+        .iter()
+        .chain(array_field(row, "candidate_resource_ids"))
+        .filter_map(Value::as_u64)
+        .map(|id| format!("resource:{id}"))
+        .collect::<BTreeSet<_>>();
+    if !ids.is_empty() {
+        return Ok(ids.into_iter().collect());
+    }
+    if let Some(url) = nonempty_string_field(row, url_field) {
+        return graph.targets_for(url);
+    }
+    Ok(Vec::new())
+}
+
+fn add_sourcemap_reference(
+    graph: &mut GraphBuilder,
+    map: &Value,
+    source: &str,
+    resource_id: u64,
+) -> Result<String> {
+    if let Some(id) = u64_field(map, "map_resource_id") {
+        let node = format!("resource:{id}");
+        graph.add_edge(
+            source,
+            &node,
+            "source_map",
+            json!({
+                "map_url":field(map,"map_url"),
+            }),
+        )?;
+        return Ok(node);
+    }
+    // Recovery from common bytes does not prove a particular HTTP response
+    // instance. Own the recovered sources on the resolution evidence node.
+    let reference = format!("sourcemap-reference:{resource_id}");
+    graph.add_node(
+        reference.clone(),
+        json!({
+            "type":"source_map_reference",
+            "source_resource_id":resource_id,
+            "map_url":field(map,"map_url"),
+            "status":field(map,"status"),
+            "map_origin":field(map,"map_origin"),
+            "map_resource_ids":field(map,"map_resource_ids"),
+            "candidate_resource_ids":field(map,"candidate_resource_ids"),
+        }),
+    )?;
+    graph.add_edge(
+        source,
+        &reference,
+        "source_map_reference",
+        json!({
+            "map_url":field(map,"map_url"),
+            "status":field(map,"status"),
+        }),
+    )?;
+    let candidates = captured_sourcemap_candidates(graph, map, "map_url")?;
+    for node in &candidates {
+        graph.add_edge(
+            &reference,
+            node,
+            "source_map_resource_candidate",
+            json!({
+                "candidate_count":candidates.len(),
+                "identity_basis":if string_field(map,"map_origin") == Some("har_shared_bytes") {
+                    "shared_verified_bytes"
+                } else {
+                    "url_only"
+                },
+            }),
+        )?;
+    }
+    Ok(reference)
+}
+
 fn add_js_reference_edges(
     graph: &mut GraphBuilder,
     jsrefs: &Value,
@@ -1630,23 +1711,7 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
             continue;
         };
         let src = format!("resource:{resource_id}");
-        let mut map_node = None::<String>;
-        if let Some(map_resource_id) = u64_field(source_map, "map_resource_id") {
-            let node = format!("resource:{map_resource_id}");
-            graph.add_edge(
-                &src,
-                &node,
-                "source_map",
-                json!({"map_url":field(source_map,"map_url")}),
-            )?;
-            map_node = Some(node);
-        } else if let Some(map_url) = nonempty_string_field(source_map, "map_url") {
-            let targets = graph.targets_for(map_url)?;
-            map_node = targets.first().cloned();
-            for dst in targets {
-                graph.add_edge(&src, &dst, "source_map", json!({"map_url":map_url}))?;
-            }
-        }
+        let map_node = add_sourcemap_reference(&mut graph, source_map, &src, resource_id)?;
 
         for recovered in array_field(source_map, "recovered") {
             if string_field(recovered, "status") != Some("recovered") {
@@ -1666,7 +1731,7 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
                 }),
             )?;
             graph.add_edge(
-                map_node.as_deref().unwrap_or(&src),
+                &map_node,
                 &node_id,
                 "source_map_source",
                 json!({"ordinal":ordinal}),
@@ -1687,12 +1752,7 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
                     "composed_sources":composition.get("composed_sources").cloned().unwrap_or_else(|| json!(0)),
                 }),
             )?;
-            graph.add_edge(
-                map_node.as_deref().unwrap_or(&src),
-                &node_id,
-                "source_map_composed",
-                json!({}),
-            )?;
+            graph.add_edge(&map_node, &node_id, "source_map_composed", json!({}))?;
             composed_node = Some(node_id);
         }
 
@@ -1713,12 +1773,7 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
                     "status":field(link,"status"),
                 }),
             )?;
-            graph.add_edge(
-                map_node.as_deref().unwrap_or(&src),
-                &chain_node,
-                "source_map_chain",
-                json!({}),
-            )?;
+            graph.add_edge(&map_node, &chain_node, "source_map_chain", json!({}))?;
             if let Some(nested_map_resource_id) = u64_field(link, "map_resource_id") {
                 graph.add_edge(
                     &chain_node,
@@ -1726,9 +1781,17 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
                     "source_map_chain_resource",
                     json!({}),
                 )?;
-            } else if let Some(map_url) = string_field(link, "map_url") {
-                for dst in graph.targets_for(map_url)? {
-                    graph.add_edge(&chain_node, &dst, "source_map_chain_resource", json!({}))?;
+            } else {
+                let candidates = captured_sourcemap_candidates(&mut graph, link, "map_url")?;
+                for node in &candidates {
+                    graph.add_edge(&chain_node, node, "source_map_chain_resource_candidate", json!({
+                        "candidate_count":candidates.len(),
+                        "identity_basis": if string_field(link,"map_origin") == Some("har_shared_bytes") {
+                            "shared_verified_bytes"
+                        } else {
+                            "url_only"
+                        },
+                    }))?;
                 }
             }
         }
@@ -1750,10 +1813,7 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
                     "bytes":field(recovered,"bytes"),
                 }),
             )?;
-            let parent = composed_node
-                .as_deref()
-                .or(map_node.as_deref())
-                .unwrap_or(&src);
+            let parent = composed_node.as_deref().unwrap_or(map_node.as_str());
             graph.add_edge(
                 parent,
                 &node_id,
