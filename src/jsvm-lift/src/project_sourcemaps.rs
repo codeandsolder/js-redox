@@ -1053,17 +1053,20 @@ mod tests {
             ],
         )]);
         let budget = WorkBudget::new("shared-path-test", work_budget::BudgetLimits::unlimited());
-        let (bytes, ids) = captured_bytes_for_url(url, &by_url, temp.path(), &budget)
-            .expect("shared path should resolve")
-            .expect("shared path should exist");
+        let Ok(Some((bytes, ids))) = captured_bytes_for_url(url, &by_url, temp.path(), &budget)
+        else {
+            bail!("shared stored body should resolve");
+        };
         assert_eq!(bytes, content);
         assert_eq!(ids, vec![2, 3, 4]);
 
         // A cached digest must not accidentally bless a second record's
         // incorrect manifest claim for the same file.
-        by_url.get_mut(url).expect("URL indexed")[1]["sha256"] = json!("wrong");
-        let error = captured_bytes_for_url(url, &by_url, temp.path(), &budget)
-            .expect_err("each claim must be checked against real bytes");
+        let candidates = by_url.get_mut(url).context("URL not indexed")?;
+        candidates[1]["sha256"] = json!("wrong");
+        let Err(error) = captured_bytes_for_url(url, &by_url, temp.path(), &budget) else {
+            bail!("each captured record must validate its SHA-256");
+        };
         let CapturedLookupError::Resource(error) = error else {
             anyhow::bail!("expected a per-capture SHA mismatch");
         };
@@ -1086,8 +1089,9 @@ mod tests {
             vec![json!({"id": 9, "output_path": "oversized"})],
         )]);
         let budget = WorkBudget::new("oversized-test", work_budget::BudgetLimits::unlimited());
-        let error = captured_bytes_for_url(url, &by_url, temp.path(), &budget)
-            .expect_err("oversized resource cannot be loaded");
+        let Err(error) = captured_bytes_for_url(url, &by_url, temp.path(), &budget) else {
+            bail!("oversized resource must be rejected");
+        };
         let CapturedLookupError::Resource(error) = error else {
             anyhow::bail!("expected a per-capture size failure");
         };
@@ -1106,8 +1110,9 @@ mod tests {
             "capture-candidate-budget-test",
             work_budget::BudgetLimits::work(1),
         );
-        let error = recover_project_sourcemaps(project, &budgets)
-            .expect_err("the second matching response must exhaust the budget");
+        let Err(error) = recover_project_sourcemaps(project, &budgets) else {
+            bail!("the second matching response must exhaust the budget");
+        };
         assert!(work_budget::find_budget_exceeded(error.as_ref()).is_some());
         assert!(!project.join("analysis/sourcemaps.json").exists());
         Ok(())
