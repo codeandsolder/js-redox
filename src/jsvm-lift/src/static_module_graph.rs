@@ -186,14 +186,12 @@ fn source_identity(
 }
 
 fn candidate_resolutions(reference: &Value, document_id: u64) -> Vec<&Value> {
-    if let Some(choices) = reference
-        .get("resolution_candidates")
-        .and_then(Value::as_array)
-    {
-        // An explicit (including empty) contextual inventory is authoritative.
-        // Falling back to the summary fields could invent an import for a
-        // document with no matching resolution.
-        return choices
+    // A present contextual inventory is authoritative. Empty or malformed
+    // arrays do not license falling back to potentially stale summary fields.
+    // The summary fallback remains for legacy records without this field.
+    match reference.get("resolution_candidates") {
+        None => vec![reference],
+        Some(Value::Array(choices)) => choices
             .iter()
             .filter(|candidate| {
                 candidate
@@ -201,9 +199,9 @@ fn candidate_resolutions(reference: &Value, document_id: u64) -> Vec<&Value> {
                     .and_then(Value::as_u64)
                     == Some(document_id)
             })
-            .collect();
+            .collect(),
+        Some(_) => Vec::new(),
     }
-    vec![reference]
 }
 
 fn match_root(
@@ -384,7 +382,7 @@ struct GraphTraversal<'a, 'source, 'manifest> {
 }
 
 impl<'a, 'source, 'manifest> GraphTraversal<'a, 'source, 'manifest> {
-    fn new(
+    const fn new(
         project: &'a Path,
         budget: &'a WorkBudget,
         catalog: &'a SourceCatalog<'source>,
@@ -488,7 +486,7 @@ impl<'a, 'source, 'manifest> GraphTraversal<'a, 'source, 'manifest> {
             let resolution = field(choice, "resolution").unwrap_or("unknown").to_owned();
             let blocked = resolution == "import_map_blocked";
             let mut target_candidates = Vec::new();
-            if let Some(url) = &resolved_url {
+            if let Some(url) = resolved_url.as_ref().filter(|_| !blocked) {
                 for &target in self.catalog.url_index.get(url).into_iter().flatten() {
                     self.budget.consume(1)?;
                     let target_identity = self.identity(target)?;
@@ -617,6 +615,22 @@ mod tests {
     use std::{fs, path::Path};
     use work_budget::WorkBudget;
 
+    #[test]
+    fn contextual_resolution_field_must_be_well_formed_and_document_specific() {
+        let stale = "https://example.test/pkg.js";
+        let empty = json!({"resolution_candidates":[],"resolved_url":stale});
+        assert_eq!(super::candidate_resolutions(&empty, 3).len(), 0);
+        let malformed = json!({"resolution_candidates":"invalid","resolved_url":stale});
+        assert_eq!(super::candidate_resolutions(&malformed, 3).len(), 0);
+        let mismatched = json!({"resolution_candidates":[
+            {"document_resource_id":4,"resolved_url":stale}
+        ],"resolved_url":stale});
+        assert_eq!(super::candidate_resolutions(&mismatched, 3).len(), 0);
+        assert_eq!(super::candidate_resolutions(&mismatched, 4).len(), 1);
+        let legacy = json!({"resolved_url":stale});
+        assert_eq!(super::candidate_resolutions(&legacy, 3).len(), 1);
+    }
+
     fn pair(
         project: &Path,
         name: &str,
@@ -654,8 +668,8 @@ mod tests {
         let (main_unit, main_refs, main_sha) = pair(
             project,
             "main",
-            "import 'pkg';import('./lazy.js');import 'ghost';",
-            "import 'pkg';\nimport('./lazy.js');\nimport 'ghost';\n",
+            "import 'pkg';import('./lazy.js');import 'ghost';import 'blocked';",
+            "import 'pkg';\nimport('./lazy.js');\nimport 'ghost';\nimport 'blocked';\n",
         )?;
         let (first_unit, mut first_refs, _) = pair(
             project,
@@ -705,6 +719,13 @@ mod tests {
                 "kind":"import_static", "specifier":"ghost", "start":35, "end":50,
                 "resolution_candidates":[],
                 "resolution":"url","resolved_url":"https://example.test/pkg.js"
+            },
+            {
+                "kind":"import_static", "specifier":"blocked", "start":51, "end":68,
+                "resolution_candidates":[{
+                    "document_resource_id":3,"resolution":"import_map_blocked",
+                    "resolved_url":"https://example.test/pkg.js"
+                }]
             }
         ]);
         main_refs["url"] = json!("https://example.test/main.js");
@@ -817,10 +838,27 @@ mod tests {
             assert_eq!(ghost.len(), 1);
             assert_eq!(ghost[0].resolution, "no_matching_document_resolution");
             assert_eq!(ghost[0].resolved_url, None);
-            assert!(ghost[0].target_candidates.is_empty());
+            assert_eq!(ghost[0].target_candidates.len(), 0);
             assert!(!ghost[0].blocked);
         }
-        assert_eq!(result.unresolved_specifiers, 3); // doc3: root, both pkg versions, dep; doc4: root; dynamic lazy is not traversed.
+        assert_eq!(result.unresolved_specifiers, 5);
+        for document_id in [3, 4] {
+            let blocked = result
+                .dependencies
+                .iter()
+                .filter(|edge| {
+                    edge.document_resource_id == document_id && edge.specifier == "blocked"
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(blocked.len(), 1);
+            assert_eq!(blocked[0].target_candidates.len(), 0);
+            if document_id == 3 {
+                assert!(blocked[0].blocked);
+                assert_eq!(blocked[0].resolution, "import_map_blocked");
+            } else {
+                assert_eq!(blocked[0].resolution, "no_matching_document_resolution");
+            }
+        } // doc3: root, both pkg versions, dep; doc4: root; dynamic lazy is not traversed.
         assert!(result
             .dependencies
             .iter()
