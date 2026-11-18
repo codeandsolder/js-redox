@@ -450,7 +450,7 @@ fn reconcile_saved_reference_roles(
 ) -> Result<()> {
     // A saved-page file path must identify one resource. Reject collisions
     // rather than silently choosing the last matching entry.
-    let by_url = index_saved_urls(&resources)?;
+    let by_url = index_saved_urls(resources)?;
     // HTML declarations describe roles, not distinct captured bodies. Gather
     // every role before choosing a stable primary kind for single-kind consumers.
     let mut roles_by_resource = vec![BTreeSet::<&str>::new(); resources.len()];
@@ -563,13 +563,13 @@ fn materialize_saved_inline_scripts(
     let mut inline_scripts = Vec::<Value>::new();
     let mut inline_seen = HashMap::<String, String>::new();
     budget.checkpoint()?;
-    for (offset, script) in extract_script_tags(&page_text).into_iter().enumerate() {
+    for (offset, script) in extract_script_tags(page_text).into_iter().enumerate() {
         budget.checkpoint()?;
         let ordinal = offset + 1;
         let script_type = script_type_essence(script.attrs.get("type").map(String::as_str));
         let src = script.attrs.get("src").and_then(|value| clean_ref(value));
         if let Some(src) = src {
-            let resolved = Url::parse(&page_url)?.join(&src)?.to_string();
+            let resolved = Url::parse(page_url)?.join(&src)?.to_string();
             inline_scripts.push(json!({
                 "parent_resource_id": page_id,
                 "ordinal": ordinal,
@@ -667,7 +667,7 @@ fn saved_page_manifest(
             .filter(|script| !script["output_path"].is_null())
             .count(),
     );
-    let original_url = infer_original_url(&page_text)?;
+    let original_url = infer_original_url(page_text)?;
     let mut source_extra = Map::new();
     source_extra.insert("parse_error".into(), Value::Null);
     source_extra.insert(
@@ -689,7 +689,7 @@ fn saved_page_manifest(
                 "saved_page_html"
             }
             .into(),
-            input: path_text(&page),
+            input: path_text(page),
             salvaged: false,
             extra: source_extra,
         },
