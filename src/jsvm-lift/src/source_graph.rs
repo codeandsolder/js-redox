@@ -162,9 +162,8 @@ fn optional_artifact(
     Ok(load_artifact(project, spec, true)?.unwrap_or(fallback))
 }
 
-/// Connect an inspector-observed function value to its precise definition
-/// only after the importer verified session + script ID + captured source hash.
-/// Definition identity is not proof that the call was executed.
+/// Relate a runtime script to captured HTTP responses without upgrading URL
+/// coincidence or parser observation into proof of response execution.
 fn add_runtime_network_source_edges(
     graph: &mut GraphBuilder,
     runtime: &Value,
@@ -259,6 +258,8 @@ fn add_runtime_network_source_edges(
     Ok(())
 }
 
+/// An inspector function definition is exact only for its session, script ID
+/// and source digest. Definition identity is not executed-call proof.
 fn add_observed_callable_definition(
     graph: &mut GraphBuilder,
     runtime_nodes: &BTreeMap<(String, String), String>,
@@ -866,8 +867,20 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
             }
             Some("inline_script") => {
                 if let Some(parents) = inline_nodes_by_sha.get(digest) {
+                    // Matching inline bytes do not identify the document or
+                    // script ordinal whose browser instance was parsed.
                     for parent in parents {
-                        graph.add_edge(parent, &runtime_node, "runtime_execution", json!({}))?;
+                        graph.add_edge(
+                            parent,
+                            &runtime_node,
+                            "runtime_source_candidate",
+                            json!({
+                                "identity_basis":"sha256_only_inline_script",
+                                "candidate_count":parents.len(),
+                                "exact_response_identity":false,
+                                "runtime_execution_observed":bool_field(source,"observed_executed"),
+                            }),
+                        )?;
                     }
                 }
             }
@@ -2089,6 +2102,123 @@ mod tests {
         analysis_artifacts::{load_artifact, write_artifact, JS_REFERENCES, SOURCE_GRAPH},
         capture_project::{write_manifest, CaptureManifest, CaptureSource, MANIFEST_NAME},
     };
+
+    fn runtime_match_test_graph() -> Result<(GraphBuilder, BTreeMap<String, Vec<String>>)> {
+        let mut graph = GraphBuilder::default();
+        let mut hashes = BTreeMap::<String, Vec<String>>::new();
+        for (id, url, digest) in [
+            ("resource:1", "https://fixture.invalid/app.js", "alpha"),
+            ("resource:2", "https://fixture.invalid/app.js", "beta"),
+            ("resource:3", "https://fixture.invalid/copy.js", "alpha"),
+        ] {
+            graph.add_node(
+                id,
+                json!({
+                    "type":"resource","kind":"javascript","url":url,"sha256":digest
+                }),
+            )?;
+            graph.register_resource_url(url, id);
+            hashes
+                .entry(digest.to_owned())
+                .or_default()
+                .push(id.to_owned());
+        }
+        Ok((graph, hashes))
+    }
+
+    #[test]
+    fn runtime_network_execution_requires_unique_hash_url_and_positive_matching_instance(
+    ) -> Result<()> {
+        let (mut graph, hashes) = runtime_match_test_graph()?;
+        let runtime = json!({
+            "sha256":"alpha","urls":["https://fixture.invalid/app.js"],
+            "observed_executed":true,
+            "script_instances":[{
+                "script_url":"https://fixture.invalid/copy.js",
+                "execution":{"status":"positive"}
+            }]
+        });
+        add_runtime_network_source_edges(&mut graph, &runtime, "runtime:parsed", &hashes)?;
+        let parsed = graph
+            .edges
+            .iter()
+            .filter(|edge| edge["to"] == "runtime:parsed")
+            .collect::<Vec<_>>();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0]["from"], "resource:1");
+        assert_eq!(parsed[0]["kind"], "runtime_source_match");
+        assert_eq!(parsed[0]["identity_basis"], "sha256_and_url");
+        assert_eq!(parsed[0]["exact_response_identity"], true);
+        assert_eq!(parsed[0]["runtime_execution_observed"], false);
+
+        let mut confirmed = runtime;
+        confirmed["script_instances"][0]["script_url"] = json!("https://fixture.invalid/app.js");
+        add_runtime_network_source_edges(&mut graph, &confirmed, "runtime:executed", &hashes)?;
+        let executed = graph
+            .edges
+            .iter()
+            .filter(|edge| edge["to"] == "runtime:executed")
+            .collect::<Vec<_>>();
+        assert_eq!(executed.len(), 1);
+        assert_eq!(executed[0]["from"], "resource:1");
+        assert_eq!(executed[0]["kind"], "runtime_execution");
+        assert_eq!(executed[0]["runtime_execution_observed"], true);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_url_and_hash_only_matches_remain_ambiguous_candidates() -> Result<()> {
+        let (mut graph, hashes) = runtime_match_test_graph()?;
+        let runtime = json!({
+            "sha256":"missing","urls":["https://fixture.invalid/app.js"],
+            "observed_executed":true,
+            "script_instances":[{
+                "script_url":"https://fixture.invalid/app.js",
+                "execution":{"status":"positive"}
+            }]
+        });
+        add_runtime_network_source_edges(&mut graph, &runtime, "runtime:url-only", &hashes)?;
+        let url_edges = graph
+            .edges
+            .iter()
+            .filter(|edge| edge["to"] == "runtime:url-only")
+            .collect::<Vec<_>>();
+        assert_eq!(url_edges.len(), 2);
+        assert_eq!(
+            url_edges
+                .iter()
+                .map(|edge| edge["from"].as_str().unwrap_or(""))
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["resource:1", "resource:2"])
+        );
+        for edge in url_edges {
+            assert_eq!(edge["kind"], "runtime_source_candidate");
+            assert_eq!(edge["identity_basis"], "url_only");
+            assert_eq!(edge["candidate_count"], 2);
+            assert_eq!(edge["exact_response_identity"], false);
+        }
+        let sha_only = json!({"sha256":"alpha","urls":[],"observed_executed":true});
+        add_runtime_network_source_edges(&mut graph, &sha_only, "runtime:sha-only", &hashes)?;
+        let hash_edges = graph
+            .edges
+            .iter()
+            .filter(|edge| edge["to"] == "runtime:sha-only")
+            .collect::<Vec<_>>();
+        assert_eq!(hash_edges.len(), 2);
+        assert_eq!(
+            hash_edges
+                .iter()
+                .map(|edge| edge["from"].as_str().unwrap_or(""))
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["resource:1", "resource:3"])
+        );
+        for edge in hash_edges {
+            assert_eq!(edge["kind"], "runtime_source_candidate");
+            assert_eq!(edge["identity_basis"], "sha256_only");
+            assert_eq!(edge["exact_response_identity"], false);
+        }
+        Ok(())
+    }
 
     #[test]
     fn shared_inline_bytes_require_exact_parent_and_ordinal() -> Result<()> {
