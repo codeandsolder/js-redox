@@ -3368,27 +3368,22 @@ pub fn proven_slow_lazy_cell_resolver_index(
     harness.result.into_proven()
 }
 
-/// Prove both state-object facts required for slow-cell construction.
-///
-/// The prototype-carrier own field must be unchanged at this factory call,
-/// and the computed method-key field must retain its inherited string value.
-///
-/// This theorem deliberately does not interpret the carrier object itself. A
-/// separate object-model proof must establish what the exact carrier value does
-/// when used as the prototype of the newly created cell.
-///
-/// # Errors
-///
-/// Returns `BudgetExceeded` if the supplied analysis budget is exhausted.
-pub fn proven_slow_lazy_cell_state_fields(
+// Extract the two independent exact-value proofs at one concrete origin
+// call. The path-level theorem separately verifies each forwarding edge.
+fn proven_slow_cell_fields_at_direct_call(
     source: &str,
     program: &Program<'_>,
     semantic: &Semantic<'_>,
-    factory_call: &ProvenSlowLazyCellFactoryCall,
+    shape: &SlowLazyCellFactoryShape,
+    call: &ProvenOriginDirectCall,
     budget: &WorkBudget,
-) -> Result<Option<ProvenSlowLazyCellStateFields>, BudgetExceeded> {
-    let call = &factory_call.call;
-    let shape = &factory_call.shape;
+) -> Result<
+    Option<(
+        ProvenExactOwnDataFieldAtDirectCall,
+        ProvenPrototypeStringAtDirectCall,
+    )>,
+    BudgetExceeded,
+> {
     let allocation = Span::new(call.callee.allocation_start, call.callee.allocation_end);
 
     let Some(string_at_allocation) = proven_prototype_string_at_allocation(
@@ -3442,6 +3437,40 @@ pub fn proven_slow_lazy_cell_state_fields(
         return Ok(None);
     }
 
+    Ok(Some((prototype_field, method_key)))
+}
+
+/// Prove both state-object facts required for slow-cell construction.
+///
+/// The prototype-carrier own field must be unchanged at this factory call,
+/// and the computed method-key field must retain its inherited string value.
+///
+/// This theorem deliberately does not interpret the carrier object itself. A
+/// separate object-model proof must establish what the exact carrier value does
+/// when used as the prototype of the newly created cell.
+///
+/// # Errors
+///
+/// Returns `BudgetExceeded` if the supplied analysis budget is exhausted.
+pub fn proven_slow_lazy_cell_state_fields(
+    source: &str,
+    program: &Program<'_>,
+    semantic: &Semantic<'_>,
+    factory_call: &ProvenSlowLazyCellFactoryCall,
+    budget: &WorkBudget,
+) -> Result<Option<ProvenSlowLazyCellStateFields>, BudgetExceeded> {
+    let Some((prototype_field, method_key)) = proven_slow_cell_fields_at_direct_call(
+        source,
+        program,
+        semantic,
+        &factory_call.shape,
+        &factory_call.call,
+        budget,
+    )?
+    else {
+        return Ok(None);
+    };
+
     Ok(Some(ProvenSlowLazyCellStateFields {
         factory_call: factory_call.clone(),
         prototype_field,
@@ -3486,57 +3515,11 @@ pub fn proven_slow_lazy_cell_state_fields_for_exact_assignment(
         return Ok(None);
     }
 
-    let allocation = Span::new(root.callee.allocation_start, root.callee.allocation_end);
-    let Some(string_at_allocation) = proven_prototype_string_at_allocation(
-        program,
-        semantic,
-        root.callee.constructor_start,
-        root.callee.constructor_end,
-        allocation,
-        &shape.method_key_field,
-        budget,
-    )?
+    let Some((prototype_field, method_key)) =
+        proven_slow_cell_fields_at_direct_call(source, program, semantic, shape, root, budget)?
     else {
         return Ok(None);
     };
-    let method_key_proofs = proven_prototype_string_at_direct_calls(
-        source,
-        program,
-        semantic,
-        &string_at_allocation,
-        budget,
-    )?;
-    let mut method_keys = method_key_proofs
-        .into_iter()
-        .filter(|proof| proof.call == *root);
-    let Some(method_key) = method_keys.next() else {
-        return Ok(None);
-    };
-    if method_keys.next().is_some() {
-        return Ok(None);
-    }
-
-    let prototype_field_proofs = proven_exact_own_data_field_at_direct_call(
-        source,
-        program,
-        semantic,
-        &shape.prototype_field,
-        root,
-        budget,
-    )?;
-    let mut prototype_fields = prototype_field_proofs.into_iter().filter(|proof| {
-        proof.direct_call == *root
-            && proof.initialization.allocation_start == root.callee.allocation_start
-            && proof.initialization.allocation_end == root.callee.allocation_end
-            && proof.initialization.constructor_start == root.callee.constructor_start
-            && proof.initialization.constructor_end == root.callee.constructor_end
-    });
-    let Some(prototype_field) = prototype_fields.next() else {
-        return Ok(None);
-    };
-    if prototype_fields.next().is_some() {
-        return Ok(None);
-    }
 
     let preserves_until = |entry: &ProvenOriginDirectCall,
                            before: &ProvenOriginDirectCall|
