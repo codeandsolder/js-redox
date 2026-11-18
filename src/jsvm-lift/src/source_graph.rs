@@ -1793,6 +1793,21 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
                         },
                     }))?;
                 }
+                let code_candidates = array_field(link, "candidate_code_resource_ids")
+                    .iter()
+                    .filter_map(Value::as_u64)
+                    .collect::<BTreeSet<_>>();
+                for code_id in &code_candidates {
+                    graph.add_edge(
+                        &chain_node,
+                        &format!("resource:{code_id}"),
+                        "source_map_chain_code_candidate",
+                        json!({
+                            "candidate_count":code_candidates.len(),
+                            "identity_basis":"source_url_only",
+                        }),
+                    )?;
+                }
             }
         }
 
