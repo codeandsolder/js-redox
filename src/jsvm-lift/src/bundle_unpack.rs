@@ -459,22 +459,7 @@ impl Collector<'_, '_> {
         oxc_span::Span,
         &'static str,
     )> {
-        match argument {
-            Argument::FunctionExpression(function) => {
-                let body = function.body.as_ref()?;
-                Some((&function.params, body.as_ref(), function.span, "function"))
-            }
-            Argument::ArrowFunctionExpression(function) => Some((
-                &function.params,
-                arrow_block_body(function)?,
-                function.span,
-                "arrow",
-            )),
-            Argument::ParenthesizedExpression(paren) => {
-                Self::amd_factory_expression_parts(&paren.expression)
-            }
-            _ => None,
-        }
+        Self::amd_factory_expression_parts(argument.as_expression()?)
     }
 
     fn amd_exports(
@@ -824,17 +809,13 @@ impl Collector<'_, '_> {
         oxc_span::Span,
         &'static str,
     )> {
+        // Unlike AMD, Browserify requires a direct function/arrow slot.
+        // Do not admit a parenthesized element during this extraction.
         match element {
-            ArrayExpressionElement::FunctionExpression(function) => {
-                let body = function.body.as_ref()?;
-                Some((&function.params, body.as_ref(), function.span, "function"))
+            ArrayExpressionElement::FunctionExpression(_)
+            | ArrayExpressionElement::ArrowFunctionExpression(_) => {
+                Self::amd_factory_expression_parts(element.as_expression()?)
             }
-            ArrayExpressionElement::ArrowFunctionExpression(function) => Some((
-                &function.params,
-                arrow_block_body(function)?,
-                function.span,
-                "arrow",
-            )),
             _ => None,
         }
     }
