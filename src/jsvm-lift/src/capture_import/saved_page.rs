@@ -454,7 +454,7 @@ fn reconcile_saved_reference_roles(
     // HTML declarations describe roles, not distinct captured bodies. Gather
     // every role before choosing a stable primary kind for single-kind consumers.
     let mut roles_by_resource = vec![BTreeSet::<&str>::new(); resources.len()];
-    for reference in &page_refs {
+    for reference in page_refs {
         budget.checkpoint()?;
         let Some(url) = reference.get("resolved_url").and_then(Value::as_str) else {
             continue;
