@@ -57,6 +57,39 @@ pub struct DetailedHandlerTableCandidate {
     pub handlers: Vec<HandlerFunctionSlot>,
 }
 
+// Construct one table inventory from already-proven source-specific observations.
+// The source-specific acceptance thresholds and provenance never live here.
+impl DetailedHandlerTableCandidate {
+    fn from_handlers(
+        binding: String,
+        span: Span,
+        scope: (Option<String>, u32, u32),
+        container_kind: &str,
+        entries: usize,
+        handlers: Vec<HandlerFunctionSlot>,
+    ) -> Self {
+        let (scope_function_id, scope_start, scope_end) = scope;
+        let function_values = handlers.len();
+        Self {
+            binding,
+            start: span.start,
+            end: span.end,
+            scope_function_id,
+            scope_start,
+            scope_end,
+            container_kind: container_kind.into(),
+            entries,
+            function_values,
+            dynamic_call_sites: 0,
+            looped_dynamic_call_sites: 0,
+            read_sites: 0,
+            dynamic_read_sites: 0,
+            looped_dynamic_read_sites: 0,
+            handlers,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ByteTransducerCandidate {
     pub function_id: String,
@@ -483,23 +516,15 @@ fn materialize_registry_handler_tables(
             .iter()
             .find(|function| function.start == scope_start && function.end == scope_end)
             .map(|function| function.id.clone());
-        tables.push(DetailedHandlerTableCandidate {
+        let entries = handlers.len();
+        tables.push(DetailedHandlerTableCandidate::from_handlers(
             binding,
-            start,
-            end,
-            scope_function_id,
-            scope_start,
-            scope_end,
-            container_kind: container_kind.into(),
-            entries: handlers.len(),
-            function_values: handlers.len(),
-            dynamic_call_sites: 0,
-            looped_dynamic_call_sites: 0,
-            read_sites: 0,
-            dynamic_read_sites: 0,
-            looped_dynamic_read_sites: 0,
+            Span::new(start, end),
+            (scope_function_id, scope_start, scope_end),
+            container_kind,
+            entries,
             handlers,
-        });
+        ));
     }
 }
 
@@ -697,26 +722,17 @@ impl<'s> Analyzer<'s> {
             }
         }
 
-        let n = arr.elements.len();
-        if handlers.len() >= 4 && handlers.len() * 2 >= n {
-            let (scope_function_id, scope_start, scope_end) = self.current_scope();
-            self.tables.push(DetailedHandlerTableCandidate {
-                binding: binding.to_string(),
-                start: arr.span.start,
-                end: arr.span.end,
-                scope_function_id,
-                scope_start,
-                scope_end,
-                container_kind: "array".into(),
-                entries: n,
-                function_values: handlers.len(),
-                dynamic_call_sites: 0,
-                looped_dynamic_call_sites: 0,
-                read_sites: 0,
-                dynamic_read_sites: 0,
-                looped_dynamic_read_sites: 0,
-                handlers,
-            });
+        if handlers.len() >= 4 && handlers.len() >= arr.elements.len().div_ceil(2) {
+            let scope = self.current_scope();
+            self.tables
+                .push(DetailedHandlerTableCandidate::from_handlers(
+                    binding.to_string(),
+                    arr.span,
+                    scope,
+                    "array",
+                    arr.elements.len(),
+                    handlers,
+                ));
         }
     }
 
@@ -738,26 +754,17 @@ impl<'s> Analyzer<'s> {
             });
         }
 
-        let n = obj.properties.len();
-        if handlers.len() >= 8 && handlers.len() * 2 >= n {
-            let (scope_function_id, scope_start, scope_end) = self.current_scope();
-            self.tables.push(DetailedHandlerTableCandidate {
-                binding: binding.to_string(),
-                start: obj.span.start,
-                end: obj.span.end,
-                scope_function_id,
-                scope_start,
-                scope_end,
-                container_kind: "object".into(),
-                entries: n,
-                function_values: handlers.len(),
-                dynamic_call_sites: 0,
-                looped_dynamic_call_sites: 0,
-                read_sites: 0,
-                dynamic_read_sites: 0,
-                looped_dynamic_read_sites: 0,
-                handlers,
-            });
+        if handlers.len() >= 8 && handlers.len() >= obj.properties.len().div_ceil(2) {
+            let scope = self.current_scope();
+            self.tables
+                .push(DetailedHandlerTableCandidate::from_handlers(
+                    binding.to_string(),
+                    obj.span,
+                    scope,
+                    "object",
+                    obj.properties.len(),
+                    handlers,
+                ));
         }
     }
 
@@ -1121,23 +1128,18 @@ impl<'s> Analyzer<'s> {
             else {
                 continue;
             };
-            let derived = DetailedHandlerTableCandidate {
-                binding: binding.clone(),
-                start,
-                end,
-                scope_function_id: source_table.scope_function_id.clone(),
-                scope_start: source_table.scope_start,
-                scope_end: source_table.scope_end,
-                container_kind: "derived-registry".into(),
-                entries: source_table.entries,
-                function_values: source_table.function_values,
-                dynamic_call_sites: 0,
-                looped_dynamic_call_sites: 0,
-                read_sites: 0,
-                dynamic_read_sites: 0,
-                looped_dynamic_read_sites: 0,
-                handlers: source_table.handlers.clone(),
-            };
+            let derived = DetailedHandlerTableCandidate::from_handlers(
+                binding.clone(),
+                Span::new(start, end),
+                (
+                    source_table.scope_function_id.clone(),
+                    source_table.scope_start,
+                    source_table.scope_end,
+                ),
+                "derived-registry",
+                source_table.entries,
+                source_table.handlers.clone(),
+            );
             self.tables.push(derived);
         }
     }
@@ -1785,6 +1787,41 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["1", "2", "3", "4"]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn literal_handler_tables_preserve_container_thresholds_and_inventory() -> TestResult {
+        let source = r#"
+            const arrayFour = [() => 1, () => 2, () => 3, () => 4];
+            const objectFour = {a: () => 1, b: () => 2, c: () => 3, d: () => 4};
+            const objectEight = {
+                a: () => 1, b: () => 2, c: () => 3, d: () => 4,
+                e: () => 5, f: () => 6, g: () => 7, h: () => 8
+            };
+            const arrayMinority = [() => 1, () => 2, 0, 0, 0];
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let analysis = analyze(source, &parsed.program, &test_budget())
+            .test_value("literal handler analysis")?;
+        let table = |name: &str| {
+            analysis
+                .handler_function_tables
+                .iter()
+                .find(|table| table.binding == name)
+        };
+        let array = table("arrayFour").test_value("four-handler array")?;
+        assert_eq!(array.container_kind, "array");
+        assert_eq!((array.entries, array.function_values), (4, 4));
+        assert_eq!(array.handlers[0].key, "0");
+        assert!(table("objectFour").is_none());
+        assert!(table("arrayMinority").is_none());
+        let object = table("objectEight").test_value("eight-handler object")?;
+        assert_eq!(object.container_kind, "object");
+        assert_eq!((object.entries, object.function_values), (8, 8));
+        assert_eq!(object.handlers[0].key, "0");
         Ok(())
     }
 
