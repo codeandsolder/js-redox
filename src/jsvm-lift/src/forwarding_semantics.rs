@@ -139,22 +139,9 @@ fn expr_key(scoping: &Scoping, expression: &Expression<'_>) -> Option<ExprKey> {
 }
 
 fn argument_key(scoping: &Scoping, argument: &Argument<'_>) -> Option<ExprKey> {
-    match argument {
-        Argument::Identifier(identifier) => scoping
-            .get_reference(identifier.reference_id.get()?)
-            .symbol_id()
-            .map(ExprKey::Symbol),
-        Argument::ComputedMemberExpression(member) if !member.optional => {
-            let Expression::NumericLiteral(index) = &member.expression else {
-                return None;
-            };
-            Some(ExprKey::Index(
-                Box::new(expr_key(scoping, &member.object)?),
-                exact_u32(index.value)?,
-            ))
-        }
-        _ => None,
-    }
+    // Spreads do not have an expression view. All other supported keys share
+    // the same identity/index proof as ordinary AST expressions.
+    expr_key(scoping, argument.as_expression()?)
 }
 
 fn assignment_target_key(scoping: &Scoping, target: &AssignmentTarget<'_>) -> Option<ExprKey> {
@@ -297,29 +284,8 @@ fn assignment_access_path(
     scoping: &Scoping,
     target: &AssignmentTarget<'_>,
 ) -> Option<(SymbolId, Vec<Option<u32>>)> {
-    match target {
-        AssignmentTarget::AssignmentTargetIdentifier(identifier) => Some((
-            scoping
-                .get_reference(identifier.reference_id.get()?)
-                .symbol_id()?,
-            Vec::new(),
-        )),
-        AssignmentTarget::ComputedMemberExpression(member) if !member.optional => {
-            let (root, mut path) = expression_access_path(scoping, &member.object)?;
-            let index = match &member.expression {
-                Expression::NumericLiteral(value) => exact_u32(value.value),
-                _ => None,
-            };
-            path.push(index);
-            Some((root, path))
-        }
-        AssignmentTarget::StaticMemberExpression(member) if !member.optional => {
-            let (root, mut path) = expression_access_path(scoping, &member.object)?;
-            path.push(None);
-            Some((root, path))
-        }
-        _ => None,
-    }
+    // Destructuring patterns are not simple targets and remain rejected.
+    simple_assignment_access_path(scoping, target.as_simple_assignment_target()?)
 }
 
 fn simple_assignment_access_path(
@@ -571,38 +537,7 @@ fn argument_index_arg(
     parameters: &[SymbolId],
     boxes: &HashSet<SymbolId>,
 ) -> Option<u32> {
-    match argument {
-        Argument::Identifier(identifier) => {
-            let symbol = scoping
-                .get_reference(identifier.reference_id.get()?)
-                .symbol_id()?;
-            parameters
-                .iter()
-                .position(|parameter| *parameter == symbol)
-                .and_then(|index| u32::try_from(index).ok())
-        }
-        Argument::ComputedMemberExpression(member) if !member.optional => {
-            let Expression::NumericLiteral(outer_index) = &member.expression else {
-                return None;
-            };
-            let outer_index = exact_u32(outer_index.value)?;
-            let Expression::ComputedMemberExpression(inner) = &member.object else {
-                return None;
-            };
-            if inner.optional {
-                return None;
-            }
-            let Expression::NumericLiteral(inner_index) = &inner.expression else {
-                return None;
-            };
-            if exact_u32(inner_index.value)? != 0 {
-                return None;
-            }
-            let box_symbol = reference_symbol(scoping, &inner.object)?;
-            boxes.contains(&box_symbol).then_some(outer_index)
-        }
-        _ => None,
-    }
+    argument_index_expr(scoping, argument.as_expression()?, parameters, boxes)
 }
 
 fn last_sequence_expression<'a>(expression: &'a Expression<'a>) -> &'a Expression<'a> {
