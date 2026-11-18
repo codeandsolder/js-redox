@@ -1793,24 +1793,24 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
                         },
                     }))?;
                 }
-                let code_candidates = array_field(link, "code_resource_ids")
-                    .iter()
-                    .chain(array_field(link, "candidate_code_resource_ids"))
-                    .filter_map(Value::as_u64)
-                    .collect::<BTreeSet<_>>();
-                let exact_code = u64_field(link, "code_resource_id");
-                for code_id in &code_candidates {
-                    let proven = exact_code == Some(*code_id) && code_candidates.len() == 1;
-                    graph.add_edge(
-                        &chain_node,
-                        &format!("resource:{code_id}"),
-                        if proven { "source_map_chain_code" } else { "source_map_chain_code_candidate" },
-                        json!({
-                            "candidate_count":code_candidates.len(),
-                            "identity_basis": if proven { "exact_resource_id" } else { "source_url_verified_common_bytes_or_ambiguous" },
-                        }),
-                    )?;
-                }
+            }
+            let code_candidates = array_field(link, "code_resource_ids")
+                .iter()
+                .chain(array_field(link, "candidate_code_resource_ids"))
+                .filter_map(Value::as_u64)
+                .collect::<BTreeSet<_>>();
+            let exact_code = u64_field(link, "code_resource_id");
+            for code_id in &code_candidates {
+                let proven = exact_code == Some(*code_id) && code_candidates.len() == 1;
+                graph.add_edge(
+                    &chain_node,
+                    &format!("resource:{code_id}"),
+                    if proven { "source_map_chain_code" } else { "source_map_chain_code_candidate" },
+                    json!({
+                        "candidate_count":code_candidates.len(),
+                        "identity_basis": if proven { "exact_resource_id" } else { "source_url_verified_common_bytes_or_ambiguous" },
+                    }),
+                )?;
             }
         }
 
