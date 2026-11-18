@@ -770,6 +770,52 @@ impl Collector<'_, '_> {
         self.reconstruct_reaching_while_with(statements, &HashMap::<SymbolId, (u64, Span)>::new());
     }
 
+    /// Apply statement-list-local rewrites without changing AST traversal.
+    ///
+    /// Empty statements in a function body have a separate transform reason
+    /// from those in nested blocks; standalone empty blocks share one reason.
+    fn collect_statement_list_rewrites(
+        &mut self,
+        statements: &[Statement<'_>],
+        empty_statement_kind: &'static str,
+    ) {
+        self.lower_if_test_statements(statements);
+        self.lower_sibling_expression_statements(statements);
+        self.fold_sibling_state_guards(statements);
+        self.reconstruct_while_pairs(statements);
+        self.reconstruct_reaching_while(statements);
+        if self.allow_effect_statements
+            && self.function_context.depth > 0
+            && self.may_remove_dead_numeric_writes
+        {
+            // Dynamic eval, mapped arguments, and dynamic with-environments
+            // may alter bindings outside the visible statement list.
+            for (span, expression) in bitwise_algebra::scan(statements, self.source, self.scoping) {
+                self.push(span, expression, "bitwise_algebra");
+            }
+        }
+        for stmt in statements {
+            match stmt {
+                Statement::EmptyStatement(empty) => {
+                    self.push(empty.span, String::new(), empty_statement_kind);
+                }
+                // Remove only standalone empty blocks; never branch, loop,
+                // labelled, or try/catch bodies with distinct semantics.
+                Statement::BlockStatement(block) if block.body.is_empty() => {
+                    self.push(block.span, String::new(), "remove_empty_block_statement");
+                }
+                Statement::BlockStatement(block) => {
+                    if let Some(flattened) =
+                        trivial_loops::flatten_standalone_block(block, self.source, self.scoping)
+                    {
+                        self.push(block.span, flattened, "flatten_redundant_block");
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// A dynamic eval in an ancestor may inspect that ancestor's bindings,
     /// but cannot inspect a *sibling child's* locally owned numeric state.
     /// Require the exact Oxc symbol to belong to the current safe function
@@ -1455,80 +1501,12 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
     }
 
     fn visit_function_body(&mut self, it: &oxc_ast::ast::FunctionBody<'a>) {
-        self.lower_if_test_statements(&it.statements);
-        self.lower_sibling_expression_statements(&it.statements);
-        self.fold_sibling_state_guards(&it.statements);
-        self.reconstruct_while_pairs(&it.statements);
-        self.reconstruct_reaching_while(&it.statements);
-        if self.allow_effect_statements
-            && self.function_context.depth > 0
-            && self.may_remove_dead_numeric_writes
-        {
-            for (span, expression) in
-                bitwise_algebra::scan(&it.statements, self.source, self.scoping)
-            {
-                self.push(span, expression, "bitwise_algebra");
-            }
-        }
-        for stmt in &it.statements {
-            match stmt {
-                Statement::EmptyStatement(empty) => {
-                    self.push(empty.span, String::new(), "remove_empty_function_statement");
-                }
-                // A standalone empty block has no bindings, declarations,
-                // effects, or control transfers. Do not rewrite blocks used
-                // as branch, loop, labelled, or try/catch bodies.
-                Statement::BlockStatement(block) if block.body.is_empty() => {
-                    self.push(block.span, String::new(), "remove_empty_block_statement");
-                }
-                Statement::BlockStatement(block) => {
-                    if let Some(flattened) =
-                        trivial_loops::flatten_standalone_block(block, self.source, self.scoping)
-                    {
-                        self.push(block.span, flattened, "flatten_redundant_block");
-                    }
-                }
-                _ => {}
-            }
-        }
+        self.collect_statement_list_rewrites(&it.statements, "remove_empty_function_statement");
         walk::walk_function_body(self, it);
     }
 
     fn visit_block_statement(&mut self, it: &oxc_ast::ast::BlockStatement<'a>) {
-        self.lower_if_test_statements(&it.body);
-        self.lower_sibling_expression_statements(&it.body);
-        self.fold_sibling_state_guards(&it.body);
-        self.reconstruct_while_pairs(&it.body);
-        self.reconstruct_reaching_while(&it.body);
-        if self.allow_effect_statements
-            && self.function_context.depth > 0
-            && self.may_remove_dead_numeric_writes
-        {
-            // Top-level var declarations may alias global object properties.
-            // Direct eval, mapped arguments, and dynamic with-environments
-            // may change local bindings outside the visible statement list.
-            for (span, expression) in bitwise_algebra::scan(&it.body, self.source, self.scoping) {
-                self.push(span, expression, "bitwise_algebra");
-            }
-        }
-        for stmt in &it.body {
-            match stmt {
-                Statement::EmptyStatement(empty) => {
-                    self.push(empty.span, String::new(), "remove_empty_block_statement");
-                }
-                Statement::BlockStatement(block) if block.body.is_empty() => {
-                    self.push(block.span, String::new(), "remove_empty_block_statement");
-                }
-                Statement::BlockStatement(block) => {
-                    if let Some(flattened) =
-                        trivial_loops::flatten_standalone_block(block, self.source, self.scoping)
-                    {
-                        self.push(block.span, flattened, "flatten_redundant_block");
-                    }
-                }
-                _ => {}
-            }
-        }
+        self.collect_statement_list_rewrites(&it.body, "remove_empty_block_statement");
         walk::walk_block_statement(self, it);
     }
 
@@ -7291,6 +7269,29 @@ mod tests {
             );
             assert!(output.source.contains("while(state!=29)"), "{}", output.source);
         }
+    }
+
+    #[test]
+    fn distinguishes_empty_function_and_nested_block_statements() {
+        let input = "function f(flag){ ; if(flag){ ; work(); } return 3; }";
+        let output = deobfuscate(input, 1);
+        assert!(output.is_some(), "source is valid JavaScript");
+        let Some(output) = output else {
+            unreachable!();
+        };
+        assert_eq!(
+            output.transforms.get("remove_empty_function_statement"),
+            Some(&1),
+            "{:?}",
+            output.transforms
+        );
+        assert_eq!(
+            output.transforms.get("remove_empty_block_statement"),
+            Some(&1),
+            "{:?}",
+            output.transforms
+        );
+        assert!(output.source.contains("work()"), "{}", output.source);
     }
 
     #[test]
