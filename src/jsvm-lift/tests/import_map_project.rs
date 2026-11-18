@@ -522,3 +522,134 @@ fn html_base_is_shared_by_har_scripts_import_maps_and_module_graph() -> Result<(
         .contains("[src/ENTRYPOINTS.md](src/ENTRYPOINTS.md)"));
     Ok(())
 }
+
+#[test]
+fn shared_modules_keep_mapped_and_unmapped_document_contexts() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let input = root.path().join("shared-contexts.har");
+    let project = root.path().join("project");
+    let mapped_page = "https://fixture.invalid/mapped.html";
+    let plain_page = "https://fixture.invalid/plain.html";
+    let shared_url = "https://fixture.invalid/modules/shared.js";
+    let child_url = "https://fixture.invalid/modules/child.js";
+    let mapped_url = "https://fixture.invalid/modules/mapped.js";
+    let mapped_html = concat!(
+        "<script type=\"importmap\">",
+        "{\"imports\":{\"pkg\":\"/modules/mapped.js\"}}",
+        "</script><script type=\"module\" src=\"/modules/shared.js\"></script>"
+    );
+    let plain_html = "<script type=\"module\" src=\"/modules/shared.js\"></script>";
+    let entries = vec![
+        har_entry(mapped_page, "text/html", mapped_html),
+        har_entry(plain_page, "text/html", plain_html),
+        har_entry(
+            shared_url,
+            "application/javascript",
+            "import 'pkg'; import './child.js';",
+        ),
+        har_entry(child_url, "application/javascript", "import 'pkg';"),
+        har_entry(
+            mapped_url,
+            "application/javascript",
+            "export const mapped = true;",
+        ),
+    ];
+    fs::write(
+        &input,
+        serde_json::to_vec(&json!({
+            "log": {
+                "version":"1.2",
+                "creator":{"name":"two-document module context regression","version":"1"},
+                "pages":[{"id":"page_1","title":"shared modules",
+                    "startedDateTime":"2026-10-04T00:00:00Z"}],
+                "entries":entries
+            }
+        }))?,
+    )?;
+    run_pipeline(&input, &project)?;
+    let manifest = read_json(&project.join("capture-manifest.json"))?;
+    let resource_id = |url: &str| -> Result<u64> {
+        manifest["resources"]
+            .as_array()
+            .context("missing resource list")?
+            .iter()
+            .find(|resource| resource["url"] == url)
+            .and_then(|resource| resource["id"].as_u64())
+            .with_context(|| format!("missing resource {url}"))
+    };
+    let mapped_id = resource_id(mapped_page)?;
+    let plain_id = resource_id(plain_page)?;
+    let shared_id = resource_id(shared_url)?;
+    let child_id = resource_id(child_url)?;
+    let mapped_target_id = resource_id(mapped_url)?;
+    let refs = read_json(&project.join("analysis/js-references.json"))?;
+    let rows = refs["code_units"]
+        .as_array()
+        .context("missing JS reference rows")?;
+    for (url, expected_resource_id) in [(shared_url, shared_id), (child_url, child_id)] {
+        let unit = code_unit(rows, url)?;
+        assert_eq!(unit["resource_id"], expected_resource_id);
+        assert_eq!(
+            unit["document_resource_ids"],
+            json!([mapped_id, plain_id]),
+            "both pages must contribute an execution context to {url}"
+        );
+        let pkg = reference(unit, "pkg")?;
+        assert_eq!(pkg["resolution"], "ambiguous_document_context");
+        assert!(pkg["resolved_url"].is_null());
+        let choices = pkg["resolution_candidates"]
+            .as_array()
+            .context("missing contextual resolution candidates")?;
+        assert_eq!(choices.len(), 2);
+        assert!(choices.iter().any(|choice| {
+            choice["document_resource_id"] == mapped_id
+                && choice["resolved_url"] == mapped_url
+                && choice["resolution"] == "import_map"
+        }));
+        assert!(choices.iter().any(|choice| {
+            choice["document_resource_id"] == plain_id
+                && choice["resolved_url"].is_null()
+                && choice["resolution"] == "unresolved_bare"
+        }));
+    }
+    let child_import = reference(code_unit(rows, shared_url)?, "./child.js")?;
+    assert_eq!(child_import["resolved_url"], child_url);
+    assert_eq!(
+        child_import["resolution_candidates"]
+            .as_array()
+            .context("child import contexts missing")?
+            .len(),
+        2
+    );
+
+    let graph = read_json(&project.join("analysis/source-graph.json"))?;
+    let edges = graph["edges"]
+        .as_array()
+        .context("source graph edges missing")?;
+    for source_id in [shared_id, child_id] {
+        let source = format!("resource:{source_id}");
+        let pkg_edges = edges
+            .iter()
+            .filter(|edge| {
+                edge["from"] == source
+                    && edge["kind"] == "js_import_static"
+                    && edge["specifier"] == "pkg"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(pkg_edges.len(), 2);
+        assert!(pkg_edges.iter().any(|edge| {
+            edge["to"] == format!("resource:{mapped_target_id}")
+                && edge["document_resource_id"] == mapped_id
+                && edge["resolution"] == "import_map"
+        }));
+        assert!(pkg_edges.iter().any(|edge| {
+            edge["to"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("specifier:"))
+                && edge["document_resource_id"] == plain_id
+                && edge["resolution"] == "unresolved_bare"
+                && edge["resolved_url"].is_null()
+        }));
+    }
+    Ok(())
+}
