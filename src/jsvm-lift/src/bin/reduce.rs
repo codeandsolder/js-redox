@@ -362,6 +362,16 @@ fn eval_binary(
     }
 }
 
+// Numeric compound updates must have identical wrapping semantics in the
+// reducer and the decoder's bounded constant-propagation pass.
+fn wrapping_compound_update(operator: &str, lhs: i64, rhs: i64) -> Option<i64> {
+    match operator {
+        "+=" => Some(lhs.wrapping_add(rhs)),
+        "-=" => Some(lhs.wrapping_sub(rhs)),
+        _ => None,
+    }
+}
+
 fn eval_assignment(
     assign: &AssignmentExpression<'_>,
     env: &mut Env,
@@ -414,26 +424,16 @@ fn eval_assignment(
             }
             rhs
         }
-        "+=" => {
-            let old = env.get(&name).and_then(Val::as_num);
-            let value = rhs.as_num();
-            if let (Some(a), Some(b)) = (old, value) {
-                let out = Val::Num(a.wrapping_add(b));
-                env.insert(name.clone(), out.clone());
-                if !ctx.structural.contains(&name) {
-                    effects.push(source_fragment(ctx.source, assign.span));
-                }
-                out
-            } else {
-                effects.push(source_fragment(ctx.source, assign.span));
-                Val::Unknown
-            }
-        }
-        "-=" => {
-            let old = env.get(&name).and_then(Val::as_num);
-            let value = rhs.as_num();
-            if let (Some(a), Some(b)) = (old, value) {
-                let out = Val::Num(a.wrapping_sub(b));
+        "+=" | "-=" => {
+            let next = env
+                .get(&name)
+                .and_then(Val::as_num)
+                .zip(rhs.as_num())
+                .and_then(|(lhs, rhs)| {
+                    wrapping_compound_update(assign.operator.as_str(), lhs, rhs)
+                });
+            if let Some(next) = next {
+                let out = Val::Num(next);
                 env.insert(name.clone(), out.clone());
                 if !ctx.structural.contains(&name) {
                     effects.push(source_fragment(ctx.source, assign.span));
@@ -568,16 +568,16 @@ fn derive_env(
                 "=" if rhs != Val::Unknown && !matches!(rhs, Val::Fork(_)) => {
                     env.insert(name, rhs);
                 }
-                "+=" => {
-                    if let (Some(a), Some(b)) = (env.get(&name).and_then(Val::as_num), rhs.as_num())
-                    {
-                        env.insert(name, Val::Num(a.wrapping_add(b)));
-                    }
-                }
-                "-=" => {
-                    if let (Some(a), Some(b)) = (env.get(&name).and_then(Val::as_num), rhs.as_num())
-                    {
-                        env.insert(name, Val::Num(a.wrapping_sub(b)));
+                "+=" | "-=" => {
+                    let next = env
+                        .get(&name)
+                        .and_then(Val::as_num)
+                        .zip(rhs.as_num())
+                        .and_then(|(lhs, rhs)| {
+                            wrapping_compound_update(assign.operator.as_str(), lhs, rhs)
+                        });
+                    if let Some(next) = next {
+                        env.insert(name, Val::Num(next));
                     }
                 }
                 _ => {}
@@ -1019,6 +1019,17 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use jsvm_lift::numeric::eval_js_bitwise_i64;
+
+    #[test]
+    fn compound_updates_share_wrapping_numeric_behavior() {
+        use super::wrapping_compound_update;
+
+        assert_eq!(wrapping_compound_update("+=", i64::MAX, 1), Some(i64::MIN));
+        assert_eq!(wrapping_compound_update("-=", i64::MIN, 1), Some(i64::MAX));
+        assert_eq!(wrapping_compound_update("+=", 9, -3), Some(6));
+        assert_eq!(wrapping_compound_update("-=", 9, -3), Some(12));
+        assert_eq!(wrapping_compound_update("*=", 9, 3), None);
+    }
 
     #[test]
     fn bitwise_evaluation_matches_javascript_32_bit_semantics() {
