@@ -1177,6 +1177,86 @@ mod tests {
     }
 
     #[test]
+    fn chained_source_code_shared_bytes_retain_both_capture_ids() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let project = temp.path();
+        let root_map = json!({
+            "version":3,"file":"app.js","sources":["source.js"],
+            "sourcesContent":[],"names":[],"mappings":"",
+        })
+        .to_string();
+        shared_map_fixture(project, &root_map, &root_map)?;
+        let code = "console.log('same');\n//# sourceMappingURL=child.map";
+        let child_map = alias_map_document("export const child = 1;");
+        for (path, bytes) in [
+            ("resources/source-a", code),
+            ("resources/source-b", code),
+            ("resources/child.map", &child_map),
+        ] {
+            fs::write(project.join(path), bytes)?;
+        }
+        let mut manifest = crate::capture_project::load_manifest(project)?;
+        for (id, path, url, bytes) in [
+            (
+                4,
+                "resources/source-a",
+                "https://fixture.invalid/source.js",
+                code,
+            ),
+            (
+                5,
+                "resources/source-b",
+                "https://fixture.invalid/source.js",
+                code,
+            ),
+            (
+                6,
+                "resources/child.map",
+                "https://fixture.invalid/child.map",
+                &child_map,
+            ),
+        ] {
+            manifest.resources.push(json!({
+                "id":id,"kind":"javascript","url":url,
+                "output_path":path,"sha256":sha256_hex(bytes.as_bytes()),
+            }));
+        }
+        crate::capture_project::write_manifest(&project.join("capture-manifest.json"), &manifest)?;
+        let budget = AnalysisBudgets::standard("shared-chained-source-code");
+        recover_project_sourcemaps(project, &budget)?;
+        let maps = read_fixture_artifact(project, "analysis/sourcemaps.json")?;
+        let link = &maps["source_maps"][0]["composition"]["links"][0];
+        assert_eq!(link["code_resource_ids"], json!([4, 5]));
+        assert!(link["code_resource_id"].is_null());
+        assert_eq!(link["map_resource_id"], 6);
+        assert_ne!(link["status"], "ambiguous_captured_resource");
+        crate::source_graph::build_source_graph(project, &budget)?;
+        let graph = read_fixture_artifact(project, "analysis/source-graph.json")?;
+        let edges = graph["edges"].as_array().context("missing graph edges")?;
+        let code_candidates = edges
+            .iter()
+            .filter(|edge| {
+                edge["from"] == "sourcemap-chain:1:0"
+                    && edge["kind"] == "source_map_chain_code_candidate"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(code_candidates.len(), 2);
+        assert_eq!(
+            code_candidates
+                .iter()
+                .filter_map(|edge| edge["to"].as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["resource:4", "resource:5"]),
+        );
+        assert!(edges
+            .iter()
+            .any(|edge| edge["from"] == "sourcemap-chain:1:0"
+                && edge["kind"] == "source_map_chain_resource"
+                && edge["to"] == "resource:6"));
+        Ok(())
+    }
+
+    #[test]
     fn data_urls_are_bounded_and_percent_decoded_without_form_semantics() -> Result<()> {
         assert_eq!(
             parse_data_url("data:application/json,%7B%22x%22%3A1%7D")?,
