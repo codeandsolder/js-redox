@@ -448,6 +448,34 @@ struct ScopedReferences<'s> {
     usages: NameUsages,
 }
 
+impl ScopedReferences<'_> {
+    // Shorthand object properties and export specifiers both use the same
+    // semantic binding and source span. Only their required syntax differs.
+    fn record_special_reference(
+        &mut self,
+        id: &IdentifierReference<'_>,
+        alias: SyntaxAlias,
+    ) -> bool {
+        let Some(symbol) = id
+            .reference_id
+            .get()
+            .and_then(|reference| statically_resolved_symbol(self.scoping, reference))
+        else {
+            return false;
+        };
+        self.usages
+            .special_references
+            .insert((id.span.start, id.span.end), alias);
+        self.usages
+            .references
+            .entry(symbol)
+            .or_default()
+            .push(id.span);
+        self.usages.used_names.insert(id.name.to_string());
+        true
+    }
+}
+
 impl<'a> Visit<'a> for ScopedReferences<'_> {
     fn visit_identifier_reference(&mut self, id: &IdentifierReference<'a>) {
         self.usages.used_names.insert(id.name.to_string());
@@ -472,23 +500,9 @@ impl<'a> Visit<'a> for ScopedReferences<'_> {
                 if id.name == "eval" {
                     self.usages.dynamic_scope = true;
                 }
-                if let Some(symbol) = id
-                    .reference_id
-                    .get()
-                    .and_then(|r| statically_resolved_symbol(self.scoping, r))
-                {
-                    self.usages.special_references.insert(
-                        (id.span.start, id.span.end),
-                        SyntaxAlias::Object(id.name.to_string()),
-                    );
-                    self.usages
-                        .references
-                        .entry(symbol)
-                        .or_default()
-                        .push(id.span);
-                    self.usages.used_names.insert(id.name.to_string());
-                    // The key and value share the same source span. Do not
-                    // traverse again: the new text expands `foo` to `foo: Bar`.
+                if self.record_special_reference(id, SyntaxAlias::Object(id.name.to_string())) {
+                    // Key and value share a span, so the visitor must not
+                    // walk the same identifier reference a second time.
                     return;
                 }
             }
@@ -498,21 +512,7 @@ impl<'a> Visit<'a> for ScopedReferences<'_> {
     fn visit_export_specifier(&mut self, specifier: &oxc_ast::ast::ExportSpecifier<'a>) {
         if specifier.local.span() == specifier.exported.span() {
             if let oxc_ast::ast::ModuleExportName::IdentifierReference(id) = &specifier.local {
-                if let Some(symbol) = id
-                    .reference_id
-                    .get()
-                    .and_then(|r| statically_resolved_symbol(self.scoping, r))
-                {
-                    self.usages.special_references.insert(
-                        (id.span.start, id.span.end),
-                        SyntaxAlias::Export(id.name.to_string()),
-                    );
-                    self.usages
-                        .references
-                        .entry(symbol)
-                        .or_default()
-                        .push(id.span);
-                    self.usages.used_names.insert(id.name.to_string());
+                if self.record_special_reference(id, SyntaxAlias::Export(id.name.to_string())) {
                     return;
                 }
             }
