@@ -27,6 +27,7 @@ struct LoadedMap {
     raw_bytes: Vec<u8>,
     map_url: Option<String>,
     map_resource_id: Option<u64>,
+    map_resource_ids: Vec<u64>,
     map_origin: &'static str,
     base_url: String,
     identity: String,
@@ -249,83 +250,145 @@ fn problem(
     object
 }
 
+type CapturedByUrl = BTreeMap<String, Vec<Value>>;
+
+/// A URL can denote multiple HTTP responses. Only common, verified bytes
+/// justify parsing the body; they never establish a unique response identity.
+fn captured_bytes_for_url(
+    url: &str,
+    by_url: &CapturedByUrl,
+    project: &Path,
+) -> std::result::Result<Option<(Vec<u8>, Vec<u64>)>, Map<String, Value>> {
+    let Some(candidates) = by_url.get(url) else {
+        return Ok(None);
+    };
+    let ids = candidates
+        .iter()
+        .filter_map(resource_id)
+        .collect::<Vec<_>>();
+    let mut reference = None::<Vec<u8>>;
+    let mut hashes = BTreeSet::new();
+    for candidate in candidates {
+        let Some(path) = resource_output_path(candidate) else {
+            return Err(problem(
+                "unavailable_captured_resource",
+                [("url", json!(url)), ("candidate_resource_ids", json!(ids))],
+            ));
+        };
+        let file = project.join(path);
+        let size = fs::metadata(&file)
+            .map_err(|error| {
+                problem(
+                    "captured_resource_read_error",
+                    [
+                        ("url", json!(url)),
+                        ("candidate_resource_ids", json!(ids)),
+                        ("error", json!(error.to_string())),
+                    ],
+                )
+            })?
+            .len();
+        if size > MAX_SOURCE_MAP_BYTES_U64 {
+            return Err(problem(
+                "captured_resource_too_large",
+                [("url", json!(url)), ("candidate_resource_ids", json!(ids))],
+            ));
+        }
+        let bytes = fs::read(&file).map_err(|error| {
+            problem(
+                "captured_resource_read_error",
+                [
+                    ("url", json!(url)),
+                    ("candidate_resource_ids", json!(ids)),
+                    ("error", json!(error.to_string())),
+                ],
+            )
+        })?;
+        let digest = sha256_hex(&bytes);
+        if candidate
+            .get("sha256")
+            .and_then(Value::as_str)
+            .is_some_and(|sha| sha != digest)
+        {
+            return Err(problem(
+                "captured_resource_sha_mismatch",
+                [
+                    ("url", json!(url)),
+                    ("candidate_resource_ids", json!(ids)),
+                    ("resource_id", json!(resource_id(candidate))),
+                    ("actual_sha256", json!(digest)),
+                ],
+            ));
+        }
+        hashes.insert(digest);
+        if reference.is_none() {
+            reference = Some(bytes);
+        }
+    }
+    if hashes.len() > 1 {
+        return Err(problem(
+            "ambiguous_captured_resource",
+            [
+                ("url", json!(url)),
+                ("candidate_resource_ids", json!(ids)),
+                ("candidate_sha256s", json!(hashes)),
+            ],
+        ));
+    }
+    Ok(reference.map(|bytes| (bytes, ids)))
+}
+
 fn load_map(
     raw_reference: &str,
     code_url: &str,
-    by_url: &BTreeMap<String, Value>,
+    by_url: &CapturedByUrl,
     project: &Path,
 ) -> std::result::Result<LoadedMap, Map<String, Value>> {
-    let (bytes, map_url, map_resource_id, map_origin, base_url) =
-        if raw_reference.starts_with("data:") {
-            let bytes = parse_data_url(raw_reference).map_err(|error| {
-                problem(
-                    "decode_error",
-                    [("error", Value::String(error.to_string()))],
-                )
-            })?;
-            (bytes, None, None, "inline_data_url", code_url.to_owned())
-        } else {
-            let map_url = join_logical(code_url, raw_reference);
-            let Some(linked) = by_url.get(&map_url) else {
-                return Err(problem(
-                    "missing_map_resource",
-                    [("map_url", Value::String(map_url))],
-                ));
-            };
-            let map_resource_id = resource_id(linked);
-            let Some(output_path) = resource_output_path(linked) else {
-                return Err(problem(
-                    "missing_map_resource",
-                    [("map_url", Value::String(map_url))],
-                ));
-            };
-            let path = project.join(output_path);
-            let metadata = fs::metadata(&path).map_err(|error| {
-                problem(
-                    "map_read_error",
-                    [
-                        ("map_url", Value::String(map_url.clone())),
-                        (
-                            "map_resource_id",
-                            map_resource_id.map_or(Value::Null, Value::from),
-                        ),
-                        ("error", Value::String(error.to_string())),
-                    ],
-                )
-            })?;
-            if metadata.len() > MAX_SOURCE_MAP_BYTES_U64 {
-                return Err(problem(
-                    "map_too_large",
-                    [
-                        ("map_url", Value::String(map_url)),
-                        (
-                            "map_resource_id",
-                            map_resource_id.map_or(Value::Null, Value::from),
-                        ),
-                    ],
-                ));
-            }
-            let bytes = fs::read(&path).map_err(|error| {
-                problem(
-                    "map_read_error",
-                    [
-                        ("map_url", Value::String(map_url.clone())),
-                        (
-                            "map_resource_id",
-                            map_resource_id.map_or(Value::Null, Value::from),
-                        ),
-                        ("error", Value::String(error.to_string())),
-                    ],
-                )
-            })?;
-            (
-                bytes,
-                Some(map_url.clone()),
-                map_resource_id,
-                "har_resource",
-                map_url,
+    let (bytes, map_url, map_resource_id, map_resource_ids, map_origin, base_url) = if raw_reference
+        .starts_with("data:")
+    {
+        let bytes = parse_data_url(raw_reference).map_err(|error| {
+            problem(
+                "decode_error",
+                [("error", Value::String(error.to_string()))],
             )
+        })?;
+        (
+            bytes,
+            None,
+            None,
+            Vec::new(),
+            "inline_data_url",
+            code_url.to_owned(),
+        )
+    } else {
+        let map_url = join_logical(code_url, raw_reference);
+        let resolved = captured_bytes_for_url(&map_url, by_url, project).map_err(|mut error| {
+            error.insert("map_url".into(), json!(map_url));
+            error.remove("url");
+            error
+        })?;
+        let Some((bytes, resource_ids)) = resolved else {
+            return Err(problem(
+                "missing_map_resource",
+                [("map_url", json!(map_url))],
+            ));
         };
+        let id = (resource_ids.len() == 1).then(|| resource_ids[0]);
+        let origin = if id.is_some() {
+            "har_resource"
+        } else {
+            "har_shared_bytes"
+        };
+        (
+            bytes,
+            Some(map_url.clone()),
+            id,
+            resource_ids,
+            origin,
+            map_url,
+        )
+    };
 
     let document = serde_json::from_slice::<Value>(&bytes).map_err(|error| {
         problem(
@@ -368,6 +431,7 @@ fn load_map(
         raw_bytes: bytes,
         map_url,
         map_resource_id,
+        map_resource_ids,
         map_origin,
         base_url,
         identity,
@@ -397,21 +461,38 @@ fn source_code(
     document: &Value,
     ordinal: usize,
     logical_source: &str,
-    by_url: &BTreeMap<String, Value>,
+    by_url: &CapturedByUrl,
     project: &Path,
-) -> Option<(String, &'static str, Option<u64>)> {
+) -> std::result::Result<Option<(String, &'static str, Option<u64>, Vec<u64>)>, Map<String, Value>>
+{
     if let Some(content) = document
         .get("sourcesContent")
         .and_then(Value::as_array)
         .and_then(|contents| contents.get(ordinal))
         .and_then(Value::as_str)
     {
-        return Some((content.to_owned(), "sources_content", None));
+        return Ok(Some((
+            content.to_owned(),
+            "sources_content",
+            None,
+            Vec::new(),
+        )));
     }
-    let linked = by_url.get(logical_source)?;
-    let output_path = resource_output_path(linked)?;
-    let text = fs::read_to_string(project.join(output_path)).ok()?;
-    Some((text, "har_resource", resource_id(linked)))
+    let Some((bytes, ids)) = captured_bytes_for_url(logical_source, by_url, project)? else {
+        return Ok(None);
+    };
+    let code = String::from_utf8(bytes).map_err(|error| {
+        problem(
+            "captured_source_encoding_error",
+            [
+                ("url", json!(logical_source)),
+                ("candidate_resource_ids", json!(ids)),
+                ("error", json!(error.to_string())),
+            ],
+        )
+    })?;
+    let resource = (ids.len() == 1).then(|| ids[0]);
+    Ok(Some((code, "har_resource", resource, ids)))
 }
 
 /// Compose two parsed source maps at the specified downstream source ordinal.
@@ -461,7 +542,7 @@ fn insert_problem(row: &mut Map<String, Value>, values: Map<String, Value>) {
 
 fn expand_map(
     loaded: &LoadedMap,
-    by_url: &BTreeMap<String, Value>,
+    by_url: &CapturedByUrl,
     project: &Path,
     stack: &BTreeSet<String>,
     depth: usize,
@@ -484,11 +565,20 @@ fn expand_map(
     for ordinal in (0..sources.len()).rev() {
         budget.checkpoint()?;
         let logical_source = value_text(&sources[ordinal]);
-        let Some((code, code_origin, code_resource_id)) =
-            source_code(&normalized, ordinal, &logical_source, by_url, project)
-        else {
-            continue;
-        };
+        let (code, code_origin, code_resource_id, code_resource_ids) =
+            match source_code(&normalized, ordinal, &logical_source, by_url, project) {
+                Ok(Some(source)) => source,
+                Ok(None) => continue,
+                Err(values) => {
+                    let mut row = Map::new();
+                    row.insert("depth".into(), json!(depth + 1));
+                    row.insert("source_ordinal".into(), json!(ordinal));
+                    row.insert("logical_source".into(), json!(logical_source));
+                    insert_problem(&mut row, values);
+                    links.push(Value::Object(row));
+                    continue;
+                }
+            };
         let Some(raw_reference) = last_source_map_directive(&code) else {
             continue;
         };
@@ -504,6 +594,7 @@ fn expand_map(
             "code_resource_id".into(),
             code_resource_id.map_or(Value::Null, Value::from),
         );
+        row.insert("code_resource_ids".into(), json!(code_resource_ids));
         row.insert("raw_reference".into(), Value::String(raw_reference.clone()));
 
         let upstream = match load_map(&raw_reference, &logical_source, by_url, project) {
@@ -522,6 +613,7 @@ fn expand_map(
             "map_resource_id".into(),
             upstream.map_resource_id.map_or(Value::Null, Value::from),
         );
+        row.insert("map_resource_ids".into(), json!(upstream.map_resource_ids));
         row.insert(
             "map_origin".into(),
             Value::String(upstream.map_origin.into()),
@@ -650,10 +742,13 @@ pub fn recover_project_sourcemaps(
     );
     stage_budget.checkpoint()?;
     let manifest = load_manifest(&project)?;
-    let mut by_url = BTreeMap::new();
+    let mut by_url = CapturedByUrl::new();
     for resource in &manifest.resources {
         if let Some(url) = resource.get("url").and_then(Value::as_str) {
-            by_url.insert(url.to_owned(), resource.clone());
+            by_url
+                .entry(url.to_owned())
+                .or_default()
+                .push(resource.clone());
         }
     }
 
@@ -766,6 +861,7 @@ pub fn recover_project_sourcemaps(
             "raw_reference": raw_reference,
             "map_url": loaded.map_url,
             "map_resource_id": loaded.map_resource_id,
+            "map_resource_ids": loaded.map_resource_ids,
             "map_origin": loaded.map_origin,
             "source_root": source_root_value,
             "sources": direct_sources,
@@ -822,6 +918,196 @@ pub fn recover_project_sourcemaps(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn shared_map_fixture(project: &Path, second: &str, root_map: &str) -> Result<()> {
+        use crate::capture_project::{write_manifest, CaptureManifest, CaptureSource, SCHEMA};
+        fs::create_dir_all(project.join("resources"))?;
+        let script = "console.log(1);\n//# sourceMappingURL=app.js.map";
+        let map_a = root_map;
+        for (path, bytes) in [("app.js", script), ("map-a", map_a), ("map-b", second)] {
+            fs::write(project.join("resources").join(path), bytes)?;
+        }
+        let resources = vec![
+            json!({
+                "id":1,"kind":"javascript","url":"https://fixture.invalid/app.js",
+                "output_path":"resources/app.js","sha256":sha256_hex(script.as_bytes()),
+                "references":[{"kind":"source_map","raw":"app.js.map"}],
+            }),
+            json!({
+                "id":2,"kind":"other","url":"https://fixture.invalid/app.js.map",
+                "output_path":"resources/map-a","sha256":sha256_hex(map_a.as_bytes()),
+            }),
+            json!({
+                "id":3,"kind":"other","url":"https://fixture.invalid/app.js.map",
+                "output_path":"resources/map-b","sha256":sha256_hex(second.as_bytes()),
+            }),
+        ];
+        write_manifest(
+            &project.join("capture-manifest.json"),
+            &CaptureManifest {
+                schema: SCHEMA.into(),
+                source: CaptureSource {
+                    kind: "har".into(),
+                    input: "source-map-alias-test".into(),
+                    salvaged: false,
+                    extra: Map::new(),
+                },
+                resources,
+                pages: Vec::new(),
+                inline_scripts: Vec::new(),
+                counts: BTreeMap::new(),
+                extra: Map::new(),
+            },
+        )?;
+        Ok(())
+    }
+
+    fn alias_map_document(content: &str) -> String {
+        json!({
+            "version":3,"file":"app.js","sources":["original.ts"],
+            "sourcesContent":[content],"names":[],"mappings":"",
+        })
+        .to_string()
+    }
+
+    fn read_fixture_artifact(project: &Path, path: &str) -> Result<Value> {
+        serde_json::from_slice(&fs::read(project.join(path))?).map_err(Into::into)
+    }
+
+    #[test]
+    fn distinct_captured_responses_at_one_map_url_remain_ambiguous() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let project = temp.path();
+        let first = alias_map_document("export const version = 1;");
+        let second = alias_map_document("export const version = 2;");
+        shared_map_fixture(project, &second, &first)?;
+        let budget = AnalysisBudgets::standard("conflicting-source-map-responses");
+        let result = recover_project_sourcemaps(project, &budget)?;
+        assert_eq!(result.referenced, 1);
+        assert_eq!(result.direct_recovered, 0);
+        let rows = read_fixture_artifact(project, "analysis/sourcemaps.json")?;
+        let source_map = &rows["source_maps"][0];
+        assert_eq!(source_map["status"], "ambiguous_captured_resource");
+        assert_eq!(source_map["map_url"], "https://fixture.invalid/app.js.map");
+        assert_eq!(source_map["candidate_resource_ids"], json!([2, 3]));
+        assert_eq!(
+            source_map["candidate_sha256s"].as_array().map(Vec::len),
+            Some(2)
+        );
+        crate::source_graph::build_source_graph(project, &budget)?;
+        let graph = read_fixture_artifact(project, "analysis/source-graph.json")?;
+        let edges = graph["edges"].as_array().context("missing edges")?;
+        let candidates = edges
+            .iter()
+            .filter(|edge| {
+                edge["from"] == "sourcemap-reference:1"
+                    && edge["kind"] == "source_map_resource_candidate"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(
+            candidates
+                .iter()
+                .filter_map(|edge| edge["to"].as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["resource:2", "resource:3"]),
+        );
+        assert!(edges.iter().all(|edge| edge["kind"] != "source_map_source"));
+        Ok(())
+    }
+
+    #[test]
+    fn same_map_bytes_preserve_candidates_without_selecting_a_parent() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let project = temp.path();
+        let map = alias_map_document("export const version = 1;");
+        shared_map_fixture(project, &map, &map)?;
+        let budget = AnalysisBudgets::standard("identical-source-map-responses");
+        let result = recover_project_sourcemaps(project, &budget)?;
+        assert_eq!(result.direct_recovered, 1);
+        let rows = read_fixture_artifact(project, "analysis/sourcemaps.json")?;
+        let source_map = &rows["source_maps"][0];
+        assert_eq!(source_map["status"], "recovered");
+        assert!(source_map["map_resource_id"].is_null());
+        assert_eq!(source_map["map_resource_ids"], json!([2, 3]));
+        assert_eq!(source_map["map_origin"], "har_shared_bytes");
+        assert_eq!(source_map["recovered"][0]["status"], "recovered");
+        crate::source_graph::build_source_graph(project, &budget)?;
+        let graph = read_fixture_artifact(project, "analysis/source-graph.json")?;
+        let edges = graph["edges"].as_array().context("missing graph edges")?;
+        let from_reference = edges
+            .iter()
+            .filter(|edge| edge["from"] == "sourcemap-reference:1")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            from_reference
+                .iter()
+                .filter(|edge| edge["kind"] == "source_map_resource_candidate")
+                .count(),
+            2
+        );
+        let recovered = from_reference
+            .iter()
+            .filter(|edge| edge["kind"] == "source_map_source")
+            .collect::<Vec<_>>();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0]["to"], "sourcemap-source:1:0");
+        assert!(edges
+            .iter()
+            .all(|edge| !(edge["kind"] == "source_map" && edge["from"] == "resource:1")));
+        Ok(())
+    }
+
+    #[test]
+    fn nested_map_with_reused_url_and_different_bodies_does_not_compose() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let project = temp.path();
+        let nested_source = "console.log(1);\n//# sourceMappingURL=child.map";
+        let map = alias_map_document(nested_source);
+        shared_map_fixture(project, &map, &map)?;
+        let map_a = alias_map_document("source A");
+        let map_b = alias_map_document("source B");
+        fs::write(project.join("resources/child-a"), &map_a)?;
+        fs::write(project.join("resources/child-b"), &map_b)?;
+        let mut manifest = crate::capture_project::load_manifest(project)?;
+        for (id, path, body) in [
+            (4, "resources/child-a", &map_a),
+            (5, "resources/child-b", &map_b),
+        ] {
+            manifest.resources.push(json!({
+                "id":id,"kind":"other","url":"https://fixture.invalid/child.map",
+                "output_path":path,"sha256":sha256_hex(body.as_bytes()),
+            }));
+        }
+        crate::capture_project::write_manifest(&project.join("capture-manifest.json"), &manifest)?;
+        let budget = AnalysisBudgets::standard("ambiguous-nested-source-map");
+        let result = recover_project_sourcemaps(project, &budget)?;
+        assert_eq!(result.composed_links, 0);
+        let rows = read_fixture_artifact(project, "analysis/sourcemaps.json")?;
+        let link = &rows["source_maps"][0]["composition"]["links"][0];
+        assert_eq!(link["status"], "ambiguous_captured_resource");
+        assert_eq!(link["map_url"], "https://fixture.invalid/child.map");
+        assert_eq!(link["candidate_resource_ids"], json!([4, 5]));
+        crate::source_graph::build_source_graph(project, &budget)?;
+        let graph = read_fixture_artifact(project, "analysis/source-graph.json")?;
+        let edges = graph["edges"].as_array().context("missing graph edges")?;
+        let candidates = edges
+            .iter()
+            .filter(|edge| {
+                edge["from"] == "sourcemap-chain:1:0"
+                    && edge["kind"] == "source_map_chain_resource_candidate"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(
+            candidates
+                .iter()
+                .filter_map(|edge| edge["to"].as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["resource:4", "resource:5"]),
+        );
+        Ok(())
+    }
 
     #[test]
     fn data_urls_are_bounded_and_percent_decoded_without_form_semantics() -> Result<()> {
