@@ -836,6 +836,8 @@ fn assert_alias_source_graph(project: &Path) -> Result<()> {
 }
 
 fn assert_alias_static_module_graph(project: &Path) -> Result<()> {
+    let source_index = read_json(&project.join("analysis/source-index.json"))?;
+    let refs = read_json(&project.join("analysis/js-references.json"))?;
     let manifest = jsvm_lift::capture_project::load_manifest(project)?;
     let budget = WorkBudget::unlimited("shared-alias-static-module-test");
     let documents = captured_document_entrypoints(project, &manifest, &budget)?;

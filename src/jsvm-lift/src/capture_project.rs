@@ -72,6 +72,27 @@ fn validate_output_path(value: Option<&Value>, label: &str) -> Result<()> {
     Ok(())
 }
 
+fn check_shared_source_sha(
+    object: &Map<String, Value>,
+    known: &mut BTreeMap<String, String>,
+    label: &str,
+) -> Result<()> {
+    let (Some(path), Some(sha)) = (
+        object.get("output_path").and_then(Value::as_str),
+        object.get("sha256").and_then(Value::as_str),
+    ) else {
+        return Ok(());
+    };
+    if let Some(existing) = known.get(path) {
+        if existing != sha {
+            bail!("{label}: conflicting SHA-256 claims for shared capture path {path}");
+        }
+    } else {
+        known.insert(path.to_owned(), sha.to_owned());
+    }
+    Ok(())
+}
+
 /// Validate the capture manifest schema and internal reference integrity.
 ///
 /// # Errors
@@ -89,6 +110,7 @@ pub fn validate_manifest(manifest: &CaptureManifest, label: &str) -> Result<()> 
     }
 
     let mut resource_ids = BTreeSet::new();
+    let mut shared_path_hashes = BTreeMap::<String, String>::new();
     for (index, resource) in manifest.resources.iter().enumerate() {
         let Some(object) = resource.as_object() else {
             bail!("{label}: resources[{index}] must be an object");
@@ -103,6 +125,7 @@ pub fn validate_manifest(manifest: &CaptureManifest, label: &str) -> Result<()> 
             object.get("output_path"),
             &format!("{label}: resources[{index}].output_path"),
         )?;
+        check_shared_source_sha(object, &mut shared_path_hashes, label)?;
     }
 
     for (index, script) in manifest.inline_scripts.iter().enumerate() {
@@ -117,6 +140,7 @@ pub fn validate_manifest(manifest: &CaptureManifest, label: &str) -> Result<()> 
             object.get("output_path"),
             &format!("{label}: inline_scripts[{index}].output_path"),
         )?;
+        check_shared_source_sha(object, &mut shared_path_hashes, label)?;
     }
     Ok(())
 }
@@ -264,6 +288,28 @@ mod tests {
             json!({"id": 7, "output_path": "resources/b.js"}),
         ];
         assert!(validate_manifest(&duplicate_id, "test").is_err());
+    }
+
+    #[test]
+    fn shared_capture_paths_require_consistent_digest_claims() {
+        let mut manifest = valid_manifest();
+        manifest.resources = vec![
+            json!({"id":1,"output_path":"resources/shared.js","sha256":"digest-a"}),
+            json!({"id":2,"output_path":"resources/shared.js","sha256":"digest-a"}),
+            json!({"id":3,"output_path":"resources/other.js"}),
+        ];
+        manifest.inline_scripts = vec![json!({
+            "parent_resource_id":1,
+            "ordinal":1,
+            "output_path":"resources/shared.js",
+            "sha256":"digest-a"
+        })];
+        assert!(validate_manifest(&manifest, "consistent reuse").is_ok());
+        manifest.inline_scripts[0]["sha256"] = json!("digest-b");
+        assert!(validate_manifest(&manifest, "conflicting inline").is_err());
+        manifest.inline_scripts[0]["sha256"] = json!("digest-a");
+        manifest.resources[1]["sha256"] = json!("digest-c");
+        assert!(validate_manifest(&manifest, "conflicting network").is_err());
     }
 
     #[test]
