@@ -12,10 +12,11 @@ use serde_json::{json, Map, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    io::Read,
     path::{Path, PathBuf},
 };
 use url::Url;
-use work_budget::WorkBudget;
+use work_budget::{BudgetExceeded, WorkBudget};
 
 const MAX_CHAIN_DEPTH: usize = 16;
 const MAX_SOURCE_MAP_BYTES: usize = 64 * 1024 * 1024;
@@ -251,7 +252,26 @@ fn problem(
 }
 
 type CapturedByUrl = BTreeMap<String, Vec<Value>>;
-type CapturedLookup<T> = std::result::Result<Option<T>, Map<String, Value>>;
+#[derive(Debug)]
+enum CapturedLookupError {
+    Resource(Map<String, Value>),
+    Budget(BudgetExceeded),
+}
+
+impl From<Map<String, Value>> for CapturedLookupError {
+    fn from(problem: Map<String, Value>) -> Self {
+        Self::Resource(problem)
+    }
+}
+
+impl From<BudgetExceeded> for CapturedLookupError {
+    fn from(error: BudgetExceeded) -> Self {
+        Self::Budget(error)
+    }
+}
+
+// Capture metadata failures are evidence; exhausted budgets abort analysis.
+type CapturedLookup<T> = std::result::Result<Option<T>, CapturedLookupError>;
 
 /// A URL can denote multiple HTTP responses. Only common, verified bytes
 /// justify parsing the body; they never establish a unique response identity.
@@ -259,6 +279,7 @@ fn captured_bytes_for_url(
     url: &str,
     by_url: &CapturedByUrl,
     project: &Path,
+    budget: &WorkBudget,
 ) -> CapturedLookup<(Vec<u8>, Vec<u64>)> {
     let Some(candidates) = by_url.get(url) else {
         return Ok(None);
@@ -269,16 +290,24 @@ fn captured_bytes_for_url(
         .collect::<Vec<_>>();
     let mut reference = None::<Vec<u8>>;
     let mut hashes = BTreeSet::new();
+    // Captures can share a physical output path. Hash it once while validating
+    // every HTTP record's claimed digest independently. Retain only one body:
+    // caching all candidates could consume N * 64 MiB for a single URL.
+    let mut path_hashes = BTreeMap::<PathBuf, String>::new();
     for candidate in candidates {
+        budget.consume(1)?;
         let Some(path) = resource_output_path(candidate) else {
             return Err(problem(
                 "unavailable_captured_resource",
                 [("url", json!(url)), ("candidate_resource_ids", json!(ids))],
-            ));
+            )
+            .into());
         };
         let file = project.join(path);
-        let size = fs::metadata(&file)
-            .map_err(|error| {
+        let digest = if let Some(digest) = path_hashes.get(&file) {
+            digest.clone()
+        } else {
+            let read_error = |error: std::io::Error| {
                 problem(
                     "captured_resource_read_error",
                     [
@@ -287,25 +316,35 @@ fn captured_bytes_for_url(
                         ("error", json!(error.to_string())),
                     ],
                 )
-            })?
-            .len();
-        if size > MAX_SOURCE_MAP_BYTES_U64 {
-            return Err(problem(
-                "captured_resource_too_large",
-                [("url", json!(url)), ("candidate_resource_ids", json!(ids))],
-            ));
-        }
-        let bytes = fs::read(&file).map_err(|error| {
-            problem(
-                "captured_resource_read_error",
-                [
-                    ("url", json!(url)),
-                    ("candidate_resource_ids", json!(ids)),
-                    ("error", json!(error.to_string())),
-                ],
-            )
-        })?;
-        let digest = sha256_hex(&bytes);
+            };
+            let file_handle = fs::File::open(&file).map_err(read_error)?;
+            if file_handle.metadata().map_err(read_error)?.len() > MAX_SOURCE_MAP_BYTES_U64 {
+                return Err(problem(
+                    "captured_resource_too_large",
+                    [("url", json!(url)), ("candidate_resource_ids", json!(ids))],
+                )
+                .into());
+            }
+            // A capture file may grow after stat: bound the actual read too.
+            let mut bytes = Vec::new();
+            file_handle
+                .take(MAX_SOURCE_MAP_BYTES_U64 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(read_error)?;
+            if bytes.len() > MAX_SOURCE_MAP_BYTES {
+                return Err(problem(
+                    "captured_resource_too_large",
+                    [("url", json!(url)), ("candidate_resource_ids", json!(ids))],
+                )
+                .into());
+            }
+            let digest = sha256_hex(&bytes);
+            path_hashes.insert(file, digest.clone());
+            if reference.is_none() {
+                reference = Some(bytes);
+            }
+            digest
+        };
         if candidate
             .get("sha256")
             .and_then(Value::as_str)
@@ -319,12 +358,10 @@ fn captured_bytes_for_url(
                     ("resource_id", json!(resource_id(candidate))),
                     ("actual_sha256", json!(digest)),
                 ],
-            ));
+            )
+            .into());
         }
         hashes.insert(digest);
-        if reference.is_none() {
-            reference = Some(bytes);
-        }
     }
     if hashes.len() > 1 {
         return Err(problem(
@@ -334,7 +371,8 @@ fn captured_bytes_for_url(
                 ("candidate_resource_ids", json!(ids)),
                 ("candidate_sha256s", json!(hashes)),
             ],
-        ));
+        )
+        .into());
     }
     Ok(reference.map(|bytes| (bytes, ids)))
 }
@@ -344,7 +382,8 @@ fn load_map(
     code_url: &str,
     by_url: &CapturedByUrl,
     project: &Path,
-) -> std::result::Result<LoadedMap, Map<String, Value>> {
+    budget: &WorkBudget,
+) -> std::result::Result<LoadedMap, CapturedLookupError> {
     let (bytes, map_url, map_resource_id, map_resource_ids, map_origin, base_url) = if raw_reference
         .starts_with("data:")
     {
@@ -364,16 +403,18 @@ fn load_map(
         )
     } else {
         let map_url = join_logical(code_url, raw_reference);
-        let resolved = captured_bytes_for_url(&map_url, by_url, project).map_err(|mut error| {
-            error.insert("map_url".into(), json!(map_url));
-            error.remove("url");
-            error
-        })?;
+        let resolved = captured_bytes_for_url(&map_url, by_url, project, budget).map_err(
+            |error| match error {
+                CapturedLookupError::Resource(mut fields) => {
+                    fields.insert("map_url".into(), json!(map_url));
+                    fields.remove("url");
+                    CapturedLookupError::Resource(fields)
+                }
+                error => error,
+            },
+        )?;
         let Some((bytes, resource_ids)) = resolved else {
-            return Err(problem(
-                "missing_map_resource",
-                [("map_url", json!(map_url))],
-            ));
+            return Err(problem("missing_map_resource", [("map_url", json!(map_url))]).into());
         };
         let id = (resource_ids.len() == 1).then(|| resource_ids[0]);
         let origin = if id.is_some() {
@@ -421,7 +462,8 @@ fn load_map(
                     Value::String("source map root is not an object".into()),
                 ),
             ],
-        ));
+        )
+        .into());
     }
     let digest = sha256_hex(&bytes);
     let identity = map_url
@@ -464,6 +506,7 @@ fn source_code(
     logical_source: &str,
     by_url: &CapturedByUrl,
     project: &Path,
+    budget: &WorkBudget,
 ) -> CapturedLookup<(String, &'static str, Option<u64>, Vec<u64>)> {
     if let Some(content) = document
         .get("sourcesContent")
@@ -478,7 +521,8 @@ fn source_code(
             Vec::new(),
         )));
     }
-    let Some((bytes, ids)) = captured_bytes_for_url(logical_source, by_url, project)? else {
+    let Some((bytes, ids)) = captured_bytes_for_url(logical_source, by_url, project, budget)?
+    else {
         return Ok(None);
     };
     let code = String::from_utf8(bytes).map_err(|error| {
@@ -565,24 +609,31 @@ fn expand_map(
     for ordinal in (0..sources.len()).rev() {
         budget.checkpoint()?;
         let logical_source = value_text(&sources[ordinal]);
-        let (code, code_origin, code_resource_id, code_resource_ids) =
-            match source_code(&normalized, ordinal, &logical_source, by_url, project) {
-                Ok(Some(source)) => source,
-                Ok(None) => continue,
-                Err(mut values) => {
-                    let mut row = Map::new();
-                    row.insert("depth".into(), json!(depth + 1));
-                    row.insert("source_ordinal".into(), json!(ordinal));
-                    row.insert("logical_source".into(), json!(logical_source));
-                    row.insert("code_url".into(), json!(logical_source));
-                    if let Some(ids) = values.remove("candidate_resource_ids") {
-                        values.insert("candidate_code_resource_ids".into(), ids);
-                    }
-                    insert_problem(&mut row, values);
-                    links.push(Value::Object(row));
-                    continue;
+        let (code, code_origin, code_resource_id, code_resource_ids) = match source_code(
+            &normalized,
+            ordinal,
+            &logical_source,
+            by_url,
+            project,
+            budget,
+        ) {
+            Ok(Some(source)) => source,
+            Ok(None) => continue,
+            Err(CapturedLookupError::Budget(error)) => return Err(error.into()),
+            Err(CapturedLookupError::Resource(mut values)) => {
+                let mut row = Map::new();
+                row.insert("depth".into(), json!(depth + 1));
+                row.insert("source_ordinal".into(), json!(ordinal));
+                row.insert("logical_source".into(), json!(logical_source));
+                row.insert("code_url".into(), json!(logical_source));
+                if let Some(ids) = values.remove("candidate_resource_ids") {
+                    values.insert("candidate_code_resource_ids".into(), ids);
                 }
-            };
+                insert_problem(&mut row, values);
+                links.push(Value::Object(row));
+                continue;
+            }
+        };
         let Some(raw_reference) = last_source_map_directive(&code) else {
             continue;
         };
@@ -601,9 +652,10 @@ fn expand_map(
         row.insert("code_resource_ids".into(), json!(code_resource_ids));
         row.insert("raw_reference".into(), Value::String(raw_reference.clone()));
 
-        let upstream = match load_map(&raw_reference, &logical_source, by_url, project) {
+        let upstream = match load_map(&raw_reference, &logical_source, by_url, project, budget) {
             Ok(upstream) => upstream,
-            Err(values) => {
+            Err(CapturedLookupError::Budget(error)) => return Err(error.into()),
+            Err(CapturedLookupError::Resource(values)) => {
                 insert_problem(&mut row, values);
                 links.push(Value::Object(row));
                 continue;
@@ -777,9 +829,10 @@ pub fn recover_project_sourcemaps(
             format!("{resource_id}:{code_url}"),
         );
         budget.checkpoint()?;
-        let loaded = match load_map(&raw_reference, code_url, &by_url, &project) {
+        let loaded = match load_map(&raw_reference, code_url, &by_url, &project, &budget) {
             Ok(loaded) => loaded,
-            Err(values) => {
+            Err(CapturedLookupError::Budget(error)) => return Err(error.into()),
+            Err(CapturedLookupError::Resource(values)) => {
                 let mut row = Map::new();
                 row.insert("resource_id".into(), Value::from(resource_id));
                 row.insert("url".into(), Value::String(code_url.into()));
@@ -976,6 +1029,88 @@ mod tests {
 
     fn read_fixture_artifact(project: &Path, path: &str) -> Result<Value> {
         serde_json::from_slice(&fs::read(project.join(path))?).map_err(Into::into)
+    }
+
+    #[test]
+    fn duplicate_capture_path_preserves_all_ids_and_checks_each_claim() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        fs::create_dir_all(temp.path().join("resources"))?;
+        let content = b"shared body";
+        fs::write(temp.path().join("resources/shared.js"), content)?;
+        let url = "https://fixture.invalid/shared.js";
+        let candidate = |id, sha: String| {
+            json!({
+                "id": id, "output_path": "resources/shared.js", "sha256": sha
+            })
+        };
+        let correct_sha = sha256_hex(content);
+        let mut by_url = CapturedByUrl::from([(
+            url.to_owned(),
+            vec![
+                candidate(2, correct_sha.clone()),
+                candidate(3, correct_sha.clone()),
+                candidate(4, correct_sha.clone()),
+            ],
+        )]);
+        let budget = WorkBudget::new("shared-path-test", work_budget::BudgetLimits::unlimited());
+        let (bytes, ids) = captured_bytes_for_url(url, &by_url, temp.path(), &budget)
+            .expect("shared path should resolve")
+            .expect("shared path should exist");
+        assert_eq!(bytes, content);
+        assert_eq!(ids, vec![2, 3, 4]);
+
+        // A cached digest must not accidentally bless a second record's
+        // incorrect manifest claim for the same file.
+        by_url.get_mut(url).expect("URL indexed")[1]["sha256"] = json!("wrong");
+        let error = captured_bytes_for_url(url, &by_url, temp.path(), &budget)
+            .expect_err("each claim must be checked against real bytes");
+        let CapturedLookupError::Resource(error) = error else {
+            anyhow::bail!("expected a per-capture SHA mismatch");
+        };
+        assert_eq!(error["status"], "captured_resource_sha_mismatch");
+        assert_eq!(error["resource_id"], 3);
+        assert_eq!(error["actual_sha256"], correct_sha);
+        assert_eq!(error["candidate_resource_ids"], json!([2, 3, 4]));
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_capture_is_rejected_before_reading() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("oversized");
+        let file = fs::File::create(&path)?;
+        file.set_len(MAX_SOURCE_MAP_BYTES_U64 + 1)?;
+        let url = "https://fixture.invalid/map";
+        let by_url = CapturedByUrl::from([(
+            url.to_owned(),
+            vec![json!({"id": 9, "output_path": "oversized"})],
+        )]);
+        let budget = WorkBudget::new("oversized-test", work_budget::BudgetLimits::unlimited());
+        let error = captured_bytes_for_url(url, &by_url, temp.path(), &budget)
+            .expect_err("oversized resource cannot be loaded");
+        let CapturedLookupError::Resource(error) = error else {
+            anyhow::bail!("expected a per-capture size failure");
+        };
+        assert_eq!(error["status"], "captured_resource_too_large");
+        assert_eq!(error["candidate_resource_ids"], json!([9]));
+        Ok(())
+    }
+
+    #[test]
+    fn captured_response_candidates_consume_work_budget() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let project = temp.path();
+        let map = alias_map_document("export const version = 1;");
+        shared_map_fixture(project, &map, &map)?;
+        let budgets = AnalysisBudgets::new(
+            "capture-candidate-budget-test",
+            work_budget::BudgetLimits::work(1),
+        );
+        let error = recover_project_sourcemaps(project, &budgets)
+            .expect_err("the second matching response must exhaust the budget");
+        assert!(work_budget::find_budget_exceeded(error.as_ref()).is_some());
+        assert!(!project.join("analysis/sourcemaps.json").exists());
+        Ok(())
     }
 
     #[test]
