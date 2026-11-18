@@ -2063,6 +2063,7 @@ mod tests {
             JS_REFERENCES,
             &json!({
                 "schema":JS_REFERENCES.schema,
+                "summary":{},
                 "code_units":[{
                     "resource_id":7,"raw_path":"resources/entry.js",
                     "references":[
