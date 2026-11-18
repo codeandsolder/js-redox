@@ -99,33 +99,11 @@ impl<'s> Plan<'s> {
         }
     }
     fn assignment_target(&mut self, target: &AssignmentTarget<'_>) -> bool {
-        match target {
-            AssignmentTarget::AssignmentTargetIdentifier(_) => {
-                let name = self.snippet(target.span());
-                self.mark(target.span(), "resolve reference", name);
-            }
-            AssignmentTarget::StaticMemberExpression(member) if !member.optional => {
-                self.expression(&member.object);
-                self.mark(
-                    target.span(),
-                    "form reference",
-                    format!("static property .{}", member.property.name),
-                );
-            }
-            AssignmentTarget::ComputedMemberExpression(member) if !member.optional => {
-                self.computed_reference(member)
-            }
-            AssignmentTarget::PrivateFieldExpression(member) if !member.optional => {
-                self.expression(&member.object);
-                self.mark(
-                    target.span(),
-                    "form private reference",
-                    "private-brand check",
-                );
-            }
-            _ => return false,
-        }
-        true
+        // OXC only exposes a simple view for the shared assignment-target
+        // variants. Destructuring and other unsupported targets remain opaque.
+        target
+            .as_simple_assignment_target()
+            .is_some_and(|simple| self.simple_target(simple))
     }
     fn simple_target(&mut self, target: &SimpleAssignmentTarget<'_>) -> bool {
         match target {
