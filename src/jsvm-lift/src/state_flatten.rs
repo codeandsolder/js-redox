@@ -4406,15 +4406,9 @@ fn expression_function_body<'a>(expr: &'a Expression<'a>) -> Option<&'a Function
 }
 
 fn argument_function_body<'a>(arg: &'a Argument<'a>) -> Option<&'a FunctionBody<'a>> {
-    match arg {
-        Argument::FunctionExpression(fun) => fun.body.as_deref(),
-        Argument::ArrowFunctionExpression(fun) => match &fun.body {
-            oxc_ast::ast::ArrowFunctionBody::FunctionBody(body) => Some(&**body),
-            _ => None,
-        },
-        Argument::ParenthesizedExpression(paren) => expression_function_body(&paren.expression),
-        _ => None,
-    }
+    // Spread arguments cannot be immediate callable function bodies. All
+    // other variants reuse the exact expression parser, including parentheses.
+    expression_function_body(arg.as_expression()?)
 }
 
 fn exec_statement_impl(
