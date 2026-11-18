@@ -1398,7 +1398,10 @@ fn parameter_binding_preserved_before_event(
     true
 }
 
-fn guard_expression<'a>(function: &'a Function<'a>) -> Option<&'a Expression<'a>> {
+// Require exactly one top-level return of a two-part sequence. The two
+// factory theorems interpret the first expression differently after this
+// shared syntactic gate; neither interpretation is weakened here.
+fn two_stage_return_guard<'a>(function: &'a Function<'a>) -> Option<&'a Expression<'a>> {
     let body = function.body.as_ref()?;
     let mut returns = body
         .statements
@@ -1417,7 +1420,13 @@ fn guard_expression<'a>(function: &'a Function<'a>) -> Option<&'a Expression<'a>
     let [guarded, _] = sequence.expressions.as_slice() else {
         return None;
     };
-    let Expression::LogicalExpression(logical) = strip_parentheses(guarded) else {
+    Some(guarded)
+}
+
+fn guard_expression<'a>(function: &'a Function<'a>) -> Option<&'a Expression<'a>> {
+    let Expression::LogicalExpression(logical) =
+        strip_parentheses(two_stage_return_guard(function)?)
+    else {
         return None;
     };
     (logical.operator.as_str() == "&&").then_some(&logical.left)
@@ -1563,25 +1572,9 @@ pub fn proven_slow_lazy_cell_factory_call(
 fn slow_sequence<'a>(
     function: &'a Function<'a>,
 ) -> Option<&'a oxc_ast::ast::SequenceExpression<'a>> {
-    let body = function.body.as_ref()?;
-    let mut returns = body
-        .statements
-        .iter()
-        .filter_map(|statement| match statement {
-            Statement::ReturnStatement(ret) => Some(ret),
-            _ => None,
-        });
-    let ret = returns.next()?;
-    if returns.next().is_some() {
-        return None;
-    }
-    let Expression::SequenceExpression(return_sequence) = ret.argument.as_ref()? else {
-        return None;
-    };
-    let [guarded, _] = return_sequence.expressions.as_slice() else {
-        return None;
-    };
-    let Expression::LogicalExpression(logical) = last_sequence_expression(guarded) else {
+    let Expression::LogicalExpression(logical) =
+        last_sequence_expression(two_stage_return_guard(function)?)
+    else {
         return None;
     };
     if logical.operator.as_str() != "&&" {
