@@ -654,8 +654,8 @@ mod tests {
         let (main_unit, main_refs, main_sha) = pair(
             project,
             "main",
-            "import 'pkg';import('./lazy.js')",
-            "import 'pkg';\nimport('./lazy.js');\n",
+            "import 'pkg';import('./lazy.js');import 'ghost';",
+            "import 'pkg';\nimport('./lazy.js');\nimport 'ghost';\n",
         )?;
         let (first_unit, mut first_refs, _) = pair(
             project,
@@ -702,7 +702,7 @@ mod tests {
                 "resolution":"url","resolved_url":"https://example.test/lazy.js"
             },
             {
-                "kind":"import_static", "specifier":"ghost", "start":34, "end":42,
+                "kind":"import_static", "specifier":"ghost", "start":35, "end":50,
                 "resolution_candidates":[],
                 "resolution":"url","resolved_url":"https://example.test/pkg.js"
             }
