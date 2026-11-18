@@ -237,7 +237,7 @@ struct RootCapture<'a> {
 }
 
 fn match_root(
-    root: RootCapture<'_>,
+    root: &RootCapture<'_>,
     raw_index: &BTreeMap<String, Vec<usize>>,
     units: &[Unit<'_>],
     bodies: &ManifestBodies<'_>,
@@ -383,7 +383,7 @@ fn discover_roots(
             }
             for source in &script.captured_sources {
                 let resolved = match_root(
-                    RootCapture {
+                    &RootCapture {
                         source,
                         document_id: document.document_resource_id,
                         ordinal: script.ordinal,
