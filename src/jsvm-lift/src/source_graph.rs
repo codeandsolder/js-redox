@@ -2056,7 +2056,7 @@ mod tests {
         };
         write_manifest(&project.join(MANIFEST_NAME), &manifest)?;
         write_artifact(
-            &project,
+            project,
             JS_REFERENCES,
             &json!({
                 "schema":JS_REFERENCES.schema,
@@ -2101,7 +2101,7 @@ mod tests {
             }),
         )?;
         build_source_graph(
-            &project,
+            project,
             &AnalysisBudgets::standard("source-graph-contextual-proof-test"),
         )?;
         Ok(())
