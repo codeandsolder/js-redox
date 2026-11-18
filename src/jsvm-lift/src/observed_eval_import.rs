@@ -3,8 +3,8 @@ use crate::sha256_hex;
 use anyhow::{bail, Context, Result};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    Argument, ArrowFunctionExpression, BindingPattern, CallExpression, Expression, Function,
-    IdentifierReference, VariableDeclarator,
+    Argument, ArrowFunctionExpression, BindingPattern, CallExpression, Expression,
+    FormalParameters, Function, IdentifierReference, VariableDeclarator,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_codegen::Codegen;
@@ -34,6 +34,22 @@ struct Frame {
     end: u32,
     #[serde(skip)]
     symbols: Vec<Option<SymbolId>>,
+}
+
+// Function and arrow frames use the same formal binding identity rules.
+// Collect both views in a single ordered pass so the names and symbols stay
+// aligned (including destructuring placeholders).
+fn frame_parameters(parameters: &FormalParameters<'_>) -> (Vec<String>, Vec<Option<SymbolId>>) {
+    parameters
+        .items
+        .iter()
+        .map(|parameter| match &parameter.pattern {
+            BindingPattern::BindingIdentifier(identifier) => {
+                (identifier.name.to_string(), identifier.symbol_id.get())
+            }
+            _ => ("<pattern>".to_owned(), None),
+        })
+        .unzip()
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -167,24 +183,7 @@ impl<'a> Visit<'a> for Scan<'_> {
     }
 
     fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
-        let params = function
-            .params
-            .items
-            .iter()
-            .map(|param| match &param.pattern {
-                BindingPattern::BindingIdentifier(id) => id.name.to_string(),
-                _ => "<pattern>".to_owned(),
-            })
-            .collect();
-        let symbols = function
-            .params
-            .items
-            .iter()
-            .map(|param| match &param.pattern {
-                BindingPattern::BindingIdentifier(id) => id.symbol_id.get(),
-                _ => None,
-            })
-            .collect();
+        let (params, symbols) = frame_parameters(&function.params);
         let binding = function
             .id
             .as_ref()
@@ -207,24 +206,7 @@ impl<'a> Visit<'a> for Scan<'_> {
     }
 
     fn visit_arrow_function_expression(&mut self, arrow: &ArrowFunctionExpression<'a>) {
-        let params = arrow
-            .params
-            .items
-            .iter()
-            .map(|param| match &param.pattern {
-                BindingPattern::BindingIdentifier(id) => id.name.to_string(),
-                _ => "<pattern>".to_owned(),
-            })
-            .collect();
-        let symbols = arrow
-            .params
-            .items
-            .iter()
-            .map(|param| match &param.pattern {
-                BindingPattern::BindingIdentifier(id) => id.symbol_id.get(),
-                _ => None,
-            })
-            .collect();
+        let (params, symbols) = frame_parameters(&arrow.params);
         let binding = self
             .bindings
             .get(&(arrow.span.start, arrow.span.end))
