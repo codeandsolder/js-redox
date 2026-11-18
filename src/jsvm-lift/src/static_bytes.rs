@@ -582,6 +582,30 @@ struct SinkCollector<'c, 'g, 'e, 'h> {
     budget_error: Option<BudgetExceeded>,
 }
 
+impl SinkCollector<'_, '_, '_, '_> {
+    // Calls and constructors have the same argument proof and sink recording.
+    // Return false on budget exhaustion so the visitor stops before walking
+    // children, exactly as it did in both original branches.
+    fn record_sink(&mut self, sink: Sink, arguments: &[Argument<'_>]) -> bool {
+        if let Some(argument) = arguments.first().and_then(Argument::as_expression) {
+            let mut state = EvalState::default();
+            match artifact_from_argument(argument, sink, self.evaluator, &mut state) {
+                Ok(Some(artifact)) => {
+                    self.direct_artifacts
+                        .insert((sink.span.start, sink.span.end), artifact);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    self.budget_error = Some(error);
+                    return false;
+                }
+            }
+        }
+        self.sinks.push(sink);
+        true
+    }
+}
+
 impl<'a> Visit<'a> for SinkCollector<'_, '_, '_, '_> {
     fn visit_call_expression(&mut self, call: &oxc_ast::ast::CallExpression<'a>) {
         if self.budget_error.is_some() || !self.poller.poll(1) {
@@ -607,25 +631,15 @@ impl<'a> Visit<'a> for SinkCollector<'_, '_, '_, '_> {
                     return;
                 }
             };
-            let sink = Sink {
-                span: call.span,
-                kind,
-            };
-            if let Some(argument) = call.arguments.first().and_then(Argument::as_expression) {
-                let mut state = EvalState::default();
-                match artifact_from_argument(argument, sink, self.evaluator, &mut state) {
-                    Ok(Some(artifact)) => {
-                        self.direct_artifacts
-                            .insert((sink.span.start, sink.span.end), artifact);
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        self.budget_error = Some(error);
-                        return;
-                    }
-                }
+            if !self.record_sink(
+                Sink {
+                    span: call.span,
+                    kind,
+                },
+                &call.arguments,
+            ) {
+                return;
             }
-            self.sinks.push(sink);
             walk::walk_call_expression(self, call);
             return;
         }
@@ -643,30 +657,15 @@ impl<'a> Visit<'a> for SinkCollector<'_, '_, '_, '_> {
             "WebAssembly",
         )
         .is_some_and(|(member, _)| member == "Module")
+            && !self.record_sink(
+                Sink {
+                    span: expression.span,
+                    kind: "new WebAssembly.Module",
+                },
+                &expression.arguments,
+            )
         {
-            let sink = Sink {
-                span: expression.span,
-                kind: "new WebAssembly.Module",
-            };
-            if let Some(argument) = expression
-                .arguments
-                .first()
-                .and_then(Argument::as_expression)
-            {
-                let mut state = EvalState::default();
-                match artifact_from_argument(argument, sink, self.evaluator, &mut state) {
-                    Ok(Some(artifact)) => {
-                        self.direct_artifacts
-                            .insert((sink.span.start, sink.span.end), artifact);
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        self.budget_error = Some(error);
-                        return;
-                    }
-                }
-            }
-            self.sinks.push(sink);
+            return;
         }
         walk::walk_new_expression(self, expression);
     }
@@ -1917,6 +1916,36 @@ mod tests {
         assert_eq!(artifacts[1].sink_kind, "WebAssembly.validate");
     }
 
+    #[test]
+    fn call_and_constructor_sinks_share_direct_argument_recovery() -> anyhow::Result<()> {
+        let source = r"
+            WebAssembly.compile(new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0]));
+            WebAssembly.instantiate(new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0]));
+            WebAssembly.validate(new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0]));
+            new WebAssembly.Module(new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0]));
+        ";
+        let analysis = analyze_webassembly_byte_artifacts(source, &test_budget())?;
+        assert_eq!(analysis.webassembly_sinks, 4);
+        assert_eq!(
+            analysis
+                .sink_diagnostics
+                .iter()
+                .map(|sink| sink.sink_kind)
+                .collect::<Vec<_>>(),
+            [
+                "WebAssembly.compile",
+                "WebAssembly.instantiate",
+                "WebAssembly.validate",
+                "new WebAssembly.Module",
+            ],
+        );
+        assert_eq!(analysis.artifacts.len(), 4);
+        assert!(analysis
+            .artifacts
+            .iter()
+            .all(|artifact| artifact.bytes == b"\0asm\x01\0\0\0"));
+        Ok(())
+    }
     #[test]
     fn invalid_validate_input_is_not_claimed_as_a_wasm_artifact() {
         let source = r"
