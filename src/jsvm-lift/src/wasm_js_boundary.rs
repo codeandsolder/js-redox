@@ -952,138 +952,200 @@ fn verified_module_bytes(project: &Path, module: &Value) -> Option<(PathBuf, Str
     Some((PathBuf::from(binary_path), module_sha256.to_owned(), bytes))
 }
 
+struct FreshAlignmentInputs {
+    function: usize,
+    length_import_index: usize,
+    length_shift: usize,
+    exact_source_length: usize,
+    exact_source_length_u32: u32,
+    exports_binding: String,
+}
+
+impl FreshAlignmentInputs {
+    /// Reject malformed allocator recipes and require one disjoint-effects
+    /// initializer source with the exact static Uint32Array argument length.
+    fn verify(context: &CopiedInputProofContext<'_>, candidate: &Value) -> Option<Self> {
+        let recipe = candidate
+            .get("fresh_destination_base_recipe")?
+            .as_object()?;
+        let export_name = context.export_name?;
+        let function = recipe
+            .get("function")?
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())?;
+        let length_import_index = recipe
+            .get("source_length_import_function")?
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())?;
+        let length_shift = recipe
+            .get("source_length_byte_shift")?
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())?;
+        let element_shift = usize_field(candidate, "destination_element_index_shift")?;
+        if length_shift != element_shift || length_shift != 2 {
+            return None;
+        }
+        let alternate_bases = recipe.get("alternate_constant_bases")?.as_array()?;
+        if alternate_bases.iter().any(|value| {
+            value
+                .as_u64()
+                .is_none_or(|value| value > u64::from(u32::MAX) || value % 4 != 0)
+        }) {
+            return None;
+        }
+        let _length_import = context.function_imports.get(length_import_index)?;
+        let source_parameter = usize_field(candidate, "source_entry_parameter");
+        let exact_source_length = fixed_uint32_source_length_exact(
+            context.module_memory_proofs,
+            Some(export_name),
+            source_parameter,
+        )?;
+        let exact_source_length_u32 = u32::try_from(exact_source_length).ok()?;
+        if exact_source_length_u32 > (u32::MAX >> length_shift) {
+            return None;
+        }
+
+        let mut exports_bindings = BTreeSet::new();
+        for proof in context.module_memory_proofs {
+            if string_field(proof, "initializer_only_wasm_export_call") != Some("__wbindgen_start")
+                || bool_field(proof, "initializer_non_start_effects_memory_disjoint") != Some(true)
+            {
+                return None;
+            }
+            exports_bindings.insert(string_field(proof, "exports_binding")?.to_owned());
+            let calls = array_field(proof, "export_calls");
+            let first = calls.first()?;
+            if string_field(first, "export_name") != Some(export_name) {
+                return None;
+            }
+            let argument_lengths = array_field(first, "static_uint32_array_argument_lengths");
+            let source_parameter = source_parameter?;
+            if argument_lengths.get(source_parameter)?.as_u64()?
+                != u64::from(exact_source_length_u32)
+            {
+                return None;
+            }
+        }
+        if exports_bindings.len() != 1 {
+            return None;
+        }
+        let exports_binding = exports_bindings.iter().next()?.clone();
+        Some(Self {
+            function,
+            length_import_index,
+            length_shift,
+            exact_source_length,
+            exact_source_length_u32,
+            exports_binding,
+        })
+    }
+}
+
+struct FreshStartEvidence {
+    start_export: Value,
+    start_import: Value,
+    start_usage: Value,
+    start_handler: Value,
+    table_export: Value,
+}
+
+impl FreshStartEvidence {
+    /// Require one exact start export, matching table-only normalized handler,
+    /// and one import-object binding for the same module instance.
+    fn verify(context: &CopiedInputProofContext<'_>, exports_binding: &str) -> Option<Self> {
+        let start_exports = array_field(context.report, "exports")
+            .iter()
+            .filter(|exported| {
+                string_field(exported, "name") == Some("__wbindgen_start")
+                    && string_field(exported, "kind") == Some("function")
+                    && usize_field(exported, "index").is_some()
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let [start_export] = start_exports.as_slice() else {
+            return None;
+        };
+        let start_function = usize_field(start_export, "index")?;
+        let start_import = context.function_imports.get(start_function)?;
+        let start_module = string_field(start_import, "module")?;
+        let start_name = string_field(start_import, "name")?;
+
+        let table_exports = array_field(context.report, "exports")
+            .iter()
+            .filter(|exported| {
+                string_field(exported, "kind") == Some("table")
+                    && string_field(exported, "name") == Some("__wbindgen_export_0")
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let [table_export] = table_exports.as_slice() else {
+            return None;
+        };
+
+        let normalized_handlers =
+            array_field(context.document, "proof_normalized_handler_semantics")
+                .iter()
+                .filter(|handler| {
+                    string_field(handler, "import_module") == Some(start_module)
+                        && string_field(handler, "import_name") == Some(start_name)
+                        && string_field(handler, "kind") == Some("table_initializer_only")
+                        && string_field(handler, "exports_binding") == Some(exports_binding)
+                        && string_field(handler, "table_export") == Some("__wbindgen_export_0")
+                        && bool_field(handler, "standard_builtin_semantics_required") == Some(true)
+                        && bool_field(handler, "standard_webassembly_builtin_semantics_required")
+                            == Some(true)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+        let [start_handler] = normalized_handlers.as_slice() else {
+            return None;
+        };
+
+        let start_usages = array_field(context.document, "import_object_usages")
+            .iter()
+            .filter(|usage| {
+                string_field(usage, "import_module") == Some(start_module)
+                    && string_field(usage, "import_name") == Some(start_name)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let exact_start_usages =
+            exact_module_usage_proofs(&start_usages, string_field(context.module, "sha256"))
+                .into_iter()
+                .filter(|usage| exact_usage_matches_binding(usage, context.binding_proofs))
+                .collect::<Vec<_>>();
+        let [start_usage] = exact_start_usages.as_slice() else {
+            return None;
+        };
+        Some(Self {
+            start_export: start_export.clone(),
+            start_import: start_import.clone(),
+            start_usage: start_usage.clone(),
+            start_handler: start_handler.clone(),
+            table_export: table_export.clone(),
+        })
+    }
+}
+
 fn fresh_destination_alignment_proof(
     context: &CopiedInputProofContext<'_>,
     candidate: &Value,
 ) -> Option<Value> {
-    let recipe = candidate
-        .get("fresh_destination_base_recipe")?
-        .as_object()?;
-    let export_name = context.export_name?;
-    let function = recipe
-        .get("function")?
-        .as_u64()
-        .and_then(|value| usize::try_from(value).ok())?;
-    let length_import_index = recipe
-        .get("source_length_import_function")?
-        .as_u64()
-        .and_then(|value| usize::try_from(value).ok())?;
-    let length_shift = recipe
-        .get("source_length_byte_shift")?
-        .as_u64()
-        .and_then(|value| usize::try_from(value).ok())?;
-    let element_shift = usize_field(candidate, "destination_element_index_shift")?;
-    if length_shift != element_shift || length_shift != 2 {
-        return None;
-    }
-    let alternate_bases = recipe.get("alternate_constant_bases")?.as_array()?;
-    if alternate_bases.iter().any(|value| {
-        value
-            .as_u64()
-            .is_none_or(|value| value > u64::from(u32::MAX) || value % 4 != 0)
-    }) {
-        return None;
-    }
-    let _length_import = context.function_imports.get(length_import_index)?;
-    let source_parameter = usize_field(candidate, "source_entry_parameter");
-    let exact_source_length = fixed_uint32_source_length_exact(
-        context.module_memory_proofs,
-        Some(export_name),
-        source_parameter,
-    )?;
-    let exact_source_length_u32 = u32::try_from(exact_source_length).ok()?;
-    if exact_source_length_u32 > (u32::MAX >> length_shift) {
-        return None;
-    }
-
-    let mut exports_bindings = BTreeSet::new();
-    for proof in context.module_memory_proofs {
-        if string_field(proof, "initializer_only_wasm_export_call") != Some("__wbindgen_start")
-            || bool_field(proof, "initializer_non_start_effects_memory_disjoint") != Some(true)
-        {
-            return None;
-        }
-        exports_bindings.insert(string_field(proof, "exports_binding")?.to_owned());
-        let calls = array_field(proof, "export_calls");
-        let first = calls.first()?;
-        if string_field(first, "export_name") != Some(export_name) {
-            return None;
-        }
-        let argument_lengths = array_field(first, "static_uint32_array_argument_lengths");
-        let source_parameter = source_parameter?;
-        if argument_lengths.get(source_parameter)?.as_u64()? != u64::from(exact_source_length_u32) {
-            return None;
-        }
-    }
-    if exports_bindings.len() != 1 {
-        return None;
-    }
-    let exports_binding = exports_bindings.iter().next()?;
-
-    let start_exports = array_field(context.report, "exports")
-        .iter()
-        .filter(|exported| {
-            string_field(exported, "name") == Some("__wbindgen_start")
-                && string_field(exported, "kind") == Some("function")
-                && usize_field(exported, "index").is_some()
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    let [start_export] = start_exports.as_slice() else {
-        return None;
-    };
-    let start_function = usize_field(start_export, "index")?;
-    let start_import = context.function_imports.get(start_function)?;
-    let start_module = string_field(start_import, "module")?;
-    let start_name = string_field(start_import, "name")?;
-
-    let table_exports = array_field(context.report, "exports")
-        .iter()
-        .filter(|exported| {
-            string_field(exported, "kind") == Some("table")
-                && string_field(exported, "name") == Some("__wbindgen_export_0")
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    let [table_export] = table_exports.as_slice() else {
-        return None;
-    };
-
-    let normalized_handlers = array_field(context.document, "proof_normalized_handler_semantics")
-        .iter()
-        .filter(|handler| {
-            string_field(handler, "import_module") == Some(start_module)
-                && string_field(handler, "import_name") == Some(start_name)
-                && string_field(handler, "kind") == Some("table_initializer_only")
-                && string_field(handler, "exports_binding") == Some(exports_binding.as_str())
-                && string_field(handler, "table_export") == Some("__wbindgen_export_0")
-                && bool_field(handler, "standard_builtin_semantics_required") == Some(true)
-                && bool_field(handler, "standard_webassembly_builtin_semantics_required")
-                    == Some(true)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    let [start_handler] = normalized_handlers.as_slice() else {
-        return None;
-    };
-
-    let start_usages = array_field(context.document, "import_object_usages")
-        .iter()
-        .filter(|usage| {
-            string_field(usage, "import_module") == Some(start_module)
-                && string_field(usage, "import_name") == Some(start_name)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    let exact_start_usages =
-        exact_module_usage_proofs(&start_usages, string_field(context.module, "sha256"))
-            .into_iter()
-            .filter(|usage| exact_usage_matches_binding(usage, context.binding_proofs))
-            .collect::<Vec<_>>();
-    let [start_usage] = exact_start_usages.as_slice() else {
-        return None;
-    };
-
+    let FreshAlignmentInputs {
+        function,
+        length_import_index,
+        length_shift,
+        exact_source_length,
+        exact_source_length_u32,
+        exports_binding,
+    } = FreshAlignmentInputs::verify(context, candidate)?;
+    let FreshStartEvidence {
+        start_export,
+        start_import,
+        start_usage,
+        start_handler,
+        table_export,
+    } = FreshStartEvidence::verify(context, &exports_binding)?;
     let length_import = context.function_imports.get(length_import_index)?;
     if string_field(length_import, "module").is_none()
         || string_field(length_import, "name").is_none()
@@ -1148,145 +1210,263 @@ fn access_is_disjoint_from_range(
     access_end <= range_start || range_end <= addr
 }
 
+struct FreshCleanupSetup {
+    slot_allocator: usize,
+    cleanup_function: usize,
+    memory_import_index: usize,
+    buffer_index: usize,
+    buffer_handler: Value,
+    binding_import_object: String,
+}
+
+impl FreshCleanupSetup {
+    /// Only the exact single buffer getter from the same import object as
+    /// memory may be bypassed during the bounded fresh cleanup sequence.
+    fn verify(context: &CopiedInputProofContext<'_>, candidate: &Value) -> Option<Self> {
+        let recipe = candidate
+            .get("fresh_cleanup_disjointness_recipe")?
+            .as_object()?;
+        let slot_allocator = recipe
+            .get("slot_allocator_function")?
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())?;
+        let cleanup_function = recipe
+            .get("cleanup_function")?
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())?;
+        if recipe.get("pre_copy_cleanup").and_then(Value::as_str) != Some("buffer")
+            || recipe.get("post_copy_cleanups") != Some(&json!(["receiver", "memory"]))
+        {
+            return None;
+        }
+        let bypassed_imports = recipe
+            .get("bypassed_setup_import_functions")?
+            .as_array()?
+            .iter()
+            .map(|value| value.as_u64().and_then(|value| usize::try_from(value).ok()))
+            .collect::<Option<Vec<_>>>()?;
+        let memory_import_index =
+            usize_field(candidate, "constructor_input_memory_import_function")?;
+        if !bypassed_imports.contains(&memory_import_index)
+            || bypassed_imports
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .len()
+                != 2
+            || context.module_memory_proofs.is_empty()
+        {
+            return None;
+        }
+        let buffer_indices = bypassed_imports
+            .iter()
+            .copied()
+            .filter(|index| *index != memory_import_index)
+            .collect::<Vec<_>>();
+        let [buffer_index] = buffer_indices.as_slice() else {
+            return None;
+        };
+        let buffer_import = context.function_imports.get(*buffer_index)?;
+        let buffer_module = string_field(buffer_import, "module")?;
+        let buffer_name = string_field(buffer_import, "name")?;
+        let binding_import_objects = context
+            .binding_proofs
+            .iter()
+            .filter_map(|proof| string_field(proof, "import_object"))
+            .collect::<BTreeSet<_>>();
+        if binding_import_objects.len() != 1 {
+            return None;
+        }
+        let binding_import_object = (*binding_import_objects.iter().next()?).to_owned();
+        let buffer_handlers = matching_handler(
+            context.document,
+            buffer_module,
+            buffer_name,
+            "property_getter",
+        )
+        .into_iter()
+        .filter(|handler| {
+            string_field(handler, "property") == Some("buffer")
+                && bool_field(handler, "standard_builtin_semantics_required") == Some(true)
+                && string_field(handler, "import_object") == Some(binding_import_object.as_str())
+        })
+        .collect::<Vec<_>>();
+        let [buffer_handler] = buffer_handlers.as_slice() else {
+            return None;
+        };
+        Some(Self {
+            slot_allocator,
+            cleanup_function,
+            memory_import_index,
+            buffer_index: *buffer_index,
+            buffer_handler: buffer_handler.clone(),
+            binding_import_object,
+        })
+    }
+}
+
+struct FreshCleanupSequence {
+    destination_base: u32,
+    byte_count: u32,
+    calls: Vec<FreshI32CallRequest>,
+    table_grows: Vec<FreshTableGrowRequest>,
+}
+
+impl FreshCleanupSequence {
+    /// The exact call sequence allocates three independent slots and then
+    /// frees them in observed order after the copy boundary.
+    fn verify(
+        candidate: &Value,
+        fresh_alignment_proof: &Value,
+        setup: &FreshCleanupSetup,
+    ) -> Option<Self> {
+        let slot_allocator = setup.slot_allocator;
+        let cleanup_function = setup.cleanup_function;
+        let destination_base = u32_field(fresh_alignment_proof, "evaluated_destination_base")?;
+        let byte_count = u32_field(fresh_alignment_proof, "allocator_byte_count")?;
+        if byte_count == 0 {
+            return None;
+        }
+        let start_handler = fresh_alignment_proof.get("start_handler")?;
+        let table_export = fresh_alignment_proof.get("table_export")?;
+        let table_index = usize_field(table_export, "index")?;
+        let grow_deltas = array_field(start_handler, "exact_grow_deltas")
+            .iter()
+            .map(|delta| delta.as_u64().and_then(|value| u32::try_from(value).ok()))
+            .collect::<Option<Vec<_>>>()?;
+        if grow_deltas.is_empty() {
+            return None;
+        }
+        let destination_function = candidate
+            .get("fresh_destination_base_recipe")
+            .and_then(|recipe| usize_field(recipe, "function"))?;
+        let calls = vec![
+            FreshI32CallRequest {
+                function_index: destination_function,
+                i32_args: vec![FreshI32Arg::Literal { value: byte_count }],
+            },
+            FreshI32CallRequest {
+                function_index: slot_allocator,
+                i32_args: Vec::new(),
+            },
+            FreshI32CallRequest {
+                function_index: slot_allocator,
+                i32_args: Vec::new(),
+            },
+            FreshI32CallRequest {
+                function_index: slot_allocator,
+                i32_args: Vec::new(),
+            },
+            FreshI32CallRequest {
+                function_index: cleanup_function,
+                i32_args: vec![FreshI32Arg::StepResult { step: 2 }],
+            },
+            FreshI32CallRequest {
+                function_index: cleanup_function,
+                i32_args: vec![FreshI32Arg::StepResult { step: 3 }],
+            },
+            FreshI32CallRequest {
+                function_index: cleanup_function,
+                i32_args: vec![FreshI32Arg::StepResult { step: 1 }],
+            },
+        ];
+        let table_grows = grow_deltas
+            .iter()
+            .map(|delta| FreshTableGrowRequest {
+                table_index,
+                delta: *delta,
+            })
+            .collect::<Vec<_>>();
+        Some(Self {
+            destination_base,
+            byte_count,
+            calls,
+            table_grows,
+        })
+    }
+}
+
+struct FreshCleanupRange {
+    target_memory: usize,
+    range_start: u64,
+    range_end: u64,
+    post_copy_accesses: Vec<Value>,
+}
+
+impl FreshCleanupRange {
+    /// Every post-copy access, not just each known write, must be disjoint
+    /// from the exact protected destination region; missing fields fail shut.
+    fn verify(
+        candidate: &Value,
+        cleanup_function: usize,
+        destination_base: u32,
+        byte_count: u32,
+        evaluation_value: &Value,
+    ) -> Option<Self> {
+        let target_memories = array_field(candidate, "destination_loads")
+            .iter()
+            .filter_map(|load| usize_field(load, "memory"))
+            .collect::<BTreeSet<_>>();
+        if target_memories.len() != 1 {
+            return None;
+        }
+        let target_memory = target_memories.iter().next().copied()?;
+        let range_start = u64::from(destination_base);
+        let range_end = range_start.checked_add(u64::from(byte_count))?;
+        if range_end > 0x1_0000_0000 {
+            return None;
+        }
+        let post_copy_accesses = array_field(evaluation_value, "steps")
+            .iter()
+            .skip(5)
+            .flat_map(|step| array_field(step, "memory_accesses").iter().cloned())
+            .collect::<Vec<_>>();
+        if !post_copy_accesses.iter().all(|access| {
+            access_is_disjoint_from_range(access, target_memory, range_start, range_end)
+        }) {
+            return None;
+        }
+        let required_internal_barriers = array_field(candidate, "destination_loads")
+            .iter()
+            .flat_map(|load| array_field(load, "internal_memory_mutation_call_barriers"))
+            .filter_map(Value::as_u64)
+            .filter_map(|value| usize::try_from(value).ok())
+            .collect::<BTreeSet<_>>();
+        if required_internal_barriers != BTreeSet::from([cleanup_function]) {
+            return None;
+        }
+        Some(Self {
+            target_memory,
+            range_start,
+            range_end,
+            post_copy_accesses,
+        })
+    }
+}
+
 fn fresh_cleanup_disjointness_proof(
     context: &CopiedInputProofContext<'_>,
     candidate: &Value,
     fresh_alignment_proof: Option<&Value>,
 ) -> Option<Value> {
-    let recipe = candidate
-        .get("fresh_cleanup_disjointness_recipe")?
-        .as_object()?;
-    let fresh_alignment_proof = fresh_alignment_proof?;
-    let slot_allocator = recipe
-        .get("slot_allocator_function")?
-        .as_u64()
-        .and_then(|value| usize::try_from(value).ok())?;
-    let cleanup_function = recipe
-        .get("cleanup_function")?
-        .as_u64()
-        .and_then(|value| usize::try_from(value).ok())?;
-    if recipe.get("pre_copy_cleanup").and_then(Value::as_str) != Some("buffer")
-        || recipe.get("post_copy_cleanups") != Some(&json!(["receiver", "memory"]))
-    {
-        return None;
-    }
-    let bypassed_imports = recipe
-        .get("bypassed_setup_import_functions")?
-        .as_array()?
-        .iter()
-        .map(|value| value.as_u64().and_then(|value| usize::try_from(value).ok()))
-        .collect::<Option<Vec<_>>>()?;
-    let memory_import_index = usize_field(candidate, "constructor_input_memory_import_function")?;
-    if !bypassed_imports.contains(&memory_import_index)
-        || bypassed_imports
-            .iter()
-            .copied()
-            .collect::<BTreeSet<_>>()
-            .len()
-            != 2
-        || context.module_memory_proofs.is_empty()
-    {
-        return None;
-    }
-    let buffer_indices = bypassed_imports
-        .iter()
-        .copied()
-        .filter(|index| *index != memory_import_index)
-        .collect::<Vec<_>>();
-    let [buffer_index] = buffer_indices.as_slice() else {
-        return None;
-    };
-    let buffer_import = context.function_imports.get(*buffer_index)?;
-    let buffer_module = string_field(buffer_import, "module")?;
-    let buffer_name = string_field(buffer_import, "name")?;
-    let binding_import_objects = context
-        .binding_proofs
-        .iter()
-        .filter_map(|proof| string_field(proof, "import_object"))
-        .collect::<BTreeSet<_>>();
-    if binding_import_objects.len() != 1 {
-        return None;
-    }
-    let binding_import_object = *binding_import_objects.iter().next()?;
-    let buffer_handlers = matching_handler(
-        context.document,
-        buffer_module,
-        buffer_name,
-        "property_getter",
-    )
-    .into_iter()
-    .filter(|handler| {
-        string_field(handler, "property") == Some("buffer")
-            && bool_field(handler, "standard_builtin_semantics_required") == Some(true)
-            && string_field(handler, "import_object") == Some(binding_import_object)
-    })
-    .collect::<Vec<_>>();
-    let [buffer_handler] = buffer_handlers.as_slice() else {
-        return None;
-    };
-
-    let destination_base = u32_field(fresh_alignment_proof, "evaluated_destination_base")?;
-    let byte_count = u32_field(fresh_alignment_proof, "allocator_byte_count")?;
-    if byte_count == 0 {
-        return None;
-    }
-    let start_handler = fresh_alignment_proof.get("start_handler")?;
-    let table_export = fresh_alignment_proof.get("table_export")?;
-    let table_index = usize_field(table_export, "index")?;
-    let grow_deltas = array_field(start_handler, "exact_grow_deltas")
-        .iter()
-        .map(|delta| delta.as_u64().and_then(|value| u32::try_from(value).ok()))
-        .collect::<Option<Vec<_>>>()?;
-    if grow_deltas.is_empty() {
-        return None;
-    }
-    let destination_function = candidate
-        .get("fresh_destination_base_recipe")
-        .and_then(|recipe| usize_field(recipe, "function"))?;
-    let calls = vec![
-        FreshI32CallRequest {
-            function_index: destination_function,
-            i32_args: vec![FreshI32Arg::Literal { value: byte_count }],
-        },
-        FreshI32CallRequest {
-            function_index: slot_allocator,
-            i32_args: Vec::new(),
-        },
-        FreshI32CallRequest {
-            function_index: slot_allocator,
-            i32_args: Vec::new(),
-        },
-        FreshI32CallRequest {
-            function_index: slot_allocator,
-            i32_args: Vec::new(),
-        },
-        FreshI32CallRequest {
-            function_index: cleanup_function,
-            i32_args: vec![FreshI32Arg::StepResult { step: 2 }],
-        },
-        FreshI32CallRequest {
-            function_index: cleanup_function,
-            i32_args: vec![FreshI32Arg::StepResult { step: 3 }],
-        },
-        FreshI32CallRequest {
-            function_index: cleanup_function,
-            i32_args: vec![FreshI32Arg::StepResult { step: 1 }],
-        },
-    ];
-    let table_grows = grow_deltas
-        .iter()
-        .map(|delta| FreshTableGrowRequest {
-            table_index,
-            delta: *delta,
-        })
-        .collect::<Vec<_>>();
+    let setup = FreshCleanupSetup::verify(context, candidate)?;
+    let alignment = fresh_alignment_proof?;
+    let sequence = FreshCleanupSequence::verify(candidate, alignment, &setup)?;
     let (_, module_sha256, bytes) = verified_module_bytes(context.project, context.module)?;
-    let evaluation =
-        evaluate_fresh_i32_sequence(&bytes, &table_grows, &calls, None, context.budget).ok()?;
-    if evaluation.outcome != FreshEvalOutcome::Returned || evaluation.steps.len() != calls.len() {
+    let evaluation = evaluate_fresh_i32_sequence(
+        &bytes,
+        &sequence.table_grows,
+        &sequence.calls,
+        None,
+        context.budget,
+    )
+    .ok()?;
+    if evaluation.outcome != FreshEvalOutcome::Returned
+        || evaluation.steps.len() != sequence.calls.len()
+    {
         return None;
     }
-    if evaluation.steps.first()?.i32_result != Some(destination_base) {
+    if evaluation.steps.first()?.i32_result != Some(sequence.destination_base) {
         return None;
     }
     let slot_results = [1usize, 2, 3]
@@ -1296,40 +1476,28 @@ fn fresh_cleanup_disjointness_proof(
     if slot_results.iter().copied().collect::<BTreeSet<_>>().len() != 3 {
         return None;
     }
-    let target_memories = array_field(candidate, "destination_loads")
-        .iter()
-        .filter_map(|load| usize_field(load, "memory"))
-        .collect::<BTreeSet<_>>();
-    if target_memories.len() != 1 {
-        return None;
-    }
-    let target_memory = target_memories.iter().next().copied()?;
-    let range_start = u64::from(destination_base);
-    let range_end = range_start.checked_add(u64::from(byte_count))?;
-    if range_end > 0x1_0000_0000 {
-        return None;
-    }
     let evaluation_value = serde_json::to_value(&evaluation).ok()?;
-    let post_copy_accesses = array_field(&evaluation_value, "steps")
-        .iter()
-        .skip(5)
-        .flat_map(|step| array_field(step, "memory_accesses").iter().cloned())
-        .collect::<Vec<_>>();
-    if !post_copy_accesses
-        .iter()
-        .all(|access| access_is_disjoint_from_range(access, target_memory, range_start, range_end))
-    {
-        return None;
-    }
-    let required_internal_barriers = array_field(candidate, "destination_loads")
-        .iter()
-        .flat_map(|load| array_field(load, "internal_memory_mutation_call_barriers"))
-        .filter_map(Value::as_u64)
-        .filter_map(|value| usize::try_from(value).ok())
-        .collect::<BTreeSet<_>>();
-    if required_internal_barriers != BTreeSet::from([cleanup_function]) {
-        return None;
-    }
+    let range = FreshCleanupRange::verify(
+        candidate,
+        setup.cleanup_function,
+        sequence.destination_base,
+        sequence.byte_count,
+        &evaluation_value,
+    )?;
+    let FreshCleanupSetup {
+        memory_import_index,
+        buffer_index,
+        buffer_handler,
+        binding_import_object,
+        ..
+    } = setup;
+    let FreshCleanupSequence { table_grows, .. } = sequence;
+    let FreshCleanupRange {
+        target_memory,
+        range_start,
+        range_end,
+        post_copy_accesses,
+    } = range;
     Some(json!({
         "fresh_instance_state_required": true,
         "module_sha256": module_sha256,
@@ -2432,10 +2600,101 @@ pub fn correlate_project(
 mod tests {
     use super::{
         source_word_semantic_overlay, BoundaryCorrelation, BoundaryExport, CopiedSourceEvidence,
-        CopyDestinationRequirements, CopyImportNames, CopyWordInterpretation,
-        FreshDestinationProof,
+        CopyDestinationRequirements, CopyImportNames, CopyWordInterpretation, FreshCleanupRange,
+        FreshCleanupSequence, FreshCleanupSetup, FreshDestinationProof,
     };
     use serde_json::json;
+
+    #[test]
+    fn fresh_cleanup_range_rejects_overlapping_or_unproven_post_copy_accesses() {
+        let candidate = json!({
+            "destination_loads": [{
+                "memory": 0,
+                "internal_memory_mutation_call_barriers": [7, 7]
+            }]
+        });
+        let mut evaluation = json!({
+            "steps": [
+                {}, {}, {}, {}, {},
+                {"memory_accesses":[
+                    {"memory":0,"addr":8,"len":8},
+                    {"memory":1,"addr":16,"len":8}
+                ]},
+                {"memory_accesses":[{"memory":0,"addr":24,"len":4}]}
+            ]
+        });
+        let exact = FreshCleanupRange::verify(&candidate, 7, 16, 8, &evaluation)
+            .expect("adjacent and other-memory accesses are disjoint");
+        assert_eq!(exact.target_memory, 0);
+        assert_eq!((exact.range_start, exact.range_end), (16, 24));
+        assert_eq!(exact.post_copy_accesses.len(), 3);
+
+        evaluation["steps"][5]["memory_accesses"][0]["len"] = json!(9);
+        assert!(
+            FreshCleanupRange::verify(&candidate, 7, 16, 8, &evaluation).is_none(),
+            "an access ending inside copied bytes is not disjoint"
+        );
+
+        evaluation["steps"][5]["memory_accesses"][0] = json!({"memory":0,"addr":8});
+        assert!(
+            FreshCleanupRange::verify(&candidate, 7, 16, 8, &evaluation).is_none(),
+            "missing length must not be treated as disjoint"
+        );
+
+        evaluation["steps"][5]["memory_accesses"][0] = json!({"memory":0,"addr":8,"len":8});
+        assert!(
+            FreshCleanupRange::verify(&candidate, 9, 16, 8, &evaluation).is_none(),
+            "the observed cleanup must be the exact required internal barrier"
+        );
+        assert!(
+            FreshCleanupRange::verify(&candidate, 7, u32::MAX, 8, &evaluation).is_none(),
+            "the copied range must fit in wasm32 memory"
+        );
+        let multiple_memories = json!({
+            "destination_loads": [
+                {"memory":0,"internal_memory_mutation_call_barriers":[7]},
+                {"memory":1,"internal_memory_mutation_call_barriers":[7]}
+            ]
+        });
+        assert!(
+            FreshCleanupRange::verify(&multiple_memories, 7, 16, 8, &evaluation).is_none(),
+            "one copied byte range cannot be justified across separate memories"
+        );
+    }
+
+    #[test]
+    fn fresh_cleanup_sequence_requires_exact_wasm_table_growth_and_nonempty_copy() {
+        let setup = FreshCleanupSetup {
+            slot_allocator: 3,
+            cleanup_function: 4,
+            memory_import_index: 0,
+            buffer_index: 1,
+            buffer_handler: json!({}),
+            binding_import_object: "imports".to_owned(),
+        };
+        let candidate = json!({"fresh_destination_base_recipe":{"function":6}});
+        let proof = json!({
+            "evaluated_destination_base":16,
+            "allocator_byte_count":8,
+            "start_handler":{"exact_grow_deltas":[2]},
+            "table_export":{"index":0}
+        });
+        let sequence = FreshCleanupSequence::verify(&candidate, &proof, &setup)
+            .expect("complete exact cleanup recipe");
+        assert_eq!(sequence.destination_base, 16);
+        assert_eq!(sequence.byte_count, 8);
+        assert_eq!(sequence.calls.len(), 7);
+        assert_eq!(sequence.table_grows.len(), 1);
+
+        let mut bad = proof.clone();
+        bad["allocator_byte_count"] = json!(0);
+        assert!(FreshCleanupSequence::verify(&candidate, &bad, &setup).is_none());
+        bad = proof;
+        bad["start_handler"]["exact_grow_deltas"] = json!([]);
+        assert!(FreshCleanupSequence::verify(&candidate, &bad, &setup).is_none());
+        bad["start_handler"]["exact_grow_deltas"] = json!([u64::MAX]);
+        assert!(FreshCleanupSequence::verify(&candidate, &bad, &setup).is_none());
+    }
 
     #[test]
     fn copied_proof_stages_keep_ambiguous_carriers_and_missing_barriers_unproven() {
