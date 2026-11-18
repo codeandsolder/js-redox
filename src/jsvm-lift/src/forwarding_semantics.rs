@@ -577,22 +577,9 @@ fn stable_receiver_expression<'a>(
 }
 
 fn array_element_key(scoping: &Scoping, element: &ArrayExpressionElement<'_>) -> Option<ExprKey> {
-    match element {
-        ArrayExpressionElement::Identifier(identifier) => scoping
-            .get_reference(identifier.reference_id.get()?)
-            .symbol_id()
-            .map(ExprKey::Symbol),
-        ArrayExpressionElement::ComputedMemberExpression(member) if !member.optional => {
-            let Expression::NumericLiteral(index) = &member.expression else {
-                return None;
-            };
-            Some(ExprKey::Index(
-                Box::new(expr_key(scoping, &member.object)?),
-                exact_u32(index.value)?,
-            ))
-        }
-        _ => None,
-    }
+    // Elisions and spreads are not expression-valued array slots.
+    // A regular element must meet the same exact-key proof as any expression.
+    expr_key(scoping, element.as_expression()?)
 }
 
 fn is_resolver_call(
