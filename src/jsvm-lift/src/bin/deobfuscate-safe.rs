@@ -246,6 +246,30 @@ struct PolishedHelperView {
     post_return_error: Option<String>,
 }
 
+// Record the same post-polish evidence for both original and specialized
+// helper views, without changing any source/report fields or transform labels.
+fn accumulate_polished_transform_counts(
+    transforms: &mut BTreeMap<String, usize>,
+    polished: &PolishedHelperView,
+) {
+    for (kind, count) in &polished.subsequent_transforms {
+        *transforms.entry(kind.clone()).or_default() += count;
+    }
+    for (kind, count) in [
+        ("source_adjacent_return_flow", polished.adjacent_returns),
+        ("source_guarded_return_flow", polished.guarded_return_joins),
+        ("source_labeled_return_flow", polished.labeled_return_joins),
+        (
+            "source_single_trip_reflow",
+            polished.single_trip_loops_reflowed,
+        ),
+    ] {
+        if count > 0 {
+            *transforms.entry(kind.to_owned()).or_default() += count;
+        }
+    }
+}
+
 /// Re-run the existing static pass after loop structure has become explicit.
 /// This allows its proven dead-branch and block reductions to see through
 /// former single-trip loops without introducing another JS evaluator.
@@ -884,6 +908,7 @@ fn build_source_tree(args: &SourceTreeArgs) -> Result<serde_json::Value> {
                 args.format_output,
                 &budgets,
             )?;
+            accumulate_polished_transform_counts(&mut transforms, &polished);
             let code = polished.source;
             let rewritten_loops = polished.single_trip_loops_reflowed;
             let post_reflow_error = polished.post_reflow_error;
@@ -891,29 +916,6 @@ fn build_source_tree(args: &SourceTreeArgs) -> Result<serde_json::Value> {
             let labeled_return_joins = polished.labeled_return_joins;
             let guarded_return_joins = polished.guarded_return_joins;
             let post_return_error = polished.post_return_error;
-            for (kind, count) in polished.subsequent_transforms {
-                *transforms.entry(kind).or_default() += count;
-            }
-            if adjacent_returns > 0 {
-                *transforms
-                    .entry("source_adjacent_return_flow".to_owned())
-                    .or_default() += adjacent_returns;
-            }
-            if guarded_return_joins > 0 {
-                *transforms
-                    .entry("source_guarded_return_flow".to_owned())
-                    .or_default() += guarded_return_joins;
-            }
-            if labeled_return_joins > 0 {
-                *transforms
-                    .entry("source_labeled_return_flow".to_owned())
-                    .or_default() += labeled_return_joins;
-            }
-            if rewritten_loops > 0 {
-                *transforms
-                    .entry("source_single_trip_reflow".to_owned())
-                    .or_default() += rewritten_loops;
-            }
             fs::write(folder.join(relative), &code)?;
             if let Some(view) = helper_navigation(&code, relative) {
                 let stem = relative
@@ -1364,6 +1366,7 @@ fn build_source_tree(args: &SourceTreeArgs) -> Result<serde_json::Value> {
                 args.format_output,
                 &budgets,
             )?;
+            accumulate_polished_transform_counts(&mut transforms, &polished);
             let code = polished.source;
             let rewritten_loops = polished.single_trip_loops_reflowed;
             let post_reflow_error = polished.post_reflow_error;
@@ -1371,29 +1374,6 @@ fn build_source_tree(args: &SourceTreeArgs) -> Result<serde_json::Value> {
             let labeled_return_joins = polished.labeled_return_joins;
             let guarded_return_joins = polished.guarded_return_joins;
             let post_return_error = polished.post_return_error;
-            for (kind, count) in polished.subsequent_transforms {
-                *transforms.entry(kind).or_default() += count;
-            }
-            if adjacent_returns > 0 {
-                *transforms
-                    .entry("source_adjacent_return_flow".to_owned())
-                    .or_default() += adjacent_returns;
-            }
-            if guarded_return_joins > 0 {
-                *transforms
-                    .entry("source_guarded_return_flow".to_owned())
-                    .or_default() += guarded_return_joins;
-            }
-            if labeled_return_joins > 0 {
-                *transforms
-                    .entry("source_labeled_return_flow".to_owned())
-                    .or_default() += labeled_return_joins;
-            }
-            if rewritten_loops > 0 {
-                *transforms
-                    .entry("source_single_trip_reflow".to_owned())
-                    .or_default() += rewritten_loops;
-            }
             fs::write(folder.join(&relative), &code)?;
             let actual_changes = code != specialized.original;
             let constants = specialized
