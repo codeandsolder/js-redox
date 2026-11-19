@@ -835,6 +835,639 @@ fn finish_source_graph(
     Ok(summary)
 }
 
+/// Contextual evidence for runtime-source classification. Identity candidates
+/// remain distinct: neither a matching URL nor matching bytes prove execution.
+struct RuntimeClassificationContext<'a> {
+    resource_nodes_by_sha: &'a BTreeMap<String, Vec<String>>,
+    inline_nodes_by_sha: &'a BTreeMap<String, Vec<String>>,
+    family_counts: &'a BTreeMap<String, Value>,
+    gtm_family_counts: &'a BTreeMap<String, Value>,
+}
+
+fn runtime_family_counts(runtime: &Value, field_name: &str) -> BTreeMap<String, Value> {
+    array_field(runtime, field_name)
+        .iter()
+        .filter_map(|row| {
+            Some((
+                nonempty_string_field(row, "shape")?.to_string(),
+                row.get("source_count").cloned().unwrap_or_else(|| json!(0)),
+            ))
+        })
+        .collect()
+}
+
+fn index_runtime_script_instances(
+    source: &Value,
+    runtime_node: &str,
+    known: &mut BTreeMap<(String, String), String>,
+    conflicts: &mut BTreeSet<(String, String)>,
+) {
+    for instance in array_field(source, "script_instances") {
+        let Some(script_id) = instance.get("script_id") else {
+            continue;
+        };
+        if script_id.is_null() {
+            continue;
+        }
+        let key = (
+            nonempty_string_field(instance, "cdp_session")
+                .unwrap_or("main")
+                .to_string(),
+            script_id
+                .as_str()
+                .map_or_else(|| script_id.to_string(), ToString::to_string),
+        );
+        if conflicts.contains(&key) {
+            continue;
+        }
+        if let Some(previous) = known.get(&key) {
+            if previous != runtime_node {
+                conflicts.insert(key.clone());
+                known.remove(&key);
+                continue;
+            }
+        }
+        known.insert(key, runtime_node.to_owned());
+    }
+}
+
+fn add_runtime_generated_code_edges(
+    graph: &mut GraphBuilder,
+    generated: &Value,
+    runtime_node: &str,
+) -> Result<()> {
+    for origin in array_field(generated, "origins") {
+        let chain = array_field(origin, "chain");
+        let Some(parent) = chain.first() else {
+            continue;
+        };
+        let edge_fields = json!({
+            "cdp_session": nonempty_string_field(origin,"cdp_session").or_else(|| nonempty_string_field(parent,"cdp_session")).unwrap_or("main"),
+            "child_script_id":field(origin,"child_script_id"),
+            "parent_script_id":field(parent,"script_id"),
+            "function_name":field(parent,"function_name"),
+            "line_number":field(parent,"line_number"),
+            "column_number":field(parent,"column_number"),
+            "generation_depth":chain.len(),
+        });
+        if let Some(parent_sha) = nonempty_string_field(parent, "sha256") {
+            graph.add_edge(
+                &format!("runtime:{}", &parent_sha[..parent_sha.len().min(20)]),
+                runtime_node,
+                "runtime_generated_code",
+                edge_fields,
+            )?;
+        } else if let Some(url) = nonempty_string_field(parent, "url") {
+            let candidates = graph.targets_for(url)?;
+            for parent_node in &candidates {
+                let mut fields = edge_fields.clone();
+                fields["identity_basis"] = json!("url_only");
+                fields["candidate_count"] = json!(candidates.len());
+                graph.add_edge(
+                    parent_node,
+                    runtime_node,
+                    "runtime_generated_code_candidate",
+                    fields,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn add_runtime_document_inline_edges(
+    graph: &mut GraphBuilder,
+    source: &Value,
+    runtime_node: &str,
+) -> Result<()> {
+    for origin in array_field(source, "document_inline_origins") {
+        let document_key = compact_key((
+            field(origin, "cdp_session"),
+            field(origin, "url"),
+            field(origin, "frame_id"),
+        ))?;
+        let document_node = digest_id("runtime-document:", &document_key);
+        graph.add_node(
+            document_node.clone(),
+            json!({
+                "type":"runtime_document",
+                "cdp_session":field(origin,"cdp_session"),
+                "url":field(origin,"url"),
+                "frame_id":field(origin,"frame_id"),
+            }),
+        )?;
+        graph.add_edge(
+            &document_node,
+            runtime_node,
+            "runtime_document_inline",
+            json!({
+                "script_id":field(origin,"script_id"),
+                "start_line":field(origin,"start_line"),
+                "start_column":field(origin,"start_column"),
+                "end_line":field(origin,"end_line"),
+                "end_column":field(origin,"end_column"),
+            }),
+        )?;
+    }
+    Ok(())
+}
+
+fn add_runtime_alpine_edges(
+    graph: &mut GraphBuilder,
+    alpine: &Value,
+    runtime_node: &str,
+    family_counts: &BTreeMap<String, Value>,
+) -> Result<()> {
+    if let Some(shape) = nonempty_string_field(alpine, "shape") {
+        let family_node = digest_id("runtime-family:", shape);
+        graph.add_node(
+            family_node.clone(),
+            json!({
+                "type":"runtime_expression_family",
+                "framework":"alpine",
+                "shape":shape,
+                "source_count":family_counts.get(shape).cloned().unwrap_or(Value::Null),
+            }),
+        )?;
+        graph.add_edge(
+            runtime_node,
+            &family_node,
+            "runtime_expression_family",
+            json!({}),
+        )?;
+    }
+    for dom_match in array_field(alpine, "dom_matches") {
+        let snapshot_key = compact_key((field(dom_match, "source"), field(dom_match, "path")))?;
+        let snapshot_node = digest_id("dom-snapshot:", &snapshot_key);
+        graph.add_node(
+                        snapshot_node.clone(),
+                        json!({"type":"dom_snapshot", "source":field(dom_match,"source"), "path":field(dom_match,"path")}),
+                    )?;
+        let directive_key = compact_key((
+            field(dom_match, "source"),
+            field(dom_match, "path"),
+            field(dom_match, "tag_ordinal"),
+            field(dom_match, "tag"),
+            field(dom_match, "attribute"),
+        ))?;
+        let directive_node = digest_id("dom-directive:", &directive_key);
+        graph.add_node(
+                        directive_node.clone(),
+                        json!({
+                            "type":"dom_directive", "source":field(dom_match,"source"), "path":field(dom_match,"path"),
+                            "tag_ordinal":field(dom_match,"tag_ordinal"), "tag":field(dom_match,"tag"), "attribute":field(dom_match,"attribute")
+                        }),
+                    )?;
+        graph.add_edge(&snapshot_node, &directive_node, "dom_directive", json!({}))?;
+        graph.add_edge(
+            &directive_node,
+            runtime_node,
+            "runtime_alpine_compile",
+            json!({
+                "mapping_kind":field(alpine,"dom_mapping_kind"),
+                "expression":field(alpine,"expression"),
+                "compiled_expression":field(alpine,"compiled_expression"),
+                "shape":field(alpine,"shape"),
+            }),
+        )?;
+    }
+    Ok(())
+}
+
+fn add_runtime_classification_edges(
+    graph: &mut GraphBuilder,
+    source: &Value,
+    digest: &str,
+    runtime_node: &str,
+    context: &RuntimeClassificationContext<'_>,
+) -> Result<()> {
+    let classification = string_field(source, "classification");
+    let alpine = source.get("alpine").unwrap_or(&Value::Null);
+    let gtm = source.get("gtm").unwrap_or(&Value::Null);
+    match classification {
+        Some("network_response" | "network_observed") => {
+            add_runtime_network_source_edges(
+                graph,
+                source,
+                runtime_node,
+                context.resource_nodes_by_sha,
+            )?;
+        }
+        Some("inline_script") => {
+            if let Some(parents) = context.inline_nodes_by_sha.get(digest) {
+                // Matching inline bytes do not identify the document or
+                // script ordinal whose browser instance was parsed.
+                for parent in parents {
+                    graph.add_edge(
+                        parent,
+                        runtime_node,
+                        "runtime_source_candidate",
+                        json!({
+                            "identity_basis":"sha256_only_inline_script",
+                            "candidate_count":parents.len(),
+                            "exact_response_identity":false,
+                            "runtime_execution_observed":bool_field(source,"observed_executed"),
+                        }),
+                    )?;
+                }
+            }
+        }
+        Some("document_inline_script") => {
+            add_runtime_document_inline_edges(graph, source, runtime_node)?;
+        }
+        Some("alpine_expression") => {
+            add_runtime_alpine_edges(graph, alpine, runtime_node, context.family_counts)?;
+        }
+        Some("gtm_custom_javascript") => {
+            if let Some(shape) = nonempty_string_field(gtm, "shape") {
+                let family_node =
+                    digest_id("runtime-family:", &format!("google_tag_manager\0{shape}"));
+                graph.add_node(
+                        family_node.clone(),
+                        json!({
+                            "type":"runtime_expression_family", "framework":"google_tag_manager", "shape":shape,
+                            "source_count":context.gtm_family_counts.get(shape).cloned().unwrap_or(Value::Null)
+                        }),
+                    )?;
+                graph.add_edge(
+                    runtime_node,
+                    &family_node,
+                    "runtime_expression_family",
+                    json!({}),
+                )?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Identity and source-path indices shared with later observed and derived
+/// graph stages. The source-path index is not evidence of script execution.
+struct RuntimeSourceGraphIndex {
+    instances: BTreeMap<(String, String), String>,
+    general_paths: BTreeMap<String, String>,
+}
+
+/// Register runtime script observations without treating URL/SHA coincidence as execution proof.
+/// Conflicting (CDP session, script ID) assertions cannot identify any runtime source.
+fn seed_runtime_script_evidence(
+    graph: &mut GraphBuilder,
+    runtime: &Value,
+    source_index: &Value,
+    deobfuscation: &Value,
+    resource_nodes_by_sha: &BTreeMap<String, Vec<String>>,
+    inline_nodes_by_sha: &BTreeMap<String, Vec<String>>,
+    budget: &work_budget::WorkBudget,
+) -> Result<RuntimeSourceGraphIndex> {
+    // Debugger-observed runtime scripts are provenance, not independent resources.
+    let family_counts = runtime_family_counts(runtime, "alpine_families");
+    let gtm_family_counts = runtime_family_counts(runtime, "gtm_families");
+    let runtime_general_paths = array_field(source_index, "units")
+        .iter()
+        .filter(|unit| string_field(unit, "origin") == Some("runtime_script"))
+        .filter_map(|unit| {
+            Some((
+                nonempty_string_field(unit, "input_sha256")?.to_owned(),
+                nonempty_string_field(unit, "source_path")?.to_owned(),
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let runtime_readable_paths = array_field(deobfuscation, "units")
+        .iter()
+        .filter_map(|unit| {
+            let digest = nonempty_string_field(unit, "raw_path")?
+                .strip_prefix("resources/runtime-scripts/")?
+                .strip_suffix(".js")?;
+            let readable = nonempty_string_field(unit, "readable_output_path")?;
+            (readable == format!("src/_readable/runtime-scripts/{digest}.js"))
+                .then(|| (digest.to_owned(), readable.to_owned()))
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let mut runtime_node_by_instance = BTreeMap::<(String, String), String>::new();
+    let mut runtime_instance_conflicts = BTreeSet::<(String, String)>::new();
+    let context = RuntimeClassificationContext {
+        resource_nodes_by_sha,
+        inline_nodes_by_sha,
+        family_counts: &family_counts,
+        gtm_family_counts: &gtm_family_counts,
+    };
+
+    for source in array_field(runtime, "sources") {
+        budget.checkpoint()?;
+        let Some(digest) = nonempty_string_field(source, "sha256") else {
+            continue;
+        };
+        let runtime_node = format!("runtime:{}", &digest[..digest.len().min(20)]);
+        let classification = string_field(source, "classification");
+        let generated = source.get("generated").unwrap_or(&Value::Null);
+        graph.add_node(
+            runtime_node.clone(),
+            json!({
+                "type":"runtime_script",
+                "classification":field(source,"classification"),
+                "sha256":digest,
+                "bytes":field(source,"size"),
+                "capture_path":field(source,"path"),
+                "event_count":field(source,"event_count"),
+                "script_ids":source.get("script_ids").cloned().unwrap_or_else(|| json!([])),
+                "cdp_sessions":source.get("cdp_sessions").cloned().unwrap_or_else(|| json!([])),
+                "execution_context_ids":source.get("execution_context_ids").cloned().unwrap_or_else(|| json!([])),
+                "script_instances":source.get("script_instances").cloned().unwrap_or_else(|| json!([])),
+                "observed_executed":field(source,"observed_executed"),
+                "observed_source_path":field(source,"observed_source_path"),
+                "general_source_path":runtime_general_paths.get(digest),
+                "safe_readable_source_path":runtime_readable_paths.get(digest),
+                "urls":source.get("urls").cloned().unwrap_or_else(|| json!([])),
+                "instrumentation_kind":field(source,"instrumentation_kind"),
+                "generated_root_sha256s":generated.get("root_sha256s").cloned().unwrap_or_else(|| json!([])),
+                "generated_root_urls":generated.get("root_urls").cloned().unwrap_or_else(|| json!([])),
+                "generation_max_depth":field(generated,"max_depth"),
+                "application_source":classification != Some("capture_instrumentation"),
+            }),
+        )?;
+
+        index_runtime_script_instances(
+            source,
+            &runtime_node,
+            &mut runtime_node_by_instance,
+            &mut runtime_instance_conflicts,
+        );
+        add_runtime_generated_code_edges(graph, generated, &runtime_node)?;
+        add_runtime_classification_edges(graph, source, digest, &runtime_node, &context)?;
+    }
+    Ok(RuntimeSourceGraphIndex {
+        instances: runtime_node_by_instance,
+        general_paths: runtime_general_paths,
+    })
+}
+
+/// A debugger frame is exact only when its session/script ID identifies one
+/// runtime source and its captured SHA agrees with that source.
+fn exact_runtime_frame_identity<'a>(
+    frame: &'a Value,
+    session: &str,
+    instances: &BTreeMap<(String, String), String>,
+) -> Option<(String, &'a str, &'a str)> {
+    if nonempty_string_field(frame, "source_identity") != Some("exact") {
+        return None;
+    }
+    let script_id = frame.get("location")?.get("scriptId")?.as_str()?;
+    let sha = nonempty_string_field(frame, "sourceSha256")?;
+    let expected = format!("runtime:{}", &sha[..sha.len().min(20)]);
+    (instances.get(&(session.to_owned(), script_id.to_owned())) == Some(&expected))
+        .then_some((expected, script_id, sha))
+}
+
+fn add_observed_pause_frames(
+    graph: &mut GraphBuilder,
+    hit: &Value,
+    session: &str,
+    node_id: &str,
+    runtime_node_by_instance: &BTreeMap<(String, String), String>,
+) -> Result<()> {
+    for (depth, frame) in array_field(hit, "frames").iter().enumerate() {
+        let Some((expected, script_id, sha)) =
+            exact_runtime_frame_identity(frame, session, runtime_node_by_instance)
+        else {
+            continue;
+        };
+        graph.add_edge(
+            &expected,
+            node_id,
+            "observed_paused_call_frame",
+            json!({
+                "stack_depth":depth,
+                "cdp_session":session,
+                "script_id":script_id,
+                "source_sha256":sha,
+                "identity_basis":"exact_session_script_hash",
+                "concrete_observation_only":true,
+            }),
+        )?;
+    }
+    Ok(())
+}
+
+fn add_observed_steps(
+    graph: &mut GraphBuilder,
+    hit: &Value,
+    ordinal: usize,
+    session: &str,
+    node_id: &str,
+    runtime_node_by_instance: &BTreeMap<(String, String), String>,
+    budget: &work_budget::WorkBudget,
+) -> Result<()> {
+    for (step_index, step) in array_field(hit, "steps").iter().enumerate() {
+        budget.checkpoint()?;
+        let step_id = format!("observed-step:{ordinal}:{step_index}");
+        let top = array_field(step, "frames").first();
+        graph.add_node(
+            step_id.clone(),
+            json!({
+                "type":"observed_step",
+                "step_index":step_index,
+                "point_id":field(hit,"pointId"),
+                "cdp_session":session,
+                "reason":field(step,"reason"),
+                "hit_breakpoints":field(step,"hitBreakpoints"),
+                "top_frame":top,
+                "frames":field(step,"frames"),
+                "scopes":field(step,"scopes"),
+                "expressions":field(step,"expressions"),
+                "concrete_observation_only":true,
+                "complete_execution_path":false,
+            }),
+        )?;
+        graph.add_edge(
+            node_id,
+            &step_id,
+            "observed_next_step",
+            json!({
+                "step_index":step_index,
+                "step_mode":field(hit,"pathWitnessMode"),
+                "concrete_observation_only":true,
+            }),
+        )?;
+        let Some(top) = top else { continue };
+        let Some((expected, script_id, sha)) =
+            exact_runtime_frame_identity(top, session, runtime_node_by_instance)
+        else {
+            continue;
+        };
+        graph.add_edge(
+                &expected, &step_id, "observed_executed_location",
+                json!({
+                    "cdp_session":session,
+                    "script_id":script_id,
+                    "source_sha256":sha,
+                    "line_number":top.get("location").and_then(|location| location.get("lineNumber")).cloned(),
+                    "column_number":top.get("location").and_then(|location| location.get("columnNumber")).cloned(),
+                    "step_index":step_index,
+                    "identity_basis":"exact_session_script_hash",
+                    "concrete_observation_only":true,
+                }),
+            )?;
+    }
+    Ok(())
+}
+
+fn add_observed_guard_witnesses(
+    graph: &mut GraphBuilder,
+    hit: &Value,
+    ordinal: usize,
+    budget: &work_budget::WorkBudget,
+) -> Result<()> {
+    for (guard_index, guard) in array_field(hit, "observed_guard_witnesses")
+        .iter()
+        .enumerate()
+    {
+        budget.checkpoint()?;
+        let Some(step_index) = guard
+            .get("step_index")
+            .and_then(Value::as_u64)
+            .and_then(|index| usize::try_from(index).ok())
+        else {
+            continue;
+        };
+        if step_index >= array_field(hit, "steps").len() {
+            continue;
+        }
+        let guard_id = format!("observed-guard:{ordinal}:{guard_index}");
+        graph.add_node(
+            guard_id.clone(),
+            json!({
+                "type":"observed_guard",
+                "witness":guard,
+                "concrete_observation_only":true,
+                "complete_execution_path":false,
+            }),
+        )?;
+        graph.add_edge(
+            &format!("observed-step:{ordinal}:{step_index}"),
+            &guard_id,
+            "observed_ast_guard_value",
+            json!({"exact_original_ast":true,"concrete_observation_only":true}),
+        )?;
+        if let Some(selected_arm) = nonempty_string_field(guard, "next_pause_in_selected_arm") {
+            if step_index + 1 < array_field(hit, "steps").len() {
+                graph.add_edge(
+                    &guard_id,
+                    &format!("observed-step:{ordinal}:{}", step_index + 1),
+                    "observed_next_pause_in_selected_arm",
+                    json!({"arm":selected_arm,"concrete_observation_only":true}),
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn add_observed_callable_witnesses(
+    graph: &mut GraphBuilder,
+    hit: &Value,
+    session: &str,
+    node_id: &str,
+    runtime_node_by_instance: &BTreeMap<(String, String), String>,
+    budget: &work_budget::WorkBudget,
+) -> Result<()> {
+    for scope in array_field(hit, "scopes") {
+        budget.checkpoint()?;
+        let scope_type = nonempty_string_field(scope, "type").unwrap_or("unknown");
+        for variable in array_field(scope, "variables") {
+            budget.checkpoint()?;
+            let label = nonempty_string_field(variable, "name").unwrap_or("");
+            if let Some(value) = variable.get("value") {
+                add_observed_callable_definition(
+                    graph,
+                    runtime_node_by_instance,
+                    node_id,
+                    session,
+                    value,
+                    scope_type,
+                    label,
+                )?;
+            }
+        }
+    }
+    for expression in array_field(hit, "expressions") {
+        budget.checkpoint()?;
+        if nonempty_string_field(expression, "status") != Some("observed") {
+            continue;
+        }
+        if let Some(value) = expression.get("value") {
+            add_observed_callable_definition(
+                graph,
+                runtime_node_by_instance,
+                node_id,
+                session,
+                value,
+                "expression",
+                nonempty_string_field(expression, "expression").unwrap_or(""),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Link debugger pause, next-step, AST-guard and callable-definition witnesses
+/// only to exact runtime instances when their CDP session, script ID and SHA agree.
+fn seed_selective_trace_witnesses(
+    graph: &mut GraphBuilder,
+    selective_trace: &Value,
+    runtime_node_by_instance: &BTreeMap<(String, String), String>,
+    budget: &work_budget::WorkBudget,
+) -> Result<()> {
+    // Concrete debugger pauses are observed state witnesses, not static edges.
+    // Only verified (CDP session, script ID, captured source SHA) triples
+    // receive a provenance edge to the matching runtime script instance.
+    for (ordinal, hit) in array_field(selective_trace, "hits").iter().enumerate() {
+        budget.checkpoint()?;
+        let node_id = format!("observed-invocation:{ordinal}");
+        graph.add_node(
+            node_id.clone(),
+            json!({
+                "type":"observed_invocation",
+                "point_id":field(hit,"pointId"),
+                "readable_view_path":field(hit,"readable_view_path"),
+                "path_view_path":field(hit,"path_view_path"),
+                "path_witness_status":field(hit,"pathWitnessStatus"),
+                "path_witness_mode":field(hit,"pathWitnessMode"),
+                "cdp_session":field(hit,"cdpSession"),
+                "at":field(hit,"at"),
+                "reason":field(hit,"reason"),
+                "frames":field(hit,"frames"),
+                "scopes":field(hit,"scopes"),
+                "expressions":field(hit,"expressions"),
+                "concrete_observation_only":true,
+            }),
+        )?;
+        let session = nonempty_string_field(hit, "cdpSession").unwrap_or("main");
+        add_observed_pause_frames(graph, hit, session, &node_id, runtime_node_by_instance)?;
+        // Each pause and step is an observation, not proof of a complete path.
+        add_observed_steps(
+            graph,
+            hit,
+            ordinal,
+            session,
+            &node_id,
+            runtime_node_by_instance,
+            budget,
+        )?;
+        add_observed_guard_witnesses(graph, hit, ordinal, budget)?;
+        add_observed_callable_witnesses(
+            graph,
+            hit,
+            session,
+            &node_id,
+            runtime_node_by_instance,
+            budget,
+        )?;
+    }
+    Ok(())
+}
+
 /// Build the project source/provenance graph from indexed capture evidence.
 ///
 /// # Errors
@@ -892,496 +1525,22 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
     let (inline_nodes, inline_nodes_by_sha) =
         seed_captured_inline_scripts(&mut graph, &manifest, &budget)?;
 
-    // Debugger-observed runtime scripts are provenance, not independent resources.
-    let family_counts = array_field(&runtime, "alpine_families")
-        .iter()
-        .filter_map(|row| {
-            Some((
-                nonempty_string_field(row, "shape")?.to_string(),
-                row.get("source_count").cloned().unwrap_or_else(|| json!(0)),
-            ))
-        })
-        .collect::<BTreeMap<_, _>>();
-    let gtm_family_counts = array_field(&runtime, "gtm_families")
-        .iter()
-        .filter_map(|row| {
-            Some((
-                nonempty_string_field(row, "shape")?.to_string(),
-                row.get("source_count").cloned().unwrap_or_else(|| json!(0)),
-            ))
-        })
-        .collect::<BTreeMap<_, _>>();
-    let runtime_general_paths = array_field(&source_index, "units")
-        .iter()
-        .filter(|unit| string_field(unit, "origin") == Some("runtime_script"))
-        .filter_map(|unit| {
-            Some((
-                nonempty_string_field(unit, "input_sha256")?.to_owned(),
-                nonempty_string_field(unit, "source_path")?.to_owned(),
-            ))
-        })
-        .collect::<BTreeMap<_, _>>();
-    let runtime_readable_paths = array_field(&deobfuscation, "units")
-        .iter()
-        .filter_map(|unit| {
-            let digest = nonempty_string_field(unit, "raw_path")?
-                .strip_prefix("resources/runtime-scripts/")?
-                .strip_suffix(".js")?;
-            let readable = nonempty_string_field(unit, "readable_output_path")?;
-            (readable == format!("src/_readable/runtime-scripts/{digest}.js"))
-                .then(|| (digest.to_owned(), readable.to_owned()))
-        })
-        .collect::<BTreeMap<_, _>>();
+    let runtime_index = seed_runtime_script_evidence(
+        &mut graph,
+        &runtime,
+        &source_index,
+        &deobfuscation,
+        &resource_nodes_by_sha,
+        &inline_nodes_by_sha,
+        &budget,
+    )?;
+    seed_selective_trace_witnesses(
+        &mut graph,
+        &selective_trace,
+        &runtime_index.instances,
+        &budget,
+    )?;
 
-    let mut runtime_node_by_instance = BTreeMap::<(String, String), String>::new();
-    let mut runtime_instance_conflicts = BTreeSet::<(String, String)>::new();
-
-    for source in array_field(&runtime, "sources") {
-        budget.checkpoint()?;
-        let Some(digest) = nonempty_string_field(source, "sha256") else {
-            continue;
-        };
-        let runtime_node = format!("runtime:{}", &digest[..digest.len().min(20)]);
-        let classification = string_field(source, "classification");
-        let alpine = source.get("alpine").unwrap_or(&Value::Null);
-        let gtm = source.get("gtm").unwrap_or(&Value::Null);
-        let generated = source.get("generated").unwrap_or(&Value::Null);
-        graph.add_node(
-            runtime_node.clone(),
-            json!({
-                "type":"runtime_script",
-                "classification":field(source,"classification"),
-                "sha256":digest,
-                "bytes":field(source,"size"),
-                "capture_path":field(source,"path"),
-                "event_count":field(source,"event_count"),
-                "script_ids":source.get("script_ids").cloned().unwrap_or_else(|| json!([])),
-                "cdp_sessions":source.get("cdp_sessions").cloned().unwrap_or_else(|| json!([])),
-                "execution_context_ids":source.get("execution_context_ids").cloned().unwrap_or_else(|| json!([])),
-                "script_instances":source.get("script_instances").cloned().unwrap_or_else(|| json!([])),
-                "observed_executed":field(source,"observed_executed"),
-                "observed_source_path":field(source,"observed_source_path"),
-                "general_source_path":runtime_general_paths.get(digest),
-                "safe_readable_source_path":runtime_readable_paths.get(digest),
-                "urls":source.get("urls").cloned().unwrap_or_else(|| json!([])),
-                "instrumentation_kind":field(source,"instrumentation_kind"),
-                "generated_root_sha256s":generated.get("root_sha256s").cloned().unwrap_or_else(|| json!([])),
-                "generated_root_urls":generated.get("root_urls").cloned().unwrap_or_else(|| json!([])),
-                "generation_max_depth":field(generated,"max_depth"),
-                "application_source":classification != Some("capture_instrumentation"),
-            }),
-        )?;
-
-        for instance in array_field(source, "script_instances") {
-            let Some(script_id) = instance.get("script_id") else {
-                continue;
-            };
-            if script_id.is_null() {
-                continue;
-            }
-            let key = (
-                nonempty_string_field(instance, "cdp_session")
-                    .unwrap_or("main")
-                    .to_string(),
-                script_id
-                    .as_str()
-                    .map_or_else(|| script_id.to_string(), ToString::to_string),
-            );
-            if runtime_instance_conflicts.contains(&key) {
-                continue;
-            }
-            if let Some(previous) = runtime_node_by_instance.get(&key) {
-                if previous != &runtime_node {
-                    runtime_instance_conflicts.insert(key.clone());
-                    runtime_node_by_instance.remove(&key);
-                    continue;
-                }
-            }
-            runtime_node_by_instance.insert(key, runtime_node.clone());
-        }
-
-        for origin in array_field(generated, "origins") {
-            let chain = array_field(origin, "chain");
-            let Some(parent) = chain.first() else {
-                continue;
-            };
-            let edge_fields = json!({
-                "cdp_session": nonempty_string_field(origin,"cdp_session").or_else(|| nonempty_string_field(parent,"cdp_session")).unwrap_or("main"),
-                "child_script_id":field(origin,"child_script_id"),
-                "parent_script_id":field(parent,"script_id"),
-                "function_name":field(parent,"function_name"),
-                "line_number":field(parent,"line_number"),
-                "column_number":field(parent,"column_number"),
-                "generation_depth":chain.len(),
-            });
-            if let Some(parent_sha) = nonempty_string_field(parent, "sha256") {
-                graph.add_edge(
-                    &format!("runtime:{}", &parent_sha[..parent_sha.len().min(20)]),
-                    &runtime_node,
-                    "runtime_generated_code",
-                    edge_fields,
-                )?;
-            } else if let Some(url) = nonempty_string_field(parent, "url") {
-                let candidates = graph.targets_for(url)?;
-                for parent_node in &candidates {
-                    let mut fields = edge_fields.clone();
-                    fields["identity_basis"] = json!("url_only");
-                    fields["candidate_count"] = json!(candidates.len());
-                    graph.add_edge(
-                        parent_node,
-                        &runtime_node,
-                        "runtime_generated_code_candidate",
-                        fields,
-                    )?;
-                }
-            }
-        }
-
-        match classification {
-            Some("network_response" | "network_observed") => {
-                add_runtime_network_source_edges(
-                    &mut graph,
-                    source,
-                    &runtime_node,
-                    &resource_nodes_by_sha,
-                )?;
-            }
-            Some("inline_script") => {
-                if let Some(parents) = inline_nodes_by_sha.get(digest) {
-                    // Matching inline bytes do not identify the document or
-                    // script ordinal whose browser instance was parsed.
-                    for parent in parents {
-                        graph.add_edge(
-                            parent,
-                            &runtime_node,
-                            "runtime_source_candidate",
-                            json!({
-                                "identity_basis":"sha256_only_inline_script",
-                                "candidate_count":parents.len(),
-                                "exact_response_identity":false,
-                                "runtime_execution_observed":bool_field(source,"observed_executed"),
-                            }),
-                        )?;
-                    }
-                }
-            }
-            Some("document_inline_script") => {
-                for origin in array_field(source, "document_inline_origins") {
-                    let document_key = compact_key((
-                        field(origin, "cdp_session"),
-                        field(origin, "url"),
-                        field(origin, "frame_id"),
-                    ))?;
-                    let document_node = digest_id("runtime-document:", &document_key);
-                    graph.add_node(
-                        document_node.clone(),
-                        json!({
-                            "type":"runtime_document",
-                            "cdp_session":field(origin,"cdp_session"),
-                            "url":field(origin,"url"),
-                            "frame_id":field(origin,"frame_id"),
-                        }),
-                    )?;
-                    graph.add_edge(
-                        &document_node,
-                        &runtime_node,
-                        "runtime_document_inline",
-                        json!({
-                            "script_id":field(origin,"script_id"),
-                            "start_line":field(origin,"start_line"),
-                            "start_column":field(origin,"start_column"),
-                            "end_line":field(origin,"end_line"),
-                            "end_column":field(origin,"end_column"),
-                        }),
-                    )?;
-                }
-            }
-            Some("alpine_expression") => {
-                if let Some(shape) = nonempty_string_field(alpine, "shape") {
-                    let family_node = digest_id("runtime-family:", shape);
-                    graph.add_node(
-                        family_node.clone(),
-                        json!({
-                            "type":"runtime_expression_family",
-                            "framework":"alpine",
-                            "shape":shape,
-                            "source_count":family_counts.get(shape).cloned().unwrap_or(Value::Null),
-                        }),
-                    )?;
-                    graph.add_edge(
-                        &runtime_node,
-                        &family_node,
-                        "runtime_expression_family",
-                        json!({}),
-                    )?;
-                }
-                for dom_match in array_field(alpine, "dom_matches") {
-                    let snapshot_key =
-                        compact_key((field(dom_match, "source"), field(dom_match, "path")))?;
-                    let snapshot_node = digest_id("dom-snapshot:", &snapshot_key);
-                    graph.add_node(
-                        snapshot_node.clone(),
-                        json!({"type":"dom_snapshot", "source":field(dom_match,"source"), "path":field(dom_match,"path")}),
-                    )?;
-                    let directive_key = compact_key((
-                        field(dom_match, "source"),
-                        field(dom_match, "path"),
-                        field(dom_match, "tag_ordinal"),
-                        field(dom_match, "tag"),
-                        field(dom_match, "attribute"),
-                    ))?;
-                    let directive_node = digest_id("dom-directive:", &directive_key);
-                    graph.add_node(
-                        directive_node.clone(),
-                        json!({
-                            "type":"dom_directive", "source":field(dom_match,"source"), "path":field(dom_match,"path"),
-                            "tag_ordinal":field(dom_match,"tag_ordinal"), "tag":field(dom_match,"tag"), "attribute":field(dom_match,"attribute")
-                        }),
-                    )?;
-                    graph.add_edge(&snapshot_node, &directive_node, "dom_directive", json!({}))?;
-                    graph.add_edge(
-                        &directive_node,
-                        &runtime_node,
-                        "runtime_alpine_compile",
-                        json!({
-                            "mapping_kind":field(alpine,"dom_mapping_kind"),
-                            "expression":field(alpine,"expression"),
-                            "compiled_expression":field(alpine,"compiled_expression"),
-                            "shape":field(alpine,"shape"),
-                        }),
-                    )?;
-                }
-            }
-            Some("gtm_custom_javascript") => {
-                if let Some(shape) = nonempty_string_field(gtm, "shape") {
-                    let family_node =
-                        digest_id("runtime-family:", &format!("google_tag_manager\0{shape}"));
-                    graph.add_node(
-                        family_node.clone(),
-                        json!({
-                            "type":"runtime_expression_family", "framework":"google_tag_manager", "shape":shape,
-                            "source_count":gtm_family_counts.get(shape).cloned().unwrap_or(Value::Null)
-                        }),
-                    )?;
-                    graph.add_edge(
-                        &runtime_node,
-                        &family_node,
-                        "runtime_expression_family",
-                        json!({}),
-                    )?;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    // Concrete debugger pauses are observed state witnesses, not static edges.
-    // Only verified (CDP session, script ID, captured source SHA) triples
-    // receive a provenance edge to the matching runtime script instance.
-    for (ordinal, hit) in array_field(&selective_trace, "hits").iter().enumerate() {
-        budget.checkpoint()?;
-        let node_id = format!("observed-invocation:{ordinal}");
-        graph.add_node(
-            node_id.clone(),
-            json!({
-                "type":"observed_invocation",
-                "point_id":field(hit,"pointId"),
-                "readable_view_path":field(hit,"readable_view_path"),
-                "path_view_path":field(hit,"path_view_path"),
-                "path_witness_status":field(hit,"pathWitnessStatus"),
-                "path_witness_mode":field(hit,"pathWitnessMode"),
-                "cdp_session":field(hit,"cdpSession"),
-                "at":field(hit,"at"),
-                "reason":field(hit,"reason"),
-                "frames":field(hit,"frames"),
-                "scopes":field(hit,"scopes"),
-                "expressions":field(hit,"expressions"),
-                "concrete_observation_only":true,
-            }),
-        )?;
-        let session = nonempty_string_field(hit, "cdpSession").unwrap_or("main");
-        for (depth, frame) in array_field(hit, "frames").iter().enumerate() {
-            if nonempty_string_field(frame, "source_identity") != Some("exact") {
-                continue;
-            }
-            let Some(script_id) = frame
-                .get("location")
-                .and_then(|location| location.get("scriptId"))
-                .and_then(Value::as_str)
-            else {
-                continue;
-            };
-            let Some(sha) = nonempty_string_field(frame, "sourceSha256") else {
-                continue;
-            };
-            let expected = format!("runtime:{}", &sha[..sha.len().min(20)]);
-            let key = (session.to_owned(), script_id.to_owned());
-            if runtime_node_by_instance.get(&key) != Some(&expected) {
-                continue;
-            }
-            graph.add_edge(
-                &expected,
-                &node_id,
-                "observed_paused_call_frame",
-                json!({
-                    "stack_depth":depth,
-                    "cdp_session":session,
-                    "script_id":script_id,
-                    "source_sha256":sha,
-                    "identity_basis":"exact_session_script_hash",
-                    "concrete_observation_only":true,
-                }),
-            )?;
-        }
-        // Each debugger step is a concrete next-pause event with explicit
-        // order; only exact top-frame source matches receive executable
-        // location edges. An unknown frame remains an unresolved step node.
-        for (step_index, step) in array_field(hit, "steps").iter().enumerate() {
-            budget.checkpoint()?;
-            let step_id = format!("observed-step:{ordinal}:{step_index}");
-            let top = array_field(step, "frames").first();
-            graph.add_node(
-                step_id.clone(),
-                json!({
-                    "type":"observed_step",
-                    "step_index":step_index,
-                    "point_id":field(hit,"pointId"),
-                    "cdp_session":session,
-                    "reason":field(step,"reason"),
-                    "hit_breakpoints":field(step,"hitBreakpoints"),
-                    "top_frame":top,
-                    "frames":field(step,"frames"),
-                    "scopes":field(step,"scopes"),
-                    "expressions":field(step,"expressions"),
-                    "concrete_observation_only":true,
-                    "complete_execution_path":false,
-                }),
-            )?;
-            graph.add_edge(
-                &node_id,
-                &step_id,
-                "observed_next_step",
-                json!({
-                    "step_index":step_index,
-                    "step_mode":field(hit,"pathWitnessMode"),
-                    "concrete_observation_only":true,
-                }),
-            )?;
-            let Some(top) = top else { continue };
-            if nonempty_string_field(top, "source_identity") != Some("exact") {
-                continue;
-            }
-            let Some(script_id) = top
-                .get("location")
-                .and_then(|location| location.get("scriptId"))
-                .and_then(Value::as_str)
-            else {
-                continue;
-            };
-            let Some(sha) = nonempty_string_field(top, "sourceSha256") else {
-                continue;
-            };
-            let expected = format!("runtime:{}", &sha[..sha.len().min(20)]);
-            let key = (session.to_owned(), script_id.to_owned());
-            if runtime_node_by_instance.get(&key) != Some(&expected) {
-                continue;
-            }
-            graph.add_edge(
-                &expected, &step_id, "observed_executed_location",
-                json!({
-                    "cdp_session":session,
-                    "script_id":script_id,
-                    "source_sha256":sha,
-                    "line_number":top.get("location").and_then(|location| location.get("lineNumber")).cloned(),
-                    "column_number":top.get("location").and_then(|location| location.get("columnNumber")).cloned(),
-                    "step_index":step_index,
-                    "identity_basis":"exact_session_script_hash",
-                    "concrete_observation_only":true,
-                }),
-            )?;
-        }
-        // Original-source AST guard witnesses are separate from both static
-        // branches and the raw debugger steps. Their source provenance flows
-        // through the already-verified observed-step nodes.
-        for (guard_index, guard) in array_field(hit, "observed_guard_witnesses")
-            .iter()
-            .enumerate()
-        {
-            budget.checkpoint()?;
-            let Some(step_index) = guard
-                .get("step_index")
-                .and_then(Value::as_u64)
-                .and_then(|index| usize::try_from(index).ok())
-            else {
-                continue;
-            };
-            if step_index >= array_field(hit, "steps").len() {
-                continue;
-            }
-            let guard_id = format!("observed-guard:{ordinal}:{guard_index}");
-            graph.add_node(
-                guard_id.clone(),
-                json!({
-                    "type":"observed_guard",
-                    "witness":guard,
-                    "concrete_observation_only":true,
-                    "complete_execution_path":false,
-                }),
-            )?;
-            graph.add_edge(
-                &format!("observed-step:{ordinal}:{step_index}"),
-                &guard_id,
-                "observed_ast_guard_value",
-                json!({"exact_original_ast":true,"concrete_observation_only":true}),
-            )?;
-            if let Some(selected_arm) = nonempty_string_field(guard, "next_pause_in_selected_arm") {
-                if step_index + 1 < array_field(hit, "steps").len() {
-                    graph.add_edge(
-                        &guard_id,
-                        &format!("observed-step:{ordinal}:{}", step_index + 1),
-                        "observed_next_pause_in_selected_arm",
-                        json!({"arm":selected_arm,"concrete_observation_only":true}),
-                    )?;
-                }
-            }
-        }
-        for scope in array_field(hit, "scopes") {
-            budget.checkpoint()?;
-            let scope_type = nonempty_string_field(scope, "type").unwrap_or("unknown");
-            for variable in array_field(scope, "variables") {
-                budget.checkpoint()?;
-                let label = nonempty_string_field(variable, "name").unwrap_or("");
-                if let Some(value) = variable.get("value") {
-                    add_observed_callable_definition(
-                        &mut graph,
-                        &runtime_node_by_instance,
-                        &node_id,
-                        session,
-                        value,
-                        scope_type,
-                        label,
-                    )?;
-                }
-            }
-        }
-        for expression in array_field(hit, "expressions") {
-            budget.checkpoint()?;
-            if nonempty_string_field(expression, "status") != Some("observed") {
-                continue;
-            }
-            if let Some(value) = expression.get("value") {
-                add_observed_callable_definition(
-                    &mut graph,
-                    &runtime_node_by_instance,
-                    &node_id,
-                    session,
-                    value,
-                    "expression",
-                    nonempty_string_field(expression, "expression").unwrap_or(""),
-                )?;
-            }
-        }
-    }
     // Runtime-observed WASM requests are capture evidence, not universal static control flow.
     for observation in array_field(&wasm_resource_provenance, "observations") {
         budget.checkpoint()?;
@@ -1425,7 +1584,7 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
                     .as_str()
                     .map_or_else(|| script_id.to_string(), ToString::to_string),
             );
-            if let Some(runtime_node) = runtime_node_by_instance.get(&key) {
+            if let Some(runtime_node) = runtime_index.instances.get(&key) {
                 source_nodes.push(runtime_node.clone());
             }
         }
@@ -1532,7 +1691,7 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
                         .strip_prefix("resources/runtime-scripts/")?
                         .strip_suffix(".js")?;
                     if string_field(unit, "input_sha256") != Some(digest)
-                        || !runtime_general_paths.contains_key(digest)
+                        || !runtime_index.general_paths.contains_key(digest)
                     {
                         return None;
                     }
@@ -2336,6 +2495,129 @@ mod tests {
         assert_eq!(artifact["summary"]["edge_kinds"]["script_src"], 2);
         assert_eq!(artifact["summary"]["edge_kinds"]["inline_script"], 2);
         assert_eq!(artifact["summary"]["node_types"]["external_url"], 1);
+        Ok(())
+    }
+
+    fn conflicting_runtime_instance_fixture() -> (String, Value, Value) {
+        let first = "a".repeat(64);
+        let second = "b".repeat(64);
+        let runtime = json!({
+            "sources":[
+                {"sha256":first,"classification":"generated_runtime","script_instances":[
+                    {"cdp_session":"worker","script_id":"7"}]},
+                {"sha256":second,"classification":"generated_runtime","script_instances":[
+                    {"cdp_session":"worker","script_id":"7"},
+                    {"cdp_session":"other","script_id":"7"}]},
+            ]
+        });
+        let exact_frame = |sha: &str| {
+            json!({
+                "source_identity":"exact","sourceSha256":sha,
+                "location":{"scriptId":"7","lineNumber":1,"columnNumber":2}
+            })
+        };
+        let callable = |sha: &str| {
+            json!({"type":"local","variables":[{
+                "name":"function","value":{"functionDefinition":{
+                    "source_identity":"exact","scriptId":"7","sourceSha256":sha,
+                    "lineNumber":1,"columnNumber":2
+                }}
+            }]})
+        };
+        let trace = json!({"hits":[
+            {"cdpSession":"worker","frames":[exact_frame(&first)],
+             "steps":[{"frames":[exact_frame(&first)]}],
+             "scopes":[callable(&first)]},
+            {"cdpSession":"other","frames":[exact_frame(&second)],
+             "steps":[{"frames":[exact_frame(&second)]},{"frames":[]}],
+             "observed_guard_witnesses":[{"step_index":0,
+                 "next_pause_in_selected_arm":"then"}],
+             "scopes":[callable(&second)]},
+            {"cdpSession":"other",
+             "frames":[{"source_identity":"inferred","sourceSha256":second,
+                 "location":{"scriptId":"7"}}],
+             "steps":[{"frames":[{"source_identity":"inferred","sourceSha256":second,
+                 "location":{"scriptId":"7"}}]}]}
+        ]});
+        (second, runtime, trace)
+    }
+
+    #[test]
+    fn runtime_script_collisions_cannot_turn_pauses_into_exact_execution_proof() -> Result<()> {
+        let (second, runtime, trace) = conflicting_runtime_instance_fixture();
+        let budget = work_budget::WorkBudget::new(
+            "runtime-source-witness-identity",
+            work_budget::BudgetLimits::unlimited(),
+        );
+        let mut graph = GraphBuilder::default();
+        let runtime_index = seed_runtime_script_evidence(
+            &mut graph,
+            &runtime,
+            &json!({"units":[]}),
+            &json!({"units":[]}),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &budget,
+        )?;
+        let instances = &runtime_index.instances;
+        assert!(!instances.contains_key(&("worker".into(), "7".into())));
+        assert_eq!(
+            instances.get(&("other".into(), "7".into())),
+            Some(&format!("runtime:{}", &second[..20]))
+        );
+        seed_selective_trace_witnesses(&mut graph, &trace, instances, &budget)?;
+        let identity_edges = graph
+            .edges
+            .iter()
+            .filter(|edge| {
+                matches!(
+                    edge["kind"].as_str(),
+                    Some(
+                        "observed_paused_call_frame"
+                            | "observed_executed_location"
+                            | "observed_callable_definition"
+                    )
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            identity_edges.len(),
+            3,
+            "only the unambiguous session may prove identity"
+        );
+        assert!(identity_edges.iter().all(|edge| {
+            edge["from"] == format!("runtime:{}", &second[..20])
+                && edge["cdp_session"] == "other"
+                && edge["script_id"] == "7"
+                && edge["source_sha256"] == second
+        }));
+        assert!(graph.nodes.contains_key("observed-invocation:0"));
+        assert!(graph.nodes.contains_key("observed-step:0:0"));
+        assert_eq!(
+            graph.nodes["observed-step:0:0"]["complete_execution_path"],
+            false
+        );
+        assert_eq!(
+            graph.nodes["observed-step:1:1"]["complete_execution_path"],
+            false
+        );
+        assert_eq!(
+            graph.nodes["observed-guard:1:0"]["concrete_observation_only"],
+            true
+        );
+        assert!(graph
+            .edges
+            .iter()
+            .any(|edge| edge["kind"] == "observed_ast_guard_value"));
+        assert!(graph.edges.iter().any(|edge| {
+            edge["kind"] == "observed_next_pause_in_selected_arm"
+                && edge["to"] == "observed-step:1:1"
+        }));
+        assert!(!graph
+            .edges
+            .iter()
+            .any(|edge| edge["to"] == "observed-step:2:0"
+                && edge["kind"] == "observed_executed_location"));
         Ok(())
     }
 
