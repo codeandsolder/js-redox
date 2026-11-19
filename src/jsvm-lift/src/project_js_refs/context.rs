@@ -190,7 +190,7 @@ pub(super) fn propagate_context_evidence(
                     .flatten()
                 {
                     let mut result =
-                        resolve_with_import_map(row_url.as_deref(), &matched_url, import_map);
+                        resolve_with_import_map(row_url.as_deref(), matched_url, import_map);
                     if let Some(resolution) = result
                         .get("resolution")
                         .and_then(Value::as_str)
