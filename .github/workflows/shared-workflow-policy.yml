@@ -1,0 +1,19 @@
+name: Shared workflow policy
+on:
+  pull_request:
+    paths: [".github/workflows/**"]
+  push:
+    branches: [main]
+    paths: [".github/workflows/**"]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    uses: codeandsolder/ci-workflows/.github/workflows/workflow-concurrency.yml@108f9de3893da7e4f6c59b4d8e3842e37096b0be # main
