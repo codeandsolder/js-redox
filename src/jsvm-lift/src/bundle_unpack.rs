@@ -654,21 +654,8 @@ impl Collector<'_, '_> {
     }
 
     fn module_dependencies(&self, value: &Expression<'_>) -> Vec<String> {
-        let value = unwrap_parenthesized(value);
-        let (params, body) = match value {
-            Expression::FunctionExpression(function) => {
-                let Some(body) = function.body.as_ref() else {
-                    return Vec::new();
-                };
-                (&function.params, body.as_ref())
-            }
-            Expression::ArrowFunctionExpression(function) => {
-                let Some(body) = arrow_block_body(function) else {
-                    return Vec::new();
-                };
-                (&function.params, body)
-            }
-            _ => return Vec::new(),
+        let Some((params, body, _, _)) = Self::amd_factory_expression_parts(value) else {
+            return Vec::new();
         };
         let Some(require_symbol) = params
             .items
@@ -686,40 +673,26 @@ impl Collector<'_, '_> {
         collector.dependencies.into_iter().collect()
     }
 
-    fn module_exports(&self, value: &Expression<'_>) -> (Vec<String>, bool) {
-        let value = unwrap_parenthesized(value);
-        let (params, body) = match value {
-            Expression::FunctionExpression(function) => {
-                let Some(body) = function.body.as_ref() else {
-                    return (Vec::new(), false);
-                };
-                (&function.params, body.as_ref())
-            }
-            Expression::ArrowFunctionExpression(function) => {
-                let Some(body) = arrow_block_body(function) else {
-                    return (Vec::new(), false);
-                };
-                (&function.params, body)
-            }
-            _ => return (Vec::new(), false),
+    // Parameter positions in factory functions are part of the bundle ABI,
+    // not interchangeable between Webpack-style and Browserify factories.
+    // Positions are ordered as [module, exports, require].
+    fn factory_exports(
+        &self,
+        params: &oxc_ast::ast::FormalParameters<'_>,
+        body: &oxc_ast::ast::FunctionBody<'_>,
+        positions: [usize; 3],
+    ) -> (Vec<String>, bool) {
+        let symbol = |index: usize| {
+            params
+                .items
+                .get(index)
+                .and_then(|param| binding_symbol(&param.pattern))
         };
-        let module_symbol = params
-            .items
-            .first()
-            .and_then(|param| binding_symbol(&param.pattern));
-        let exports_symbol = params
-            .items
-            .get(1)
-            .and_then(|param| binding_symbol(&param.pattern));
-        let require_symbol = params
-            .items
-            .get(2)
-            .and_then(|param| binding_symbol(&param.pattern));
         let mut collector = ExportCollector {
             scoping: self.scoping,
-            module_symbol,
-            exports_symbol,
-            require_symbol,
+            module_symbol: symbol(positions[0]),
+            exports_symbol: symbol(positions[1]),
+            require_symbol: symbol(positions[2]),
             names: BTreeSet::new(),
             commonjs_export: false,
         };
@@ -728,6 +701,14 @@ impl Collector<'_, '_> {
             collector.names.into_iter().collect(),
             collector.commonjs_export,
         )
+    }
+
+    fn module_exports(&self, value: &Expression<'_>) -> (Vec<String>, bool) {
+        let Some((params, body, _, _)) = Self::amd_factory_expression_parts(value) else {
+            return (Vec::new(), false);
+        };
+        // Webpack-style module ABI: (module, exports, require).
+        self.factory_exports(params, body, [0, 1, 2])
     }
 
     fn module_records(
@@ -820,39 +801,6 @@ impl Collector<'_, '_> {
         }
     }
 
-    fn browserify_exports(
-        &self,
-        params: &oxc_ast::ast::FormalParameters<'_>,
-        body: &oxc_ast::ast::FunctionBody<'_>,
-    ) -> (Vec<String>, bool) {
-        // Browserify factory ABI: (require, module, exports).
-        let require_symbol = params
-            .items
-            .first()
-            .and_then(|param| binding_symbol(&param.pattern));
-        let module_symbol = params
-            .items
-            .get(1)
-            .and_then(|param| binding_symbol(&param.pattern));
-        let exports_symbol = params
-            .items
-            .get(2)
-            .and_then(|param| binding_symbol(&param.pattern));
-        let mut collector = ExportCollector {
-            scoping: self.scoping,
-            module_symbol,
-            exports_symbol,
-            require_symbol,
-            names: BTreeSet::new(),
-            commonjs_export: false,
-        };
-        collector.visit_function_body(body);
-        (
-            collector.names.into_iter().collect(),
-            collector.commonjs_export,
-        )
-    }
-
     fn browserify_module_records(
         &self,
         module_table: &oxc_ast::ast::ObjectExpression<'_>,
@@ -886,7 +834,8 @@ impl Collector<'_, '_> {
                 return None;
             };
             let dependency_map = self.browserify_dependency_map(dependency_object)?;
-            let (export_names, commonjs_export) = self.browserify_exports(params, body);
+            // Browserify factory ABI: (require, module, exports).
+            let (export_names, commonjs_export) = self.factory_exports(params, body, [1, 2, 0]);
             modules.push(ModuleRecord {
                 id,
                 property_start: prop.span.start,
@@ -1740,6 +1689,75 @@ mod tests {
             .is_some());
         }
         assert!(AmdLoaderMember::from_property("unrelated").is_none());
+    }
+
+    #[test]
+    fn webpack_and_browserify_factory_roles_remain_distinct() -> Result<(), BudgetExceeded> {
+        let webpack = r#"
+            (function(modules) {
+                function load(id) { return modules[id]; }
+                load.m = modules;
+            })({
+                1: (module, exports, require) => {
+                    exports.web = require(2);
+                    module.exports.extra = 1;
+                },
+                2: function(module, exports, require) {
+                    exports.other = 1;
+                }
+            });
+        "#;
+        let browserify = r#"
+            (function(modules, cache, entries) {})({
+                1: [function(require, module, exports) {
+                    exports.browser = require("./dep");
+                    module.exports = {};
+                }, {"./dep": "2"}],
+                2: [(require, module, exports) => { exports.dep = 1; }, {}]
+            }, {}, [1]);
+        "#;
+        let budget = WorkBudget::unlimited("factory-abi-test");
+        let webpack_report = analyze_bundle_source(webpack, "webpack", &budget)?;
+        let webpack_bundle = webpack_report
+            .bundles
+            .iter()
+            .find(|bundle| bundle.kind == "webpack_object_bootstrap");
+        assert!(webpack_bundle.is_some(), "Webpack bootstrap must be proven");
+        if let Some(webpack_bundle) = webpack_bundle {
+            let module = webpack_bundle
+                .modules
+                .iter()
+                .find(|module| module.id == "1");
+            assert!(module.is_some());
+            if let Some(module) = module {
+                assert_eq!(module.export_names, ["extra", "web"]);
+                assert_eq!(module.dependencies, ["2"]);
+                assert!(!module.commonjs_export);
+            }
+        }
+
+        let browserify_report = analyze_bundle_source(browserify, "browserify", &budget)?;
+        let browserify_bundle = browserify_report
+            .bundles
+            .iter()
+            .find(|bundle| bundle.kind == "browserify_module_table");
+        assert!(
+            browserify_bundle.is_some(),
+            "Browserify bootstrap must be proven"
+        );
+        if let Some(browserify_bundle) = browserify_bundle {
+            let module = browserify_bundle
+                .modules
+                .iter()
+                .find(|module| module.id == "1");
+            assert!(module.is_some());
+            if let Some(module) = module {
+                assert_eq!(module.export_names, ["browser"]);
+                assert_eq!(module.dependencies, ["2"]);
+                assert!(module.commonjs_export);
+            }
+        }
+        Ok(())
     }
 
     #[test]
