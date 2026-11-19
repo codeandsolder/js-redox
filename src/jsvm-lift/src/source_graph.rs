@@ -1922,46 +1922,51 @@ fn seed_bundle_module_nodes<'a>(
     })
 }
 
+/// Do not resolve a dependency to a factory inside the source factory's
+/// private Webpack module-table range.
+fn nested_private_bundle_candidate(
+    candidate_node: &str,
+    source_module: &Value,
+    index: &BundleGraphIndex<'_>,
+) -> bool {
+    let Some(candidate_module) = index.module_rows.get(candidate_node).copied() else {
+        return false;
+    };
+    let Some(candidate_bundle_id) = u64_field(candidate_module, "bundle_id") else {
+        return false;
+    };
+    let Some(candidate_bundle) = index.bundle_rows_by_id.get(&candidate_bundle_id).copied() else {
+        return false;
+    };
+    if string_field(candidate_bundle, "kind") != Some("webpack_module_table")
+        || string_field(candidate_bundle, "parent_path")
+            != string_field(source_module, "parent_path")
+    {
+        return false;
+    }
+    let Some(source_start) = u64_field(source_module, "value_start") else {
+        return false;
+    };
+    let Some(source_end) = u64_field(source_module, "value_end") else {
+        return false;
+    };
+    let Some(bundle_start) = u64_field(candidate_bundle, "start") else {
+        return false;
+    };
+    let Some(bundle_end) = u64_field(candidate_bundle, "end") else {
+        return false;
+    };
+    source_start <= bundle_start && bundle_end <= source_end
+}
+
 fn seed_bundle_dependency_edges(
     graph: &mut GraphBuilder,
     index: &BundleGraphIndex<'_>,
     budget: &work_budget::WorkBudget,
 ) -> Result<()> {
-    let bundle_rows_by_id = &index.bundle_rows_by_id;
     let bundle_module_nodes = &index.bundle_module_nodes;
     let module_nodes_by_id = &index.module_nodes_by_id;
     let module_rows = &index.module_rows;
-    let nested_private_bundle_candidate = |candidate_node: &str, source_module: &Value| -> bool {
-        let Some(candidate_module) = module_rows.get(candidate_node).copied() else {
-            return false;
-        };
-        let Some(candidate_bundle_id) = u64_field(candidate_module, "bundle_id") else {
-            return false;
-        };
-        let Some(candidate_bundle) = bundle_rows_by_id.get(&candidate_bundle_id).copied() else {
-            return false;
-        };
-        if string_field(candidate_bundle, "kind") != Some("webpack_module_table")
-            || string_field(candidate_bundle, "parent_path")
-                != string_field(source_module, "parent_path")
-        {
-            return false;
-        }
-        let Some(source_start) = u64_field(source_module, "value_start") else {
-            return false;
-        };
-        let Some(source_end) = u64_field(source_module, "value_end") else {
-            return false;
-        };
-        let Some(bundle_start) = u64_field(candidate_bundle, "start") else {
-            return false;
-        };
-        let Some(bundle_end) = u64_field(candidate_bundle, "end") else {
-            return false;
-        };
-        source_start <= bundle_start && bundle_end <= source_end
-    };
-
     for (source_node, module) in module_rows {
         budget.checkpoint()?;
         let bundle_id = required_u64(module, "bundle_id", "bundle module")?;
@@ -1992,7 +1997,7 @@ fn seed_bundle_dependency_edges(
                         .cloned()
                         .unwrap_or_default();
                     for candidate in all_candidates {
-                        if nested_private_bundle_candidate(&candidate, module) {
+                        if nested_private_bundle_candidate(&candidate, module, index) {
                             excluded_nested.push(candidate);
                         } else {
                             candidates.push(candidate);
@@ -2840,15 +2845,18 @@ mod tests {
         };
         let entry = "bundle-module:1:0";
         assert_eq!(
-            direct(entry, "bundle-module:1:1").unwrap()["cross_bundle"],
+            direct(entry, "bundle-module:1:1").context("missing exact local factory")?
+                ["cross_bundle"],
             false
         );
         assert_eq!(
-            direct(entry, "bundle-module:4:1").unwrap()["cross_bundle"],
+            direct(entry, "bundle-module:4:1").context("missing exact cross-bundle factory")?
+                ["cross_bundle"],
             true
         );
         assert_eq!(
-            direct("bundle-module:1:4", "bundle-module:2:1").unwrap()["cross_bundle"],
+            direct("bundle-module:1:4", "bundle-module:2:1")
+                .context("missing module outside private nesting")?["cross_bundle"],
             true
         );
         assert!(
