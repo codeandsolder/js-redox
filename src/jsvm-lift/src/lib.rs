@@ -30,6 +30,7 @@ pub(crate) mod test_support;
 
 mod har_project;
 pub mod http_capture;
+mod import_map;
 pub mod invocation_views;
 pub mod js_format;
 pub mod js_refs;
