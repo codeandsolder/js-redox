@@ -7,8 +7,8 @@ use crate::{
     browser_decode::decode_html,
     browser_script_types::is_executable_script,
     har_project::html::{document_base, extract_script_tags, script_preload_links},
+    import_map::{merge_import_map, parse_import_map, resolve_with_import_map, ImportMap},
     js_refs::extract_js_references,
-    project_js_refs::{merge_import_map, parse_import_map, resolve_with_import_map, ImportMap},
 };
 use anyhow::{ensure, Context, Result};
 use base64::Engine;
