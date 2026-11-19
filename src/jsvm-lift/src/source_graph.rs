@@ -1962,7 +1962,7 @@ fn seed_bundle_dependency_edges(
         source_start <= bundle_start && bundle_end <= source_end
     };
 
-    for (source_node, module) in &module_rows {
+    for (source_node, module) in module_rows {
         budget.checkpoint()?;
         let bundle_id = required_u64(module, "bundle_id", "bundle module")?;
         for dependency in array_field(module, "dependencies") {
