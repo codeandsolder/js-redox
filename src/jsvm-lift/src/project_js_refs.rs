@@ -483,6 +483,47 @@ fn push_candidate(
         .insert(candidate_key(&candidate), candidate);
 }
 
+// The document-specific module graph state is shared by all reference kinds
+// within a source unit. Keep it borrowed only for this unit's reference pass.
+struct ContextRouting<'a> {
+    units_by_url: &'a BTreeMap<String, Vec<usize>>,
+    contexts: &'a mut [BTreeSet<u64>],
+    queue: &'a mut VecDeque<(usize, u64)>,
+}
+
+// Normal imports and captured dynamic globs must use precisely the same
+// document-context propagation and candidate deduplication. Only glob
+// metadata and its resolution classification are specific to the caller.
+fn push_contextual_resolution(
+    store: &mut BTreeMap<(usize, usize), BTreeMap<String, Value>>,
+    key: (usize, usize),
+    document_id: u64,
+    mut resolution: Value,
+    glob_match_url: Option<&str>,
+    routing: &mut ContextRouting<'_>,
+) -> Result<()> {
+    let candidate = resolution
+        .as_object_mut()
+        .context("resolution must be object")?;
+    candidate.insert("document_resource_id".into(), Value::from(document_id));
+    if let Some(url) = glob_match_url {
+        candidate.insert("glob_match_url".into(), Value::String(url.to_owned()));
+    }
+    let resolved = candidate
+        .get("resolved_url")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    push_candidate(store, key, resolution);
+    if let Some(resolved) = resolved {
+        for &target in routing.units_by_url.get(&resolved).into_iter().flatten() {
+            if routing.contexts[target].insert(document_id) {
+                routing.queue.push_back((target, document_id));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn set_resolution_fields(target: &mut Map<String, Value>, source: &Value) {
     for key in [
         "resolved_url",
@@ -783,6 +824,11 @@ pub fn scan_project_references(
             .cloned()
             .unwrap_or_default();
         let import_map = import_maps.get(&document_id);
+        let mut routing = ContextRouting {
+            units_by_url: &units_by_url,
+            contexts: &mut contexts,
+            queue: &mut queue,
+        };
         for (ref_index, reference) in references.iter().enumerate() {
             let kind = reference
                 .get("kind")
@@ -811,25 +857,14 @@ pub fn scan_project_references(
                             .context("resolution must be object")?
                             .insert("resolution".into(), Value::String(updated));
                     }
-                    let mut candidate = result
-                        .as_object()
-                        .cloned()
-                        .context("resolution must be object")?;
-                    candidate.insert("document_resource_id".into(), Value::from(document_id));
-                    candidate.insert("glob_match_url".into(), Value::String(matched_url));
-                    let candidate = Value::Object(candidate);
-                    let resolved = candidate
-                        .get("resolved_url")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned);
-                    push_candidate(&mut candidates, (row_id, ref_index), candidate);
-                    if let Some(resolved) = resolved {
-                        for &target in units_by_url.get(&resolved).into_iter().flatten() {
-                            if contexts[target].insert(document_id) {
-                                queue.push_back((target, document_id));
-                            }
-                        }
-                    }
+                    push_contextual_resolution(
+                        &mut candidates,
+                        (row_id, ref_index),
+                        document_id,
+                        result,
+                        Some(&matched_url),
+                        &mut routing,
+                    )?;
                 }
                 continue;
             }
@@ -841,24 +876,14 @@ pub fn scan_project_references(
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             let result = resolve_with_import_map(row_url.as_deref(), specifier, import_map);
-            let mut candidate = result
-                .as_object()
-                .cloned()
-                .context("resolution must be object")?;
-            candidate.insert("document_resource_id".into(), Value::from(document_id));
-            let candidate = Value::Object(candidate);
-            let resolved = candidate
-                .get("resolved_url")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned);
-            push_candidate(&mut candidates, (row_id, ref_index), candidate);
-            if let Some(resolved) = resolved {
-                for &target in units_by_url.get(&resolved).into_iter().flatten() {
-                    if contexts[target].insert(document_id) {
-                        queue.push_back((target, document_id));
-                    }
-                }
-            }
+            push_contextual_resolution(
+                &mut candidates,
+                (row_id, ref_index),
+                document_id,
+                result,
+                None,
+                &mut routing,
+            )?;
         }
     }
 
@@ -1166,6 +1191,70 @@ mod tests {
         assert_eq!(added["resolved_url"], "https://new.test/extra.js");
         assert_eq!(added["resolution"], "import_map_scope");
         assert_eq!(existing.scopes[scope].len(), 2);
+    }
+
+    #[test]
+    fn import_and_glob_candidates_propagate_context_once_per_document() -> Result<()> {
+        let units_by_url =
+            BTreeMap::from([("https://example.test/dependency.js".to_owned(), vec![1, 2])]);
+        let mut store = BTreeMap::new();
+        let mut contexts = vec![BTreeSet::new(); 3];
+        let mut queue = VecDeque::new();
+        let mut routing = ContextRouting {
+            units_by_url: &units_by_url,
+            contexts: &mut contexts,
+            queue: &mut queue,
+        };
+        let resolution = json!({
+            "resolution": "url",
+            "resolved_url": "https://example.test/dependency.js",
+        });
+        push_contextual_resolution(
+            &mut store,
+            (0, 0),
+            7,
+            resolution.clone(),
+            None,
+            &mut routing,
+        )?;
+        push_contextual_resolution(
+            &mut store,
+            (0, 0),
+            7,
+            resolution.clone(),
+            None,
+            &mut routing,
+        )?;
+        assert_eq!(store[&(0, 0)].len(), 1);
+        assert_eq!(
+            store[&(0, 0)]
+                .values()
+                .next()
+                .context("import candidate missing")?["document_resource_id"],
+            7
+        );
+        assert_eq!(routing.queue.len(), 2);
+        assert_eq!(routing.contexts[1], BTreeSet::from([7]));
+        assert_eq!(routing.contexts[2], BTreeSet::from([7]));
+
+        push_contextual_resolution(
+            &mut store,
+            (0, 1),
+            9,
+            resolution,
+            Some("https://example.test/dependency.js"),
+            &mut routing,
+        )?;
+        let glob = store[&(0, 1)]
+            .values()
+            .next()
+            .context("glob candidate missing")?;
+        assert_eq!(glob["document_resource_id"], 9);
+        assert_eq!(glob["glob_match_url"], "https://example.test/dependency.js");
+        assert_eq!(routing.contexts[1], BTreeSet::from([7, 9]));
+        assert_eq!(routing.contexts[2], BTreeSet::from([7, 9]));
+        assert_eq!(routing.queue.len(), 4);
+        Ok(())
     }
 
     #[test]
