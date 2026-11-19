@@ -163,12 +163,17 @@ pub(super) fn seed_generated_and_vm_evidence(
         }
     }
 
+    let mut vm_identities = BTreeSet::new();
     for unit in array_field(jsvm, "devirtualized_units") {
         budget.checkpoint()?;
         let parent_scan_id = required_u64(unit, "parent_scan_id", "devirtualized unit")?;
         let ordinal = required_u64(unit, "vm_ordinal", "devirtualized unit")?;
         let vm_kind = nonempty_string_field(unit, "vm_kind").unwrap_or("unknown");
         let node_id = format!("devirtualized:{parent_scan_id}:{vm_kind}:{ordinal}");
+        anyhow::ensure!(
+            vm_identities.insert(node_id.clone()),
+            "duplicate devirtualized VM identity {node_id}"
+        );
         graph.add_node(
             node_id.clone(),
             json!({
@@ -387,6 +392,15 @@ mod tests {
                     ]
                 }),
                 "duplicate code unit scan id",
+            ),
+            (
+                json!({
+                    "devirtualized_units":[
+                        {"parent_scan_id":1, "vm_ordinal":2, "vm_kind":"function_table"},
+                        {"parent_scan_id":1, "vm_ordinal":2, "vm_kind":"function_table"}
+                    ]
+                }),
+                "duplicate devirtualized VM identity",
             ),
         ];
         for (jsvm, expected_error) in cases {
