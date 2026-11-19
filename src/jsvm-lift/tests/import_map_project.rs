@@ -667,6 +667,7 @@ const SHARED_MAPPED_PAGE_URL: &str = "https://fixture.invalid/mapped.html";
 const SHARED_PLAIN_PAGE_URL: &str = "https://fixture.invalid/plain.html";
 const SHARED_MODULE_URL: &str = "https://fixture.invalid/modules/shared.js";
 const SHARED_CHILD_URL: &str = "https://fixture.invalid/modules/child.js";
+const SHARED_REEXPORTED_URL: &str = "https://fixture.invalid/modules/reexported.js";
 const SHARED_MAPPED_MODULE_URL: &str = "https://fixture.invalid/modules/mapped.js";
 
 fn write_shared_module_context_fixture(input: &Path, project: &Path) -> Result<()> {
@@ -682,9 +683,14 @@ fn write_shared_module_context_fixture(input: &Path, project: &Path) -> Result<(
         har_entry(
             SHARED_MODULE_URL,
             "application/javascript",
-            "import 'pkg'; import './child.js';",
+            "import 'pkg'; import './child.js'; export * from './reexported.js'; export { mapped } from 'pkg';",
         ),
         har_entry(SHARED_CHILD_URL, "application/javascript", "import 'pkg';"),
+        har_entry(
+            SHARED_REEXPORTED_URL,
+            "application/javascript",
+            "import 'pkg'; export const reexported = true;",
+        ),
         har_entry(
             SHARED_MAPPED_MODULE_URL,
             "application/javascript",
@@ -727,14 +733,17 @@ fn shared_modules_keep_mapped_and_unmapped_document_contexts() -> Result<()> {
     let plain_id = resource_id(SHARED_PLAIN_PAGE_URL)?;
     let shared_id = resource_id(SHARED_MODULE_URL)?;
     let child_id = resource_id(SHARED_CHILD_URL)?;
+    let reexported_id = resource_id(SHARED_REEXPORTED_URL)?;
     let mapped_target_id = resource_id(SHARED_MAPPED_MODULE_URL)?;
     let refs = read_json(&project.join("analysis/js-references.json"))?;
     let rows = refs["code_units"]
         .as_array()
         .context("missing JS reference rows")?;
-    for (url, expected_resource_id) in
-        [(SHARED_MODULE_URL, shared_id), (SHARED_CHILD_URL, child_id)]
-    {
+    for (url, expected_resource_id) in [
+        (SHARED_MODULE_URL, shared_id),
+        (SHARED_CHILD_URL, child_id),
+        (SHARED_REEXPORTED_URL, reexported_id),
+    ] {
         let unit = code_unit(rows, url)?;
         assert_eq!(unit["resource_id"], expected_resource_id);
         assert_eq!(
@@ -760,6 +769,31 @@ fn shared_modules_keep_mapped_and_unmapped_document_contexts() -> Result<()> {
                 && choice["resolution"] == "unresolved_bare"
         }));
     }
+    // A module reached only through a re-export must inherit every document
+    // context. A named re-export must also retain mapped and unmapped choices.
+    let shared_references = code_unit(rows, SHARED_MODULE_URL)?["references"]
+        .as_array()
+        .context("missing shared module reference inventory")?;
+    let wildcard = shared_references
+        .iter()
+        .find(|reference| reference["kind"] == "reexport_all")
+        .context("missing wildcard re-export")?;
+    assert_eq!(wildcard["resolved_url"], SHARED_REEXPORTED_URL);
+    assert_eq!(
+        wildcard["resolution_candidates"].as_array().map(Vec::len),
+        Some(2)
+    );
+    let named = shared_references
+        .iter()
+        .find(|reference| reference["kind"] == "reexport_named")
+        .context("missing named re-export")?;
+    assert_eq!(named["resolution"], "ambiguous_document_context");
+    assert!(named["resolved_url"].is_null());
+    assert_eq!(
+        named["resolution_candidates"].as_array().map(Vec::len),
+        Some(2)
+    );
+
     let child_import = reference(code_unit(rows, SHARED_MODULE_URL)?, "./child.js")?;
     assert_eq!(child_import["resolved_url"], SHARED_CHILD_URL);
     assert_eq!(
@@ -774,7 +808,7 @@ fn shared_modules_keep_mapped_and_unmapped_document_contexts() -> Result<()> {
     let edges = graph["edges"]
         .as_array()
         .context("source graph edges missing")?;
-    for source_id in [shared_id, child_id] {
+    for source_id in [shared_id, child_id, reexported_id] {
         let source = format!("resource:{source_id}");
         let pkg_edges = edges
             .iter()
