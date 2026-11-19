@@ -1112,7 +1112,7 @@ fn seed_runtime_script_evidence(
     resource_nodes_by_sha: &BTreeMap<String, Vec<String>>,
     inline_nodes_by_sha: &BTreeMap<String, Vec<String>>,
     budget: &work_budget::WorkBudget,
-) -> Result<BTreeMap<(String, String), String>> {
+) -> Result<(BTreeMap<(String, String), String>, BTreeMap<String, String>)> {
     // Debugger-observed runtime scripts are provenance, not independent resources.
     let family_counts = runtime_family_counts(runtime, "alpine_families");
     let gtm_family_counts = runtime_family_counts(runtime, "gtm_families");
@@ -1190,11 +1190,9 @@ fn seed_runtime_script_evidence(
         add_runtime_generated_code_edges(graph, generated, &runtime_node)?;
         add_runtime_classification_edges(graph, source, digest, &runtime_node, &context)?;
     }
-    Ok(runtime_node_by_instance)
+    Ok((runtime_node_by_instance, runtime_general_paths))
 }
 
-/// Link debugger pause, next-step, AST-guard and callable-definition witnesses
-/// only to exact runtime instances when their CDP session, script ID and SHA agree.
 /// A debugger frame is exact only when its session/script ID identifies one
 /// runtime source and its captured SHA agrees with that source.
 fn exact_runtime_frame_identity<'a>(
@@ -1403,6 +1401,8 @@ fn add_observed_callable_witnesses(
     Ok(())
 }
 
+/// Link debugger pause, next-step, AST-guard and callable-definition witnesses
+/// only to exact runtime instances when their CDP session, script ID and SHA agree.
 fn seed_selective_trace_witnesses(
     graph: &mut GraphBuilder,
     selective_trace: &Value,
@@ -1515,7 +1515,7 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
     let (inline_nodes, inline_nodes_by_sha) =
         seed_captured_inline_scripts(&mut graph, &manifest, &budget)?;
 
-    let runtime_node_by_instance = seed_runtime_script_evidence(
+    let (runtime_node_by_instance, runtime_general_paths) = seed_runtime_script_evidence(
         &mut graph,
         &runtime,
         &source_index,
@@ -2535,7 +2535,7 @@ mod tests {
             work_budget::BudgetLimits::unlimited(),
         );
         let mut graph = GraphBuilder::default();
-        let instances = seed_runtime_script_evidence(
+        let (instances, _) = seed_runtime_script_evidence(
             &mut graph,
             &runtime,
             &json!({"units":[]}),
