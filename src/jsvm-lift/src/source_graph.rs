@@ -1609,24 +1609,53 @@ fn seed_runtime_wasm_observations(
     Ok(())
 }
 
-/// Attach only successfully recovered originals to their exact map resource
-/// or to the uncertainty-preserving map-resolution evidence node.
-fn add_sourcemap_recovered_sources(
+/// The two recovered-source stages differ only in their observed artifact
+/// category and ownership. The parent must be resolved separately: an exact
+/// map resource or the map-reference evidence node for originals, and an
+/// optional composed-map node for final composed sources.
+#[derive(Clone, Copy)]
+enum RecoveredMapStage {
+    Original,
+    Composed,
+}
+
+impl RecoveredMapStage {
+    fn fields(self) -> (&'static str, &'static str, &'static str, &'static str) {
+        match self {
+            Self::Original => (
+                "recovered",
+                "sourcemap-source",
+                "sourcemap_source",
+                "source_map_source",
+            ),
+            Self::Composed => (
+                "composed_recovered",
+                "sourcemap-final",
+                "sourcemap_composed_source",
+                "source_map_composed_source",
+            ),
+        }
+    }
+}
+
+fn add_recovered_sourcemap_sources(
     graph: &mut GraphBuilder,
     source_map: &Value,
     resource_id: u64,
-    map_node: &str,
+    parent: &str,
+    stage: RecoveredMapStage,
 ) -> Result<()> {
-    for recovered in array_field(source_map, "recovered") {
+    let (source_field, node_prefix, node_type, edge_kind) = stage.fields();
+    for recovered in array_field(source_map, source_field) {
         if string_field(recovered, "status") != Some("recovered") {
             continue;
         }
         let ordinal = u64_field(recovered, "ordinal").unwrap_or(0);
-        let node_id = format!("sourcemap-source:{resource_id}:{ordinal}");
+        let node_id = format!("{node_prefix}:{resource_id}:{ordinal}");
         graph.add_node(
             node_id.clone(),
             json!({
-                "type":"sourcemap_source",
+                "type":node_type,
                 "parent_resource_id":resource_id,
                 "ordinal":ordinal,
                 "logical_source":field(recovered,"logical_source"),
@@ -1634,14 +1663,8 @@ fn add_sourcemap_recovered_sources(
                 "bytes":field(recovered,"bytes"),
             }),
         )?;
-        graph.add_edge(
-            map_node,
-            &node_id,
-            "source_map_source",
-            json!({"ordinal":ordinal}),
-        )?;
+        graph.add_edge(parent, &node_id, edge_kind, json!({"ordinal":ordinal}))?;
     }
-
     Ok(())
 }
 
@@ -1714,41 +1737,6 @@ fn add_sourcemap_chain_links(
     Ok(())
 }
 
-/// The composed-source owner is the composed map when published, otherwise
-/// the original map or map-resolution evidence node.
-fn add_composed_sourcemap_sources(
-    graph: &mut GraphBuilder,
-    source_map: &Value,
-    resource_id: u64,
-    parent: &str,
-) -> Result<()> {
-    for recovered in array_field(source_map, "composed_recovered") {
-        if string_field(recovered, "status") != Some("recovered") {
-            continue;
-        }
-        let ordinal = u64_field(recovered, "ordinal").unwrap_or(0);
-        let node_id = format!("sourcemap-final:{resource_id}:{ordinal}");
-        graph.add_node(
-            node_id.clone(),
-            json!({
-                "type":"sourcemap_composed_source",
-                "parent_resource_id":resource_id,
-                "ordinal":ordinal,
-                "logical_source":field(recovered,"logical_source"),
-                "source_path":field(recovered,"source_path"),
-                "bytes":field(recovered,"bytes"),
-            }),
-        )?;
-        graph.add_edge(
-            parent,
-            &node_id,
-            "source_map_composed_source",
-            json!({"ordinal":ordinal}),
-        )?;
-    }
-    Ok(())
-}
-
 /// Build a composed map node only when composition actually produced a map.
 fn add_sourcemap_composition(
     graph: &mut GraphBuilder,
@@ -1779,7 +1767,13 @@ fn add_sourcemap_composition(
 
     add_sourcemap_chain_links(graph, composition, resource_id, map_node)?;
     let parent = composed_node.as_deref().unwrap_or(map_node);
-    add_composed_sourcemap_sources(graph, source_map, resource_id, parent)?;
+    add_recovered_sourcemap_sources(
+        graph,
+        source_map,
+        resource_id,
+        parent,
+        RecoveredMapStage::Composed,
+    )?;
     Ok(())
 }
 
@@ -1798,7 +1792,13 @@ fn seed_sourcemap_evidence(
         let src = format!("resource:{resource_id}");
         let map_node = add_sourcemap_reference(graph, source_map, &src, resource_id)?;
 
-        add_sourcemap_recovered_sources(graph, source_map, resource_id, &map_node)?;
+        add_recovered_sourcemap_sources(
+            graph,
+            source_map,
+            resource_id,
+            &map_node,
+            RecoveredMapStage::Original,
+        )?;
         add_sourcemap_composition(graph, source_map, resource_id, &map_node)?;
     }
     Ok(())
