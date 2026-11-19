@@ -27,7 +27,7 @@ pub(super) fn seed_generated_and_vm_evidence(
 ) -> Result<()> {
     // Static Function(...) recovery is a generated-code provenance edge.
     let mut sources = BTreeMap::<(u64, u64), DynamicSource>::new();
-    let mut child_scan_ids = BTreeSet::<u64>::new();
+    let mut child_claims = BTreeMap::<u64, (u64, u64)>::new();
     for dynamic in array_field(jsvm, "dynamic_code_units") {
         budget.checkpoint()?;
         let parent_scan_id = required_u64(dynamic, "parent_scan_id", "dynamic code unit")?;
@@ -81,7 +81,9 @@ pub(super) fn seed_generated_and_vm_evidence(
         let child_scan_id = u64_field(dynamic, "child_scan_id");
         if let Some(child_scan_id) = child_scan_id {
             anyhow::ensure!(
-                child_scan_ids.insert(child_scan_id),
+                child_claims
+                    .insert(child_scan_id, (parent_scan_id, ordinal))
+                    .is_none(),
                 "multiple generated sources claim child scan id {child_scan_id}"
             );
         }
@@ -110,6 +112,18 @@ pub(super) fn seed_generated_and_vm_evidence(
             scan_ids.insert(scan_id),
             "duplicate code unit scan id {scan_id}"
         );
+        // A generated site can claim a child scan ID only for that exact
+        // generated code-unit row. An inconsistent capture must not allow a
+        // resource-root row with that ID to parent nested generated evidence.
+        if let Some(&claimed_identity) = child_claims.get(&scan_id) {
+            let actual_identity =
+                u64_field(unit, "parent_scan_id").zip(u64_field(unit, "parent_dynamic_ordinal"));
+            if string_field(unit, "origin") != Some("generated_dynamic_code")
+                || actual_identity != Some(claimed_identity)
+            {
+                continue;
+            }
+        }
         let parent = if string_field(unit, "origin") == Some("generated_dynamic_code") {
             // Both sides must agree on the exact generated-site identity and
             // scan linkage. Never synthesize a parent node for missing or stale
@@ -311,6 +325,36 @@ mod tests {
             graph.nodes["devirtualized:88:table:1"]["type"],
             "devirtualized_vm"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn generated_child_claims_cannot_impersonate_capture_roots() -> Result<()> {
+        let jsvm = json!({
+            "code_units": [
+                {"scan_id":1, "resource_id":7},
+                {"scan_id":2, "resource_id":8}
+            ],
+            "dynamic_code_units": [
+                {"parent_scan_id":1, "ordinal":1, "child_scan_id":2},
+                {"parent_scan_id":2, "ordinal":3}
+            ],
+            "devirtualized_units": [
+                {"parent_scan_id":2, "vm_ordinal":4, "vm_kind":"table"}
+            ]
+        });
+        let mut graph = GraphBuilder::default();
+        seed_generated_and_vm_evidence(&mut graph, &jsvm, &BTreeMap::new(), &budget())?;
+        assert!(graph
+            .edges
+            .iter()
+            .any(|edge| edge["kind"] == "generated_code"
+                && edge["from"] == "resource:7"
+                && edge["to"] == "dynamic:1:1"));
+        assert!(!graph.edges.iter().any(|edge| edge["from"] == "resource:8"
+            || edge["to"] == "dynamic:2:3"
+            || edge["kind"] == "devirtualized_vm"));
+        assert!(graph.nodes.contains_key("dynamic:2:3"));
         Ok(())
     }
 
