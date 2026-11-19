@@ -1584,7 +1584,7 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
                     .as_str()
                     .map_or_else(|| script_id.to_string(), ToString::to_string),
             );
-            if let Some(runtime_node) = runtime_node_by_instance.get(&key) {
+            if let Some(runtime_node) = runtime_index.instances.get(&key) {
                 source_nodes.push(runtime_node.clone());
             }
         }
