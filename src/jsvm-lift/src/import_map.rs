@@ -31,18 +31,17 @@ pub(crate) fn join_url(base: &str, value: &str) -> Option<String> {
 }
 
 fn url_like(base_url: Option<&str>, specifier: &str) -> Option<String> {
-    let specifier = specifier.trim();
     if specifier.is_empty() {
         return None;
     }
-    if absolute_url(specifier) {
-        return Some(specifier.to_owned());
+    if let Ok(url) = Url::parse(specifier) {
+        return Some(url.to_string());
     }
-    if specifier.starts_with("//") {
-        let base = Url::parse(base_url?).ok()?;
-        return Some(format!("{}:{specifier}", base.scheme()));
-    }
-    if specifier.starts_with("./") || specifier.starts_with("../") || specifier.starts_with('/') {
+    if specifier.starts_with("//")
+        || specifier.starts_with("./")
+        || specifier.starts_with("../")
+        || specifier.starts_with('/')
+    {
         return join_url(base_url?, specifier);
     }
     None
@@ -255,7 +254,6 @@ pub(crate) fn resolve_with_import_map(
     specifier: &str,
     import_map: Option<&ImportMap>,
 ) -> Value {
-    let specifier = specifier.trim();
     let normalized_url = url_like(base_url, specifier);
     let normalized = normalized_url.as_deref().unwrap_or(specifier);
     if let (Some(import_map), Some(base_url)) = (import_map, base_url) {
@@ -295,6 +293,37 @@ pub(crate) fn resolve_with_import_map(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bare_specifiers_preserve_whitespace_and_absolute_urls_are_canonical() {
+        let mut warnings = Vec::new();
+        let map = parse_import_map(
+            "https://app.test/index.html",
+            &serde_json::json!({
+                "imports": {
+                    " pkg ": "/spaced.js",
+                    "pkg": "/plain.js",
+                    "https://APP.TEST:443/CAPS.js": "/canonical.js"
+                }
+            }),
+            &mut warnings,
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let spaced = resolve_with_import_map(Some("https://app.test/main.js"), " pkg ", Some(&map));
+        assert_eq!(spaced["resolved_url"], "https://app.test/spaced.js");
+        assert_eq!(spaced["bare_specifier"], true);
+        let plain = resolve_with_import_map(Some("https://app.test/main.js"), "pkg", Some(&map));
+        assert_eq!(plain["resolved_url"], "https://app.test/plain.js");
+        let canonical = resolve_with_import_map(
+            Some("https://app.test/main.js"),
+            "https://app.test/CAPS.js",
+            Some(&map),
+        );
+        assert_eq!(canonical["resolved_url"], "https://app.test/canonical.js");
+        let missing =
+            resolve_with_import_map(Some("https://app.test/main.js"), " missing ", Some(&map));
+        assert_eq!(missing["resolution"], "unresolved_bare");
+    }
 
     #[test]
     fn import_map_normalizes_url_keys_and_addresses() {
