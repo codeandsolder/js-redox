@@ -1620,7 +1620,7 @@ enum RecoveredMapStage {
 }
 
 impl RecoveredMapStage {
-    fn fields(self) -> (&'static str, &'static str, &'static str, &'static str) {
+    const fn fields(self) -> (&'static str, &'static str, &'static str, &'static str) {
         match self {
             Self::Original => (
                 "recovered",
