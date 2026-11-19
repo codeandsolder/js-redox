@@ -1073,10 +1073,10 @@ fn add_runtime_classification_edges(
             }
         }
         Some("document_inline_script") => {
-            add_runtime_document_inline_edges(graph, source, runtime_node)?
+            add_runtime_document_inline_edges(graph, source, runtime_node)?;
         }
         Some("alpine_expression") => {
-            add_runtime_alpine_edges(graph, alpine, runtime_node, context.family_counts)?
+            add_runtime_alpine_edges(graph, alpine, runtime_node, context.family_counts)?;
         }
         Some("gtm_custom_javascript") => {
             if let Some(shape) = nonempty_string_field(gtm, "shape") {
@@ -1102,6 +1102,13 @@ fn add_runtime_classification_edges(
     Ok(())
 }
 
+/// Identity and source-path indices shared with later observed and derived
+/// graph stages. The source-path index is not evidence of script execution.
+struct RuntimeSourceGraphIndex {
+    instances: BTreeMap<(String, String), String>,
+    general_paths: BTreeMap<String, String>,
+}
+
 /// Register runtime script observations without treating URL/SHA coincidence as execution proof.
 /// Conflicting (CDP session, script ID) assertions cannot identify any runtime source.
 fn seed_runtime_script_evidence(
@@ -1112,7 +1119,7 @@ fn seed_runtime_script_evidence(
     resource_nodes_by_sha: &BTreeMap<String, Vec<String>>,
     inline_nodes_by_sha: &BTreeMap<String, Vec<String>>,
     budget: &work_budget::WorkBudget,
-) -> Result<(BTreeMap<(String, String), String>, BTreeMap<String, String>)> {
+) -> Result<RuntimeSourceGraphIndex> {
     // Debugger-observed runtime scripts are provenance, not independent resources.
     let family_counts = runtime_family_counts(runtime, "alpine_families");
     let gtm_family_counts = runtime_family_counts(runtime, "gtm_families");
@@ -1190,7 +1197,10 @@ fn seed_runtime_script_evidence(
         add_runtime_generated_code_edges(graph, generated, &runtime_node)?;
         add_runtime_classification_edges(graph, source, digest, &runtime_node, &context)?;
     }
-    Ok((runtime_node_by_instance, runtime_general_paths))
+    Ok(RuntimeSourceGraphIndex {
+        instances: runtime_node_by_instance,
+        general_paths: runtime_general_paths,
+    })
 }
 
 /// A debugger frame is exact only when its session/script ID identifies one
@@ -1225,7 +1235,7 @@ fn add_observed_pause_frames(
         };
         graph.add_edge(
             &expected,
-            &node_id,
+            node_id,
             "observed_paused_call_frame",
             json!({
                 "stack_depth":depth,
@@ -1271,7 +1281,7 @@ fn add_observed_steps(
             }),
         )?;
         graph.add_edge(
-            &node_id,
+            node_id,
             &step_id,
             "observed_next_step",
             json!({
@@ -1372,7 +1382,7 @@ fn add_observed_callable_witnesses(
                 add_observed_callable_definition(
                     graph,
                     runtime_node_by_instance,
-                    &node_id,
+                    node_id,
                     session,
                     value,
                     scope_type,
@@ -1390,7 +1400,7 @@ fn add_observed_callable_witnesses(
             add_observed_callable_definition(
                 graph,
                 runtime_node_by_instance,
-                &node_id,
+                node_id,
                 session,
                 value,
                 "expression",
@@ -1515,7 +1525,7 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
     let (inline_nodes, inline_nodes_by_sha) =
         seed_captured_inline_scripts(&mut graph, &manifest, &budget)?;
 
-    let (runtime_node_by_instance, runtime_general_paths) = seed_runtime_script_evidence(
+    let runtime_index = seed_runtime_script_evidence(
         &mut graph,
         &runtime,
         &source_index,
@@ -1527,7 +1537,7 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
     seed_selective_trace_witnesses(
         &mut graph,
         &selective_trace,
-        &runtime_node_by_instance,
+        &runtime_index.instances,
         &budget,
     )?;
 
@@ -1681,7 +1691,7 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
                         .strip_prefix("resources/runtime-scripts/")?
                         .strip_suffix(".js")?;
                     if string_field(unit, "input_sha256") != Some(digest)
-                        || !runtime_general_paths.contains_key(digest)
+                        || !runtime_index.general_paths.contains_key(digest)
                     {
                         return None;
                     }
@@ -2488,8 +2498,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn runtime_script_collisions_cannot_turn_pauses_into_exact_execution_proof() -> Result<()> {
+    fn conflicting_runtime_instance_fixture() -> (String, Value, Value) {
         let first = "a".repeat(64);
         let second = "b".repeat(64);
         let runtime = json!({
@@ -2530,12 +2539,18 @@ mod tests {
              "steps":[{"frames":[{"source_identity":"inferred","sourceSha256":second,
                  "location":{"scriptId":"7"}}]}]}
         ]});
+        (second, runtime, trace)
+    }
+
+    #[test]
+    fn runtime_script_collisions_cannot_turn_pauses_into_exact_execution_proof() -> Result<()> {
+        let (second, runtime, trace) = conflicting_runtime_instance_fixture();
         let budget = work_budget::WorkBudget::new(
             "runtime-source-witness-identity",
             work_budget::BudgetLimits::unlimited(),
         );
         let mut graph = GraphBuilder::default();
-        let (instances, _) = seed_runtime_script_evidence(
+        let runtime_index = seed_runtime_script_evidence(
             &mut graph,
             &runtime,
             &json!({"units":[]}),
@@ -2544,12 +2559,13 @@ mod tests {
             &BTreeMap::new(),
             &budget,
         )?;
+        let instances = &runtime_index.instances;
         assert!(!instances.contains_key(&("worker".into(), "7".into())));
         assert_eq!(
             instances.get(&("other".into(), "7".into())),
             Some(&format!("runtime:{}", &second[..20]))
         );
-        seed_selective_trace_witnesses(&mut graph, &trace, &instances, &budget)?;
+        seed_selective_trace_witnesses(&mut graph, &trace, instances, &budget)?;
         let identity_edges = graph
             .edges
             .iter()
