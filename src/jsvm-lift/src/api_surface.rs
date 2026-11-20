@@ -19,6 +19,7 @@ const STANDARD_BROWSER_API_ASSUMPTION: &str = "standard_browser_api_binding_sema
 use work_budget::WorkBudget;
 
 mod callables;
+mod forwarding;
 use callables::{ApiArguments, ApiKind, Callable, CallableIndex};
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Serialize)]
@@ -31,6 +32,10 @@ pub struct ApiCallsite {
     pub callee: String,
     pub api_origin: String,
     pub invocation_form: String,
+    /// Final underlying sink expression when this row specializes a local
+    /// wrapper invocation (not evidence that either expression executed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub forwarded_sink_span: Option<[u32; 2]>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub binding_witnesses: Vec<ApiBindingWitness>,
     pub proof: String,
@@ -385,6 +390,7 @@ const MUTATION_TARGETS: &[(&str, &[&str], usize)] = &[
         &["XMLHttpRequest", "prototype", "open"],
         2,
     ),
+    ("rest_iterator", &["Array", "prototype"], 2),
     ("function_bind", &["Function", "prototype", "bind"], 2),
     ("function_call", &["Function", "prototype", "call"], 2),
     ("function_apply", &["Function", "prototype", "apply"], 2),
@@ -450,6 +456,7 @@ fn mutation_prefix_matches(path: &[Option<String>], target: &[&str]) -> bool {
 
 #[derive(Default)]
 struct SinkMutations {
+    wrapper_globals: std::collections::BTreeMap<String, String>,
     definite: BTreeSet<String>,
     possible: BTreeSet<String>,
     sites: BTreeSet<ApiMutationSite>,
@@ -482,6 +489,18 @@ impl SinkMutations {
                         && mutation_prefix_matches(normalized, target)
                     {
                         affected.push(family.to_owned());
+                    }
+                }
+                if let [Some(array), Some(prototype), None] = normalized {
+                    if array == "Array" && prototype == "prototype" {
+                        affected.push("rest_iterator".to_owned());
+                    }
+                }
+                if let [key] = normalized {
+                    if let Some(key) = key {
+                        affected.extend(self.wrapper_globals.get(key).cloned());
+                    } else {
+                        affected.extend(self.wrapper_globals.values().cloned());
                     }
                 }
                 for &(family, target) in OWN_DISPATCH_TARGETS {
@@ -927,6 +946,16 @@ impl Collector<'_, '_> {
     }
 
     fn emit_invocation(&mut self, callee: &Expression<'_>, callable: Callable, span: Span) {
+        self.emit_forwarded(callee, callable, span, &BTreeSet::new());
+    }
+
+    fn emit_forwarded(
+        &mut self,
+        callee: &Expression<'_>,
+        callable: Callable,
+        span: Span,
+        forwarding_dependencies: &BTreeSet<String>,
+    ) {
         if callable.kind == ApiKind::XhrConstructor {
             return;
         }
@@ -949,7 +978,11 @@ impl Collector<'_, '_> {
                 affected.insert(family.to_owned());
             }
         }
-        for dependency in callable.dispatch_dependencies() {
+        for dependency in callable
+            .dispatch_dependencies()
+            .into_iter()
+            .chain(forwarding_dependencies.iter().cloned())
+        {
             if self.mutations.any(&dependency) {
                 mutated = true;
                 affected.insert(dependency);
@@ -978,7 +1011,9 @@ impl Collector<'_, '_> {
             method.2 = Some("conditional".into());
         }
         let proof = if mutated {
-            if callable.captured || callable.constructor_captured {
+            if callable.invocation_form() == "wrapper" {
+                "forwarded_api_binding_or_local_wrapper_may_be_mutated"
+            } else if callable.captured || callable.constructor_captured {
                 "captured_api_binding_or_native_dispatch_may_be_mutated"
             } else {
                 match callable.kind {
@@ -993,6 +1028,8 @@ impl Collector<'_, '_> {
             }
         } else if escaped {
             "unreassigned_binding_initialized_from_standard_XMLHttpRequest_but_receiver_escapes_or_is_mutable"
+        } else if callable.invocation_form() == "wrapper" {
+            "stable_local_wrapper_with_semantically_forwarded_arguments"
         } else if matches!(
             callable.invocation_form(),
             "call" | "apply" | "reflect_apply"
@@ -1019,6 +1056,7 @@ impl Collector<'_, '_> {
             callee: callee_text,
             api_origin: callable.kind.canonical_path().to_owned(),
             invocation_form: callable.invocation_form().to_owned(),
+            forwarded_sink_span: callable.forwarded_sink_span,
             binding_witnesses: callable.witnesses(),
             proof: proof.to_owned(),
             binding_status: if candidate { "candidate" } else { "standard" }.to_owned(),
@@ -1107,6 +1145,7 @@ pub fn analyze_api_surface(source: &str, budget: &WorkBudget) -> Result<ApiSurfa
 
         let semantic = SemanticBuilder::new()
             .with_check_syntax_error(true)
+            .with_build_nodes(true)
             .build(&program);
         if !semantic.diagnostics.is_empty() {
             continue;
@@ -1119,13 +1158,22 @@ pub fn analyze_api_surface(source: &str, budget: &WorkBudget) -> Result<ApiSurfa
         let callables = CallableIndex::collect(&program, source, scoping, &constants);
         budget.checkpoint()?;
 
+        let wrappers = forwarding::WrapperIndex::collect(&semantic.semantic, budget)?;
+        let wrapper_globals = wrappers
+            .root_mutation_targets()
+            .map(|(name, family)| (name.to_owned(), family))
+            .collect();
+
         let mut mutations = SinkMutationCollector {
             source,
             lines: LineIndex::new(source),
             scoping,
             constants: &constants,
             callables: &callables,
-            mutations: SinkMutations::default(),
+            mutations: SinkMutations {
+                wrapper_globals,
+                ..SinkMutations::default()
+            },
         };
         mutations.visit_program(&program);
         budget.checkpoint()?;
@@ -1152,6 +1200,19 @@ pub fn analyze_api_surface(source: &str, budget: &WorkBudget) -> Result<ApiSurfa
             callsites: BTreeSet::new(),
         };
         collector.visit_program(&program);
+        budget.checkpoint()?;
+        for node in semantic.semantic.nodes().iter() {
+            budget.consume(1)?;
+            if let oxc_ast::AstKind::CallExpression(call) = node.kind() {
+                forwarding::specialize(
+                    call,
+                    &semantic.semantic,
+                    &wrappers,
+                    &mut collector,
+                    budget,
+                )?;
+            }
+        }
         budget.checkpoint()?;
         let mut callsites = collector.callsites.into_iter().collect::<Vec<_>>();
         callsites.sort_by(|left, right| {
@@ -1215,6 +1276,197 @@ xhr.send(payload);
         assert_eq!(rows[5].kind, "xhr_open");
         assert_eq!(rows[5].method.as_deref(), Some("POST"));
         assert_eq!(rows[5].line, 8);
+        Ok(())
+    }
+
+    #[test]
+    fn wrapper_chains_specialize_reordered_arguments_without_losing_original_sink() -> Result<()> {
+        let source = r#"
+function send(url, init) { return fetch(url, init); }
+const relay = (ignored, init, url) => send(url, init);
+const alias = relay;
+alias(17, {method: "PATCH"}, "https://example.test/one");
+alias(18, {method: "POST"}, "/two");
+"#;
+        let rows = analyze_api_surface(source)?;
+        assert_eq!(rows.len(), 4, "{rows:#?}");
+        let original = rows
+            .iter()
+            .find(|row| row.callee == "fetch")
+            .context("missing original sink")?;
+        assert!(original.forwarded_sink_span.is_none());
+        assert!(original.url.is_none());
+        let specialized = rows
+            .iter()
+            .filter(|row| row.callee == "alias")
+            .collect::<Vec<_>>();
+        assert_eq!(specialized.len(), 2);
+        assert_eq!(
+            specialized[0].url.as_deref(),
+            Some("https://example.test/one")
+        );
+        assert_eq!(specialized[0].method.as_deref(), Some("PATCH"));
+        assert_eq!(specialized[1].method.as_deref(), Some("POST"));
+        for row in specialized {
+            assert_eq!(row.invocation_form, "wrapper");
+            assert_eq!(row.binding_status, "standard");
+            assert_eq!(
+                row.forwarded_sink_span,
+                Some([original.start, original.end])
+            );
+            assert_eq!(
+                row.binding_witnesses
+                    .iter()
+                    .filter(|w| w.kind == "wrapper_definition")
+                    .count(),
+                2
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn wrappers_forward_callable_values_and_rest_without_inventing_receivers() -> Result<()> {
+        let source = r#"
+const invoke = (fn, ...args) => fn(...args);
+const send = navigator.sendBeacon.bind(navigator);
+invoke(fetch, "/fetch", {method: "PUT"});
+invoke(navigator.sendBeacon, "/detached", payload);
+invoke(send, "/beacon", payload);
+invoke(fetch.bind(window, "/bound"), {method: "DELETE"});
+"#;
+        let rows = analyze_api_surface(source)?;
+        assert_eq!(rows.len(), 3, "{rows:#?}");
+        assert!(rows
+            .iter()
+            .all(|row| row.invocation_form == "wrapper" && row.binding_status == "standard"));
+        assert_eq!(rows[0].url.as_deref(), Some("/fetch"));
+        assert_eq!(rows[0].method.as_deref(), Some("PUT"));
+        assert_eq!(rows[1].kind, "send_beacon");
+        assert_eq!(rows[1].url.as_deref(), Some("/beacon"));
+        assert_eq!(rows[2].url.as_deref(), Some("/bound"));
+        assert_eq!(rows[2].method.as_deref(), Some("DELETE"));
+        Ok(())
+    }
+
+    #[test]
+    fn wrapper_constructor_and_inline_arrow_recovery_preserves_invocation_kind() -> Result<()> {
+        let source = r#"
+const Socket = WebSocket.bind(null);
+function connect(url) { return new Socket(url); }
+connect("wss://example.test/live");
+((u) => fetch(u))("/inline");
+const invalid = (u) => WebSocket(u);
+invalid("wss://example.test/bad");
+"#;
+        let rows = analyze_api_surface(source)?;
+        assert_eq!(rows.len(), 4, "{rows:#?}");
+        let specialized = rows
+            .iter()
+            .filter(|row| row.invocation_form == "wrapper")
+            .collect::<Vec<_>>();
+        assert_eq!(specialized.len(), 2);
+        assert_eq!(specialized[0].kind, "websocket");
+        assert_eq!(
+            specialized[0].url.as_deref(),
+            Some("wss://example.test/live")
+        );
+        assert_eq!(specialized[1].url.as_deref(), Some("/inline"));
+        Ok(())
+    }
+
+    #[test]
+    fn wrapper_scope_and_mutation_proof_do_not_invent_exact_local_targets() -> Result<()> {
+        let source = r#"
+function stable(url) { return fetch(url); }
+const root = window;
+root.stable = replacement;
+stable("/candidate");
+function changed(url) { return fetch(url); }
+changed = replacement;
+changed("/not-local");
+function outer(stable) { stable("/shadow"); }
+const recursive = (url) => recursive(url);
+recursive("/recursive");
+const effects = (url, init) => fetch((modify(init), url), init);
+effects("/not-proven", {method: "PATCH"});
+const mapped = function(url) { return fetch((arguments[0] = "/changed", url)); };
+mapped("/not-original");
+function* generator(url) { return fetch(url); }
+generator("/not-executed");
+"#;
+        let analysis =
+            super::analyze_api_surface(source, &WorkBudget::unlimited("wrapper-mutation-proof"))?;
+        let rows = &analysis.callsites;
+        let specialized = rows
+            .iter()
+            .filter(|row| row.invocation_form == "wrapper")
+            .collect::<Vec<_>>();
+        assert_eq!(specialized.len(), 2, "{rows:#?}");
+        assert_eq!(specialized[0].callee, "stable");
+        assert_eq!(specialized[0].kind, "fetch_candidate");
+        assert_eq!(specialized[0].method_status.as_deref(), Some("conditional"));
+        let site = &analysis.mutation_sites[specialized[0].mutation_site_ordinals[0]];
+        assert!(site
+            .affected_families
+            .iter()
+            .any(|family| family.starts_with("wrapper_global:")));
+        assert_eq!(specialized[1].callee, "effects");
+        assert!(specialized[1].url.is_none());
+        assert!(specialized[1].method.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn wrapper_rest_prefixes_preserve_later_formal_positions_and_unknown_spreads() -> Result<()> {
+        let source = r#"
+const leaf = (a, b, c, url, init) => fetch(url, init);
+const duplicate = (...args) => leaf(...args, ...args);
+duplicate(1, {method: "PUT"}, 3, "/known", {method: "PATCH"});
+duplicate(1, 2, ...unknown, "/not-known");
+const omitted = (url, init) => fetch(url, init);
+omitted("/omitted-init");
+Array.prototype[Symbol.iterator] = unsafeIterator;
+"#;
+        let analysis = super::analyze_api_surface(source, &WorkBudget::unlimited("wrapper-rest"))?;
+        let rows = &analysis.callsites;
+        let duplicate = rows
+            .iter()
+            .filter(|row| row.callee == "duplicate")
+            .collect::<Vec<_>>();
+        assert_eq!(duplicate.len(), 2, "{rows:#?}");
+        assert_eq!(duplicate[0].url.as_deref(), Some("/known"));
+        assert_eq!(duplicate[0].method.as_deref(), Some("PATCH"));
+        assert_eq!(duplicate[0].kind, "fetch_candidate");
+        assert_eq!(duplicate[1].url, None);
+        assert_eq!(duplicate[1].method_status.as_deref(), Some("unknown"));
+        assert!(duplicate
+            .iter()
+            .all(|row| row.mutation_site_ordinals == [0]));
+        let omitted = rows
+            .iter()
+            .find(|row| row.callee == "omitted")
+            .context("missing omitted initializer wrapper")?;
+        assert_eq!(omitted.method.as_deref(), Some("GET"));
+        assert!(omitted.mutation_site_ordinals.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn visible_direct_eval_precludes_wrapper_parameter_specialization() -> Result<()> {
+        let source = r#"
+const unsafe = (url) => fetch((eval("url='other'"), url));
+unsafe("/not-proven");
+const safe = (url) => fetch(url);
+safe("/safe");
+"#;
+        let rows = analyze_api_surface(source)?;
+        let wrappers = rows
+            .iter()
+            .filter(|row| row.invocation_form == "wrapper")
+            .collect::<Vec<_>>();
+        assert_eq!(wrappers.len(), 1, "{rows:#?}");
+        assert_eq!(wrappers[0].url.as_deref(), Some("/safe"));
         Ok(())
     }
 
