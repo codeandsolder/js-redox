@@ -23,7 +23,7 @@ fn string_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
 }
 
 /// Analyze every selected JavaScript view in a capture project and persist the
-/// canonical `capture-api-surface/v2` artifact.
+/// canonical `capture-api-surface/v3` artifact.
 ///
 /// # Errors
 ///
@@ -169,6 +169,7 @@ pub fn analyze_project_api_surface(project: &Path, budgets: &AnalysisBudgets) ->
     let summary = json!({
         "units": analyzed_units,
         "callsites": callsites.len(),
+        "candidates": callsites.iter().filter(|row| string_field(row, "binding_status") == Some("candidate")).count(),
         "failures": failures.len(),
         "kinds": kinds,
         "static_urls": callsites.iter().filter(|row| string_field(row, "url").is_some()).count(),

@@ -46,7 +46,7 @@ fn main() -> Result<()> {
     let callsites = analyze_api_surface(&source, &budget)
         .with_context(|| format!("analyzing {}", input.display()))?;
     let report = ApiSurfaceFileReport {
-        schema: "jsvm-api-surface/v2",
+        schema: "jsvm-api-surface/v3",
         input: input.display().to_string(),
         bytes: source.len(),
         callsites,
