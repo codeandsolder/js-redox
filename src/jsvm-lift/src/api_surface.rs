@@ -31,6 +31,9 @@ pub struct ApiCallsite {
     /// "candidate" retains syntax and arguments without proving the API binding.
     pub binding_status: String,
     pub standard_browser_api_semantics_required: bool,
+    /// Stable ordinals into the same source unit's mutation_sites collection.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub mutation_site_ordinals: Vec<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub method: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -41,6 +44,25 @@ pub struct ApiCallsite {
     pub url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url_expression: Option<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+pub struct ApiMutationSite {
+    pub start: u32,
+    pub end: u32,
+    pub line: usize,
+    pub column: usize,
+    pub operation: String,
+    pub certainty: String,
+    pub target_pattern: Vec<Option<String>>,
+    pub affected_families: Vec<String>,
+    pub expression: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+pub struct ApiSurfaceAnalysis {
+    pub callsites: Vec<ApiCallsite>,
+    pub mutation_sites: Vec<ApiMutationSite>,
 }
 
 fn unparenthesized<'a>(mut expression: &'a Expression<'a>) -> &'a Expression<'a> {
@@ -311,28 +333,55 @@ const MUTATION_TARGETS: &[(&str, &[&str])] = &[
 struct SinkMutations {
     definite: BTreeSet<&'static str>,
     possible: BTreeSet<&'static str>,
+    sites: BTreeSet<ApiMutationSite>,
 }
 
 impl SinkMutations {
-    fn record(&mut self, path: &[Option<String>]) {
-        let path = normalized_mutation_path(path);
+    fn record(
+        &mut self,
+        path: &[Option<String>],
+        span: Span,
+        operation: &str,
+        reflective: bool,
+        source: &str,
+        lines: &LineIndex,
+    ) {
+        let normalized = normalized_mutation_path(path);
+        let mut affected = Vec::new();
+        let possible = reflective || normalized.iter().any(Option::is_none);
         for &(family, target) in MUTATION_TARGETS {
-            // Assigning to an ancestor namespace can replace a descendant
-            // binding, while writing below the binding cannot replace it.
-            if path.len() > target.len()
-                || !path
+            // An ancestor write may replace the entire API binding. A write
+            // below that binding cannot replace the binding itself.
+            if normalized.len() > target.len()
+                || !normalized
                     .iter()
                     .zip(target)
                     .all(|(segment, name)| segment.as_deref().is_none_or(|value| value == *name))
             {
                 continue;
             }
-            if path.iter().all(Option::is_some) {
-                self.definite.insert(family);
-            } else {
+            affected.push(family.to_owned());
+            if possible {
                 self.possible.insert(family);
+            } else {
+                self.definite.insert(family);
             }
         }
+        if affected.is_empty() {
+            return;
+        }
+        let (line, column) = lines.line_column(span.start);
+        self.sites.insert(ApiMutationSite {
+            start: span.start,
+            end: span.end,
+            line,
+            column,
+            operation: operation.to_owned(),
+            certainty: if possible { "possible" } else { "definite" }.to_owned(),
+            target_pattern: path.to_vec(),
+            affected_families: affected,
+            expression: source_fragment(source, span),
+        });
     }
 
     fn definitely(&self, family: &str) -> bool {
@@ -341,6 +390,19 @@ impl SinkMutations {
 
     fn possibly(&self, family: &str) -> bool {
         self.possible.contains(family)
+    }
+
+    fn relevant_ordinals(&self, families: &[&str]) -> Vec<usize> {
+        self.sites
+            .iter()
+            .enumerate()
+            .filter_map(|(ordinal, site)| {
+                site.affected_families
+                    .iter()
+                    .any(|family| families.contains(&family.as_str()))
+                    .then_some(ordinal)
+            })
+            .collect()
     }
 }
 
@@ -375,21 +437,78 @@ fn assignment_target_global_path_pattern(
     }
 }
 
-struct SinkMutationCollector<'c> {
+struct SinkMutationCollector<'s, 'c> {
+    source: &'s str,
+    lines: LineIndex,
     scoping: &'c Scoping,
     constants: &'c ProvenConstantEnvironment,
     mutations: SinkMutations,
 }
 
-impl SinkMutationCollector<'_> {
-    fn record(&mut self, path: Option<Vec<Option<String>>>) {
+impl SinkMutationCollector<'_, '_> {
+    fn record(
+        &mut self,
+        path: Option<Vec<Option<String>>>,
+        span: Span,
+        operation: &str,
+        reflective: bool,
+    ) {
         if let Some(path) = path {
-            self.mutations.record(&path);
+            self.mutations
+                .record(&path, span, operation, reflective, self.source, &self.lines);
+        }
+    }
+
+    fn reflective_target(&self, call: &CallExpression<'_>) -> Option<Vec<Option<String>>> {
+        let target = call.arguments.first()?.as_expression()?;
+        global_path_pattern(self.scoping, self.constants, target)
+    }
+
+    fn reflective_key(&self, arg: Option<&oxc_ast::ast::Argument<'_>>) -> Option<String> {
+        let expression = arg?.as_expression()?;
+        static_string(expression, self.scoping, self.constants)
+    }
+
+    /// Object.assign copies own enumerable keys in source order; a spread or
+    /// nonliteral source can introduce arbitrary keys. Traverse nested literal
+    /// spreads instead of discarding their statically exposed property names.
+    fn record_assign_source(
+        &mut self,
+        target: &[Option<String>],
+        source: &Expression<'_>,
+        call_span: Span,
+    ) {
+        if let Expression::ObjectExpression(object) = unparenthesized(source) {
+            for property in &object.properties {
+                match property {
+                    ObjectPropertyKind::ObjectProperty(property) => {
+                        let key = property
+                            .key
+                            .static_name()
+                            .and_then(|name| name.into_cow_str().map(|text| text.into_owned()))
+                            .or_else(|| {
+                                property.key.as_expression().and_then(|expr| {
+                                    static_string(expr, self.scoping, self.constants)
+                                })
+                            });
+                        let mut path = target.to_vec();
+                        path.push(key);
+                        self.record(Some(path), call_span, "Object.assign", true);
+                    }
+                    ObjectPropertyKind::SpreadProperty(spread) => {
+                        self.record_assign_source(target, &spread.argument, call_span);
+                    }
+                }
+            }
+        } else {
+            let mut path = target.to_vec();
+            path.push(None);
+            self.record(Some(path), call_span, "Object.assign", true);
         }
     }
 }
 
-impl<'a> Visit<'a> for SinkMutationCollector<'_> {
+impl<'a> Visit<'a> for SinkMutationCollector<'_, '_> {
     fn visit_assignment_expression(&mut self, assignment: &oxc_ast::ast::AssignmentExpression<'a>) {
         self.record(
             assignment
@@ -398,28 +517,67 @@ impl<'a> Visit<'a> for SinkMutationCollector<'_> {
                 .and_then(|target| {
                     assignment_target_global_path_pattern(self.scoping, self.constants, target)
                 }),
+            assignment.span,
+            "assignment",
+            false,
         );
         walk::walk_assignment_expression(self, assignment);
     }
 
     fn visit_update_expression(&mut self, update: &oxc_ast::ast::UpdateExpression<'a>) {
-        self.record(assignment_target_global_path_pattern(
-            self.scoping,
-            self.constants,
-            &update.argument,
-        ));
+        self.record(
+            assignment_target_global_path_pattern(self.scoping, self.constants, &update.argument),
+            update.span,
+            "update",
+            false,
+        );
         walk::walk_update_expression(self, update);
     }
 
     fn visit_unary_expression(&mut self, unary: &oxc_ast::ast::UnaryExpression<'a>) {
         if unary.operator.as_str() == "delete" {
-            self.record(global_path_pattern(
-                self.scoping,
-                self.constants,
-                &unary.argument,
-            ));
+            self.record(
+                global_path_pattern(self.scoping, self.constants, &unary.argument),
+                unary.span,
+                "delete",
+                false,
+            );
         }
         walk::walk_unary_expression(self, unary);
+    }
+
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        if !call.optional {
+            let method = global_path(self.scoping, self.constants, &call.callee);
+            match method.as_deref() {
+                Some("Object.defineProperty" | "Reflect.set") if call.arguments.len() >= 3 => {
+                    if let Some(mut target) = self.reflective_target(call) {
+                        target.push(self.reflective_key(call.arguments.get(1)));
+                        self.record(
+                            Some(target),
+                            call.span,
+                            method.as_deref().unwrap_or_default(),
+                            true,
+                        );
+                    }
+                }
+                Some("Object.assign") if call.arguments.len() >= 2 => {
+                    if let Some(target) = self.reflective_target(call) {
+                        for source in &call.arguments[1..] {
+                            if let Some(source) = source.as_expression() {
+                                self.record_assign_source(&target, source, call.span);
+                            } else {
+                                let mut path = target.clone();
+                                path.push(None);
+                                self.record(Some(path), call.span, "Object.assign", true);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        walk::walk_call_expression(self, call);
     }
 }
 
@@ -632,6 +790,13 @@ impl Collector<'_, '_> {
                 "standard".to_owned()
             },
             standard_browser_api_semantics_required: true,
+            mutation_site_ordinals: self.mutations.relevant_ordinals(match kind {
+                "fetch_candidate" | "fetch" => &["fetch", "request_init_method_prototype"],
+                "send_beacon_candidate" => &["send_beacon"],
+                "websocket_candidate" => &["websocket"],
+                "xhr_open_candidate" => &["xhr", "xhr_open_method"],
+                _ => &[],
+            }),
             method,
             method_expression,
             method_status,
@@ -856,7 +1021,7 @@ fn contains_with_statement(program: &Program<'_>) -> bool {
 /// # Errors
 ///
 /// Fails on work-budget exhaustion, a `with` statement that makes identifier resolution environment-dependent, or failure to parse and semantically validate the source in supported JavaScript modes.
-pub fn analyze_api_surface(source: &str, budget: &WorkBudget) -> Result<Vec<ApiCallsite>> {
+pub fn analyze_api_surface(source: &str, budget: &WorkBudget) -> Result<ApiSurfaceAnalysis> {
     budget.checkpoint()?;
     for source_type in [SourceType::unambiguous(), SourceType::cjs()] {
         let allocator = Allocator::default();
@@ -891,6 +1056,8 @@ pub fn analyze_api_surface(source: &str, budget: &WorkBudget) -> Result<Vec<ApiC
         budget.checkpoint()?;
 
         let mut mutations = SinkMutationCollector {
+            source,
+            lines: LineIndex::new(source),
             scoping,
             constants: &constants,
             mutations: SinkMutations::default(),
@@ -930,7 +1097,10 @@ pub fn analyze_api_surface(source: &str, budget: &WorkBudget) -> Result<Vec<ApiC
                 right.kind.as_str(),
             ))
         });
-        return Ok(callsites);
+        return Ok(ApiSurfaceAnalysis {
+            callsites,
+            mutation_sites: mutations.mutations.sites.into_iter().collect(),
+        });
     }
 
     Err(anyhow!(
@@ -946,7 +1116,10 @@ mod tests {
     use work_budget::WorkBudget;
 
     fn analyze_api_surface(source: &str) -> Result<Vec<ApiCallsite>> {
-        analyze_api_surface_budgeted(source, &WorkBudget::unlimited("api-surface-test"))
+        Ok(
+            analyze_api_surface_budgeted(source, &WorkBudget::unlimited("api-surface-test"))?
+                .callsites,
+        )
     }
 
     #[test]
@@ -978,6 +1151,203 @@ xhr.send(payload);
         assert_eq!(rows[5].kind, "xhr_open");
         assert_eq!(rows[5].method.as_deref(), Some("POST"));
         assert_eq!(rows[5].line, 8);
+        Ok(())
+    }
+
+    #[test]
+    fn reflective_define_property_preserves_candidate_and_mutation_witness() -> Result<()> {
+        let src = r#"
+const key = "fe" + "tch";
+Object.defineProperty(window, key, { value: replacement });
+fetch("https://api.example.test/one", { method: "POST" });
+navigator.sendBeacon("https://api.example.test/two", payload);
+"#;
+        let result =
+            super::analyze_api_surface(src, &WorkBudget::unlimited("reflective-define-property"))?;
+        assert_eq!(result.callsites.len(), 2);
+        assert_eq!(result.mutation_sites.len(), 1, "{result:#?}");
+        let site = &result.mutation_sites[0];
+        assert_eq!(site.operation, "Object.defineProperty");
+        assert_eq!(site.certainty, "possible");
+        assert_eq!(
+            site.target_pattern,
+            vec![Some("window".into()), Some("fetch".into())]
+        );
+        assert_eq!(site.affected_families, ["fetch"]);
+        assert!(site.expression.starts_with("Object.defineProperty"));
+        assert_eq!(result.callsites[0].kind, "fetch_candidate");
+        assert_eq!(
+            result.callsites[0].method_status.as_deref(),
+            Some("conditional")
+        );
+        assert_eq!(result.callsites[0].mutation_site_ordinals, [0]);
+        assert_eq!(result.callsites[1].kind, "send_beacon");
+        assert!(result.callsites[1].mutation_site_ordinals.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn reflective_set_and_unknown_key_maintain_narrow_mutation_provenance() -> Result<()> {
+        let src = r#"
+const key = runtimeKey();
+Reflect.set(navigator, key, replacement);
+fetch("https://api.example.test/safe");
+navigator.sendBeacon("https://api.example.test/uncertain", payload);
+const xhr = new XMLHttpRequest();
+xhr.open("GET", "https://api.example.test/xhr");
+"#;
+        let result = super::analyze_api_surface(src, &WorkBudget::unlimited("reflective-set"))?;
+        assert_eq!(result.callsites.len(), 3);
+        assert_eq!(result.mutation_sites.len(), 1);
+        assert_eq!(result.mutation_sites[0].operation, "Reflect.set");
+        assert_eq!(
+            result.mutation_sites[0].target_pattern,
+            vec![Some("navigator".into()), None,]
+        );
+        assert_eq!(result.mutation_sites[0].affected_families, ["send_beacon"]);
+        assert_eq!(result.callsites[0].kind, "fetch");
+        assert_eq!(result.callsites[1].kind, "send_beacon_candidate");
+        assert_eq!(result.callsites[1].mutation_site_ordinals, [0]);
+        assert_eq!(result.callsites[2].kind, "xhr_open");
+        Ok(())
+    }
+
+    #[test]
+    fn assign_literal_keys_and_spreads_emit_precise_mutation_sites() -> Result<()> {
+        let src = r#"
+const key = "Web" + "Socket";
+Object.assign(window, {
+    fetch: replacement,
+    [key]: CustomSocket,
+    ...{ navigator: alteredNavigator },
+    ...external,
+    irrelevant: 1
+});
+fetch("https://api.example.test/uncertain");
+navigator.sendBeacon("https://api.example.test/uncertain", data);
+new WebSocket("wss://api.example.test/uncertain");
+const xhr = new XMLHttpRequest();
+xhr.open("POST", "https://api.example.test/uncertain");
+"#;
+        let result =
+            super::analyze_api_surface(src, &WorkBudget::unlimited("assign-literal-and-spread"))?;
+        assert_eq!(result.callsites.len(), 4);
+        assert_eq!(
+            result
+                .callsites
+                .iter()
+                .map(|row| row.kind.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "fetch_candidate",
+                "send_beacon_candidate",
+                "websocket_candidate",
+                "xhr_open_candidate"
+            ]
+        );
+        assert!(result.mutation_sites.len() >= 4, "{result:#?}");
+        assert!(result
+            .mutation_sites
+            .iter()
+            .all(|site| site.operation == "Object.assign" && site.certainty == "possible"));
+        for (idx, row) in result.callsites.iter().enumerate() {
+            assert!(!row.mutation_site_ordinals.is_empty(), "{idx}: {row:#?}");
+            for &ordinal in &row.mutation_site_ordinals {
+                assert!(ordinal < result.mutation_sites.len());
+            }
+        }
+        assert!(result.mutation_sites.iter().any(|site| {
+            site.target_pattern == [Some("window".into()), Some("WebSocket".into())]
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn reflective_method_and_xhr_prototype_writes_keep_specific_inference_boundaries() -> Result<()>
+    {
+        let src = r#"
+Object.defineProperty(Object.prototype, "method", {value: "DELETE"});
+Object.assign(XMLHttpRequest.prototype, {open: customOpen});
+fetch("https://api.example.test/implicit", {});
+fetch("https://api.example.test/own", {method: "PATCH"});
+fetch("https://api.example.test/omitted");
+const xhr = new XMLHttpRequest();
+xhr.open("POST", "https://api.example.test/xhr");
+"#;
+        let result =
+            super::analyze_api_surface(src, &WorkBudget::unlimited("reflective-prototypes"))?;
+        assert_eq!(result.callsites.len(), 4);
+        assert_eq!(result.callsites[0].kind, "fetch");
+        assert_eq!(
+            result.callsites[0].method_status.as_deref(),
+            Some("unknown")
+        );
+        assert_eq!(result.callsites[1].method.as_deref(), Some("PATCH"));
+        assert_eq!(result.callsites[2].method.as_deref(), Some("GET"));
+        assert_eq!(result.callsites[3].kind, "xhr_open_candidate");
+        assert_eq!(
+            result.callsites[3].method_status.as_deref(),
+            Some("conditional")
+        );
+        assert!(result
+            .mutation_sites
+            .iter()
+            .any(|site| { site.affected_families == ["xhr_open_method"] }));
+        Ok(())
+    }
+
+    #[test]
+    fn shadowed_reflective_names_and_unrelated_mutations_are_not_global_witnesses() -> Result<()> {
+        let src = r#"
+function local(Object, Reflect) {
+    Object.defineProperty(window, "fetch", {value: fake});
+    Reflect.set(window, "WebSocket", fake);
+    Object.assign(window, {navigator: fake});
+}
+Object.defineProperty(window, "unrelated", {value: 1});
+Reflect.set(globalThis.fetch, "unrelated", replacement);
+Object.assign(window, {});
+fetch("https://api.example.test/verified");
+navigator.sendBeacon("https://api.example.test/verified", data);
+new WebSocket("wss://api.example.test/verified");
+"#;
+        let result =
+            super::analyze_api_surface(src, &WorkBudget::unlimited("reflective-shadowed"))?;
+        assert_eq!(result.callsites.len(), 3);
+        assert!(result
+            .callsites
+            .iter()
+            .all(|row| row.binding_status == "standard"));
+        assert!(result.mutation_sites.is_empty(), "{result:#?}");
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_reflective_keys_and_unknown_assign_sources_retain_candidate_provenance() -> Result<()>
+    {
+        let src = r#"
+let key = getKey();
+Object.defineProperty(globalThis, key, {value: replacement});
+Object.assign(navigator, unknownSource);
+fetch("https://api.example.test/a");
+navigator.sendBeacon("https://api.example.test/b", data);
+new WebSocket("wss://api.example.test/c");
+"#;
+        let result = super::analyze_api_surface(src, &WorkBudget::unlimited("reflective-unknown"))?;
+        assert_eq!(result.callsites.len(), 3);
+        assert!(result
+            .callsites
+            .iter()
+            .all(|row| row.binding_status == "candidate"));
+        assert_eq!(result.mutation_sites.len(), 2);
+        assert!(result.mutation_sites.iter().any(|site| {
+            site.target_pattern == [Some("globalThis".into()), None]
+                && site.affected_families.contains(&"fetch".to_string())
+        }));
+        assert!(result.mutation_sites.iter().any(|site| {
+            site.target_pattern == [Some("navigator".into()), None]
+                && site.affected_families == ["send_beacon"]
+        }));
         Ok(())
     }
 

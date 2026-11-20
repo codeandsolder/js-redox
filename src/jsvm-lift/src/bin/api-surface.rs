@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::Parser as ClapParser;
 use jsvm_lift::{
     analysis_budget::{AnalysisBudgets, AnalysisOperation},
-    api_surface::{analyze_api_surface, ApiCallsite},
+    api_surface::{analyze_api_surface, ApiCallsite, ApiMutationSite},
 };
 use serde::Serialize;
 use std::{fs, path::PathBuf};
@@ -24,6 +24,7 @@ struct ApiSurfaceFileReport {
     input: String,
     bytes: usize,
     callsites: Vec<ApiCallsite>,
+    mutation_sites: Vec<ApiMutationSite>,
 }
 
 fn main() -> Result<()> {
@@ -43,13 +44,14 @@ fn main() -> Result<()> {
         fs::read_to_string(&input).with_context(|| format!("reading {}", input.display()))?;
     let budgets = AnalysisBudgets::standard("api-surface");
     let budget = budgets.operation(AnalysisOperation::ApiSurface, input.display().to_string());
-    let callsites = analyze_api_surface(&source, &budget)
+    let analysis = analyze_api_surface(&source, &budget)
         .with_context(|| format!("analyzing {}", input.display()))?;
     let report = ApiSurfaceFileReport {
-        schema: "jsvm-api-surface/v3",
+        schema: "jsvm-api-surface/v4",
         input: input.display().to_string(),
         bytes: source.len(),
-        callsites,
+        callsites: analysis.callsites,
+        mutation_sites: analysis.mutation_sites,
     };
     println!("{}", serde_json::to_string(&report)?);
     Ok(())

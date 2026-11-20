@@ -8,7 +8,7 @@ use super::{
     array_field, bool_field, field, required_u64, string_field, u64_field, GraphBuilder,
     InlineSourceIndex, RuntimeSourceGraphIndex,
 };
-use anyhow::Result;
+use anyhow::{bail, Result};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use work_budget::WorkBudget;
@@ -96,10 +96,23 @@ pub(super) fn seed_safe_deobfuscation_sources(
     Ok(deob_nodes)
 }
 
-/// Attach browser API observations to the selected source derivative.
-///
-/// Callsite URL targets are candidates, not evidence that a network request
-/// executed; the api_target edge retains the source proof requirements.
+/// Resolve the exact chosen source derivative for an API mutation or call.
+/// Both kinds of observation must attach to the same selected source.
+fn api_source_parent(
+    row: &Value,
+    deob_nodes: &BTreeMap<u64, String>,
+    inline_nodes: &InlineSourceIndex,
+) -> Option<String> {
+    u64_field(row, "deobfuscation_ordinal")
+        .and_then(|ordinal| deob_nodes.get(&ordinal).cloned())
+        .or_else(|| inline_nodes.for_record(row))
+        .or_else(|| {
+            u64_field(row, "resource_id").map(|resource_id| format!("resource:{resource_id}"))
+        })
+}
+
+/// Attach browser API callsites and exact local mutation-site provenance to
+/// the selected source derivative. Static graph edges do not prove execution.
 pub(super) fn seed_browser_api_callsites(
     graph: &mut GraphBuilder,
     api_surface: &Value,
@@ -107,6 +120,41 @@ pub(super) fn seed_browser_api_callsites(
     inline_nodes: &InlineSourceIndex,
     budget: &WorkBudget,
 ) -> Result<()> {
+    let mut mutation_nodes = BTreeMap::<(u64, u64), (String, &Value)>::new();
+    for row in array_field(api_surface, "mutation_sites") {
+        budget.checkpoint()?;
+        let source_index_ordinal = required_u64(row, "source_index_ordinal", "api mutation site")?;
+        let site_ordinal = required_u64(row, "mutation_site_ordinal", "api mutation site")?;
+        let node_id = format!("api-mutation:{source_index_ordinal}:{site_ordinal}");
+        if mutation_nodes
+            .insert((source_index_ordinal, site_ordinal), (node_id.clone(), row))
+            .is_some()
+        {
+            bail!("duplicate API mutation site: {node_id}");
+        }
+        graph.add_node(
+            node_id.clone(),
+            json!({
+                "type": "api_mutation",
+                "resource_id": field(row, "resource_id"),
+                "source_index_ordinal": source_index_ordinal,
+                "source_path": field(row, "analysis_path"),
+                "raw_path": field(row, "raw_path"),
+                "start": field(row, "start"),
+                "end": field(row, "end"),
+                "line": field(row, "line"),
+                "column": field(row, "column"),
+                "operation": field(row, "operation"),
+                "certainty": field(row, "certainty"),
+                "target_pattern": field(row, "target_pattern"),
+                "affected_families": field(row, "affected_families"),
+                "expression": field(row, "expression"),
+            }),
+        )?;
+        if let Some(parent) = api_source_parent(row, deob_nodes, inline_nodes) {
+            graph.add_edge(&parent, &node_id, "api_mutation_site", json!({}))?;
+        }
+    }
     // Static browser API callsites hang off the exact selected source derivative.
     for row in array_field(api_surface, "callsites") {
         budget.checkpoint()?;
@@ -129,6 +177,7 @@ pub(super) fn seed_browser_api_callsites(
                 "callee":field(row,"callee"),
                 "proof":field(row,"proof"),
                 "binding_status":field(row,"binding_status"),
+                "mutation_site_ordinals":field(row,"mutation_site_ordinals"),
                 "method":field(row,"method"),
                 "method_expression":field(row,"method_expression"),
                 "method_status":field(row,"method_status"),
@@ -137,17 +186,35 @@ pub(super) fn seed_browser_api_callsites(
                 "standard_browser_api_semantics_required":bool_field(row,"standard_browser_api_semantics_required"),
             }),
         )?;
-        let mut parent = u64_field(row, "deobfuscation_ordinal")
-            .and_then(|ordinal| deob_nodes.get(&ordinal).cloned());
-        if parent.is_none() {
-            parent = inline_nodes.for_record(row);
-        }
-        if parent.is_none() {
-            parent =
-                u64_field(row, "resource_id").map(|resource_id| format!("resource:{resource_id}"));
-        }
-        if let Some(parent) = parent {
+        if let Some(parent) = api_source_parent(row, deob_nodes, inline_nodes) {
             graph.add_edge(&parent, &node_id, "api_callsite", json!({}))?;
+        }
+        if let Some(ordinals) = row.get("mutation_site_ordinals") {
+            let Some(ordinals) = ordinals.as_array() else {
+                bail!("API callsite {node_id} has non-array mutation site ordinals");
+            };
+            for ordinal in ordinals {
+                budget.checkpoint()?;
+                let Some(site_ordinal) = ordinal.as_u64() else {
+                    bail!("API callsite {node_id} has non-integer mutation site ordinal");
+                };
+                let Some((mutation_node, site)) =
+                    mutation_nodes.get(&(source_index_ordinal, site_ordinal))
+                else {
+                    bail!("API callsite {node_id} references missing mutation site {site_ordinal}");
+                };
+                graph.add_edge(
+                    mutation_node,
+                    &node_id,
+                    "api_mutation_evidence",
+                    json!({
+                        "operation": field(site, "operation"),
+                        "certainty": field(site, "certainty"),
+                        "affected_families": field(site, "affected_families"),
+                        "source_mutation_span": [field(site, "start"), field(site, "end")],
+                    }),
+                )?;
+            }
         }
         if bool_field(row, "absolute_network_url")
             && !string_field(row, "kind").is_some_and(|kind| kind.ends_with("_candidate"))
@@ -244,6 +311,101 @@ mod tests {
                 .context("missing deob node")?["safe_static_only"],
             Value::Bool(true)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn reflective_mutation_sites_attach_to_exact_derivative_and_candidate_calls() -> Result<()> {
+        let mut graph = GraphBuilder::default();
+        graph.register_resource_url("https://api.test/data", "resource:99");
+        let deob_nodes = BTreeMap::from([(3, "deobfuscated:3".to_owned())]);
+        let document = json!({
+            "mutation_sites": [
+                {
+                    "source_index_ordinal": 2, "mutation_site_ordinal": 0,
+                    "resource_id": 7, "deobfuscation_ordinal": 3,
+                    "analysis_path": "src/_deobfuscated/app.js",
+                    "start": 9, "end": 65,
+                    "line": 1, "column": 9,
+                    "operation": "Object.defineProperty",
+                    "certainty": "possible",
+                    "target_pattern": ["window","fetch"],
+                    "affected_families": ["fetch"],
+                    "expression": "Object.defineProperty(window, 'fetch', descriptor)"
+                }
+            ],
+            "callsites": [
+                {
+                    "source_index_ordinal": 2, "callsite_ordinal": 0,
+                    "resource_id": 7, "deobfuscation_ordinal": 3,
+                    "analysis_path": "src/_deobfuscated/app.js",
+                    "kind": "fetch_candidate", "binding_status": "candidate",
+                    "method": "GET", "method_status": "conditional",
+                    "mutation_site_ordinals": [0],
+                    "url": "https://api.test/data", "absolute_network_url": true
+                }
+            ]
+        });
+        let budget = AnalysisBudgets::standard("api-mutation-provenance-graph")
+            .operation(AnalysisOperation::SourceGraph, "reflective");
+        seed_browser_api_callsites(
+            &mut graph,
+            &document,
+            &deob_nodes,
+            &InlineSourceIndex::default(),
+            &budget,
+        )?;
+        let mutation = graph
+            .nodes
+            .get("api-mutation:2:0")
+            .context("missing mutation")?;
+        assert_eq!(mutation["operation"], "Object.defineProperty");
+        assert_eq!(mutation["certainty"], "possible");
+        assert_eq!(mutation["target_pattern"], json!(["window", "fetch"]));
+        let call = graph
+            .nodes
+            .get("api-call:2:0")
+            .context("missing candidate")?;
+        assert_eq!(call["mutation_site_ordinals"], json!([0]));
+        assert!(graph.edges.iter().any(|edge| {
+            edge["from"] == "deobfuscated:3"
+                && edge["to"] == "api-mutation:2:0"
+                && edge["kind"] == "api_mutation_site"
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge["from"] == "api-mutation:2:0"
+                && edge["to"] == "api-call:2:0"
+                && edge["kind"] == "api_mutation_evidence"
+        }));
+        assert!(!graph.edges.iter().any(|edge| edge["kind"] == "api_target"));
+        Ok(())
+    }
+
+    #[test]
+    fn api_mutation_references_cannot_cross_source_units_or_dangle() -> Result<()> {
+        let mut graph = GraphBuilder::default();
+        let document = json!({
+            "mutation_sites": [
+                {"source_index_ordinal": 1, "mutation_site_ordinal": 0,
+                 "resource_id": 3, "operation": "Reflect.set",
+                 "certainty": "possible", "affected_families": ["fetch"]}
+            ],
+            "callsites": [
+                {"source_index_ordinal": 2, "callsite_ordinal": 0,
+                 "resource_id": 4, "kind": "fetch_candidate",
+                 "mutation_site_ordinals": [0]}
+            ]
+        });
+        let budget = AnalysisBudgets::standard("api-mutation-identity-guard")
+            .operation(AnalysisOperation::SourceGraph, "cross-unit");
+        assert!(seed_browser_api_callsites(
+            &mut graph,
+            &document,
+            &BTreeMap::new(),
+            &InlineSourceIndex::default(),
+            &budget,
+        )
+        .is_err());
         Ok(())
     }
 
