@@ -914,7 +914,7 @@ fn expose_static_strings_allow_with(
         }
         let mut counts = Counts::default();
         let Some(next) = apply(
-            &current,
+            &program,
             replacements,
             &mut counts,
             &mut Vec::new(),
@@ -1115,7 +1115,7 @@ pub fn recover_base91_strings_with_source_mode(
             current.clone()
         } else {
             let Some(next) = apply(
-                &current,
+                &program,
                 replacements,
                 &mut counts,
                 &mut Vec::new(),

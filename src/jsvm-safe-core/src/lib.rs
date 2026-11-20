@@ -2034,7 +2034,7 @@ fn transform_once(
             continue;
         }
         let Some(next) = apply(
-            source,
+            &program,
             replacements,
             counts,
             arithmetic_state_proofs,
@@ -2100,7 +2100,7 @@ fn recover_static_decoders_with_mode(
             break;
         }
         let Some(next) = apply(
-            &current,
+            &program,
             pass.replacements,
             &mut counts,
             &mut Vec::new(),
@@ -7293,7 +7293,9 @@ mod tests {
 
     #[test]
     fn distinguishes_empty_function_and_nested_block_statements() {
-        let input = "function f(flag){ ; if(flag){ ; work(); } return 3; }";
+        // The first empty statement terminates the directive prologue. Only
+        // the second empty statement is ordinary removable function-body syntax.
+        let input = "function f(flag){ ; ; if(flag){ ; work(); } return 3; }";
         let output = deobfuscate(input, 1);
         assert!(output.is_some(), "source is valid JavaScript");
         let Some(output) = output else {
@@ -7310,6 +7312,16 @@ mod tests {
             Some(&1),
             "{:?}",
             output.transforms
+        );
+        let compact: String = output
+            .source
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert!(
+            compact.starts_with("functionf(flag){;if"),
+            "{}",
+            output.source
         );
         assert!(output.source.contains("work()"), "{}", output.source);
     }
@@ -7406,6 +7418,57 @@ mod tests {
                 .copied()
                 .unwrap_or_default()
                 >= 1
+        );
+    }
+
+    #[test]
+    fn statement_cleanup_preserves_asi_and_directive_boundaries() {
+        let fixtures = [
+            "function f(){a()\n{ (b)() }}",
+            "function f(){ {a()} (b)() }",
+            "function f(){a()\n{}\n(b)()}",
+            "function f(){a()\n0;\n(b)()}",
+            "function f(){a()\nif(true) (b)()}",
+        ];
+        for input in fixtures {
+            let result = deobfuscate(input, 32).unwrap_or_else(|| unreachable!());
+            let compact: String = result
+                .source
+                .chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect();
+            assert!(compact.contains("a();(b)()"), "{}", result.source);
+        }
+        for input in [
+            "function f(){; 'use strict'; return this;}",
+            "function f(){{} 'use strict'; return this;}",
+            "function f(){0; 'use strict'; return this;}",
+            "function f(){if(true) 'use strict'; return this;}",
+            "function f(){'use ' + 'strict'; return this;}",
+        ] {
+            let result = deobfuscate(input, 32).unwrap_or_else(|| unreachable!());
+            let compact: String = result
+                .source
+                .chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect();
+            assert!(compact.starts_with("functionf(){;"), "{}", result.source);
+        }
+    }
+
+    #[test]
+    fn statement_rewrite_retains_an_existing_implicit_directive_terminator() {
+        let source = "function f(){'use strict'\nif(true) (work)()\nreturn this;}";
+        let result = deobfuscate(source, 32).unwrap_or_else(|| unreachable!());
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert!(
+            compact.contains("'usestrict';(work)()"),
+            "{}",
+            result.source
         );
     }
 

@@ -7,7 +7,10 @@
 //! JavaScript tokens into a different token.
 
 use crate::ArithmeticStateProof;
-use std::collections::BTreeMap;
+use oxc_ast::ast::{FunctionBody, Program, Statement};
+use oxc_ast_visit::{walk, Visit};
+use oxc_span::GetSpan;
+use std::collections::{BTreeMap, HashSet};
 use string_wizard::{MagicString, TextEdit};
 
 #[derive(Debug, Clone)]
@@ -169,7 +172,148 @@ fn lexically_safe_texts(source: &str, selected: &[Replacement]) -> Option<Vec<St
     Some(adjusted)
 }
 
+/// Statement-list source boundaries and true ECMAScript directive prologues.
+/// Removing a statement or changing its leading token can invalidate a
+/// previously implicit semicolon, even though the new program still parses.
+#[derive(Default)]
+struct StatementBoundaries {
+    prologue_ends: HashSet<usize>,
+    implicit_left: HashSet<usize>,
+    nonempty_statements: HashSet<(usize, usize)>,
+}
+
+impl StatementBoundaries {
+    fn record_prologue_end(
+        &mut self,
+        directives: &[oxc_ast::ast::Directive<'_>],
+        body: &[Statement<'_>],
+        source: &str,
+    ) {
+        if let Some(first) = body.first() {
+            let start = first.span().start as usize;
+            self.prologue_ends.insert(start);
+            if let Some(last) = directives.last() {
+                if !crate::fragment(source, last.span())
+                    .trim_end()
+                    .ends_with(';')
+                {
+                    self.implicit_left.insert(start);
+                }
+            }
+        }
+    }
+
+    fn possible_directive(text: &str) -> bool {
+        let text = text.trim_start();
+        text.starts_with("<!--")
+            || text.starts_with("-->")
+            || text
+                .chars()
+                .next()
+                .is_none_or(|first| matches!(first, '\'' | '"' | '/' | '\u{feff}'))
+    }
+
+    fn protect(&self, source: &str, replacements: &mut Vec<Replacement>) {
+        for replacement in &mut *replacements {
+            if replacement.text.is_empty()
+                && self
+                    .nonempty_statements
+                    .contains(&(replacement.start, replacement.end))
+            {
+                // This either terminates the preceding statement or becomes
+                // an empty statement, which can be cleaned up on a later pass.
+                replacement.text.push(';');
+            }
+            let prologue_risk = self.prologue_ends.contains(&replacement.start)
+                && Self::possible_directive(&replacement.text);
+            let left_risk = self.implicit_left.contains(&replacement.start)
+                && !replacement.text.is_empty()
+                && !replacement.text.trim_start().starts_with(';');
+            if prologue_risk || left_risk {
+                // The new first token may join the preceding expression, or
+                // create/destroy a directive. Source spans establish the
+                // insertion is before an actual direct-list statement.
+                replacement.text.insert_str(0, ";\n");
+            }
+        }
+        // Do not repeat an attempted removal of a prologue terminator.
+        replacements.retain(|replacement| {
+            source
+                .get(replacement.start..replacement.end)
+                .is_none_or(|original| {
+                    original != replacement.text
+                        && !(original == ";" && replacement.text.trim() == ";")
+                })
+        });
+    }
+}
+
+struct BoundaryCollector<'s> {
+    source: &'s str,
+    boundaries: StatementBoundaries,
+}
+
+impl<'a> Visit<'a> for BoundaryCollector<'_> {
+    fn visit_program(&mut self, program: &Program<'a>) {
+        self.boundaries
+            .record_prologue_end(&program.directives, &program.body, self.source);
+        walk::walk_program(self, program);
+    }
+
+    fn visit_function_body(&mut self, body: &FunctionBody<'a>) {
+        self.boundaries
+            .record_prologue_end(&body.directives, &body.statements, self.source);
+        walk::walk_function_body(self, body);
+    }
+
+    fn visit_statements(&mut self, statements: &oxc_allocator::Vec<'a, Statement<'a>>) {
+        let mut previous = None;
+        for statement in statements {
+            let span = statement.span();
+            if previous
+                .is_some_and(|span| !crate::fragment(self.source, span).trim_end().ends_with(';'))
+            {
+                self.boundaries.implicit_left.insert(span.start as usize);
+            }
+            if !matches!(statement, Statement::EmptyStatement(_)) {
+                self.boundaries
+                    .nonempty_statements
+                    .insert((span.start as usize, span.end as usize));
+            }
+            previous = Some(span);
+            self.visit_statement(statement);
+        }
+    }
+}
+
 pub fn apply(
+    program: &Program<'_>,
+    mut replacements: Vec<Replacement>,
+    counts: &mut Counts,
+    arithmetic_state_proofs: &mut Vec<ArithmeticStateProof>,
+    iteration: usize,
+) -> Option<String> {
+    let mut collector = BoundaryCollector {
+        source: program.source_text,
+        boundaries: StatementBoundaries::default(),
+    };
+    collector.visit_program(program);
+    collector
+        .boundaries
+        .protect(program.source_text, &mut replacements);
+    if replacements.is_empty() {
+        return Some(program.source_text.to_owned());
+    }
+    apply_raw(
+        program.source_text,
+        replacements,
+        counts,
+        arithmetic_state_proofs,
+        iteration,
+    )
+}
+
+fn apply_raw(
     source: &str,
     replacements: Vec<Replacement>,
     counts: &mut Counts,
@@ -216,7 +360,7 @@ mod tests {
     }
 
     fn rewrite(source: &str, replacements: Vec<Replacement>) -> String {
-        let rewritten = apply(
+        let rewritten = apply_raw(
             source,
             replacements,
             &mut Counts::default(),
@@ -319,7 +463,7 @@ mod tests {
     fn malformed_spans_fail_before_accounting() {
         let mut counts = Counts::default();
         let mut proofs = Vec::new();
-        assert!(apply(
+        assert!(apply_raw(
             "πx",
             vec![replacement(1, 2, "y")],
             &mut counts,
