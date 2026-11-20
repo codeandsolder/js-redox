@@ -681,6 +681,14 @@ impl DispatchMode {
     }
 }
 
+/// The native operation and its result allocation location may differ
+/// when a source-local factory creates the bound callable.
+#[derive(Clone, Copy)]
+pub(super) struct BindingSite {
+    pub(super) operation: Span,
+    pub(super) allocation: Span,
+}
+
 pub(super) struct DispatchOperands<'s, 'e, 'a> {
     pub(super) original_object: &'e Expression<'a>,
     pub(super) object: &'e Expression<'a>,
@@ -898,7 +906,15 @@ impl CallableIndex {
         let callable = self.resolve(object, source, scoping, constants)?;
         let args = PositionalArguments::from_syntax(&call.arguments, 3);
         self.bind_values(
-            callable, &args, call.span, call.span, source, scoping, constants,
+            callable,
+            &args,
+            BindingSite {
+                operation: call.span,
+                allocation: call.span,
+            },
+            source,
+            scoping,
+            constants,
         )
     }
 
@@ -909,8 +925,7 @@ impl CallableIndex {
         &self,
         mut callable: Callable,
         args: &PositionalArguments<'_, '_>,
-        bind_span: Span,
-        allocation_span: Span,
+        site: BindingSite,
         source: &str,
         scoping: &Scoping,
         constants: &ProvenConstantEnvironment,
@@ -922,7 +937,7 @@ impl CallableIndex {
         }
         self.add_receiver_dependencies(&mut callable, receiver, scoping, constants);
         let dependency = callable.dispatch_member_family("bind");
-        callable.add_witness("bind", bind_span, Some(dependency));
+        callable.add_witness("bind", site.operation, Some(dependency));
         callable.prefix.append_forwarded(
             args.values.iter().skip(1).cloned(),
             args.unknown_tail,
@@ -933,7 +948,7 @@ impl CallableIndex {
         callable.bound = true;
         callable.captured = true;
         callable.detached = false;
-        callable.bound_object = Some(allocation_span);
+        callable.bound_object = Some(site.allocation);
         Some(callable)
     }
 
