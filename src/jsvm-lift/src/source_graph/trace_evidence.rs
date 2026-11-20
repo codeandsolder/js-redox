@@ -146,7 +146,7 @@ fn add_observed_steps(
         budget.consume(1)?;
         let step_id = format!("observed-step:{ordinal}:{step_index}");
         let top = array_field(step, "frames").first();
-        graph.add_node(
+        graph.insert_node(
             step_id.clone(),
             json!({
                 "type":"observed_step",
@@ -272,7 +272,7 @@ fn add_observed_guard_witnesses(
         let identity = exact_guard_identity(guard, step, session, instances, budget)?;
         let exact = identity.is_some();
         let guard_id = format!("observed-guard:{ordinal}:{guard_index}");
-        graph.add_node(
+        graph.insert_node(
             guard_id.clone(),
             json!({
                 "type":"observed_guard",
@@ -393,7 +393,7 @@ pub(super) fn seed_selective_trace_witnesses(
     for (ordinal, hit) in array_field(selective_trace, "hits").iter().enumerate() {
         budget.consume(1)?;
         let node_id = format!("observed-invocation:{ordinal}");
-        graph.add_node(
+        graph.insert_node(
             node_id.clone(),
             json!({
                 "type":"observed_invocation",
@@ -531,8 +531,8 @@ mod tests {
         );
         seed_selective_trace_witnesses(&mut graph, &trace, instances, &budget)?;
         let identity_edges = graph
-            .edges
-            .iter()
+            .edges()
+            .values()
             .filter(|edge| {
                 matches!(
                     edge["kind"].as_str(),
@@ -555,44 +555,44 @@ mod tests {
                 && edge["script_id"] == "7"
                 && edge["source_sha256"] == second
         }));
-        assert!(graph.nodes.contains_key("observed-invocation:0"));
+        assert!(graph.nodes().contains_key("observed-invocation:0"));
         assert_eq!(
-            graph.nodes["observed-guard:0:0"]["exact_original_ast"],
+            graph.nodes()["observed-guard:0:0"]["exact_original_ast"],
             false
         );
         assert_eq!(
-            graph.nodes["observed-guard:1:0"]["exact_original_ast"],
+            graph.nodes()["observed-guard:1:0"]["exact_original_ast"],
             true
         );
         assert!(graph
-            .edges
-            .iter()
+            .edges()
+            .values()
             .any(|edge| edge["kind"] == "observed_guard_candidate"
                 && edge["to"] == "observed-guard:0:0"));
-        assert!(graph.nodes.contains_key("observed-step:0:0"));
+        assert!(graph.nodes().contains_key("observed-step:0:0"));
         assert_eq!(
-            graph.nodes["observed-step:0:0"]["complete_execution_path"],
+            graph.nodes()["observed-step:0:0"]["complete_execution_path"],
             false
         );
         assert_eq!(
-            graph.nodes["observed-step:1:1"]["complete_execution_path"],
+            graph.nodes()["observed-step:1:1"]["complete_execution_path"],
             false
         );
         assert_eq!(
-            graph.nodes["observed-guard:1:0"]["concrete_observation_only"],
+            graph.nodes()["observed-guard:1:0"]["concrete_observation_only"],
             true
         );
         assert!(graph
-            .edges
-            .iter()
+            .edges()
+            .values()
             .any(|edge| edge["kind"] == "observed_ast_guard_value"));
-        assert!(graph.edges.iter().any(|edge| {
+        assert!(graph.edges().values().any(|edge| {
             edge["kind"] == "observed_next_pause_in_selected_arm"
                 && edge["to"] == "observed-step:1:1"
         }));
         assert!(!graph
-            .edges
-            .iter()
+            .edges()
+            .values()
             .any(|edge| edge["to"] == "observed-step:2:0"
                 && edge["kind"] == "observed_executed_location"));
         Ok(())
@@ -636,12 +636,12 @@ mod tests {
             &budget,
         )?;
         assert!(graph
-            .edges
-            .iter()
+            .edges()
+            .values()
             .any(|edge| edge["kind"] == "observed_ast_guard_value"));
         assert!(!graph
-            .edges
-            .iter()
+            .edges()
+            .values()
             .any(|edge| edge["kind"] == "observed_next_pause_in_selected_arm"));
         let limited = WorkBudget::new("guard-budget", work_budget::BudgetLimits::work(0));
         assert!(exact_guard_identity(&guard, &step, "other", &index.instances, &limited).is_err());

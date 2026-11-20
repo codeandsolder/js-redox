@@ -5,12 +5,11 @@
 //! authoritative contextual candidate inventory.
 
 use super::{
-    array_field, bool_field, digest_id, field, nonempty_string_field, object_field, string_field,
-    u64_field, GraphBuilder, InlineSourceIndex,
+    array_field, digest_id, field, nonempty_string_field, object_field, string_field, u64_field,
+    GraphBuilder, InlineSourceIndex,
 };
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
 use work_budget::WorkBudget;
 
 fn reference_resolutions(reference: &Value) -> Vec<&Value> {
@@ -31,9 +30,9 @@ fn is_blocked_resolution(value: &Value) -> bool {
 
 fn add_reference_edges(
     graph: &mut GraphBuilder,
-    specifier_nodes: &mut BTreeMap<String, String>,
     source: &str,
     reference: &Value,
+    budget: &WorkBudget,
 ) -> Result<()> {
     let kind = format!(
         "js_{}",
@@ -41,24 +40,17 @@ fn add_reference_edges(
     );
     let choices = reference_resolutions(reference);
     if choices.is_empty() {
-        return add_unresolved_reference(graph, specifier_nodes, source, reference, &kind, None);
+        return add_unresolved_reference(graph, source, reference, &kind, None);
     }
     for choice in choices {
         let blocked = is_blocked_resolution(choice);
         if blocked || nonempty_string_field(choice, "resolved_url").is_none() {
-            add_unresolved_reference(
-                graph,
-                specifier_nodes,
-                source,
-                reference,
-                &kind,
-                Some(choice),
-            )?;
+            add_unresolved_reference(graph, source, reference, &kind, Some(choice))?;
             continue;
         }
         let url = nonempty_string_field(choice, "resolved_url")
             .context("checked nonempty candidate URL disappeared")?;
-        for target in graph.targets_for(url)? {
+        for target in graph.targets_for(url, budget)? {
             graph.add_edge(
                 source,
                 &target,
@@ -83,29 +75,22 @@ fn add_reference_edges(
 
 fn add_unresolved_reference(
     graph: &mut GraphBuilder,
-    specifier_nodes: &mut BTreeMap<String, String>,
     source: &str,
     reference: &Value,
     kind: &str,
     context: Option<&Value>,
 ) -> Result<()> {
     let specifier = string_field(reference, "specifier").unwrap_or("");
-    let node_id = if let Some(existing) = specifier_nodes.get(specifier) {
-        existing.clone()
-    } else {
-        let node_id = digest_id("specifier:", specifier);
-        graph.add_node(
-            node_id.clone(),
-            json!({
-                "type":"module_specifier",
-                "specifier":specifier,
-                "bare":bool_field(reference,"bare_specifier"),
-                "captured":false,
-            }),
-        )?;
-        specifier_nodes.insert(specifier.to_owned(), node_id.clone());
-        node_id
-    };
+    let node_id = digest_id("specifier:", specifier);
+    graph.intern_node(
+        node_id.clone(),
+        json!({
+            "type":"module_specifier",
+            "specifier":specifier,
+            "bare":reference.get("bare_specifier").and_then(Value::as_bool),
+            "captured":false,
+        }),
+    )?;
     let proof = context.unwrap_or(reference);
     let blocked = is_blocked_resolution(proof);
     graph.add_edge(
@@ -136,7 +121,6 @@ pub(super) fn seed_js_reference_edges(
     inline_nodes: &InlineSourceIndex,
     budget: &WorkBudget,
 ) -> Result<()> {
-    let mut specifier_nodes = BTreeMap::<String, String>::new();
     for unit in array_field(jsrefs, "code_units") {
         budget.checkpoint()?;
         let Some(resource_id) = u64_field(unit, "resource_id") else {
@@ -153,7 +137,7 @@ pub(super) fn seed_js_reference_edges(
             format!("resource:{resource_id}")
         };
         for reference in array_field(unit, "references") {
-            add_reference_edges(graph, &mut specifier_nodes, &source, reference)?;
+            add_reference_edges(graph, &source, reference, budget)?;
         }
     }
     Ok(())
@@ -196,7 +180,7 @@ pub(super) fn seed_import_map_definitions(
                     }
                     continue;
                 };
-                for dst in graph.targets_for(resolved)? {
+                for dst in graph.targets_for(resolved, budget)? {
                     graph.add_edge(
                         &src,
                         &dst,
@@ -229,7 +213,7 @@ pub(super) fn seed_import_map_definitions(
                         }
                         continue;
                     };
-                    for dst in graph.targets_for(resolved)? {
+                    for dst in graph.targets_for(resolved, budget)? {
                         graph.add_edge(
                             &src,
                             &dst,
@@ -258,7 +242,7 @@ fn add_blocked_import_map_entry(
     scope: Value,
 ) -> Result<()> {
     let target = digest_id("specifier:", specifier);
-    graph.add_node(
+    graph.intern_node(
         target.clone(),
         json!({
             "type":"module_specifier",
@@ -329,8 +313,8 @@ mod tests {
         ]});
         seed_import_map_definitions(&mut graph, &maps, &inline, &budget())?;
         let blocked = graph
-            .edges
-            .iter()
+            .edges()
+            .values()
             .filter(|edge| edge["kind"] == "import_map_entry_blocked")
             .collect::<Vec<_>>();
         assert_eq!(blocked.len(), 3);
@@ -352,19 +336,21 @@ mod tests {
         }));
         let target = digest_id("specifier:", "blocked");
         assert!(blocked.iter().all(|edge| edge["to"] == target));
-        assert_eq!(graph.nodes[&target]["type"], "module_specifier");
+        assert_eq!(graph.nodes()[&target]["type"], "module_specifier");
         let mapped = graph
-            .edges
-            .iter()
+            .edges()
+            .values()
             .filter(|edge| edge["kind"] == "import_map_entry")
             .collect::<Vec<_>>();
         assert_eq!(mapped.len(), 4);
         assert!(mapped.iter().all(|edge| edge["from"] == "inline:3:1"));
         assert!(mapped.iter().any(|edge| edge["to"] == "resource:8"));
         assert!(mapped.iter().any(|edge| edge["to"] == "resource:9"));
-        assert!(!graph.nodes.contains_key(&digest_id("specifier:", "ghost")));
         assert!(!graph
-            .nodes
+            .nodes()
+            .contains_key(&digest_id("specifier:", "ghost")));
+        assert!(!graph
+            .nodes()
             .contains_key(&digest_id("specifier:", "malformed")));
         Ok(())
     }
@@ -404,16 +390,16 @@ mod tests {
             }
         ]});
         seed_js_reference_edges(&mut graph, &refs, &inline, &budget())?;
-        assert_eq!(graph.edges.len(), 2);
-        assert!(graph.edges.iter().any(|edge| {
+        assert_eq!(graph.edges().len(), 2);
+        assert!(graph.edges().values().any(|edge| {
             edge["from"] == "inline:3:1"
                 && edge["to"] == "resource:12"
                 && edge["document_resource_id"] == 3
                 && edge["resolution"] == "import_map"
         }));
         let unresolved = graph
-            .edges
-            .iter()
+            .edges()
+            .values()
             .find(|edge| edge["from"] == "inline:4:1" && edge["document_resource_id"] == 4)
             .context("missing blocked inline reference")?;
         assert!(unresolved["to"]
@@ -422,8 +408,8 @@ mod tests {
         assert_eq!(unresolved["blocked"], true);
         assert_eq!(unresolved["resolution"], "import_map_blocked");
         assert!(!graph
-            .edges
-            .iter()
+            .edges()
+            .values()
             .any(|edge| edge["resolved_url"] == "https://example.test/WRONG.js"));
         Ok(())
     }
@@ -456,10 +442,10 @@ mod tests {
             &budget(),
         )?;
         let target = digest_id("specifier:", "pkg");
-        assert_eq!(graph.nodes[&target]["type"], "module_specifier");
-        assert_eq!(graph.nodes[&target]["bare"], true);
-        assert_eq!(graph.edges.len(), 2);
-        assert!(graph.edges.iter().all(|edge| edge["to"] == target));
+        assert_eq!(graph.nodes()[&target]["type"], "module_specifier");
+        assert_eq!(graph.nodes()[&target]["bare"], true);
+        assert_eq!(graph.edges().len(), 2);
+        assert!(graph.edges().values().all(|edge| edge["to"] == target));
         Ok(())
     }
 }

@@ -80,14 +80,7 @@ fn resolve_initiator(
         });
     }
     if let Some(url) = nonempty_string_field(primary, "url") {
-        let count = graph.url_to_resources.get(url).map_or(1, Vec::len);
-        budget.consume(u64::try_from(count)?)?;
-        let nodes = graph
-            .targets_for(url)?
-            .into_iter()
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
+        let nodes = graph.targets_for(url, budget)?;
         return Ok(InitiatorResolution {
             nodes,
             basis: InitiatorBasis::UrlOnly,
@@ -173,7 +166,7 @@ pub(super) fn seed_runtime_wasm_observations(
         let primary = observation.get("primary_initiator").unwrap_or(&Value::Null);
         let response = ObservedResponse::from_observation(observation, budget)?;
         let initiator = resolve_initiator(graph, observation, primary, runtime_instances, budget)?;
-        graph.add_node(
+        graph.insert_node(
             observation_id.clone(),
             json!({
                 "type":"runtime_wasm_request",
@@ -266,7 +259,7 @@ mod tests {
         let mut graph = GraphBuilder::default();
         let shared = "https://w.test/ambiguous.js";
         for id in ["resource:1", "resource:2"] {
-            graph.add_node(id, json!({"type":"resource","url":shared}))?;
+            graph.insert_node(id, json!({"type":"resource","url":shared}))?;
             graph.register_resource_url(shared, id);
         }
         let mut instances = RuntimeInstances::default();
@@ -279,7 +272,7 @@ mod tests {
         )?;
         let observation = |request_id: &str| -> Result<&str> {
             graph
-                .nodes
+                .nodes()
                 .values()
                 .find(|node| node["request_id"] == request_id)
                 .and_then(|node| node["id"].as_str())
@@ -288,8 +281,8 @@ mod tests {
         let sources = |request_id: &str| -> Result<BTreeSet<&str>> {
             let target = observation(request_id)?;
             Ok(graph
-                .edges
-                .iter()
+                .edges()
+                .values()
                 .filter(|edge| {
                     edge["kind"] == "runtime_wasm_request_initiator" && edge["to"] == target
                 })
@@ -308,12 +301,12 @@ mod tests {
         let external = sources("external")?;
         assert_eq!(external.len(), 1);
         assert!(external.iter().all(|node| node.starts_with("external:")));
-        assert_eq!(graph.external_nodes.len(), 1);
+        assert_eq!(graph.external_url_count(), 1);
 
         let exact = observation("exact")?;
         let response = graph
-            .edges
-            .iter()
+            .edges()
+            .values()
             .filter(|edge| edge["from"] == exact)
             .collect::<Vec<_>>();
         assert_eq!(response.len(), 1);
@@ -323,8 +316,8 @@ mod tests {
 
         let ambiguous = observation("resource-fallback")?;
         let candidates = graph
-            .edges
-            .iter()
+            .edges()
+            .values()
             .filter(|edge| edge["from"] == ambiguous)
             .collect::<Vec<_>>();
         assert_eq!(candidates.len(), 2);
@@ -339,8 +332,8 @@ mod tests {
             == "runtime_observed_wasm_response_candidate"
             && edge["exact_resource_occurrence"] == false
             && edge["exact_response_identity"] == false));
-        assert_eq!(graph.nodes[ambiguous]["exact_response_identity"], false);
-        assert!(graph.edges.iter().all(|edge| {
+        assert_eq!(graph.nodes()[ambiguous]["exact_response_identity"], false);
+        assert!(graph.edges().values().all(|edge| {
             edge["kind"] != "runtime_wasm_request_initiator"
                 || edge["from"] != "runtime:worker"
                 || edge["to"] == exact
@@ -389,8 +382,8 @@ mod tests {
             assert_eq!(response.exact_occurrence(), occurrence);
             let mut graph = GraphBuilder::default();
             response.add_edges(&mut graph, &row, "request", &budget)?;
-            assert_eq!(graph.edges.len(), count);
-            for edge in graph.edges {
+            assert_eq!(graph.edges().len(), count);
+            for edge in graph.edges().values() {
                 assert_eq!(edge["exact_response_identity"], body);
                 assert_eq!(edge["exact_resource_occurrence"], occurrence);
                 assert_eq!(

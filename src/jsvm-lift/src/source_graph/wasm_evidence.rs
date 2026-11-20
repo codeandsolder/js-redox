@@ -19,7 +19,7 @@ pub(super) fn seed_static_wasm_modules(
         budget.checkpoint()?;
         let digest = string_field(module, "sha256").context("WASM module sha256 is required")?;
         let node_id = format!("wasm:{}", &digest[..digest.len().min(20)]);
-        graph.add_node(
+        graph.intern_node(
             node_id.clone(),
             json!({
                 "type":"wasm_module",
@@ -104,8 +104,8 @@ mod tests {
         }]});
         seed_static_wasm_modules(&mut graph, &wasm, &budget())?;
         let wasm_id = format!("wasm:{}", "a".repeat(20));
-        assert_eq!(graph.nodes[&wasm_id]["sha256"], sha);
-        assert_eq!(graph.edges.len(), 5);
+        assert_eq!(graph.nodes()[&wasm_id]["sha256"], sha);
+        assert_eq!(graph.edges().len(), 5);
         for (from, kind) in [
             ("resource:7", "wasm_resource"),
             ("resource:8", "wasm_inline_base64"),
@@ -114,15 +114,15 @@ mod tests {
             ("inline:3:4", "wasm_static_bytes"),
         ] {
             assert!(
-                graph.edges.iter().any(|edge| {
+                graph.edges().values().any(|edge| {
                     edge["from"] == from && edge["to"] == wasm_id && edge["kind"] == kind
                 }),
                 "missing {kind} edge from {from}"
             );
         }
         assert!(!graph
-            .edges
-            .iter()
+            .edges()
+            .values()
             .any(|edge| edge["from"] == "resource:99" || edge["from"] == "inline:3:0"));
         Ok(())
     }
@@ -143,8 +143,8 @@ mod tests {
             }]}),
             &budget(),
         )?;
-        assert_eq!(graph.nodes.len(), 1);
-        assert!(graph.edges.is_empty());
+        assert_eq!(graph.nodes().len(), 1);
+        assert!(graph.edges().is_empty());
         assert!(seed_static_wasm_modules(
             &mut GraphBuilder::default(),
             &json!({"modules":[{"origins":[]}]}),

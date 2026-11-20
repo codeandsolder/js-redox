@@ -34,7 +34,7 @@ pub(super) fn seed_safe_deobfuscation_sources(
         let ordinal = u64_field(unit, "ordinal").unwrap_or(0);
         let node_id = format!("deobfuscated:{ordinal}");
         deob_nodes.insert(ordinal, node_id.clone());
-        graph.add_node(
+        graph.insert_node(
             node_id.clone(),
             json!({
                 "type":"deobfuscated_source",
@@ -132,7 +132,7 @@ pub(super) fn seed_browser_api_callsites(
         {
             bail!("duplicate API mutation site: {node_id}");
         }
-        graph.add_node(
+        graph.insert_node(
             node_id.clone(),
             json!({
                 "type": "api_mutation",
@@ -189,7 +189,7 @@ pub(super) fn seed_browser_api_callsites(
                     .push(node_id.clone());
             }
         }
-        graph.add_node(
+        graph.insert_node(
             node_id.clone(),
             json!({
                 "type":"api_callsite",
@@ -257,7 +257,7 @@ pub(super) fn seed_browser_api_callsites(
             )
         {
             if let Some(url) = string_field(row, "url") {
-                for target in graph.targets_for(url)? {
+                for target in graph.targets_for(url, budget)? {
                     graph.add_edge(
                         &node_id,
                         &target,
@@ -331,8 +331,8 @@ mod tests {
         assert_eq!(nodes.len(), 3);
         assert!(!nodes.contains_key(&9));
         let edges = graph
-            .edges
-            .iter()
+            .edges()
+            .values()
             .filter(|edge| edge["kind"] == "safe_deobfuscation")
             .collect::<Vec<_>>();
         assert_eq!(edges.len(), 3);
@@ -347,7 +347,7 @@ mod tests {
             .any(|edge| { edge["from"] == "resource:13" && edge["to"] == "deobfuscated:8" }));
         assert_eq!(
             graph
-                .nodes
+                .nodes()
                 .get("deobfuscated:4")
                 .context("missing deob node")?["safe_static_only"],
             Value::Bool(true)
@@ -399,31 +399,34 @@ mod tests {
             &budget,
         )?;
         let mutation = graph
-            .nodes
+            .nodes()
             .get("api-mutation:2:0")
             .context("missing mutation")?;
         assert_eq!(mutation["operation"], "Object.defineProperty");
         assert_eq!(mutation["certainty"], "possible");
         assert_eq!(mutation["target_pattern"], json!(["window", "fetch"]));
         let call = graph
-            .nodes
+            .nodes()
             .get("api-call:2:0")
             .context("missing candidate")?;
         assert_eq!(call["mutation_site_ordinals"], json!([0]));
         assert_eq!(call["api_origin"], "fetch");
         assert_eq!(call["invocation_form"], "bound");
         assert_eq!(call["binding_witnesses"][0]["kind"], "bind");
-        assert!(graph.edges.iter().any(|edge| {
+        assert!(graph.edges().values().any(|edge| {
             edge["from"] == "deobfuscated:3"
                 && edge["to"] == "api-mutation:2:0"
                 && edge["kind"] == "api_mutation_site"
         }));
-        assert!(graph.edges.iter().any(|edge| {
+        assert!(graph.edges().values().any(|edge| {
             edge["from"] == "api-mutation:2:0"
                 && edge["to"] == "api-call:2:0"
                 && edge["kind"] == "api_mutation_evidence"
         }));
-        assert!(!graph.edges.iter().any(|edge| edge["kind"] == "api_target"));
+        assert!(!graph
+            .edges()
+            .values()
+            .any(|edge| edge["kind"] == "api_target"));
         Ok(())
     }
 
@@ -448,19 +451,19 @@ mod tests {
             &budget,
         )?;
         let forwarding = graph
-            .edges
-            .iter()
+            .edges()
+            .values()
             .filter(|edge| edge["kind"] == "api_forwarded_invocation")
             .collect::<Vec<_>>();
         assert_eq!(forwarding.len(), 2);
         assert!(forwarding.iter().all(|edge| edge["to"] == "api-call:2:0"));
         assert!(graph
-            .edges
-            .iter()
+            .edges()
+            .values()
             .any(|edge| edge["kind"] == "api_target" && edge["from"] == "api-call:2:1"));
         assert!(!graph
-            .edges
-            .iter()
+            .edges()
+            .values()
             .any(|edge| edge["kind"] == "api_target" && edge["from"] == "api-call:2:2"));
         Ok(())
     }
@@ -532,20 +535,20 @@ mod tests {
             &budget,
         )?;
         let target_edges = graph
-            .edges
-            .iter()
+            .edges()
+            .values()
             .filter(|edge| edge["kind"] == "api_target")
             .collect::<Vec<_>>();
         assert_eq!(target_edges.len(), 1, "{target_edges:#?}");
         assert_eq!(target_edges[0]["from"], "api-call:7:2");
         for ordinal in 0..2 {
             let id = format!("api-call:7:{ordinal}");
-            let node = graph.nodes.get(&id).context("candidate node missing")?;
+            let node = graph.nodes().get(&id).context("candidate node missing")?;
             assert_eq!(node["binding_status"], "candidate");
             assert_eq!(node["url"], "https://app.test/api");
             assert!(graph
-                .edges
-                .iter()
+                .edges()
+                .values()
                 .any(|edge| { edge["to"] == id && edge["kind"] == "api_callsite" }));
         }
         Ok(())
@@ -589,8 +592,8 @@ mod tests {
             .operation(AnalysisOperation::SourceGraph, "callsites");
         seed_browser_api_callsites(&mut graph, &calls, &deob_nodes, &inline, &budget)?;
         let parents = graph
-            .edges
-            .iter()
+            .edges()
+            .values()
             .filter(|edge| edge["kind"] == "api_callsite")
             .map(|edge| (edge["from"].as_str(), edge["to"].as_str()))
             .collect::<Vec<_>>();
@@ -604,8 +607,8 @@ mod tests {
             ]
         );
         let targets = graph
-            .edges
-            .iter()
+            .edges()
+            .values()
             .filter(|edge| edge["kind"] == "api_target")
             .collect::<Vec<_>>();
         assert_eq!(targets.len(), 1);
@@ -613,7 +616,7 @@ mod tests {
         assert_eq!(targets[0]["to"], "resource:99");
         assert_eq!(
             graph
-                .nodes
+                .nodes()
                 .get("api-call:1:1")
                 .context("missing callsite")?["source_index_ordinal"],
             1

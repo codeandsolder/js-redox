@@ -33,7 +33,7 @@ pub(super) fn seed_generated_and_vm_evidence(
         let parent_scan_id = required_u64(dynamic, "parent_scan_id", "dynamic code unit")?;
         let ordinal = required_u64(dynamic, "ordinal", "dynamic code unit")?;
         let node_id = format!("dynamic:{parent_scan_id}:{ordinal}");
-        graph.add_node(
+        graph.insert_node(
             node_id.clone(),
             json!({
                 "type":"generated_dynamic_code",
@@ -57,7 +57,7 @@ pub(super) fn seed_generated_and_vm_evidence(
         if let Some(analysis_path) = nonempty_string_field(dynamic, "analysis_path") {
             if string_field(dynamic, "raw_dump") != Some(analysis_path) {
                 let recovery_node = format!("generated-recovery:{parent_scan_id}:{ordinal}");
-                graph.add_node(
+                graph.insert_node(
                     recovery_node.clone(),
                     json!({
                         "type":"generated_recovered_source",
@@ -174,7 +174,7 @@ pub(super) fn seed_generated_and_vm_evidence(
             vm_identities.insert(node_id.clone()),
             "duplicate devirtualized VM identity {node_id}"
         );
-        graph.add_node(
+        graph.insert_node(
             node_id.clone(),
             json!({
                 "type":"devirtualized_vm",
@@ -252,13 +252,19 @@ mod tests {
         });
         let mut graph = GraphBuilder::default();
         seed_generated_and_vm_evidence(&mut graph, &jsvm, &BTreeMap::new(), &budget())?;
-        assert_eq!(graph.nodes["dynamic:1:1"]["type"], "generated_dynamic_code");
-        assert_eq!(graph.nodes["dynamic:2:2"]["type"], "generated_dynamic_code");
         assert_eq!(
-            graph.nodes["generated-recovery:1:1"]["recovery_stage"],
+            graph.nodes()["dynamic:1:1"]["type"],
+            "generated_dynamic_code"
+        );
+        assert_eq!(
+            graph.nodes()["dynamic:2:2"]["type"],
+            "generated_dynamic_code"
+        );
+        assert_eq!(
+            graph.nodes()["generated-recovery:1:1"]["recovery_stage"],
             "safe_deobfuscation"
         );
-        assert!(!graph.nodes.contains_key("generated-recovery:2:2"));
+        assert!(!graph.nodes().contains_key("generated-recovery:2:2"));
         for (kind, from, to) in [
             ("generated_code", "resource:7", "dynamic:1:1"),
             (
@@ -275,13 +281,13 @@ mod tests {
         ] {
             assert!(
                 graph
-                    .edges
-                    .iter()
+                    .edges()
+                    .values()
                     .any(|edge| edge["kind"] == kind && edge["from"] == from && edge["to"] == to),
                 "missing {kind} edge {from} -> {to}"
             );
         }
-        assert_eq!(graph.edges.len(), 4);
+        assert_eq!(graph.edges().len(), 4);
         Ok(())
     }
 
@@ -311,23 +317,23 @@ mod tests {
         let mut graph = GraphBuilder::default();
         seed_generated_and_vm_evidence(&mut graph, &jsvm, &BTreeMap::new(), &budget())?;
         let generated = graph
-            .edges
-            .iter()
+            .edges()
+            .values()
             .filter(|edge| edge["kind"] == "generated_code")
             .collect::<Vec<_>>();
         assert_eq!(generated.len(), 1);
         assert_eq!(generated[0]["from"], "resource:7");
         assert_eq!(generated[0]["to"], "dynamic:1:1");
         assert!(!graph
-            .edges
-            .iter()
+            .edges()
+            .values()
             .any(|edge| edge["kind"] == "devirtualized_vm"));
         assert_eq!(
-            graph.nodes["dynamic:88:1"]["type"],
+            graph.nodes()["dynamic:88:1"]["type"],
             "generated_dynamic_code"
         );
         assert_eq!(
-            graph.nodes["devirtualized:88:table:1"]["type"],
+            graph.nodes()["devirtualized:88:table:1"]["type"],
             "devirtualized_vm"
         );
         Ok(())
@@ -351,15 +357,18 @@ mod tests {
         let mut graph = GraphBuilder::default();
         seed_generated_and_vm_evidence(&mut graph, &jsvm, &BTreeMap::new(), &budget())?;
         assert!(graph
-            .edges
-            .iter()
+            .edges()
+            .values()
             .any(|edge| edge["kind"] == "generated_code"
                 && edge["from"] == "resource:7"
                 && edge["to"] == "dynamic:1:1"));
-        assert!(!graph.edges.iter().any(|edge| edge["from"] == "resource:8"
-            || edge["to"] == "dynamic:2:3"
-            || edge["kind"] == "devirtualized_vm"));
-        assert!(graph.nodes.contains_key("dynamic:2:3"));
+        assert!(!graph
+            .edges()
+            .values()
+            .any(|edge| edge["from"] == "resource:8"
+                || edge["to"] == "dynamic:2:3"
+                || edge["kind"] == "devirtualized_vm"));
+        assert!(graph.nodes().contains_key("dynamic:2:3"));
         Ok(())
     }
 
@@ -432,10 +441,10 @@ mod tests {
         });
         let deob = BTreeMap::from([(3, "deobfuscated:3".to_owned())]);
         seed_generated_and_vm_evidence(&mut graph, &jsvm, &deob, &budget())?;
-        assert_eq!(graph.edges.len(), 2);
+        assert_eq!(graph.edges().len(), 2);
         assert!(graph
-            .edges
-            .iter()
+            .edges()
+            .values()
             .all(|edge| edge["from"] == "deobfuscated:3"));
         Ok(())
     }
