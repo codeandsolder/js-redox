@@ -215,6 +215,65 @@ mod tests {
     }
 
     #[test]
+    fn project_artifact_retains_candidate_identity_and_argument_proof() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let project = temp.path();
+        fs::create_dir_all(project.join("src"))?;
+        fs::write(
+            project.join("src/app.js"),
+            r#"
+let key = location.hash;
+globalThis[key] = replacement;
+fetch("https://api.example.test/data", {method: "PATCH"});
+navigator.sendBeacon("https://api.example.test/events", payload);
+"#,
+        )?;
+        write_artifact(
+            project,
+            SOURCE_INDEX,
+            &json!({
+                "schema": SOURCE_INDEX.schema,
+                "summary": {},
+                "units": [{
+                    "kind": "javascript",
+                    "resource_id": 8,
+                    "raw_path": "resources/app.js",
+                    "source_path": "src/app.js",
+                    "url": "https://app.example.test/app.js"
+                }]
+            }),
+        )?;
+        let summary = analyze_project_api_surface(
+            project,
+            &AnalysisBudgets::standard("dynamic-api-candidate-artifact"),
+        )?;
+        assert_eq!(summary["units"], 1);
+        assert_eq!(summary["callsites"], 2);
+        assert_eq!(summary["candidates"], 2);
+        assert_eq!(summary["kinds"]["fetch_candidate"], 1);
+        assert_eq!(summary["kinds"]["send_beacon_candidate"], 1);
+        let doc = read_artifact(&project.join(API_SURFACE.relative_path), API_SURFACE)?;
+        assert_eq!(doc["schema"], "capture-api-surface/v3");
+        let rows = doc["callsites"]
+            .as_array()
+            .context("api surface callsites missing")?;
+        assert_eq!(rows[0]["source_index_ordinal"], 0);
+        assert_eq!(rows[0]["resource_id"], 8);
+        assert_eq!(rows[0]["binding_status"], "candidate");
+        assert_eq!(rows[0]["method"], "PATCH");
+        assert_eq!(rows[0]["method_status"], "conditional");
+        assert_eq!(rows[0]["url"], "https://api.example.test/data");
+        assert_eq!(
+            rows[0]["url_expression"],
+            r#""https://api.example.test/data""#
+        );
+        assert_eq!(rows[1]["binding_status"], "candidate");
+        assert_eq!(rows[1]["method"], "POST");
+        assert_eq!(rows[1]["method_status"], "conditional");
+        Ok(())
+    }
+
+    #[test]
     fn project_mode_prefers_deobfuscated_sources_and_records_failures() -> anyhow::Result<()> {
         let project = temp_project();
         if project.exists() {
