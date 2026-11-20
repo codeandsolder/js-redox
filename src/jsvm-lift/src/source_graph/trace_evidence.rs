@@ -521,7 +521,7 @@ mod tests {
             &BTreeMap::new(),
             &budget,
         )?;
-        let instances = &runtime_index.instances;
+        let instances = &runtime_index;
         assert!(instances
             .observed_node("worker", &json!("7"), None)
             .is_none());
@@ -615,26 +615,18 @@ mod tests {
         let mut hit = trace["hits"][1].clone();
         let guard = hit["observed_guard_witnesses"][0].clone();
         let step = hit["steps"][0].clone();
-        assert!(exact_guard_identity(&guard, &step, "other", &index.instances, &budget)?.is_some());
+        assert!(exact_guard_identity(&guard, &step, "other", &index, &budget)?.is_some());
         let mut wrong = guard.clone();
         wrong["source_sha256"] = json!(format!("{}{}", &sha[..20], "c".repeat(44)));
-        assert!(exact_guard_identity(&wrong, &step, "other", &index.instances, &budget)?.is_none());
+        assert!(exact_guard_identity(&wrong, &step, "other", &index, &budget)?.is_none());
         let mut wrong = guard.clone();
         wrong["observed_value"] = json!(false);
-        assert!(exact_guard_identity(&wrong, &step, "other", &index.instances, &budget)?.is_none());
+        assert!(exact_guard_identity(&wrong, &step, "other", &index, &budget)?.is_none());
         let mut wrong_step = step.clone();
         wrong_step["frames"][0]["location"]["lineNumber"] = Value::Null;
-        assert!(
-            exact_guard_identity(&guard, &wrong_step, "other", &index.instances, &budget)?
-                .is_none()
-        );
+        assert!(exact_guard_identity(&guard, &wrong_step, "other", &index, &budget)?.is_none());
         hit["steps"][1]["frames"][0]["functionLocation"]["lineNumber"] = json!(9);
-        seed_selective_trace_witnesses(
-            &mut graph,
-            &json!({"hits":[hit]}),
-            &index.instances,
-            &budget,
-        )?;
+        seed_selective_trace_witnesses(&mut graph, &json!({"hits":[hit]}), &index, &budget)?;
         assert!(graph
             .edges()
             .values()
@@ -644,7 +636,7 @@ mod tests {
             .values()
             .any(|edge| edge["kind"] == "observed_next_pause_in_selected_arm"));
         let limited = WorkBudget::new("guard-budget", work_budget::BudgetLimits::work(0));
-        assert!(exact_guard_identity(&guard, &step, "other", &index.instances, &limited).is_err());
+        assert!(exact_guard_identity(&guard, &step, "other", &index, &limited).is_err());
         Ok(())
     }
 }
