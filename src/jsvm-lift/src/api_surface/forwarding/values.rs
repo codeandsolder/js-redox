@@ -56,7 +56,7 @@ impl<'s, 'a> ValueBuilder<'s, 'a> {
                 .symbol_id()
                 .and_then(|symbol| self.frame.as_ref()?.get(&symbol))
             {
-                return value.primitive(self.scoping, self.constants);
+                return value.primitive().cloned();
             }
             self.constants
                 .resolve_identifier(id, self.scoping)

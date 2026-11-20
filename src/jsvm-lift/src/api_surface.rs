@@ -1339,6 +1339,173 @@ xhr.send(payload);
     }
 
     #[test]
+    fn frame_primitives_compose_urls_data_keys_and_request_methods() -> Result<()> {
+        let source = r#"
+const transport = (base, path, key, select) => {
+    const endpoint = base + path;
+    const verb = select ? "PATCH" : "DELETE";
+    const init = {[key]: verb};
+    return fetch(endpoint, init);
+};
+transport("https://example.test", "/one", "method", true);
+transport("https://example.test", "/two", "method", false);
+transport("https://example.test", "/three", "other", false);
+"#;
+        let rows = analyze_api_surface(source)?;
+        let wrappers = rows
+            .iter()
+            .filter(|row| row.invocation_form == "wrapper")
+            .collect::<Vec<_>>();
+        let evidence = wrappers
+            .iter()
+            .map(|row| {
+                (
+                    row.url.as_deref(),
+                    row.method.as_deref(),
+                    row.method_status.as_deref(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            evidence,
+            [
+                (
+                    Some("https://example.test/one"),
+                    Some("PATCH"),
+                    Some("exact")
+                ),
+                (
+                    Some("https://example.test/two"),
+                    Some("DELETE"),
+                    Some("exact")
+                ),
+                (
+                    Some("https://example.test/three"),
+                    Some("GET"),
+                    Some("exact")
+                ),
+            ],
+            "{rows:#?}"
+        );
+        assert!(wrappers
+            .iter()
+            .all(|row| row.url_expression.as_deref() == Some("base + path")));
+        assert_eq!(
+            wrappers[0].method_expression.as_deref(),
+            Some(r#"select ? "PATCH" : "DELETE""#)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cached_frame_requirements_are_independent_of_incoming_value_types() -> Result<()> {
+        let source = r#"
+const send = (base, path, options) => fetch(base + path, options);
+send({toString() { sideEffect(); return "/object"; }}, "/unsafe", {method:"POST"});
+send("/known", "/first", {method:"PUT"});
+send(unknown, "/unresolved", {method:"DELETE"});
+send("/known", "/second", {method:"PATCH"});
+const spread = (url, options) => fetch(...[url, options]);
+spread("/materialized", {method:"POST"});
+"#;
+        let rows = analyze_api_surface(source)?;
+        let evidence = rows
+            .iter()
+            .filter(|row| row.invocation_form == "wrapper")
+            .map(|row| (row.url.as_deref(), row.method.as_deref()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            evidence,
+            [
+                (Some("/known/first"), Some("PUT")),
+                (Some("/known/second"), Some("PATCH")),
+                (Some("/materialized"), Some("POST")),
+            ],
+            "{rows:#?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn frame_primitives_preserve_lexical_origins_and_missing_value_semantics() -> Result<()> {
+        let source = r#"
+const base = "https://example.test";
+const relay = (suffix, verb) => {
+    const path = base + suffix;
+    return leaf(path, verb);
+};
+const leaf = (base, choose) => {
+    const url = base + "/data";
+    return fetch(url, {method: choose ?? "PATCH"});
+};
+relay("/one", "PUT");
+relay("/two");
+const templated = (name, count) => fetch("https://api.test/" + name + "/" + count, {method: count === 0 ? "POST" : "DELETE"});
+templated("widget", 0);
+templated("other", 2);
+"#;
+        let rows = analyze_api_surface(source)?;
+        let selected = rows
+            .iter()
+            .filter(|row| matches!(row.callee.as_str(), "relay" | "templated"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|row| (row.url.as_deref(), row.method.as_deref()))
+                .collect::<Vec<_>>(),
+            [
+                (Some("https://example.test/one/data"), Some("PUT")),
+                (Some("https://example.test/two/data"), Some("PATCH")),
+                (Some("https://api.test/widget/0"), Some("POST")),
+                (Some("https://api.test/other/2"), Some("DELETE")),
+            ],
+            "{rows:#?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn computed_apply_values_follow_native_nullish_and_primitive_rules() -> Result<()> {
+        let source = r#"
+const bound = fetch.bind(window, "/bound");
+const invoke = (fn, empty) => fn.apply(empty ? null : 123, empty ? void 0 : 4);
+invoke(bound, true);
+invoke(bound, false);
+const reflected = (fn, empty) => Reflect.apply(fn, null, empty ? null : 1);
+reflected(bound, true);
+reflected(bound, false);
+"#;
+        let rows = analyze_api_surface(source)?;
+        assert_eq!(rows.len(), 1, "{rows:#?}");
+        assert_eq!(rows[0].url.as_deref(), Some("/bound"));
+        assert_eq!(rows[0].method.as_deref(), Some("GET"));
+        assert_eq!(rows[0].invocation_form, "wrapper");
+        Ok(())
+    }
+
+    #[test]
+    fn primitive_template_interpolation_reuses_ecmascript_coercion() -> Result<()> {
+        let source = r#"
+const render = (name, count, flag) => fetch(`/${name}/${count}/${flag}`);
+render("name", 12, true);
+render("other", -0, false);
+"#;
+        let rows = analyze_api_surface(source)?;
+        let urls = rows
+            .iter()
+            .filter(|row| row.invocation_form == "wrapper")
+            .map(|row| row.url.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            urls,
+            [Some("/name/12/true"), Some("/other/0/false")],
+            "{rows:#?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn wrapper_local_frames_propagate_aliases_and_private_record_fields() -> Result<()> {
         let source = r#"
 function transport(fn, receiver, url, method) {

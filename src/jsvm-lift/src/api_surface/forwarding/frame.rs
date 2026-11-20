@@ -271,6 +271,7 @@ fn reference_requirements(
             continue;
         }
         let mut dispatch_member = false;
+        let mut in_materialized_array = false;
         let mut accepted = false;
         for id in semantic.nodes().ancestor_ids(reference.node_id()) {
             budget.consume(1)?;
@@ -286,7 +287,8 @@ fn reference_requirements(
                 {
                     requirements.primitive = true;
                 }
-                AstKind::ArrayExpression(_) | AstKind::ObjectExpression(_) if !dispatch_member => {}
+                AstKind::ArrayExpression(_) if !dispatch_member => in_materialized_array = true,
+                AstKind::ObjectExpression(_) if !dispatch_member => in_materialized_array = false,
                 AstKind::ObjectProperty(property)
                     if !dispatch_member
                         && property.kind == PropertyKind::Init
@@ -305,7 +307,11 @@ fn reference_requirements(
                         break;
                     }
                 }
-                AstKind::SpreadElement(_) if !dispatch_member => requirements.array = true,
+                AstKind::SpreadElement(_) if !dispatch_member => {
+                    if !in_materialized_array {
+                        requirements.array = true;
+                    }
+                }
                 AstKind::StaticMemberExpression(member)
                     if !dispatch_member
                         && !member.optional
@@ -357,12 +363,9 @@ fn reference_requirements(
 }
 
 impl ReferenceRequirements {
-    fn accepts(self, value: &ForwardedValue<'_, '_>, collector: &Collector<'_, '_>) -> bool {
+    fn accepts(self, value: &ForwardedValue<'_, '_>) -> bool {
         self.confined
-            && (!self.primitive
-                || value
-                    .primitive(collector.scoping, collector.constants)
-                    .is_some())
+            && (!self.primitive || value.primitive().is_some())
             && (!self.array || known_array(value))
     }
 }
@@ -488,7 +491,7 @@ pub(super) fn instantiate<'a, 's>(
             args.value(index)
         };
         let requirement = proof.requirements(symbol);
-        if requirement.accepts(&value, collector) {
+        if requirement.accepts(&value) {
             if let Some(frame) = &mut builder.frame {
                 frame.insert(symbol, value);
             }
@@ -506,7 +509,7 @@ pub(super) fn instantiate<'a, 's>(
             return Ok(None);
         }
         let value = builder.expression(local.expression)?;
-        if !proof.requirements(local.symbol).accepts(&value, collector) {
+        if !proof.requirements(local.symbol).accepts(&value) {
             return Ok(None);
         }
         if let Some(frame) = &mut builder.frame {

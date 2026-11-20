@@ -107,18 +107,13 @@ impl<'e, 'a> ForwardedValue<'e, 'a> {
             _ => None,
         }
     }
-    pub(super) fn primitive(
-        &self,
-        scoping: &Scoping,
-        constants: &ProvenConstantEnvironment,
-    ) -> Option<StaticPrimitiveValue> {
+    /// Primitive facts are captured once in their originating frame.
+    /// An unresolved expression must never be re-evaluated with another
+    /// invocation's lexical bindings.
+    pub(super) fn primitive(&self) -> Option<&StaticPrimitiveValue> {
         match self {
-            Self::Primitive { value, .. } => Some(value.as_ref().clone()),
-            Self::Missing => Some(StaticPrimitiveValue::Undefined),
-            Self::Expression(expr) => constants.exact_primitive(expr, scoping).or_else(|| {
-                (global_path(scoping, constants, expr).as_deref() == Some("undefined"))
-                    .then_some(StaticPrimitiveValue::Undefined)
-            }),
+            Self::Primitive { value, .. } => Some(value.as_ref()),
+            Self::Missing => Some(&StaticPrimitiveValue::Undefined),
             _ => None,
         }
     }

@@ -59,7 +59,7 @@ fn attach_source_identity(
 }
 
 /// Analyze every selected JavaScript view in a capture project and persist the
-/// canonical `capture-api-surface/v9` artifact.
+/// canonical `capture-api-surface/v10` artifact.
 ///
 /// # Errors
 ///
@@ -286,15 +286,15 @@ mod tests {
     fn project_artifact_retains_wrapper_sink_and_specialized_arguments() -> anyhow::Result<()> {
         let (summary, doc) = analyze_single_source_project(
             r#"
-const send = (url, method) => {const init = {method}; const args = [url, init]; return fetch.apply(window, args);};
-send("https://api.test/one", "POST");
+const send = (path, verb) => {const url = "https://api.test/" + path; const init = {method: verb + "ST"}; const args = [url, init]; return fetch.apply(window, args);};
+send("one", "PO");
 "#,
             7,
             "project-wrapper-forwarding",
         )?;
         assert_eq!(summary["callsites"], 2);
         assert_eq!(summary["forwarded_callsites"], 1);
-        assert_eq!(doc["schema"], "capture-api-surface/v9");
+        assert_eq!(doc["schema"], "capture-api-surface/v10");
         let original = &doc["callsites"][0];
         let forwarded = &doc["callsites"][1];
         assert_eq!(forwarded["invocation_form"], "wrapper");
@@ -335,7 +335,7 @@ new WebSocket("wss://api.test/live");
         assert_eq!(summary["callsites"], 2);
         assert_eq!(summary["candidates"], 1);
         assert_eq!(summary["mutation_sites"], 1);
-        assert_eq!(document["schema"], "capture-api-surface/v9");
+        assert_eq!(document["schema"], "capture-api-surface/v10");
         let site = &document["mutation_sites"][0];
         assert_eq!(site["source_index_ordinal"], 0);
         assert_eq!(site["mutation_site_ordinal"], 0);
@@ -380,7 +380,7 @@ navigator.sendBeacon("https://api.example.test/events", payload);
         assert_eq!(summary["candidates"], 2);
         assert_eq!(summary["kinds"]["fetch_candidate"], 1);
         assert_eq!(summary["kinds"]["send_beacon_candidate"], 1);
-        assert_eq!(doc["schema"], "capture-api-surface/v9");
+        assert_eq!(doc["schema"], "capture-api-surface/v10");
         let rows = doc["callsites"]
             .as_array()
             .context("api surface callsites missing")?;
