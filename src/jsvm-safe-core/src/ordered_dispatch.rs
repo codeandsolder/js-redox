@@ -368,12 +368,9 @@ mod tests {
         let result = deobfuscate(bounded, 32, &WorkBudget::unlimited("bounded-dispatch"))?
             .unwrap_or_else(|| unreachable!());
         assert_eq!(result.transforms.get("ordered_switch_unflatten"), Some(&1));
-        let positions = ["work('A')", "work('B')", "work('C')", "work('D')"].map(|text| {
-            result
-                .source
-                .find(text)
-                .unwrap_or_else(|| panic!("{}", result.source))
-        });
+        let positions = ["work('A')", "work('B')", "work('C')", "work('D')"]
+            .map(|text| result.source.find(text));
+        assert!(positions.iter().all(Option::is_some), "{}", result.source);
         assert!(positions.windows(2).all(|p| p[0] < p[1]));
         assert!(!result.source.contains("switch"), "{}", result.source);
         for input in [
@@ -399,7 +396,7 @@ mod tests {
             "while(true){switch(next()){case 0:(eval)('work()');continue;case 1:other();break;}break;}",
         ] {
             let result = deobfuscate(source, 32, &WorkBudget::unlimited("dispatch-hazards"))?.unwrap_or_else(|| unreachable!());
-            assert!(result.transforms.get("dispatch_switch_structured").is_none(), "{}", result.source);
+            assert!(!result.transforms.contains_key("dispatch_switch_structured"), "{}", result.source);
             assert!(result.source.contains("switch"));
         }
         Ok(())
