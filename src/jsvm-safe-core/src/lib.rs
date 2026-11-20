@@ -2139,6 +2139,8 @@ pub struct SafeTransformResult {
     pub iterations: usize,
     pub transforms: BTreeMap<String, usize>,
     pub arithmetic_state_proofs: Vec<ArithmeticStateProof>,
+    /// Both semantic and presentation passes reached a validated fixed point.
+    /// Exhausting the iteration cap, even with valid output, is incomplete.
     pub analysis_complete: bool,
     /// Exact repeat of a prior pass. Never claim a fixed point for a cycle.
     pub iteration_cycle: Option<IterationCycle>,
@@ -2264,7 +2266,7 @@ fn deobfuscate_with_mode(
         iterations,
         transforms: counts.into_inner(),
         arithmetic_state_proofs,
-        analysis_complete: iteration_cycle.is_none(),
+        analysis_complete: iteration_cycle.is_none() && iterations < max_iterations,
         iteration_cycle,
         source_recovery: None,
     }))
@@ -8264,6 +8266,28 @@ console.log(d(0x10,"k"),d(0x11,"k"));
             probe.values,
             [Some("hello".to_string()), None, Some("world".to_string())]
         );
+    }
+
+    #[test]
+    fn completion_requires_an_observed_no_op_iteration() {
+        let source = "sink(1 + 2);";
+        let zero = deobfuscate(source, 0).unwrap_or_else(|| unreachable!());
+        assert_eq!(zero.source, source);
+        assert_eq!(zero.iterations, 0);
+        assert!(!zero.analysis_complete);
+
+        let capped = deobfuscate(source, 1).unwrap_or_else(|| unreachable!());
+        assert_ne!(capped.source, source);
+        assert_eq!(capped.iterations, 1);
+        assert!(!capped.analysis_complete);
+        assert!(capped.iteration_cycle.is_none());
+
+        let complete = deobfuscate(source, 8).unwrap_or_else(|| unreachable!());
+        assert!(complete.analysis_complete);
+        assert_eq!(complete.source, capped.source);
+        let stable = deobfuscate(&complete.source, 1).unwrap_or_else(|| unreachable!());
+        assert_eq!(stable.iterations, 0);
+        assert!(stable.analysis_complete);
     }
 
     #[test]

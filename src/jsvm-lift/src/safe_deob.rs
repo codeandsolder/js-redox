@@ -105,6 +105,7 @@ pub struct SafeDeobReport {
     pub safe_static_only: bool,
     pub presentation_formatted: bool,
     pub runtime_semantics_preserved_by_design: bool,
+    /// A validated no-op pass was observed before the iteration limit.
     pub analysis_complete: bool,
     /// Nontrivial multi-pass cycle (the ordinary no-op fixed point is separate).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -221,7 +222,7 @@ pub fn deobfuscate_source(
     };
 
     let report = SafeDeobReport {
-        schema: "js-safe-deobfuscate/v1",
+        schema: "js-safe-deobfuscate/v2",
         source_mode: source_mode.as_str(),
         input: input_label.into(),
         input_sha256: sha256_hex(original.as_bytes()),
@@ -258,6 +259,20 @@ mod tests {
             SourceMode::CommonJs
         );
         assert_eq!(SourceMode::for_path(Path::new("app.js")), SourceMode::Auto);
+    }
+
+    #[test]
+    fn report_distinguishes_iteration_limit_from_fixed_point() -> Result<()> {
+        let source = "sink(1 + 2);";
+        let budget = WorkBudget::unlimited("safe-deob-test");
+        let capped = deobfuscate_source(source, "fixture.js", SourceMode::Auto, 1, false, &budget)?;
+        let complete =
+            deobfuscate_source(source, "fixture.js", SourceMode::Auto, 8, false, &budget)?;
+        assert!(capped.report.changed);
+        assert!(!capped.report.analysis_complete);
+        assert!(complete.report.analysis_complete);
+        assert_eq!(capped.source, complete.source);
+        Ok(())
     }
 
     #[test]
