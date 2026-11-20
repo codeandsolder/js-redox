@@ -1917,19 +1917,15 @@ pub fn safe_source_rejection(source: &str, mode: SafeSourceMode) -> Option<SafeS
     }
 }
 
-#[derive(Clone, Copy)]
-struct TransformOptions {
-    standard_numeric_builtins: bool,
-    allow_effect_statements: bool,
-}
-
+/// Select a semantic rewrite first, falling back to presentation rewrites
+/// only for the exact same source snapshot after a semantic no-op.
 fn transform_once(
     source: &str,
     source_type: SourceType,
     counts: &mut Counts,
     arithmetic_state_proofs: &mut Vec<ArithmeticStateProof>,
     iteration: usize,
-    options: TransformOptions,
+    standard_numeric_builtins: bool,
     budget: &WorkBudget,
 ) -> Result<Option<String>, BudgetExceeded> {
     budget.checkpoint()?;
@@ -2001,7 +1997,7 @@ fn transform_once(
         pure_functions: &pure_functions,
         from_char_code_aliases: &from_char_code_aliases,
         global_object_aliases: &global_object_aliases,
-        standard_numeric_builtins: options.standard_numeric_builtins,
+        standard_numeric_builtins,
         reference_identity_tables: &reference_identity_tables,
         selector_dispatchers: &selector_dispatchers,
         dispatch_orders: &dispatch_orders,
@@ -2015,22 +2011,42 @@ fn transform_once(
         may_remove_dead_numeric_writes: !numeric_state_risks.unsafe_top_level,
         unsafe_numeric_functions: &numeric_state_risks.unsafe_functions,
         function_context: FunctionContext::default(),
-        allow_effect_statements: options.allow_effect_statements,
-        replacements: initial_replacements,
+        allow_effect_statements: false,
+        replacements: Vec::new(),
     };
-    collector.visit_program(&program);
-    budget.checkpoint()?;
-    if collector.replacements.is_empty() {
-        Ok(Some(source.to_string()))
-    } else {
-        Ok(apply(
+    // All facts above are immutable and indexed to this source/AST. A
+    // semantic no-op leaves their byte spans and symbol identities valid,
+    // so reuse them for a fresh presentation traversal instead of parsing
+    // and deriving the entire environment again. Any source change returns
+    // immediately and the next iteration rebuilds every fact.
+    for allow_effect_statements in [false, true] {
+        budget.checkpoint()?;
+        collector.allow_effect_statements = allow_effect_statements;
+        collector.replacements = if allow_effect_statements {
+            std::mem::take(&mut initial_replacements)
+        } else {
+            initial_replacements.clone()
+        };
+        collector.visit_program(&program);
+        budget.checkpoint()?;
+        let replacements = std::mem::take(&mut collector.replacements);
+        if replacements.is_empty() {
+            continue;
+        }
+        let Some(next) = apply(
             source,
-            collector.replacements,
+            replacements,
             counts,
             arithmetic_state_proofs,
             iteration,
-        ))
+        ) else {
+            return Ok(None);
+        };
+        if next != source {
+            return Ok(Some(next));
+        }
     }
+    Ok(Some(source.to_owned()))
 }
 
 #[derive(Debug, Clone)]
@@ -2197,39 +2213,18 @@ fn deobfuscate_with_mode(
         // we normalize the remaining discarded expressions for readability.
         // An eager presentation rewrite can hide source shapes required by
         // other analyzers (notably the decoder and WASM import recognizers).
-        let Some(mut next) = transform_once(
+        let Some(next) = transform_once(
             &current,
             source_type,
             &mut counts,
             &mut arithmetic_state_proofs,
             iteration,
-            TransformOptions {
-                standard_numeric_builtins,
-                allow_effect_statements: false,
-            },
+            standard_numeric_builtins,
             budget,
         )?
         else {
             return Ok(None);
         };
-        if next == current {
-            let Some(presented) = transform_once(
-                &current,
-                source_type,
-                &mut counts,
-                &mut arithmetic_state_proofs,
-                iteration,
-                TransformOptions {
-                    standard_numeric_builtins,
-                    allow_effect_statements: true,
-                },
-                budget,
-            )?
-            else {
-                return Ok(None);
-            };
-            next = presented;
-        }
         if next == current {
             break;
         }
@@ -8288,6 +8283,22 @@ console.log(d(0x10,"k"),d(0x11,"k"));
         let stable = deobfuscate(&complete.source, 1).unwrap_or_else(|| unreachable!());
         assert_eq!(stable.iterations, 0);
         assert!(stable.analysis_complete);
+    }
+
+    #[test]
+    fn semantic_rewrites_precede_presentation_on_shared_source_snapshot() {
+        let source = "function f(flag,obj){sink(1+2);flag && (obj.value = work());}";
+        let first = deobfuscate(source, 1).unwrap_or_else(|| unreachable!());
+        assert!(first.transforms.contains_key("constant_fold"));
+        assert!(!first.transforms.contains_key("effect_statement_lowering"));
+        let complete = deobfuscate(source, 12).unwrap_or_else(|| unreachable!());
+        assert!(complete
+            .transforms
+            .contains_key("effect_statement_lowering"));
+        assert!(complete.source.contains("if ("));
+        let stable = deobfuscate(&complete.source, 1).unwrap_or_else(|| unreachable!());
+        assert_eq!(stable.source, complete.source);
+        assert!(stable.transforms.is_empty());
     }
 
     #[test]
