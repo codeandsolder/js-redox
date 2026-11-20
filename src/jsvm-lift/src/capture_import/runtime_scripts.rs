@@ -667,6 +667,12 @@ pub(super) fn analyze_recorder_runtime_scripts(
             Value::Array(sorted_unique_values(execution_context_values.into_iter())),
         );
         row.insert("script_instances".into(), Value::Array(script_instances));
+        row.insert(
+            "coverage_mode".into(),
+            coverage
+                .as_ref()
+                .map_or(Value::Null, |index| json!(index.mode())),
+        );
         let observed_executed = row
             .get("script_instances")
             .and_then(Value::as_array)

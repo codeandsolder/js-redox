@@ -133,7 +133,8 @@ pub fn materialize_observed_runtime_sources(
     let mut entries = Vec::new();
     let mut readme = String::from(
         "# Positively observed JavaScript\n\n\
-         Positive V8 counters show code executed during this browser interval.\n\
+         Positive V8 counters witness execution under the recorded observation mode.\n\
+         Best-effort coverage is incomplete; precise coverage changes JIT behavior.\n\
          Zero or missing coverage does not prove other code never executed.\n\
          See analysis/observed-source.json and analysis/runtime-scripts.json for \
          provenance, script IDs, sessions, and original URLs.\n\n",
@@ -244,6 +245,7 @@ pub fn materialize_observed_runtime_sources(
             "classification":category,
             "urls":source.get("urls").cloned().unwrap_or(Value::Null),
             "script_instances":source.get("script_instances").cloned().unwrap_or(Value::Null),
+            "coverage_mode":source.get("coverage_mode").cloned().unwrap_or(Value::Null),
             "formatted":was_formatted,
             "format_error":error,
             "safe_deob": safe_deob,

@@ -378,7 +378,7 @@ pub fn refresh_project_readme(project: &Path, budgets: &AnalysisBudgets) -> Resu
     }
     if project.join("analysis/observed-source.json").is_file() {
         lines.push("- [src/_observed/](src/_observed/) — Oxc-formatted runtime sources with positive V8 execution counters; unlisted code is not necessarily unexecuted.".into());
-        lines.push("- [analysis/execution-coverage.json](analysis/execution-coverage.json) — per-session execution witnesses and V8 source offsets.".into());
+        lines.push("- [analysis/execution-coverage.json](analysis/execution-coverage.json) — per-session execution witnesses, V8 source offsets and observation mode.".into());
         lines.push("- [analysis/observed-source.json](analysis/observed-source.json) — observed source identity, provenance, and formatting status.".into());
     }
     if project

@@ -15,7 +15,10 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { evaluateDuringScroll, isTerminalTargetClosedError } from "./scroll-retry.mjs";
 import { classifyRelevantBodies } from "./network-completeness.mjs";
-import { normalizePreciseCoverage, summarizePreciseCoverage } from "./precise-coverage.mjs";
+import {
+  COVERAGE_MODES, enableExecutionCoverage, collectExecutionCoverage,
+  summarizeExecutionCoverage,
+} from "./execution-coverage.mjs";
 import { validateTraceSpec, breakpointParams } from "./selective-trace.mjs";
 import { createSelectivePathController } from "./selective-path.mjs";
 import {
@@ -46,7 +49,8 @@ Options:
       --keep-cache          Do not disable the HTTP cache
       --no-consent          Do not inject AutoConsent or click fallback buttons
       --no-screenshot       Skip final full-page screenshot
-      --trace-points <json>  Opt-in bounded V8 debugger value/stack witnesses at specified breakpoints
+      --coverage <mode>     none | best-effort (default) | precise
+      --trace-points <json>  Optional high-perturbation debugger tracing
       --help                Show this help
 
 The recorder always keeps JS/HTML/CSS/JSON/fetch/XHR/WASM/other unknown bodies,
@@ -74,6 +78,7 @@ function parseArgs(argv) {
     consent: true,
     screenshot: true,
     tracePointsPath: null,
+    coverage: "best-effort",
   };
 
   const take = (i, flag) => {
@@ -128,6 +133,10 @@ function parseArgs(argv) {
         opts.timeoutMs = Number(take(i, arg));
         i += 1;
         break;
+      case "--coverage":
+        opts.coverage = take(i, arg);
+        i += 1;
+        break;
       case "--trace-points":
         opts.tracePointsPath = take(i, arg);
         i += 1;
@@ -150,6 +159,9 @@ function parseArgs(argv) {
   }
 
   if (!opts.url) usage(2);
+  if (!COVERAGE_MODES.includes(opts.coverage)) {
+    throw new Error(`unknown coverage mode: ${opts.coverage}; expected ${COVERAGE_MODES.join(", ")}`);
+  }
   for (const [name, value] of [
     ["scrollPasses", opts.scrollPasses],
     ["maxScrollSteps", opts.maxScrollSteps],
@@ -1126,15 +1138,13 @@ async function main() {
         }
       }
     }
-    // Start before navigation or before resuming a newly attached worker.
-    // Coverage belongs to a CDP target session, not just a script URL.
-    try {
-      await cdpSession.send("Profiler.enable");
-      await cdpSession.send("Profiler.startPreciseCoverage", { callCount: true, detailed: true });
-      coverageSessions.set(cdpSessionName, { session: cdpSession, status: "started" });
-    } catch (error) {
-      coverageSessions.set(cdpSessionName, { status: "unavailable", error: String(error) });
-    }
+    // Best-effort reads V8's existing function counters without forcing
+    // unoptimized execution. Precise coverage is strictly opt-in.
+    // Both modes stay scoped to the exact CDP target session.
+    coverageSessions.set(
+      cdpSessionName,
+      await enableExecutionCoverage(cdpSession, opts.coverage),
+    );
   }
 
   const cdp = await context.newCDPSession(page);
@@ -1484,35 +1494,21 @@ async function main() {
 
   await drainJobs();
 
-  // Snapshot per-target V8 execution counters BEFORE closing the browser.
-  // A parsed source is not proof of execution; positive counters are.
+  // Positive counters witness execution only under this capture's observation
+  // mode. Missing or zero coverage says nothing about unobserved execution.
   const coverageRows = [];
   for (const [name, state] of coverageSessions) {
-    if (state.status !== "started") {
-      coverageRows.push({ cdpSession: name, status: "unavailable", error: state.error, scripts: [] });
-      continue;
-    }
-    try {
-      const snapshot = await withTimeout(
-        state.session.send("Profiler.takePreciseCoverage"),
-        Math.min(opts.timeoutMs, 15_000),
-        "takePreciseCoverage",
-      );
-      coverageRows.push({
-        cdpSession: name,
-        status: "captured",
-        timestamp: snapshot.timestamp,
-        scripts: normalizePreciseCoverage(snapshot),
-      });
-    } catch (error) {
-      coverageRows.push({ cdpSession: name, status: "unavailable", error: String(error), scripts: [] });
-    }
+    coverageRows.push({
+      cdpSession: name,
+      ...(await collectExecutionCoverage(state, withTimeout, Math.min(opts.timeoutMs, 15_000))),
+    });
   }
   const executionCoverage = {
-    schema: "js-redox/precise-execution-coverage/v1",
+    schema: "js-redox/execution-coverage/v2",
+    mode: opts.coverage,
     offsetUnits: "utf16",
     sessions: coverageRows,
-    summary: summarizePreciseCoverage(coverageRows),
+    summary: summarizeExecutionCoverage(coverageRows),
   };
   // A requested debugger step that has no subsequent pause event is incomplete,
   // not a negative statement about JS execution.
@@ -1626,6 +1622,14 @@ async function main() {
     runtimeScriptsSeen: runtimeScripts.size,
     runtimeScriptsCaptured: [...runtimeScripts.values()].filter((r) => r.captured).length,
     executionCoverage: executionCoverage.summary,
+    observation: {
+      coverageMode: opts.coverage,
+      debuggerAttached: true,
+      workerTargetsWaitForDebugger: true,
+      httpCacheDisabled: !opts.keepCache,
+      autoconsentInjected: opts.consent,
+      selectiveBreakpointsEnabled: Boolean(traceSpec),
+    },
     ...(selectiveTrace ? { selectiveTrace: selectiveTrace.summary } : {}),
     websocketEvents: websocketEvents.length,
     eventSourceEvents: eventSourceEvents.length,
@@ -1725,7 +1729,12 @@ async function main() {
       ...(workerCdpSessionsUnpausedAtAttach ? [
         `${workerCdpSessionsUnpausedAtAttach} worker target(s) were already running when recursively attached; observed evidence is exact, but early CDP-event completeness is not claimed for those targets.`,
       ] : []),
-      "Precise V8 counters prove only observed executed code ranges; missing or zero-count coverage does not prove code is unreachable, and the snapshot covers only the recorded browser interval.",
+      ...(opts.coverage === "none"
+        ? ["No V8 coverage collected: script parsing and source capture do not prove execution."]
+        : opts.coverage === "best-effort"
+          ? ["Best-effort V8 function counters are low-perturbation positive execution witnesses; GC and optimization can hide executions. Missing or zero coverage is inconclusive."]
+          : ["Precise V8 coverage disables optimized execution and changes timing and memory behavior; positive counters prove execution only under this instrumentation. Missing or zero coverage is inconclusive."]),
+      "Even without precise coverage, CDP Debugger attachment, worker auto-attach, consent interaction, scrolling and cache policy may perturb behavior.",
       ...(selectiveTrace ? ["Selective debugger witness capture is opt-in, bounded and may perturb timing. Positive breakpoint hits are actual observed paused states, not exhaustive execution paths or branch/handler proofs. Inspector heap IDs are session-local and may become invalid after collection."] : []),
       "Bodies larger than maxBodyMiB are intentionally reported but not persisted unless the limit is increased.",
       "Image/media/font bodies are intentionally omitted unless --all-bodies is used.",
