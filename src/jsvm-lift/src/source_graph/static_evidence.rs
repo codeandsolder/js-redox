@@ -5,8 +5,8 @@
 //! derivative takes precedence over its original captured source.
 
 use super::{
-    array_field, bool_field, field, required_u64, string_field, u64_field, GraphBuilder,
-    InlineSourceIndex, RuntimeSourceGraphIndex,
+    array_field, bool_field, field, required_u64, runtime_evidence::runtime_node_id, string_field,
+    u64_field, GraphBuilder, InlineSourceIndex, RuntimeSourceGraphIndex,
 };
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
@@ -73,7 +73,7 @@ pub(super) fn seed_safe_deobfuscation_sources(
                     {
                         return None;
                     }
-                    Some(format!("runtime:{}", &digest[..digest.len().min(20)]))
+                    Some(runtime_node_id(digest))
                 })
             })
             .or_else(|| {
@@ -300,7 +300,7 @@ mod tests {
         let runtime_sha = "a".repeat(64);
         let runtime_path = format!("resources/runtime-scripts/{runtime_sha}.js");
         let runtime_index = RuntimeSourceGraphIndex {
-            instances: BTreeMap::new(),
+            instances: Default::default(),
             general_paths: BTreeMap::from([(runtime_sha.clone(), runtime_path.clone())]),
         };
         let units = json!({
