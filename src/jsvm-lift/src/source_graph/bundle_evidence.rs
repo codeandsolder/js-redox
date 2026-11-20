@@ -440,23 +440,23 @@ mod tests {
         let missing = ref_for("missing")?;
         let duplicate = ref_for("dup")?;
         assert_eq!(
-            graph.nodes()[&private]["excluded_nested_module_table_nodes"],
+            graph.node_value(&private)["excluded_nested_module_table_nodes"],
             json!(["bundle-module:2:1"])
         );
-        assert_eq!(graph.nodes()[&private]["candidate_nodes"], json!([]));
-        assert_eq!(graph.nodes()[&private]["ambiguous"], false);
+        assert_eq!(graph.node_value(&private)["candidate_nodes"], json!([]));
+        assert_eq!(graph.node_value(&private)["ambiguous"], false);
         assert_eq!(
-            graph.nodes()[&ambiguous]["candidate_nodes"],
+            graph.node_value(&ambiguous)["candidate_nodes"],
             json!(["bundle-module:3:1", "bundle-module:4:2"])
         );
-        assert_eq!(graph.nodes()[&ambiguous]["ambiguous"], true);
-        assert_eq!(graph.nodes()[&missing]["ambiguous"], false);
+        assert_eq!(graph.node_value(&ambiguous)["ambiguous"], true);
+        assert_eq!(graph.node_value(&missing)["ambiguous"], false);
         assert_eq!(
-            graph.nodes()[&duplicate]["candidate_nodes"],
+            graph.node_value(&duplicate)["candidate_nodes"],
             json!(["bundle-module:1:2", "bundle-module:1:3"])
         );
         assert_eq!(
-            graph.nodes()[&duplicate]["ambiguous"],
+            graph.node_value(&duplicate)["ambiguous"],
             true,
             "multiple factories sharing a logical ID must not select the last factory"
         );
@@ -509,8 +509,7 @@ mod tests {
                 })
                 .context("missing unresolved edge")?;
             let node = graph
-                .nodes()
-                .get(edge["to"].as_str().context("missing target ID")?)
+                .node(edge["to"].as_str().context("missing target ID")?)
                 .context("missing reference node")?;
             assert_eq!(node["source_module_node"], source);
             assert_eq!(edge["candidate_count"], 2);

@@ -555,13 +555,13 @@ mod tests {
                 && edge["script_id"] == "7"
                 && edge["source_sha256"] == second
         }));
-        assert!(graph.nodes().contains_key("observed-invocation:0"));
+        assert!(graph.has_node("observed-invocation:0"));
         assert_eq!(
-            graph.nodes()["observed-guard:0:0"]["exact_original_ast"],
+            graph.node_value("observed-guard:0:0")["exact_original_ast"],
             false
         );
         assert_eq!(
-            graph.nodes()["observed-guard:1:0"]["exact_original_ast"],
+            graph.node_value("observed-guard:1:0")["exact_original_ast"],
             true
         );
         assert!(graph
@@ -569,17 +569,17 @@ mod tests {
             .values()
             .any(|edge| edge["kind"] == "observed_guard_candidate"
                 && edge["to"] == "observed-guard:0:0"));
-        assert!(graph.nodes().contains_key("observed-step:0:0"));
+        assert!(graph.has_node("observed-step:0:0"));
         assert_eq!(
-            graph.nodes()["observed-step:0:0"]["complete_execution_path"],
+            graph.node_value("observed-step:0:0")["complete_execution_path"],
             false
         );
         assert_eq!(
-            graph.nodes()["observed-step:1:1"]["complete_execution_path"],
+            graph.node_value("observed-step:1:1")["complete_execution_path"],
             false
         );
         assert_eq!(
-            graph.nodes()["observed-guard:1:0"]["concrete_observation_only"],
+            graph.node_value("observed-guard:1:0")["concrete_observation_only"],
             true
         );
         assert!(graph

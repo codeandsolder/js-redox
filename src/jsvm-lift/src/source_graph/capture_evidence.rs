@@ -357,15 +357,17 @@ mod tests {
             ["resource:7", "resource:19"]
         );
         assert_eq!(
-            graph.resource_urls()[url],
-            BTreeSet::from(["resource:7".into(), "resource:19".into()])
+            graph
+                .captured_targets(url)
+                .context("captured URL missing")?,
+            &BTreeSet::from(["resource:7".into(), "resource:19".into()])
         );
         assert_eq!(
-            graph.nodes()["resource:7"]["source_paths"],
+            graph.node_value("resource:7")["source_paths"],
             json!(["src/a.js", "src/a-readable.js"])
         );
         assert_eq!(
-            graph.nodes()["resource:19"]["source_paths"],
+            graph.node_value("resource:19")["source_paths"],
             json!(["src/b.js"])
         );
         assert_eq!(
@@ -424,12 +426,12 @@ mod tests {
             "expected duplicate resource error: {result:?}"
         );
         assert_eq!(
-            graph.nodes()["resource:4"]["url"],
+            graph.node_value("resource:4")["url"],
             "https://example.test/first.js"
         );
-        assert!(!graph
-            .resource_urls()
-            .contains_key("https://example.test/second.js"));
+        assert!(graph
+            .captured_targets("https://example.test/second.js")
+            .is_none());
     }
 
     #[test]

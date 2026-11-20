@@ -24,17 +24,55 @@ pub(super) struct EdgeIdentity {
     evidence: String,
 }
 
+enum NodeRecord {
+    Occurrence(Value),
+    Shared(Value),
+}
+
+impl NodeRecord {
+    const fn value(&self) -> &Value {
+        match self {
+            Self::Occurrence(value) | Self::Shared(value) => value,
+        }
+    }
+    fn into_value(self) -> Value {
+        match self {
+            Self::Occurrence(value) | Self::Shared(value) => value,
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct GraphBuilder {
-    nodes: BTreeMap<String, Value>,
+    nodes: BTreeMap<String, NodeRecord>,
     edges: BTreeMap<EdgeIdentity, Value>,
     resource_urls: BTreeMap<String, BTreeSet<String>>,
     external_nodes: BTreeMap<String, String>,
 }
 
 impl GraphBuilder {
-    pub(super) fn nodes(&self) -> &BTreeMap<String, Value> {
-        &self.nodes
+    pub(super) fn node(&self, id: &str) -> Option<&Value> {
+        self.nodes.get(id).map(NodeRecord::value)
+    }
+
+    pub(super) fn has_node(&self, id: &str) -> bool {
+        self.nodes.contains_key(id)
+    }
+
+    #[cfg(test)]
+    pub(super) fn node_value(&self, id: &str) -> &Value {
+        self.node(id)
+            .unwrap_or_else(|| panic!("missing graph node {id}"))
+    }
+
+    #[cfg(test)]
+    pub(super) fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn node_values(&self) -> impl Iterator<Item = &Value> {
+        self.nodes.values().map(NodeRecord::value)
     }
 
     #[cfg(test)]
@@ -42,8 +80,8 @@ impl GraphBuilder {
         &self.edges
     }
 
-    pub(super) fn resource_urls(&self) -> &BTreeMap<String, BTreeSet<String>> {
-        &self.resource_urls
+    pub(super) fn captured_targets(&self, url: &str) -> Option<&BTreeSet<String>> {
+        self.resource_urls.get(url)
     }
 
     #[cfg(test)]
@@ -80,7 +118,7 @@ impl GraphBuilder {
             }
             Entry::Vacant(entry) => {
                 fields.insert("id".into(), Value::String(entry.key().clone()));
-                entry.insert(Value::Object(fields));
+                entry.insert(NodeRecord::Occurrence(Value::Object(fields)));
             }
         }
         Ok(())
@@ -95,12 +133,14 @@ impl GraphBuilder {
         match self.nodes.entry(id) {
             Entry::Vacant(entry) => {
                 fields.insert("id".into(), Value::String(entry.key().clone()));
-                entry.insert(Value::Object(fields));
+                entry.insert(NodeRecord::Shared(Value::Object(fields)));
             }
             Entry::Occupied(mut entry) => {
                 let key = entry.key().clone();
-                let existing = entry
-                    .get_mut()
+                let NodeRecord::Shared(record) = entry.get_mut() else {
+                    anyhow::bail!("graph node {key} was registered as a unique occurrence");
+                };
+                let existing = record
                     .as_object_mut()
                     .context("stored graph node must be an object")?;
                 for (field, value) in &fields {
@@ -200,7 +240,7 @@ impl GraphBuilder {
             *edge_counts.entry(identity.kind.clone()).or_default() += 1;
         }
         let mut node_counts = BTreeMap::<String, usize>::new();
-        for node in self.nodes.values() {
+        for node in self.nodes.values().map(NodeRecord::value) {
             budget.checkpoint()?;
             let kind =
                 nonempty_string_field(node, "type").context("stored graph node missing type")?;
@@ -216,7 +256,7 @@ impl GraphBuilder {
             "schema": SOURCE_GRAPH.schema,
             "project": project.display().to_string(),
             "capture_salvaged": manifest.source.salvaged,
-            "nodes": self.nodes.into_values().collect::<Vec<_>>(),
+            "nodes": self.nodes.into_values().map(NodeRecord::into_value).collect::<Vec<_>>(),
             "edges": self.edges.into_values().collect::<Vec<_>>(),
             "summary": {
                 "nodes": summary.nodes,
@@ -244,6 +284,10 @@ mod tests {
         assert!(graph
             .insert_node("source:a", json!({"type":"resource","value":1}))
             .is_err());
+        assert!(graph
+            .intern_node("source:a", json!({"type":"resource","additional":true}))
+            .is_err());
+        assert_eq!(graph.node_value("source:a")["additional"], Value::Null);
         graph.intern_node(
             "source:b",
             json!({"type":"wasm_module","sha256":"full-a","unknown":null}),
@@ -263,8 +307,8 @@ mod tests {
             .intern_node("source:b", json!({"type":"runtime_script"}))
             .is_err());
         assert_eq!(
-            graph.nodes()["source:b"],
-            json!({"id":"source:b","type":"wasm_module","sha256":"full-a","unknown":42,"metadata":{"items":[1,2]}})
+            graph.node_value("source:b"),
+            &json!({"id":"source:b","type":"wasm_module","sha256":"full-a","unknown":42,"metadata":{"items":[1,2]}})
         );
         for fields in [
             json!({"id":"spoofed","type":"resource"}),
@@ -274,7 +318,7 @@ mod tests {
         ] {
             assert!(graph.insert_node("invalid", fields).is_err());
         }
-        assert_eq!(graph.nodes().len(), 2);
+        assert_eq!(graph.node_count(), 2);
         Ok(())
     }
 

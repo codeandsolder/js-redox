@@ -216,7 +216,7 @@ fn add_recovered_sourcemap_sources(
         let ordinal = required_u64(recovered, "ordinal", source_field)?;
         let node_id = format!("{node_prefix}:{resource_id}:{ordinal}");
         anyhow::ensure!(
-            !graph.nodes().contains_key(&node_id),
+            !graph.has_node(&node_id),
             "duplicate recovered source identity {node_id}"
         );
         graph.insert_node(
@@ -446,9 +446,9 @@ mod tests {
             edges_from("source_map_source", "sourcemap-reference:7").len(),
             1
         );
-        assert!(!graph.nodes().contains_key("sourcemap-source:7:1"));
+        assert!(!graph.has_node("sourcemap-source:7:1"));
         assert_eq!(
-            graph.nodes()["sourcemap-composed:7"]["source_path"],
+            graph.node_value("sourcemap-composed:7")["source_path"],
             "maps/composed.map"
         );
         assert_eq!(
@@ -459,7 +459,7 @@ mod tests {
             edges_from("source_map_composed_source", "sourcemap-composed:7").len(),
             1
         );
-        assert!(!graph.nodes().contains_key("sourcemap-final:7:1"));
+        assert!(!graph.has_node("sourcemap-final:7:1"));
 
         let map_candidates =
             edges_from("source_map_chain_resource_candidate", "sourcemap-chain:7:0");
@@ -528,8 +528,8 @@ mod tests {
             "resource:43",
             "sourcemap-final:42:2"
         ));
-        assert!(!graph.nodes().contains_key("sourcemap-reference:42"));
-        assert!(!graph.nodes().contains_key("sourcemap-composed:42"));
+        assert!(!graph.has_node("sourcemap-reference:42"));
+        assert!(!graph.has_node("sourcemap-composed:42"));
         assert!(has_edge(
             "source_map_reference",
             "resource:44",
@@ -545,7 +545,7 @@ mod tests {
             "sourcemap-reference:44",
             "sourcemap-final:44:2"
         ));
-        assert!(!graph.nodes().contains_key("sourcemap-composed:44"));
+        assert!(!graph.has_node("sourcemap-composed:44"));
         assert_eq!(graph.external_url_count(), 1);
         assert_eq!(
             graph
@@ -578,15 +578,15 @@ mod tests {
                 .collect()
         };
         assert_eq!(
-            graph.nodes()["sourcemap-chain:7:0"]["map_resource_id"],
+            graph.node_value("sourcemap-chain:7:0")["map_resource_id"],
             Value::Null
         );
         assert_eq!(
-            graph.nodes()["sourcemap-chain:7:0"]["claimed_map_resource_id"],
+            graph.node_value("sourcemap-chain:7:0")["claimed_map_resource_id"],
             10
         );
         assert_eq!(
-            graph.nodes()["sourcemap-chain:7:0"]["code_resource_id"],
+            graph.node_value("sourcemap-chain:7:0")["code_resource_id"],
             Value::Null
         );
         assert_eq!(targets("resource:7", "source_map").len(), 0);
