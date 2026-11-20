@@ -81,7 +81,7 @@ pub struct ApiSurfaceAnalysis {
     pub mutation_sites: Vec<ApiMutationSite>,
 }
 
-fn unparenthesized<'a>(mut expression: &'a Expression<'a>) -> &'a Expression<'a> {
+fn unparenthesized<'a, 'e>(mut expression: &'e Expression<'a>) -> &'e Expression<'a> {
     while let Expression::ParenthesizedExpression(parenthesized) = expression {
         expression = &parenthesized.expression;
     }
