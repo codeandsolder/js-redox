@@ -296,13 +296,12 @@ fn reference_requirements(
                 {
                     if property.computed && property.key.span() == current {
                         requirements.primitive = true;
-                    } else if property.value.span() != current {
-                        break;
-                    } else if !property.computed
-                        && literal_data_key(property, |expr| {
-                            constants.exact_primitive(expr, scoping)
-                        })
-                        .is_none()
+                    } else if property.value.span() != current
+                        || (!property.computed
+                            && literal_data_key(property, |expr| {
+                                constants.exact_primitive(expr, scoping)
+                            })
+                            .is_none())
                     {
                         break;
                     }

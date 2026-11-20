@@ -1196,6 +1196,7 @@ pub fn analyze_api_surface(source: &str, budget: &WorkBudget) -> Result<ApiSurfa
         let semantic = SemanticBuilder::new()
             .with_check_syntax_error(true)
             .with_build_nodes(true)
+            .with_cfg(true)
             .build(&program);
         if !semantic.diagnostics.is_empty() {
             continue;
@@ -1434,6 +1435,7 @@ const relay = (suffix, verb) => {
     const path = base + suffix;
     return leaf(path, verb);
 };
+relay("/before-initialization", "POST");
 const leaf = (base, choose) => {
     const url = base + "/data";
     return fetch(url, {method: choose ?? "PATCH"});
@@ -1460,6 +1462,35 @@ templated("other", 2);
                 (Some("https://api.test/widget/0"), Some("POST")),
                 (Some("https://api.test/other/2"), Some("DELETE")),
             ],
+            "{rows:#?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn deferred_lookup_does_not_move_alias_initialization_to_invocation_time() -> Result<()> {
+        let source = r#"
+const invoke = url => alias(url);
+const alias = later;
+const later = url => fetch(url);
+invoke("/initializer-in-tdz");
+const early = url => future(url);
+early("/before-initialization");
+const future = url => fetch(url);
+early("/after-initialization");
+const validAlias = future;
+const throughAlias = url => validAlias(url);
+throughAlias("/initialized-alias");
+"#;
+        let rows = analyze_api_surface(source)?;
+        let urls = rows
+            .iter()
+            .filter(|row| row.invocation_form == "wrapper")
+            .filter_map(|row| row.url.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            urls,
+            ["/after-initialization", "/initialized-alias"],
             "{rows:#?}"
         );
         Ok(())

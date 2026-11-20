@@ -21,8 +21,36 @@ enum LocalBinding<'a> {
     Function(&'a Function<'a>),
     Initializer {
         value: &'a Expression<'a>,
-        after: u32,
+        declaration: Span,
     },
+}
+
+/// Anchor a deferred root-scope lookup to an actual specializing
+/// invocation. Initializer expressions still use their own evaluation
+/// positions, never the later position of a caller that reads their result.
+#[derive(Clone, Copy)]
+struct DeferredLookup<'s, 'a> {
+    semantic: &'s Semantic<'a>,
+    invocation: Span,
+}
+
+impl DeferredLookup<'_, '_> {
+    fn initialized(self, symbol: SymbolId, declaration: Span, budget: &WorkBudget) -> Result<bool> {
+        let scoping = self.semantic.scoping();
+        if scoping.symbol_scope_id(symbol) != scoping.root_scope_id()
+            || declaration.end > self.invocation.start
+        {
+            return Ok(false);
+        }
+        Ok(
+            crate::cfg_order::prove_event_completion_before_nested_event(
+                self.semantic,
+                declaration,
+                self.invocation,
+                budget,
+            )?,
+        )
+    }
 }
 
 enum BindingOrigin<'a> {
@@ -118,7 +146,7 @@ impl<'a> WrapperIndex<'a> {
                         symbol,
                         LocalBinding::Initializer {
                             value,
-                            after: decl.span.end,
+                            declaration: decl.span,
                         },
                     )
                 }
@@ -229,6 +257,7 @@ impl<'a> WrapperIndex<'a> {
         budget: &WorkBudget,
         witnesses: &mut Vec<ApiBindingWitness>,
         alias_kind: &str,
+        mut deferred: Option<DeferredLookup<'_, 'a>>,
     ) -> Result<Option<BindingOrigin<'a>>> {
         let mut visited = BTreeSet::new();
         loop {
@@ -246,10 +275,18 @@ impl<'a> WrapperIndex<'a> {
                 LocalBinding::Function(fun) => {
                     return Ok(Some(BindingOrigin::Declaration(symbol, fun)))
                 }
-                LocalBinding::Initializer { value, after } => {
-                    if expr.span().start < *after {
-                        return Ok(None);
+                LocalBinding::Initializer { value, declaration } => {
+                    if expr.span().start < declaration.end {
+                        let Some(lookup) = deferred else {
+                            return Ok(None);
+                        };
+                        if !lookup.initialized(symbol, *declaration, budget)? {
+                            return Ok(None);
+                        }
                     }
+                    // Following an alias reads its initializer at creation
+                    // time; do not transfer a later invocation anchor.
+                    deferred = None;
                     witnesses.push(ApiBindingWitness {
                         kind: alias_kind.into(),
                         start: value.span().start,
@@ -268,8 +305,14 @@ impl<'a> WrapperIndex<'a> {
         budget: &WorkBudget,
         witnesses: &mut Vec<ApiBindingWitness>,
     ) -> Result<Option<&'a CallExpression<'a>>> {
-        let Some(BindingOrigin::Expression(expr)) =
-            self.binding_origin(expr, scoping, budget, witnesses, "wrapper_return_alias")?
+        let Some(BindingOrigin::Expression(expr)) = self.binding_origin(
+            expr,
+            scoping,
+            budget,
+            witnesses,
+            "wrapper_return_alias",
+            None,
+        )?
         else {
             return Ok(None);
         };
@@ -286,9 +329,17 @@ impl<'a> WrapperIndex<'a> {
         budget: &WorkBudget,
         dependencies: &mut BTreeSet<String>,
         witnesses: &mut Vec<ApiBindingWitness>,
+        deferred: Option<DeferredLookup<'_, 'a>>,
     ) -> Result<Option<Wrapper<'a>>> {
         Ok(
-            match self.binding_origin(expr, scoping, budget, witnesses, "wrapper_alias")? {
+            match self.binding_origin(
+                expr,
+                scoping,
+                budget,
+                witnesses,
+                "wrapper_alias",
+                deferred,
+            )? {
                 Some(BindingOrigin::Declaration(symbol, fun)) => {
                     if self.script_root_functions.contains_key(&symbol) {
                         dependencies.insert(format!("wrapper_global:{symbol:?}"));
@@ -354,6 +405,7 @@ fn resolve_returned_callable<'a>(
             budget,
             &mut dependencies,
             &mut witnesses,
+            None,
         )?
         else {
             return Ok(None);
@@ -528,8 +580,17 @@ pub(super) fn specialize<'a>(
         if constructor {
             return Ok(());
         }
-        let Some(wrapper) =
-            wrappers.resolve(callee, scoping, budget, &mut dependencies, &mut witnesses)?
+        let Some(wrapper) = wrappers.resolve(
+            callee,
+            scoping,
+            budget,
+            &mut dependencies,
+            &mut witnesses,
+            (!visited.is_empty() && !captured_target).then_some(DeferredLookup {
+                semantic,
+                invocation: site.span,
+            }),
+        )?
         else {
             return Ok(());
         };
