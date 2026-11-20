@@ -1170,6 +1170,7 @@ dependencies = [
  "oxc_allocator",
  "oxc_ast",
  "oxc_ast_visit",
+ "oxc_compat",
  "oxc_ecmascript",
  "oxc_parser",
  "oxc_regular_expression",
@@ -1459,8 +1460,6 @@ dependencies = [
 [[package]]
 name = "oxc_compat"
 version = "0.158.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4a664fbec0ceda1154dff4744b0b94c5a60191faddf14916f11d16842c12a2a9"
 dependencies = [
  "cow-utils",
  "oxc-browserslist",
