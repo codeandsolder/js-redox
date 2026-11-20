@@ -17,6 +17,24 @@ use oxc_syntax::scope::ScopeId;
 use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 use values::{ArgumentList, ValueBuilder};
 
+pub(super) struct FrameContext<'s, 'c> {
+    source: &'s str,
+    scoping: &'c Scoping,
+    constants: &'c ProvenConstantEnvironment,
+    callables: &'c CallableIndex,
+}
+
+impl<'s, 'c> From<&Collector<'s, 'c>> for FrameContext<'s, 'c> {
+    fn from(collector: &Collector<'s, 'c>) -> Self {
+        Self {
+            source: collector.source,
+            scoping: collector.scoping,
+            constants: collector.constants,
+            callables: collector.callables,
+        }
+    }
+}
+
 enum LocalBinding<'a> {
     Function(&'a Function<'a>),
     Initializer {
@@ -216,7 +234,7 @@ impl<'a> WrapperIndex<'a> {
         wrapper: &Wrapper<'_>,
         sink: Span,
         semantic: &Semantic<'_>,
-        collector: &Collector<'_, '_>,
+        collector: &FrameContext<'_, '_>,
         budget: &WorkBudget,
     ) -> Result<Option<Rc<FrameProof>>> {
         let key = (wrapper.span.start, wrapper.span.end, sink.start, sink.end);
@@ -365,37 +383,42 @@ struct ReturnedCallable {
 /// Async returns, closure creation and calls requiring a new environment
 /// are not interpreted as existing native callable values.
 fn resolve_returned_callable<'a>(
-    mut expr: &'a Expression<'a>,
+    expr: &'a Expression<'a>,
     semantic: &Semantic<'a>,
     wrappers: &WrapperIndex<'a>,
-    collector: &Collector<'_, '_>,
+    collector: &FrameContext<'_, '_>,
     budget: &WorkBudget,
 ) -> Result<Option<ReturnedCallable>> {
     let mut witnesses = Vec::new();
+    let Some(factory) = wrappers.factory_call(expr, collector.scoping, budget, &mut witnesses)?
+    else {
+        return Ok(None);
+    };
+    resolve_factory_chain(factory, witnesses, semantic, wrappers, collector, budget)
+}
+
+fn resolve_factory_call<'a>(
+    factory: &'a CallExpression<'a>,
+    semantic: &Semantic<'a>,
+    wrappers: &WrapperIndex<'a>,
+    collector: &FrameContext<'_, '_>,
+    budget: &WorkBudget,
+) -> Result<Option<ReturnedCallable>> {
+    resolve_factory_chain(factory, Vec::new(), semantic, wrappers, collector, budget)
+}
+
+fn resolve_factory_chain<'a>(
+    mut factory: &'a CallExpression<'a>,
+    mut witnesses: Vec<ApiBindingWitness>,
+    semantic: &Semantic<'a>,
+    wrappers: &WrapperIndex<'a>,
+    collector: &FrameContext<'_, '_>,
+    budget: &WorkBudget,
+) -> Result<Option<ReturnedCallable>> {
     let mut dependencies = BTreeSet::new();
     let mut visited = BTreeSet::new();
     loop {
         budget.consume(1)?;
-        if !visited.is_empty() {
-            if let Some(mut callable) = collector.callables.resolve(
-                expr,
-                collector.source,
-                collector.scoping,
-                collector.constants,
-            ) {
-                callable.capture_as_argument();
-                return Ok(Some(ReturnedCallable {
-                    callable,
-                    witnesses,
-                    dependencies,
-                }));
-            }
-        }
-        let Some(factory) =
-            wrappers.factory_call(expr, collector.scoping, budget, &mut witnesses)?
-        else {
-            return Ok(None);
-        };
         if !visited.insert((factory.span.start, factory.span.end)) {
             return Ok(None);
         }
@@ -410,9 +433,27 @@ fn resolve_returned_callable<'a>(
         else {
             return Ok(None);
         };
-        if !wrapper.returns_value || wrapper.invocation().is_some() {
+        if !wrapper.returns_value {
             return Ok(None);
         }
+        // Only recognized native bind returns may create a new callable.
+        // Ordinary sink calls and arbitrary factory calls are not values.
+        let bind = match unparenthesized(wrapper.body) {
+            Expression::CallExpression(call) if !call.optional => {
+                let Some((object, key)) =
+                    member_parts(&call.callee, collector.scoping, collector.constants)
+                else {
+                    return Ok(None);
+                };
+                if key != "bind" {
+                    return Ok(None);
+                }
+                Some((call, object))
+            }
+            _ if wrapper.invocation().is_some() => return Ok(None),
+            _ => None,
+        };
+        let sink = bind.map_or(wrapper.body.span(), |(call, _)| call.span);
         let mut arguments = ValueBuilder::new(
             None,
             collector.scoping,
@@ -424,9 +465,7 @@ fn resolve_returned_callable<'a>(
         if arguments.used_iterator {
             dependencies.insert("rest_iterator".into());
         }
-        let Some(proof) =
-            wrappers.frame_proof(&wrapper, wrapper.body.span(), semantic, collector, budget)?
-        else {
+        let Some(proof) = wrappers.frame_proof(&wrapper, sink, semantic, collector, budget)? else {
             return Ok(None);
         };
         let Some(mut builder) = instantiate(
@@ -440,8 +479,36 @@ fn resolve_returned_callable<'a>(
         else {
             return Ok(None);
         };
-        let Some(origin) = wrapper.returned_origin(&mut builder, collector)? else {
-            return Ok(None);
+        let bound = if let Some((call, original_object)) = bind {
+            let Some(object) = builder.expression(original_object)?.expression() else {
+                return Ok(None);
+            };
+            let Some(mut target) = collector.callables.resolve(
+                object,
+                collector.source,
+                collector.scoping,
+                collector.constants,
+            ) else {
+                return Ok(None);
+            };
+            if !std::ptr::eq(object, original_object) {
+                target.capture_as_argument();
+            }
+            let arguments = builder.call(&call.arguments)?;
+            let Some(bound) = collector.callables.bind_values(
+                target,
+                &arguments,
+                call.span,
+                factory.span,
+                collector.source,
+                collector.scoping,
+                collector.constants,
+            ) else {
+                return Ok(None);
+            };
+            Some(bound)
+        } else {
+            None
         };
         if builder.used_iterator {
             dependencies.insert("rest_iterator".into());
@@ -462,8 +529,111 @@ fn resolve_returned_callable<'a>(
             start: factory.span.start,
             end: factory.span.end,
         });
-        expr = origin;
+        if let Some(callable) = bound {
+            return Ok(Some(ReturnedCallable {
+                callable,
+                witnesses,
+                dependencies,
+            }));
+        }
+        let Some(origin) = wrapper.returned_origin(&mut builder, collector)? else {
+            return Ok(None);
+        };
+        if builder.used_iterator {
+            dependencies.insert("rest_iterator".into());
+        }
+        if let Some(mut callable) = collector.callables.resolve(
+            origin,
+            collector.source,
+            collector.scoping,
+            collector.constants,
+        ) {
+            callable.capture_as_argument();
+            return Ok(Some(ReturnedCallable {
+                callable,
+                witnesses,
+                dependencies,
+            }));
+        }
+        let Some(next) =
+            wrappers.factory_call(origin, collector.scoping, budget, &mut witnesses)?
+        else {
+            return Ok(None);
+        };
+        factory = next;
     }
+}
+
+/// Cache factory values in source completion order before analyzing any
+/// mutation paths. Calls complete after their nested argument calls, and
+/// immutable aliases become available only after their initializer.
+pub(super) fn collect_returned_values<'a>(
+    semantic: &Semantic<'a>,
+    wrappers: &WrapperIndex<'a>,
+    callables: &mut CallableIndex,
+    source: &str,
+    constants: &ProvenConstantEnvironment,
+    budget: &WorkBudget,
+) -> Result<()> {
+    let scoping = semantic.scoping();
+    let mut events = Vec::new();
+    for node in semantic.nodes().iter() {
+        budget.consume(1)?;
+        match node.kind() {
+            AstKind::CallExpression(call)
+                if !call.optional && wrappers.may_resolve(&call.callee, scoping) =>
+            {
+                events.push((call.span.end, call.span.start, node.kind()))
+            }
+            AstKind::VariableDeclarator(decl)
+                if decl
+                    .id
+                    .get_binding_identifier()
+                    .and_then(|id| id.symbol_id.get())
+                    .is_some_and(|symbol| wrappers.bindings.contains_key(&symbol)) =>
+            {
+                events.push((decl.span.end, decl.span.start, node.kind()))
+            }
+            _ => {}
+        }
+    }
+    // At equal end positions a nested call completes before its declaration.
+    events.sort_unstable_by_key(|(end, start, _)| (*end, std::cmp::Reverse(*start)));
+    for (_, _, kind) in events {
+        budget.consume(1)?;
+        match kind {
+            AstKind::CallExpression(call) => {
+                let context = FrameContext {
+                    source,
+                    scoping,
+                    constants,
+                    callables,
+                };
+                // The semantic AST stores call nodes separately from the
+                // enclosing Expression enum. Resolve via the direct call
+                // entry point, retaining the existing alias-chain path.
+                if let Some(returned) =
+                    resolve_factory_call(call, semantic, wrappers, &context, budget)?
+                {
+                    let mut callable = returned.callable;
+                    callable.mark_returned(&returned.witnesses, returned.dependencies);
+                    callables.record_returned_value(call.span, callable);
+                }
+            }
+            AstKind::VariableDeclarator(decl) => {
+                if let Some(callable) = decl
+                    .init
+                    .as_ref()
+                    .and_then(|init| callables.resolve(init, source, scoping, constants))
+                    .filter(Callable::is_returned)
+                {
+                    callables.record_returned_alias(decl, scoping, callable);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Resolve the same native dispatch head used by direct calls, but from the
@@ -475,7 +645,7 @@ fn forwarded_dispatch<'a>(
     args: &ArgumentList<'a>,
     span: Span,
     builder: &mut ValueBuilder<'_, 'a>,
-    collector: &Collector<'_, '_>,
+    collector: &FrameContext<'_, '_>,
 ) -> Result<Option<Callable>> {
     let scoping = collector.scoping;
     let constants = collector.constants;
@@ -521,9 +691,15 @@ pub(super) fn specialize<'a>(
     budget: &WorkBudget,
 ) -> Result<()> {
     let scoping = collector.scoping;
-    if !wrappers.may_resolve(site.callee, scoping) {
+    if collector
+        .callables
+        .resolve(site.callee, collector.source, scoping, collector.constants)
+        .is_some()
+        || !wrappers.may_resolve(site.callee, scoping)
+    {
         return Ok(());
     }
+    let context = FrameContext::from(&*collector);
     let mut callee = site.callee;
     let mut builder = ValueBuilder::new(
         None,
@@ -544,22 +720,27 @@ pub(super) fn specialize<'a>(
     let mut sink = site.span;
     loop {
         budget.consume(1)?;
-        let callable = if let Some(returned) =
-            resolve_returned_callable(callee, semantic, wrappers, collector, budget)?
-        {
-            witnesses.extend(returned.witnesses);
-            dependencies.extend(returned.dependencies);
-            Some(returned.callable)
-        } else if !visited.is_empty() {
-            collector
+        let callable = if !visited.is_empty() {
+            context
                 .callables
-                .resolve(callee, collector.source, scoping, collector.constants)
+                .resolve(callee, context.source, scoping, context.constants)
                 .map(|mut callable| {
                     if captured_target {
                         callable.capture_as_argument();
                     }
                     callable
                 })
+        } else {
+            None
+        };
+        let callable = if callable.is_some() {
+            callable
+        } else if let Some(returned) =
+            resolve_returned_callable(callee, semantic, wrappers, &context, budget)?
+        {
+            witnesses.extend(returned.witnesses);
+            dependencies.extend(returned.dependencies);
+            Some(returned.callable)
         } else {
             None
         };
@@ -611,14 +792,14 @@ pub(super) fn specialize<'a>(
             end: sink_span.end,
         });
         sink = sink_span;
-        let Some(proof) = wrappers.frame_proof(&wrapper, sink, semantic, collector, budget)? else {
+        let Some(proof) = wrappers.frame_proof(&wrapper, sink, semantic, &context, budget)? else {
             return Ok(());
         };
         let Some(mut builder) = instantiate(
             &wrapper,
             &args,
             &proof,
-            collector,
+            &context,
             wrappers.positional_limit,
             budget,
         )?
@@ -629,7 +810,7 @@ pub(super) fn specialize<'a>(
         let next_args = builder.call(forwarded)?;
         if !is_new {
             if let Some(mut callable) =
-                forwarded_dispatch(target, forwarded, &next_args, sink, &mut builder, collector)?
+                forwarded_dispatch(target, forwarded, &next_args, sink, &mut builder, &context)?
             {
                 if builder.used_iterator {
                     dependencies.insert("rest_iterator".into());
