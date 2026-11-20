@@ -327,7 +327,7 @@ fn assert_main_contract(file: &str, outcome: &SafeDeobOutcome) {
 
 #[test]
 #[ignore = "requires Node; run the focused test explicitly"]
-fn statement_boundary_and_directive_runtime_equivalence() -> Result<()> {
+fn depythonify_safe_deob_statement_boundary_and_directive_runtime_equivalence() -> Result<()> {
     let source = r#"
 function example1(log) {
  function a(){log.push('a');return ()=>log.push('bad');}
