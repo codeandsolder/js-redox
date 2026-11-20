@@ -19,7 +19,7 @@ const STANDARD_BROWSER_API_ASSUMPTION: &str = "standard_browser_api_binding_sema
 use work_budget::WorkBudget;
 
 mod callables;
-use callables::{ApiArguments, ApiKind, CallableIndex};
+use callables::{ApiArguments, ApiKind, Callable, CallableIndex};
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Serialize)]
 pub struct ApiCallsite {
@@ -145,25 +145,32 @@ struct SafeMemberReferenceCollector<'s, 'c> {
 
 impl<'a> Visit<'a> for SafeMemberReferenceCollector<'_, '_> {
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
-        if let Some(bound) =
-            self.callables
-                .resolve_bind(call, self.source, self.scoping, self.constants)
-        {
-            if bound.kind == ApiKind::XhrOpen
-                && !bound
-                    .bind_dependencies()
+        let resolved = self
+            .callables
+            .resolve_dispatch(call, self.source, self.scoping, self.constants)
+            .map(|dispatch| (dispatch.callable, dispatch.receiver_ref))
+            .or_else(|| {
+                let bound =
+                    self.callables
+                        .resolve_bind(call, self.source, self.scoping, self.constants)?;
+                let receiver_ref = call
+                    .arguments
+                    .first()
+                    .and_then(|arg| arg.as_expression())
+                    .filter(|expr| expression_symbol(self.scoping, expr) == bound.receiver)
+                    .and_then(direct_reference_id);
+                Some((bound, receiver_ref))
+            });
+        if let Some((callable, Some(reference_id))) = resolved {
+            if callable.kind == ApiKind::XhrOpen
+                && !callable
+                    .dispatch_dependencies()
                     .iter()
                     .any(|key| self.mutations.any(key))
                 && !self.mutations.any("xhr")
                 && !self.mutations.any("xhr_open_method")
             {
-                if let Some(receiver) = call.arguments.first().and_then(|arg| arg.as_expression()) {
-                    if expression_symbol(self.scoping, receiver) == bound.receiver {
-                        if let Some(reference_id) = direct_reference_id(receiver) {
-                            self.refs.insert(reference_id);
-                        }
-                    }
-                }
+                self.refs.insert(reference_id);
             }
         }
         walk::walk_call_expression(self, call);
@@ -366,6 +373,9 @@ fn normalized_mutation_path(path: &[Option<String>]) -> &[Option<String>] {
 // XMLHttpRequest/Function/Object replacement does not itself mutate the
 // original constructor's prototype object.
 const MUTATION_TARGETS: &[(&str, &[&str], usize)] = &[
+    ("namespace_window", &["window"], 1),
+    ("namespace_self", &["self"], 1),
+    ("namespace_globalThis", &["globalThis"], 1),
     ("fetch", &["fetch"], 1),
     ("send_beacon", &["navigator", "sendBeacon"], 1),
     ("websocket", &["WebSocket"], 1),
@@ -376,6 +386,9 @@ const MUTATION_TARGETS: &[(&str, &[&str], usize)] = &[
         2,
     ),
     ("function_bind", &["Function", "prototype", "bind"], 2),
+    ("function_call", &["Function", "prototype", "call"], 2),
+    ("function_apply", &["Function", "prototype", "apply"], 2),
+    ("reflect_apply", &["Reflect", "apply"], 1),
     (
         "request_init_method_prototype",
         &["Object", "prototype", "method"],
@@ -383,16 +396,14 @@ const MUTATION_TARGETS: &[(&str, &[&str], usize)] = &[
     ),
 ];
 
-const OWN_BIND_TARGETS: &[(&str, &[&str])] = &[
-    ("fetch_bind", &["fetch", "bind"]),
-    ("send_beacon_bind", &["navigator", "sendBeacon", "bind"]),
-    ("websocket_bind", &["WebSocket", "bind"]),
-    ("xhr_bind", &["XMLHttpRequest", "bind"]),
-    (
-        "xhr_open_method_bind",
-        &["XMLHttpRequest", "prototype", "open", "bind"],
-    ),
+const OWN_DISPATCH_TARGETS: &[(&str, &[&str])] = &[
+    ("fetch", &["fetch"]),
+    ("send_beacon", &["navigator", "sendBeacon"]),
+    ("websocket", &["WebSocket"]),
+    ("xhr", &["XMLHttpRequest"]),
+    ("xhr_open_method", &["XMLHttpRequest", "prototype", "open"]),
 ];
+const DISPATCH_MEMBERS: &[&str] = &["bind", "call", "apply"];
 
 /// A mutation path is either global-rooted or relative to a specific
 /// function object created by a native bind expression. Keep these domains
@@ -473,11 +484,15 @@ impl SinkMutations {
                         affected.push(family.to_owned());
                     }
                 }
-                for &(family, target) in OWN_BIND_TARGETS {
-                    if normalized.len() == target.len()
-                        && mutation_prefix_matches(normalized, target)
-                    {
-                        affected.push(family.to_owned());
+                for &(family, target) in OWN_DISPATCH_TARGETS {
+                    if let Some((key, object)) = normalized.split_last() {
+                        if object.len() == target.len() && mutation_prefix_matches(object, target) {
+                            for &operation in DISPATCH_MEMBERS {
+                                if key.as_deref().is_none_or(|key| key == operation) {
+                                    affected.push(format!("{family}_{operation}"));
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -486,8 +501,10 @@ impl SinkMutations {
                 members,
             } => {
                 if let [key] = members.as_slice() {
-                    if key.as_deref().is_none_or(|key| key == "bind") {
-                        affected.push(format!("bound_bind:{function_start}"));
+                    for &operation in DISPATCH_MEMBERS {
+                        if key.as_deref().is_none_or(|key| key == operation) {
+                            affected.push(format!("bound_{operation}:{function_start}"));
+                        }
                     }
                 }
             }
@@ -552,11 +569,17 @@ struct SinkMutationCollector<'s, 'c> {
 
 impl SinkMutationCollector<'_, '_> {
     fn object_path(&self, expression: &Expression<'_>) -> Option<MutationPath> {
-        self.target_path(expression).or_else(|| {
-            self.callables
-                .resolve(expression, self.source, self.scoping, self.constants)
-                .map(|callable| callable.mutation_object_path())
-        })
+        self.target_path(expression)
+            .or_else(|| {
+                self.callables
+                    .namespace_path(expression, self.scoping, self.constants)
+                    .map(MutationPath::Global)
+            })
+            .or_else(|| {
+                self.callables
+                    .resolve(expression, self.source, self.scoping, self.constants)
+                    .map(|callable| callable.mutation_object_path())
+            })
     }
 
     fn target_path(&self, expression: &Expression<'_>) -> Option<MutationPath> {
@@ -717,7 +740,9 @@ impl<'a> Visit<'a> for SinkMutationCollector<'_, '_> {
 
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         if !call.optional {
-            let method = global_path(self.scoping, self.constants, &call.callee);
+            let method = self
+                .callables
+                .intrinsic_path(&call.callee, self.scoping, self.constants);
             match method.as_deref() {
                 Some("Object.defineProperty" | "Reflect.set") if call.arguments.len() >= 3 => {
                     if let Some(mut target) = self.reflective_target(call) {
@@ -753,24 +778,6 @@ impl<'a> Visit<'a> for SinkMutationCollector<'_, '_> {
     }
 }
 
-fn exact_argument(
-    source: &str,
-    argument: Option<&oxc_ast::ast::Argument<'_>>,
-    scoping: &Scoping,
-    constants: &ProvenConstantEnvironment,
-) -> (Option<String>, Option<String>) {
-    let Some(argument) = argument else {
-        return (None, None);
-    };
-    let Some(expression) = argument.as_expression() else {
-        return (None, Some(source_fragment(source, argument.span())));
-    };
-    (
-        static_string(expression, scoping, constants),
-        Some(source_fragment(source, expression.span())),
-    )
-}
-
 #[derive(Debug, Clone, Eq, PartialEq)]
 enum FetchInitMethod {
     Missing,
@@ -784,16 +791,10 @@ enum FetchInitMethod {
 
 fn fetch_init_method(
     source: &str,
-    argument: Option<&oxc_ast::ast::Argument<'_>>,
+    expression: &Expression<'_>,
     scoping: &Scoping,
     constants: &ProvenConstantEnvironment,
 ) -> FetchInitMethod {
-    let Some(argument) = argument else {
-        return FetchInitMethod::Missing;
-    };
-    let Some(expression) = argument.as_expression() else {
-        return FetchInitMethod::Unknown;
-    };
     let Expression::ObjectExpression(object) = unparenthesized(expression) else {
         return FetchInitMethod::Unknown;
     };
@@ -915,7 +916,18 @@ impl Collector<'_, '_> {
         else {
             return;
         };
-        if !callable.callable_as(constructor) || callable.kind == ApiKind::XhrConstructor {
+        if !callable.callable_as(constructor) {
+            return;
+        }
+        let mut callable = callable;
+        callable
+            .prefix
+            .append(arguments, self.source, self.scoping, self.constants);
+        self.emit_invocation(callee, callable, span);
+    }
+
+    fn emit_invocation(&mut self, callee: &Expression<'_>, callable: Callable, span: Span) {
+        if callable.kind == ApiKind::XhrConstructor {
             return;
         }
         let family = callable.kind.family();
@@ -937,7 +949,7 @@ impl Collector<'_, '_> {
                 affected.insert(family.to_owned());
             }
         }
-        for dependency in callable.bind_dependencies() {
+        for dependency in callable.dispatch_dependencies() {
             if self.mutations.any(&dependency) {
                 mutated = true;
                 affected.insert(dependency);
@@ -947,14 +959,13 @@ impl Collector<'_, '_> {
             !symbol_is_safe_xhr_receiver(self.scoping, symbol, self.safe_member_refs)
         });
         let candidate = mutated || escaped;
-        let mut arguments_evidence = callable.prefix.clone();
-        arguments_evidence.append(arguments, self.source, self.scoping, self.constants);
+        let arguments_evidence = &callable.prefix;
         let url = arguments_evidence.exact(usize::from(callable.kind == ApiKind::XhrOpen));
         let prototype_mutated = self.mutations.any("request_init_method_prototype");
         let mut method = match callable.kind {
             ApiKind::Fetch => arguments_evidence.fetch_method(url.0.is_some(), prototype_mutated),
             ApiKind::Beacon => (Some("POST".to_owned()), None, Some("exact".to_owned())),
-            ApiKind::XhrOpen => xhr_method(&arguments_evidence),
+            ApiKind::XhrOpen => xhr_method(arguments_evidence),
             ApiKind::WebSocket | ApiKind::XhrConstructor => (None, None, None),
         };
         if callable.kind == ApiKind::Fetch
@@ -968,7 +979,7 @@ impl Collector<'_, '_> {
         }
         let proof = if mutated {
             if callable.captured || callable.constructor_captured {
-                "captured_api_binding_or_native_bind_may_be_mutated"
+                "captured_api_binding_or_native_dispatch_may_be_mutated"
             } else {
                 match callable.kind {
                     ApiKind::Fetch => "unresolved_global_member_mutation_may_replace_fetch",
@@ -982,6 +993,11 @@ impl Collector<'_, '_> {
             }
         } else if escaped {
             "unreassigned_binding_initialized_from_standard_XMLHttpRequest_but_receiver_escapes_or_is_mutable"
+        } else if matches!(
+            callable.invocation_form(),
+            "call" | "apply" | "reflect_apply"
+        ) {
+            "native_api_dispatch_with_proven_receiver"
         } else if callable.bound {
             "native_bound_api_with_proven_receiver"
         } else if callable.captured {
@@ -1020,7 +1036,14 @@ impl Collector<'_, '_> {
 impl<'a> Visit<'a> for Collector<'_, '_> {
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         if !call.optional {
-            self.visit_invocation(&call.callee, &call.arguments, call.span, false);
+            if let Some(dispatch) =
+                self.callables
+                    .resolve_dispatch(call, self.source, self.scoping, self.constants)
+            {
+                self.emit_invocation(&call.callee, dispatch.callable, call.span);
+            } else {
+                self.visit_invocation(&call.callee, &call.arguments, call.span, false);
+            }
         }
         walk::walk_call_expression(self, call);
     }
@@ -1192,6 +1215,224 @@ xhr.send(payload);
         assert_eq!(rows[5].kind, "xhr_open");
         assert_eq!(rows[5].method.as_deref(), Some("POST"));
         assert_eq!(rows[5].line, 8);
+        Ok(())
+    }
+
+    #[test]
+    fn global_namespace_rebinding_affects_only_dependent_lookups() -> Result<()> {
+        let source = r#"
+const root = window;
+window = replacement;
+root.fetch("/captured");
+window.fetch("/window");
+globalThis.fetch("/global");
+fetch("/bare");
+fetch.call(window, "/receiver");
+"#;
+        let result =
+            super::analyze_api_surface(source, &WorkBudget::unlimited("namespace-rebinding"))?;
+        let rows = &result.callsites;
+        assert_eq!(rows.len(), 5, "{rows:#?}");
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.binding_status.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "candidate",
+                "candidate",
+                "standard",
+                "standard",
+                "candidate"
+            ]
+        );
+        assert_eq!(result.mutation_sites.len(), 1);
+        assert_eq!(
+            result.mutation_sites[0].affected_families,
+            ["namespace_window"]
+        );
+        assert!(rows[2].mutation_site_ordinals.is_empty());
+        assert_eq!(rows[4].mutation_site_ordinals, [0]);
+        Ok(())
+    }
+
+    #[test]
+    fn namespace_aliases_and_nested_destructuring_retain_native_identity() -> Result<()> {
+        let source = r#"
+const root = globalThis;
+const nav = root.navigator;
+const key = "fe" + "tch";
+const {[key]: request, navigator: {sendBeacon: report}, WebSocket: Socket} = root;
+root.fetch("/direct");
+request("/destructured", {method: "PATCH"});
+nav.sendBeacon("/member", payload);
+report.call(nav, "/report", payload);
+new Socket("wss://example.test/live");
+"#;
+        let rows = analyze_api_surface(source)?;
+        assert_eq!(rows.len(), 5, "{rows:#?}");
+        assert_eq!(
+            rows.iter().map(|row| row.kind.as_str()).collect::<Vec<_>>(),
+            ["fetch", "fetch", "send_beacon", "send_beacon", "websocket"]
+        );
+        assert!(rows.iter().all(|row| row.binding_status == "standard"));
+        assert_eq!(rows[0].invocation_form, "alias");
+        assert_eq!(rows[1].method.as_deref(), Some("PATCH"));
+        assert_eq!(
+            rows[1].binding_witnesses.last().map(|w| w.kind.as_str()),
+            Some("destructure")
+        );
+        assert_eq!(rows[2].url.as_deref(), Some("/member"));
+        assert_eq!(rows[3].invocation_form, "call");
+        assert_eq!(rows[3].url.as_deref(), Some("/report"));
+        assert_eq!(rows[4].url.as_deref(), Some("wss://example.test/live"));
+        Ok(())
+    }
+
+    #[test]
+    fn namespace_aliases_respect_scope_and_do_not_invent_dotted_properties() -> Result<()> {
+        let source = r#"
+const root = window;
+function nested(root) { root.fetch("/shadow"); }
+root["navigator.sendBeacon"]("/not-nested");
+const {fetch: fallback = other} = root;
+fallback("/not-proven");
+let mutable = root;
+mutable.fetch("/mutable");
+const {navigator: nav} = root;
+const {sendBeacon: detached} = nav;
+detached("/invalid-receiver");
+nav.sendBeacon("/real", body);
+"#;
+        let rows = analyze_api_surface(source)?;
+        assert_eq!(rows.len(), 1, "{rows:#?}");
+        assert_eq!(rows[0].url.as_deref(), Some("/real"));
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_dispatch_reuses_bound_arguments_and_checks_receiver() -> Result<()> {
+        let source = r#"
+const nav = navigator;
+const send = nav.sendBeacon;
+send.call(window, "/invalid");
+send.call(nav, "/call", payload);
+send.apply(nav, ["/apply", payload]);
+const xhr = new XMLHttpRequest();
+const open = xhr.open;
+Reflect.apply(open, xhr, ["PATCH", "/xhr"]);
+const request = fetch.bind(window, "/bound");
+request.apply(null, [{method: "PUT"}]);
+const r = Reflect;
+r["ap" + "ply"](fetch, window, ["/reflected", {method: "POST"}]);
+"#;
+        let rows = analyze_api_surface(source)?;
+        assert_eq!(rows.len(), 5, "{rows:#?}");
+        assert!(rows.iter().all(|row| row.binding_status == "standard"));
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.invocation_form.as_str())
+                .collect::<Vec<_>>(),
+            ["call", "apply", "reflect_apply", "apply", "reflect_apply"]
+        );
+        assert_eq!(rows[0].url.as_deref(), Some("/call"));
+        assert_eq!(rows[1].url.as_deref(), Some("/apply"));
+        assert_eq!(rows[2].kind, "xhr_open");
+        assert_eq!(rows[2].method.as_deref(), Some("PATCH"));
+        assert_eq!(rows[3].url.as_deref(), Some("/bound"));
+        assert_eq!(rows[3].method.as_deref(), Some("PUT"));
+        assert_eq!(rows[4].method.as_deref(), Some("POST"));
+        Ok(())
+    }
+
+    #[test]
+    fn dispatch_argument_arrays_preserve_holes_and_unknown_spread_boundaries() -> Result<()> {
+        let source = r#"
+fetch.apply(window, ["/known", ...args, {method: "POST"}]);
+fetch.apply(window, [...args, "/unknown"]);
+fetch.apply(window, [, {method: "PATCH"}]);
+fetch.apply(window, args);
+fetch.call(window, ...args, "/unknown");
+Reflect.apply(fetch, window, null);
+const bound = fetch.bind(window, "/invalid-array-like");
+bound.apply(null, 3);
+Reflect.apply(bound, null, "invalid");
+"#;
+        let rows = analyze_api_surface(source)?;
+        assert_eq!(rows.len(), 5, "{rows:#?}");
+        assert_eq!(rows[0].url.as_deref(), Some("/known"));
+        assert_eq!(rows[0].method_status.as_deref(), Some("unknown"));
+        assert!(rows[1..].iter().all(|row| row.url.is_none()));
+        assert_eq!(rows[2].method.as_deref(), Some("PATCH"));
+        assert_eq!(rows[3].method_status.as_deref(), Some("unknown"));
+        assert_eq!(rows[4].method_status.as_deref(), Some("unknown"));
+        Ok(())
+    }
+
+    #[test]
+    fn namespace_and_dispatch_writes_invalidate_only_relevant_operations() -> Result<()> {
+        let source = r#"
+const root = window;
+const F = root.Function;
+const request = root.fetch;
+F.prototype.call = customCall;
+const r = root.Reflect;
+r.apply = customReflect;
+request.apply = customApply;
+request.call(root, "/call");
+request.apply(root, ["/apply"]);
+r.apply(request, root, ["/reflect"]);
+request("/direct");
+const nav = root.navigator;
+const O = root.Object;
+O.defineProperty(nav, "sendBeacon", {value: fake});
+nav.sendBeacon("/beacon", payload);
+"#;
+        let result = super::analyze_api_surface(
+            source,
+            &WorkBudget::unlimited("namespace-dispatch-writes"),
+        )?;
+        let rows = &result.callsites;
+        assert_eq!(rows.len(), 5, "{rows:#?}");
+        assert!(rows[..3].iter().all(|row| row.kind == "fetch_candidate"));
+        assert_eq!(rows[3].kind, "fetch");
+        assert!(rows[3].mutation_site_ordinals.is_empty());
+        for (row, family) in rows[..3]
+            .iter()
+            .zip(["function_call", "fetch_apply", "reflect_apply"])
+        {
+            assert_eq!(row.mutation_site_ordinals.len(), 1, "{row:#?}");
+            assert_eq!(
+                result.mutation_sites[row.mutation_site_ordinals[0]].affected_families,
+                [family]
+            );
+        }
+        assert_eq!(rows[4].kind, "send_beacon_candidate");
+        assert_eq!(
+            result.mutation_sites[rows[4].mutation_site_ordinals[0]].operation,
+            "Object.defineProperty"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dispatch_member_mutation_on_one_bound_object_does_not_affect_others() -> Result<()> {
+        let source = r#"
+const a = fetch.bind(window);
+const b = fetch.bind(window);
+a.call = other;
+a.call(null, "/candidate");
+b.call(null, "/standard");
+a("/direct");
+"#;
+        let result =
+            super::analyze_api_surface(source, &WorkBudget::unlimited("bound-dispatch-writes"))?;
+        assert_eq!(result.callsites.len(), 3, "{result:#?}");
+        assert_eq!(result.callsites[0].kind, "fetch_candidate");
+        assert_eq!(result.callsites[1].kind, "fetch");
+        assert_eq!(result.callsites[2].kind, "fetch");
+        let site = &result.mutation_sites[0];
+        assert!(site.bound_function_start.is_some());
+        assert_eq!(site.target_pattern, [Some("call".into())]);
         Ok(())
     }
 

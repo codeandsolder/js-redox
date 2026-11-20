@@ -5,7 +5,9 @@
 //! captured at the bind expression, and unknown spreads never shift a later
 //! argument into a falsely proven position.
 use super::*;
-use oxc_ast::ast::{Argument, VariableDeclaration, VariableDeclarationKind};
+use oxc_ast::ast::{
+    Argument, ArrayExpressionElement, VariableDeclaration, VariableDeclarationKind,
+};
 use std::{collections::BTreeMap, rc::Rc};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -99,20 +101,86 @@ impl ApiArguments {
         constants: &ProvenConstantEnvironment,
     ) {
         for arg in args {
-            if self.prefix.len() >= 2 || self.unknown_tail.is_some() {
+            if self.complete() {
                 break;
             }
-            if arg.as_expression().is_none() {
+            if let Some(expr) = arg.as_expression() {
+                self.push_expression(expr, source, scoping, constants);
+            } else {
                 self.unknown_tail = Some(Rc::from(source_fragment(source, arg.span())));
+            }
+        }
+    }
+
+    fn complete(&self) -> bool {
+        self.prefix.len() >= 2 || self.unknown_tail.is_some()
+    }
+
+    fn push_expression(
+        &mut self,
+        expr: &Expression<'_>,
+        source: &str,
+        scoping: &Scoping,
+        constants: &ProvenConstantEnvironment,
+    ) {
+        self.prefix.push(Rc::new(ArgumentEvidence {
+            string: static_string(expr, scoping, constants),
+            expression: Some(source_fragment(source, expr.span())),
+            init: fetch_init_method(source, expr, scoping, constants),
+        }));
+    }
+
+    fn append_array(
+        &mut self,
+        arg: Option<&Argument<'_>>,
+        source: &str,
+        scoping: &Scoping,
+        constants: &ProvenConstantEnvironment,
+        reflect: bool,
+    ) -> Option<()> {
+        let Some(arg) = arg else {
+            return (!reflect).then_some(());
+        };
+        let expr = unparenthesized(arg.as_expression()?);
+        if matches!(expr, Expression::NullLiteral(_))
+            || global_path(scoping, constants, expr).as_deref() == Some("undefined")
+        {
+            return (!reflect).then_some(());
+        }
+        if matches!(
+            expr,
+            Expression::StringLiteral(_)
+                | Expression::NumericLiteral(_)
+                | Expression::BooleanLiteral(_)
+                | Expression::BigIntLiteral(_)
+        ) || static_string(expr, scoping, constants).is_some()
+        {
+            return None;
+        }
+        if self.complete() {
+            return Some(());
+        }
+        let Expression::ArrayExpression(array) = expr else {
+            self.unknown_tail = Some(Rc::from(source_fragment(source, expr.span())));
+            return Some(());
+        };
+        for element in &array.elements {
+            if self.complete() {
                 break;
             }
-            let (string, expression) = exact_argument(source, Some(arg), scoping, constants);
-            self.prefix.push(Rc::new(ArgumentEvidence {
-                string,
-                expression,
-                init: fetch_init_method(source, Some(arg), scoping, constants),
-            }));
+            match element {
+                ArrayExpressionElement::Elision(_) => self.prefix.push(Rc::new(ArgumentEvidence {
+                    string: None,
+                    expression: None,
+                    init: FetchInitMethod::Unknown,
+                })),
+                ArrayExpressionElement::SpreadElement(_) => {
+                    self.unknown_tail = Some(Rc::from(source_fragment(source, element.span())));
+                }
+                _ => self.push_expression(element.as_expression()?, source, scoping, constants),
+            }
         }
+        Some(())
     }
 
     pub(super) fn exact(&self, index: usize) -> (Option<String>, Option<String>) {
@@ -155,7 +223,7 @@ impl ApiArguments {
 struct WitnessLink {
     previous: Option<Rc<Self>>,
     witness: ApiBindingWitness,
-    bind_dependency: Option<String>,
+    dependency: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -169,6 +237,8 @@ pub(super) struct Callable {
     pub(super) prefix: ApiArguments,
     witness: Option<Rc<WitnessLink>>,
     bound_object: Option<u32>,
+    dispatch: Option<&'static str>,
+    namespace_dependencies: BTreeSet<&'static str>,
 }
 
 impl Callable {
@@ -183,10 +253,12 @@ impl Callable {
             prefix: ApiArguments::default(),
             witness: None,
             bound_object: None,
+            dispatch: None,
+            namespace_dependencies: BTreeSet::new(),
         }
     }
 
-    fn add_witness(&mut self, kind: &str, span: Span, bind_dependency: Option<String>) {
+    fn add_witness(&mut self, kind: &str, span: Span, dependency: Option<String>) {
         self.witness = Some(Rc::new(WitnessLink {
             previous: self.witness.take(),
             witness: ApiBindingWitness {
@@ -194,7 +266,7 @@ impl Callable {
                 start: span.start,
                 end: span.end,
             },
-            bind_dependency,
+            dependency,
         }));
     }
 
@@ -209,23 +281,29 @@ impl Callable {
         result
     }
 
-    pub(super) fn bind_dependencies(&self) -> BTreeSet<String> {
-        let mut result = BTreeSet::new();
+    pub(super) fn dispatch_dependencies(&self) -> BTreeSet<String> {
+        let mut result = self
+            .namespace_dependencies
+            .iter()
+            .map(|key| (*key).to_owned())
+            .collect::<BTreeSet<_>>();
         let mut cursor = self.witness.as_deref();
         while let Some(link) = cursor {
-            if let Some(key) = &link.bind_dependency {
+            if let Some(key) = &link.dependency {
                 result.insert(key.clone());
-                result.insert("function_bind".into());
+                if matches!(link.witness.kind.as_str(), "bind" | "call" | "apply") {
+                    result.insert(format!("function_{}", link.witness.kind));
+                }
             }
             cursor = link.previous.as_deref();
         }
         result
     }
 
-    fn bind_member_family(&self) -> String {
+    fn dispatch_member_family(&self, operation: &str) -> String {
         self.bound_object.map_or_else(
-            || format!("{}_bind", self.kind.family()),
-            |start| format!("bound_bind:{start}"),
+            || format!("{}_{operation}", self.kind.family()),
+            |start| format!("bound_{operation}:{start}"),
         )
     }
 
@@ -247,7 +325,9 @@ impl Callable {
     }
 
     pub(super) fn invocation_form(&self) -> &'static str {
-        if self.bound {
+        if let Some(dispatch) = self.dispatch {
+            dispatch
+        } else if self.bound {
             "bound"
         } else if self.captured {
             "alias"
@@ -273,9 +353,79 @@ impl<T> Available<T> {
     }
 }
 
+#[derive(Clone, Debug)]
+struct Namespace {
+    path: String,
+    witness: Option<Rc<WitnessLink>>,
+    dependencies: BTreeSet<&'static str>,
+}
+
+fn global_root_dependency(path: &str) -> Option<&'static str> {
+    match path.split('.').next()? {
+        "window" => Some("namespace_window"),
+        "self" => Some("namespace_self"),
+        "globalThis" => Some("namespace_globalThis"),
+        _ => None,
+    }
+}
+
+impl Namespace {
+    fn from_path(path: String, witness: Option<Rc<WitnessLink>>) -> Option<Self> {
+        let relative = path
+            .strip_prefix("window.")
+            .or_else(|| path.strip_prefix("globalThis."))
+            .or_else(|| path.strip_prefix("self."))
+            .unwrap_or(&path);
+        let canonical = match relative {
+            "window" | "globalThis" | "self" => "globalThis",
+            "navigator" | "Object" | "Reflect" | "Function" | "Object.prototype"
+            | "Function.prototype" => relative,
+            _ => return None,
+        };
+        Some(Self {
+            path: canonical.to_owned(),
+            witness,
+            dependencies: global_root_dependency(&path).into_iter().collect(),
+        })
+    }
+
+    fn property(&self, name: &str) -> Option<String> {
+        (!name.contains('.')).then(|| format!("{}.{}", self.path, name))
+    }
+
+    fn child(&self, key: &str) -> Option<Self> {
+        let mut child = Self::from_path(self.property(key)?, self.witness.clone())?;
+        child.dependencies = self.dependencies.clone();
+        Some(child)
+    }
+
+    fn callable(&self, key: &str) -> Option<Callable> {
+        let kind = ApiKind::from_global(&self.property(key)?)?;
+        let mut callable = Callable::native(kind);
+        callable.captured = self.witness.is_some();
+        callable.witness = self.witness.clone();
+        callable
+            .namespace_dependencies
+            .clone_from(&self.dependencies);
+        Some(callable)
+    }
+}
+
+#[derive(Clone, Debug)]
+enum NamespaceValue {
+    Namespace(Namespace),
+    Callable(Callable),
+}
+
+pub(super) struct DispatchInvocation {
+    pub(super) callable: Callable,
+    pub(super) receiver_ref: Option<ReferenceId>,
+}
+
 #[derive(Default)]
 pub(super) struct CallableIndex {
     aliases: BTreeMap<SymbolId, Available<Callable>>,
+    namespaces: BTreeMap<SymbolId, Available<Namespace>>,
     xhr: BTreeMap<SymbolId, Available<Callable>>,
 }
 
@@ -324,6 +474,49 @@ impl CallableIndex {
         collector.index
     }
 
+    fn namespace(
+        &self,
+        expr: &Expression<'_>,
+        scoping: &Scoping,
+        constants: &ProvenConstantEnvironment,
+    ) -> Option<Namespace> {
+        if let Some(path) = global_path(scoping, constants, expr) {
+            return Namespace::from_path(path, None);
+        }
+        if let Some(symbol) = expression_symbol(scoping, expr) {
+            return self.namespaces.get(&symbol)?.at(expr.span().start).cloned();
+        }
+        let (object, key) = member_parts(expr, scoping, constants)?;
+        let parent = self.namespace(object, scoping, constants)?;
+        parent.child(&key)
+    }
+
+    pub(super) fn namespace_path(
+        &self,
+        expr: &Expression<'_>,
+        scoping: &Scoping,
+        constants: &ProvenConstantEnvironment,
+    ) -> Option<Vec<Option<String>>> {
+        let namespace = self.namespace(expr, scoping, constants)?;
+        Some(
+            namespace
+                .path
+                .split('.')
+                .map(|part| Some(part.to_owned()))
+                .collect(),
+        )
+    }
+
+    pub(super) fn intrinsic_path(
+        &self,
+        expr: &Expression<'_>,
+        scoping: &Scoping,
+        constants: &ProvenConstantEnvironment,
+    ) -> Option<String> {
+        let (object, key) = member_parts(expr, scoping, constants)?;
+        self.namespace(object, scoping, constants)?.property(&key)
+    }
+
     pub(super) fn resolve(
         &self,
         expr: &Expression<'_>,
@@ -332,16 +525,24 @@ impl CallableIndex {
         constants: &ProvenConstantEnvironment,
     ) -> Option<Callable> {
         let expr = unparenthesized(expr);
-        if let Some(kind) = global_path(scoping, constants, expr)
-            .as_deref()
-            .and_then(ApiKind::from_global)
-        {
-            return Some(Callable::native(kind));
+        if let Some(path) = global_path(scoping, constants, expr) {
+            if let Some(kind) = ApiKind::from_global(&path) {
+                let mut callable = Callable::native(kind);
+                callable
+                    .namespace_dependencies
+                    .extend(global_root_dependency(&path));
+                return Some(callable);
+            }
         }
         if let Some(symbol) = expression_symbol(scoping, expr) {
             return self.aliases.get(&symbol)?.at(expr.span().start).cloned();
         }
         if let Some((object, key)) = member_parts(expr, scoping, constants) {
+            if let Some(namespace) = self.namespace(object, scoping, constants) {
+                if let Some(callable) = namespace.callable(&key) {
+                    return Some(callable);
+                }
+            }
             if key == "open" {
                 let symbol = expression_symbol(scoping, object)?;
                 let constructor = self.xhr.get(&symbol)?.at(object.span().start)?;
@@ -349,6 +550,9 @@ impl CallableIndex {
                 callable.receiver = Some(symbol);
                 callable.constructor_captured = constructor.captured;
                 callable.witness = constructor.witness.clone();
+                callable
+                    .namespace_dependencies
+                    .clone_from(&constructor.namespace_dependencies);
                 return Some(callable);
             }
         }
@@ -377,28 +581,11 @@ impl CallableIndex {
             Some(arg) => Some(arg.as_expression()?),
             None => None,
         };
-        let receiver_path = receiver.and_then(|expr| global_path(scoping, constants, expr));
-        let valid_receiver = callable.bound
-            || callable.kind.is_constructor()
-            || match callable.kind {
-                ApiKind::Fetch => {
-                    receiver.is_none()
-                        || receiver.is_some_and(|expr| {
-                            matches!(unparenthesized(expr), Expression::NullLiteral(_))
-                        })
-                        || receiver_path
-                            .as_deref()
-                            .is_some_and(|path| is_global_receiver(path) || path == "undefined")
-                }
-                ApiKind::Beacon => receiver_path.as_deref().is_some_and(is_navigator_receiver),
-                ApiKind::XhrOpen => receiver
-                    .is_some_and(|expr| expression_symbol(scoping, expr) == callable.receiver),
-                ApiKind::WebSocket | ApiKind::XhrConstructor => true,
-            };
-        if !valid_receiver {
+        if !self.valid_receiver(&callable, receiver, scoping, constants) {
             return None;
         }
-        let dependency = callable.bind_member_family();
+        self.add_receiver_dependencies(&mut callable, receiver, scoping, constants);
+        let dependency = callable.dispatch_member_family("bind");
         callable.add_witness("bind", call.span, Some(dependency));
         callable.prefix.append(
             call.arguments.get(1..).unwrap_or_default(),
@@ -411,6 +598,119 @@ impl CallableIndex {
         callable.detached = false;
         callable.bound_object = Some(call.span.start);
         Some(callable)
+    }
+    fn valid_receiver(
+        &self,
+        callable: &Callable,
+        receiver: Option<&Expression<'_>>,
+        scoping: &Scoping,
+        constants: &ProvenConstantEnvironment,
+    ) -> bool {
+        let namespace = receiver.and_then(|expr| self.namespace(expr, scoping, constants));
+        let path = namespace.as_ref().map(|ns| ns.path.as_str());
+        callable.bound
+            || callable.kind.is_constructor()
+            || match callable.kind {
+                ApiKind::Fetch => {
+                    receiver.is_none()
+                        || receiver.is_some_and(|expr| {
+                            matches!(unparenthesized(expr), Expression::NullLiteral(_))
+                                || global_path(scoping, constants, expr).as_deref()
+                                    == Some("undefined")
+                        })
+                        || path.is_some_and(is_global_receiver)
+                }
+                ApiKind::Beacon => path.is_some_and(is_navigator_receiver),
+                ApiKind::XhrOpen => receiver
+                    .is_some_and(|expr| expression_symbol(scoping, expr) == callable.receiver),
+                ApiKind::WebSocket | ApiKind::XhrConstructor => true,
+            }
+    }
+
+    fn add_receiver_dependencies(
+        &self,
+        callable: &mut Callable,
+        receiver: Option<&Expression<'_>>,
+        scoping: &Scoping,
+        constants: &ProvenConstantEnvironment,
+    ) {
+        // Rebinding an already bound function ignores the supplied receiver.
+        if callable.bound || callable.kind.is_constructor() {
+            return;
+        }
+        if let Some(namespace) = receiver.and_then(|expr| self.namespace(expr, scoping, constants))
+        {
+            callable
+                .namespace_dependencies
+                .extend(namespace.dependencies);
+        }
+    }
+
+    pub(super) fn resolve_dispatch(
+        &self,
+        call: &CallExpression<'_>,
+        source: &str,
+        scoping: &Scoping,
+        constants: &ProvenConstantEnvironment,
+    ) -> Option<DispatchInvocation> {
+        if call.optional {
+            return None;
+        }
+        let (object, key) = member_parts(&call.callee, scoping, constants)?;
+        let reflective_namespace = self
+            .namespace(object, scoping, constants)
+            .filter(|namespace| key == "apply" && namespace.path == "Reflect");
+        let reflection = reflective_namespace.is_some();
+        let (mut callable, offset, operation, dependency) = if reflection {
+            let target = call.arguments.first()?.as_expression()?;
+            let callable = self.resolve(target, source, scoping, constants)?;
+            (callable, 1, "reflect_apply", "reflect_apply".to_owned())
+        } else {
+            let operation = match key.as_str() {
+                "call" => "call",
+                "apply" => "apply",
+                _ => return None,
+            };
+            let callable = self.resolve(object, source, scoping, constants)?;
+            let dependency = callable.dispatch_member_family(operation);
+            (callable, 0, operation, dependency)
+        };
+        if callable.kind.is_constructor() {
+            return None;
+        }
+        let receiver = match call.arguments.get(offset) {
+            Some(arg) => Some(arg.as_expression()?),
+            None => None,
+        };
+        if !self.valid_receiver(&callable, receiver, scoping, constants) {
+            return None;
+        }
+        self.add_receiver_dependencies(&mut callable, receiver, scoping, constants);
+        if let Some(namespace) = reflective_namespace {
+            callable
+                .namespace_dependencies
+                .extend(namespace.dependencies);
+        }
+        let receiver_ref = receiver
+            .filter(|expr| {
+                callable.receiver.is_some() && expression_symbol(scoping, expr) == callable.receiver
+            })
+            .and_then(direct_reference_id);
+        let args = call.arguments.get(offset + 1..).unwrap_or_default();
+        if operation == "call" {
+            callable.prefix.append(args, source, scoping, constants);
+        } else {
+            callable
+                .prefix
+                .append_array(args.first(), source, scoping, constants, reflection)?;
+        }
+        callable.detached = false;
+        callable.dispatch = Some(operation);
+        callable.add_witness(operation, call.span, Some(dependency));
+        Some(DispatchInvocation {
+            callable,
+            receiver_ref,
+        })
     }
 }
 
@@ -427,31 +727,124 @@ impl BindingCollector<'_, '_> {
             .resolve(expr, self.source, self.scoping, self.constants)
     }
 
+    fn bind_value(
+        &mut self,
+        pattern: &BindingPattern<'_>,
+        value: NamespaceValue,
+        span: Span,
+        after: u32,
+        kind: &str,
+    ) {
+        match pattern {
+            BindingPattern::BindingIdentifier(identifier) => {
+                let Some(symbol) = identifier.symbol_id.get() else {
+                    return;
+                };
+                if !xhr_binding_is_not_reassigned(self.scoping, symbol) {
+                    return;
+                }
+                match value {
+                    NamespaceValue::Callable(mut callable) => {
+                        callable.captured = true;
+                        callable.detached = !callable.bound && callable.kind.needs_receiver();
+                        callable.add_witness(kind, span, None);
+                        self.index.aliases.insert(
+                            symbol,
+                            Available {
+                                after,
+                                value: callable,
+                            },
+                        );
+                    }
+                    NamespaceValue::Namespace(mut namespace) => {
+                        namespace.witness = Some(Rc::new(WitnessLink {
+                            previous: namespace.witness.take(),
+                            witness: ApiBindingWitness {
+                                kind: kind.to_owned(),
+                                start: span.start,
+                                end: span.end,
+                            },
+                            dependency: None,
+                        }));
+                        self.index.namespaces.insert(
+                            symbol,
+                            Available {
+                                after,
+                                value: namespace,
+                            },
+                        );
+                    }
+                }
+            }
+            BindingPattern::ObjectPattern(object) => {
+                let NamespaceValue::Namespace(namespace) = value else {
+                    return;
+                };
+                for property in &object.properties {
+                    let key = property
+                        .key
+                        .static_name()
+                        .and_then(|name| name.into_cow_str().map(|key| key.into_owned()))
+                        .or_else(|| {
+                            property
+                                .key
+                                .as_expression()
+                                .and_then(|expr| static_string(expr, self.scoping, self.constants))
+                        });
+                    let Some(key) = key else {
+                        continue;
+                    };
+                    let property_value = namespace
+                        .callable(&key)
+                        .map(NamespaceValue::Callable)
+                        .or_else(|| namespace.child(&key).map(NamespaceValue::Namespace));
+                    if let Some(value) = property_value {
+                        self.bind_value(
+                            &property.value,
+                            value,
+                            property.span,
+                            after,
+                            "destructure",
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn record(&mut self, declaration: &VariableDeclarator<'_>, immutable: bool) {
+        let Some(init) = declaration.init.as_ref() else {
+            return;
+        };
+        if immutable {
+            let value = self
+                .resolve(init)
+                .map(NamespaceValue::Callable)
+                .or_else(|| {
+                    self.index
+                        .namespace(init, self.scoping, self.constants)
+                        .map(NamespaceValue::Namespace)
+                });
+            if let Some(value) = value {
+                self.bind_value(
+                    &declaration.id,
+                    value,
+                    declaration.span,
+                    declaration.span.end,
+                    "const_alias",
+                );
+                return;
+            }
+        }
         let BindingPattern::BindingIdentifier(identifier) = &declaration.id else {
             return;
         };
-        let (Some(symbol), Some(init)) = (identifier.symbol_id.get(), declaration.init.as_ref())
-        else {
+        let Some(symbol) = identifier.symbol_id.get() else {
             return;
         };
         if !xhr_binding_is_not_reassigned(self.scoping, symbol) {
             return;
-        }
-        if immutable {
-            if let Some(mut callable) = self.resolve(init) {
-                callable.captured = true;
-                callable.detached = !callable.bound && callable.kind.needs_receiver();
-                callable.add_witness("const_alias", declaration.span, None);
-                self.index.aliases.insert(
-                    symbol,
-                    Available {
-                        after: declaration.span.end,
-                        value: callable,
-                    },
-                );
-                return;
-            }
         }
         if let Expression::NewExpression(new) = unparenthesized(init) {
             if let Some(constructor) = self.resolve(&new.callee) {
