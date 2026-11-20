@@ -1,314 +1,21 @@
-//! Specialize single-expression local forwarding chains using existing lexical
-//! parameter proof and native callable evidence. Separate original body sink
-//! sites from their call-specific specializations. No AST rewriting/evaluation.
+//! Source-local callable indexing and bounded wrapper-chain specialization.
+//! Preserve original and specializing invocation provenance, not execution proof.
+mod frame;
+mod values;
+
 use super::{
-    callables::{member_parts, DispatchOperands, ForwardedValue, PositionalArguments},
+    callables::{member_parts, DispatchOperands},
     *,
 };
-use crate::source_tree_callflow::stable_parameter_index;
+use frame::{append_local_witnesses, instantiate, uses_arguments_object, Wrapper};
 use oxc_ast::{
-    ast::{
-        Argument, ArrayExpression, ArrayExpressionElement, FormalParameters, Function,
-        FunctionBody, Statement,
-    },
+    ast::{Argument, Function},
     AstKind,
 };
 use oxc_semantic::Semantic;
 use oxc_syntax::scope::ScopeId;
-use std::{collections::BTreeMap, rc::Rc};
-
-type ArgumentList<'a> = PositionalArguments<'a, 'a>;
-
-/// Carry value origins rather than copying syntax into a different scope.
-/// Materialized arrays share their positional contents; spreading a known
-/// array or rest value consumes those positions, while apply uses indexed
-/// contents without depending on Array.prototype[Symbol.iterator].
-struct ValueBuilder<'s, 'a> {
-    parameters: Option<(&'s Parameters, &'s ArgumentList<'a>)>,
-    scoping: &'s Scoping,
-    limit: usize,
-    budget: &'s WorkBudget,
-    used_iterator: bool,
-}
-
-impl<'s, 'a> ValueBuilder<'s, 'a> {
-    fn new(
-        parameters: Option<(&'s Parameters, &'s ArgumentList<'a>)>,
-        scoping: &'s Scoping,
-        limit: usize,
-        budget: &'s WorkBudget,
-    ) -> Self {
-        Self {
-            parameters,
-            scoping,
-            limit,
-            budget,
-            used_iterator: false,
-        }
-    }
-
-    fn expression(&mut self, expr: &'a Expression<'a>) -> Result<ForwardedValue<'a, 'a>> {
-        self.budget.consume(1)?;
-        if let Some((params, origin)) = self.parameters {
-            if let Some(symbol) = expression_symbol(self.scoping, expr) {
-                if params.forwardable.contains(&symbol) {
-                    if params.rest == Some(symbol) {
-                        let mut positions = ArgumentList::default();
-                        self.extend(&mut positions, origin, params.fixed.len(), expr.span())?;
-                        return Ok(ForwardedValue::Array {
-                            span: expr.span(),
-                            positions: Rc::new(positions),
-                        });
-                    }
-                    if let Some(index) = stable_parameter_index(
-                        self.scoping,
-                        symbol,
-                        params.fixed.iter().copied().map(Some),
-                    ) {
-                        return Ok(origin.value(index));
-                    }
-                }
-            }
-            if let Expression::ArrayExpression(array) = unparenthesized(expr) {
-                let positions = self.array(array)?;
-                return Ok(ForwardedValue::Array {
-                    span: expr.span(),
-                    positions: Rc::new(positions),
-                });
-            }
-        }
-        Ok(ForwardedValue::Expression(expr))
-    }
-
-    fn extend(
-        &self,
-        result: &mut ArgumentList<'a>,
-        origin: &ArgumentList<'a>,
-        start: usize,
-        span: Span,
-    ) -> Result<()> {
-        let available = origin.values.len().saturating_sub(start);
-        let count = self
-            .limit
-            .saturating_sub(result.values.len())
-            .min(available);
-        self.budget.consume(count as u64)?;
-        result
-            .values
-            .extend(origin.values.iter().skip(start).take(count).cloned());
-        result.unknown_tail = if count < available {
-            Some(span)
-        } else {
-            origin.unknown_tail
-        };
-        Ok(())
-    }
-
-    fn spread(
-        &mut self,
-        result: &mut ArgumentList<'a>,
-        expression: &'a Expression<'a>,
-        span: Span,
-    ) -> Result<()> {
-        let value = self.expression(expression)?;
-        match value {
-            ForwardedValue::Array { positions, .. } => {
-                self.used_iterator = true;
-                self.extend(result, &positions, 0, span)?;
-            }
-            ForwardedValue::Expression(expr) => {
-                if let Expression::ArrayExpression(array) = unparenthesized(expr) {
-                    // An expression captured in a preceding caller is not
-                    // evaluated in the current wrapper's lexical frame.
-                    let mut captured = Self::new(None, self.scoping, self.limit, self.budget);
-                    let positions = captured.array(array)?;
-                    self.used_iterator = true;
-                    self.extend(result, &positions, 0, span)?;
-                } else {
-                    result.unknown_tail = Some(span);
-                }
-            }
-            _ => result.unknown_tail = Some(span),
-        }
-        Ok(())
-    }
-
-    fn full(&self, result: &mut ArgumentList<'a>, span: Span) -> bool {
-        if result.values.len() >= self.limit {
-            result.unknown_tail = Some(span);
-        }
-        result.unknown_tail.is_some()
-    }
-
-    fn call(&mut self, args: &'a [Argument<'a>]) -> Result<ArgumentList<'a>> {
-        let mut result = ArgumentList::default();
-        self.budget.consume(args.len() as u64)?;
-        for arg in args {
-            if self.full(&mut result, arg.span()) {
-                break;
-            }
-            if let Argument::SpreadElement(spread) = arg {
-                self.spread(&mut result, &spread.argument, arg.span())?;
-            } else if let Some(expr) = arg.as_expression() {
-                result.values.push(self.expression(expr)?);
-            }
-            if result.unknown_tail.is_some() {
-                break;
-            }
-        }
-        Ok(result)
-    }
-
-    fn array(&mut self, array: &'a ArrayExpression<'a>) -> Result<ArgumentList<'a>> {
-        let mut result = ArgumentList::default();
-        self.budget.consume(array.elements.len() as u64)?;
-        for element in &array.elements {
-            if self.full(&mut result, element.span()) {
-                break;
-            }
-            match element {
-                ArrayExpressionElement::Elision(_) => {
-                    result.values.push(ForwardedValue::Unknown(None))
-                }
-                ArrayExpressionElement::SpreadElement(spread) => {
-                    self.spread(&mut result, &spread.argument, spread.span)?;
-                }
-                _ => {
-                    if let Some(expr) = element.as_expression() {
-                        result.values.push(self.expression(expr)?);
-                    }
-                }
-            }
-            if result.unknown_tail.is_some() {
-                break;
-            }
-        }
-        Ok(result)
-    }
-}
-
-struct Parameters {
-    fixed: Vec<SymbolId>,
-    rest: Option<SymbolId>,
-    forwardable: BTreeSet<SymbolId>,
-}
-
-impl Parameters {
-    fn from_formals(params: &FormalParameters<'_>, scoping: &Scoping) -> Option<Self> {
-        let fixed = params
-            .items
-            .iter()
-            .map(|param| {
-                if param.initializer.is_some() {
-                    return None;
-                }
-                param.pattern.get_binding_identifier()?.symbol_id.get()
-            })
-            .collect::<Option<Vec<_>>>()?;
-        let rest = if let Some(rest) = &params.rest {
-            let symbol = rest
-                .rest
-                .argument
-                .get_binding_identifier()?
-                .symbol_id
-                .get()?;
-            if !xhr_binding_is_not_reassigned(scoping, symbol) {
-                return None;
-            }
-            // A rest array can be mutated via a member/escape even if its
-            // binding is never reassigned. Only direct spread uses are trusted.
-            Some(symbol)
-        } else {
-            None
-        };
-        let all = fixed.iter().copied().chain(rest);
-        let mut unique = BTreeSet::new();
-        if !all.into_iter().all(|symbol| unique.insert(symbol)) {
-            return None;
-        }
-        Some(Self {
-            fixed,
-            rest,
-            forwardable: BTreeSet::new(),
-        })
-    }
-}
-
-struct Wrapper<'a> {
-    span: Span,
-    params: Parameters,
-    body: &'a Expression<'a>,
-}
-
-fn single_expression<'a>(body: &'a FunctionBody<'a>) -> Option<&'a Expression<'a>> {
-    match body.statements.as_slice() {
-        [Statement::ReturnStatement(statement)] => statement.argument.as_ref(),
-        [Statement::ExpressionStatement(statement)] => Some(&statement.expression),
-        _ => None,
-    }
-}
-
-#[derive(Default)]
-struct ArgumentsObjectProbe(bool);
-
-impl<'a> Visit<'a> for ArgumentsObjectProbe {
-    fn visit_identifier_reference(&mut self, id: &oxc_ast::ast::IdentifierReference<'a>) {
-        self.0 |= id.name == "arguments";
-    }
-}
-
-fn uses_arguments_object(expression: &Expression<'_>) -> bool {
-    let mut probe = ArgumentsObjectProbe::default();
-    probe.visit_expression(expression);
-    probe.0
-}
-
-impl<'a> Wrapper<'a> {
-    fn function(fun: &'a Function<'a>, scoping: &Scoping) -> Option<Self> {
-        if fun.generator {
-            return None;
-        }
-        Some(Self {
-            span: fun.span,
-            params: Parameters::from_formals(&fun.params, scoping)?,
-            body: single_expression(fun.body.as_ref()?)?,
-        })
-    }
-
-    fn expression(expr: &'a Expression<'a>, scoping: &Scoping) -> Option<Self> {
-        match unparenthesized(expr) {
-            Expression::FunctionExpression(fun) => Self::function(fun, scoping),
-            Expression::ArrowFunctionExpression(fun) => {
-                let body = match &fun.body {
-                    oxc_ast::ast::ArrowFunctionBody::FunctionBody(body) => single_expression(body)?,
-                    body => body.as_expression()?,
-                };
-                Some(Self {
-                    span: fun.span,
-                    params: Parameters::from_formals(&fun.params, scoping)?,
-                    body,
-                })
-            }
-            _ => None,
-        }
-    }
-
-    fn invocation(&self) -> Option<(&'a Expression<'a>, &'a [Argument<'a>], Span, bool)> {
-        let expr = unparenthesized(self.body);
-        let expr = if let Expression::AwaitExpression(awaited) = expr {
-            unparenthesized(&awaited.argument)
-        } else {
-            expr
-        };
-        match expr {
-            Expression::CallExpression(call) if !call.optional => {
-                Some((&call.callee, &call.arguments, call.span, false))
-            }
-            Expression::NewExpression(new) => Some((&new.callee, &new.arguments, new.span, true)),
-            _ => None,
-        }
-    }
-}
+use std::collections::BTreeMap;
+use values::{ArgumentList, ValueBuilder};
 
 enum LocalBinding<'a> {
     Function(&'a Function<'a>),
@@ -316,6 +23,11 @@ enum LocalBinding<'a> {
         value: &'a Expression<'a>,
         after: u32,
     },
+}
+
+enum BindingOrigin<'a> {
+    Declaration(SymbolId, &'a Function<'a>),
+    Expression(&'a Expression<'a>),
 }
 
 /// Reuse the already validated semantic AST, rather than reparsing the source
@@ -358,9 +70,16 @@ impl<'a> WrapperIndex<'a> {
             budget.consume(1)?;
             let (symbol, binding) = match node.kind() {
                 AstKind::Function(fun) if fun.is_declaration() => {
-                    if !Wrapper::function(fun, scoping)
-                        .is_some_and(|wrapper| wrapper.invocation().is_some())
-                    {
+                    if !Wrapper::function(fun, scoping).is_some_and(|wrapper| {
+                        wrapper.invocation().is_some()
+                            || (wrapper.returns_value
+                                && matches!(
+                                    unparenthesized(wrapper.body),
+                                    Expression::Identifier(_)
+                                        | Expression::StaticMemberExpression(_)
+                                        | Expression::ComputedMemberExpression(_)
+                                ))
+                    }) {
                         continue;
                     }
                     let Some(symbol) = fun.id.as_ref().and_then(|id| id.symbol_id.get()) else {
@@ -387,6 +106,7 @@ impl<'a> WrapperIndex<'a> {
                         Expression::Identifier(_)
                             | Expression::FunctionExpression(_)
                             | Expression::ArrowFunctionExpression(_)
+                            | Expression::CallExpression(_)
                     ) {
                         continue;
                     }
@@ -440,13 +160,13 @@ impl<'a> WrapperIndex<'a> {
             .map(|(symbol, name)| (name.as_str(), format!("wrapper_global:{symbol:?}")))
     }
 
-    fn parameters_have_dynamic_scope(
+    fn frame_has_dynamic_scope(
         &self,
-        parameters: &Parameters,
+        wrapper: &Wrapper<'_>,
         scoping: &Scoping,
         budget: &WorkBudget,
     ) -> Result<bool> {
-        for symbol in parameters.fixed.iter().copied().chain(parameters.rest) {
+        for symbol in wrapper.symbols() {
             for scope in &self.eval_scopes {
                 budget.consume(1)?;
                 if scoping.find_binding(*scope, scoping.symbol_name(symbol).into()) == Some(symbol)
@@ -462,46 +182,42 @@ impl<'a> WrapperIndex<'a> {
         expression_symbol(scoping, expr).is_some_and(|symbol| self.bindings.contains_key(&symbol))
             || matches!(
                 unparenthesized(expr),
-                Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_)
+                Expression::FunctionExpression(_)
+                    | Expression::ArrowFunctionExpression(_)
+                    | Expression::CallExpression(_)
             )
     }
 
-    fn resolve(
+    fn binding_origin(
         &self,
         mut expr: &'a Expression<'a>,
         scoping: &Scoping,
         budget: &WorkBudget,
-        dependencies: &mut BTreeSet<String>,
         witnesses: &mut Vec<ApiBindingWitness>,
-    ) -> Result<Option<Wrapper<'a>>> {
+        alias_kind: &str,
+    ) -> Result<Option<BindingOrigin<'a>>> {
         let mut visited = BTreeSet::new();
         loop {
             budget.consume(1)?;
-            if let Some(wrapper) = Wrapper::expression(expr, scoping) {
-                return Ok(Some(wrapper));
-            }
             let Some(symbol) = expression_symbol(scoping, expr) else {
-                return Ok(None);
+                return Ok(Some(BindingOrigin::Expression(expr)));
+            };
+            let Some(binding) = self.bindings.get(&symbol) else {
+                return Ok(Some(BindingOrigin::Expression(expr)));
             };
             if !visited.insert(symbol) {
                 return Ok(None);
             }
-            let Some(binding) = self.bindings.get(&symbol) else {
-                return Ok(None);
-            };
             match binding {
                 LocalBinding::Function(fun) => {
-                    if self.script_root_functions.contains_key(&symbol) {
-                        dependencies.insert(format!("wrapper_global:{symbol:?}"));
-                    }
-                    return Ok(Wrapper::function(fun, scoping));
+                    return Ok(Some(BindingOrigin::Declaration(symbol, fun)))
                 }
                 LocalBinding::Initializer { value, after } => {
                     if expr.span().start < *after {
                         return Ok(None);
                     }
                     witnesses.push(ApiBindingWitness {
-                        kind: "wrapper_alias".into(),
+                        kind: alias_kind.into(),
                         start: value.span().start,
                         end: value.span().end,
                     });
@@ -510,75 +226,158 @@ impl<'a> WrapperIndex<'a> {
             }
         }
     }
+
+    fn factory_call(
+        &self,
+        expr: &'a Expression<'a>,
+        scoping: &Scoping,
+        budget: &WorkBudget,
+        witnesses: &mut Vec<ApiBindingWitness>,
+    ) -> Result<Option<&'a CallExpression<'a>>> {
+        let Some(BindingOrigin::Expression(expr)) =
+            self.binding_origin(expr, scoping, budget, witnesses, "wrapper_return_alias")?
+        else {
+            return Ok(None);
+        };
+        Ok(match unparenthesized(expr) {
+            Expression::CallExpression(call) if !call.optional => Some(call),
+            _ => None,
+        })
+    }
+
+    fn resolve(
+        &self,
+        expr: &'a Expression<'a>,
+        scoping: &Scoping,
+        budget: &WorkBudget,
+        dependencies: &mut BTreeSet<String>,
+        witnesses: &mut Vec<ApiBindingWitness>,
+    ) -> Result<Option<Wrapper<'a>>> {
+        Ok(
+            match self.binding_origin(expr, scoping, budget, witnesses, "wrapper_alias")? {
+                Some(BindingOrigin::Declaration(symbol, fun)) => {
+                    if self.script_root_functions.contains_key(&symbol) {
+                        dependencies.insert(format!("wrapper_global:{symbol:?}"));
+                    }
+                    Wrapper::function(fun, scoping)
+                }
+                Some(BindingOrigin::Expression(value)) => Wrapper::expression(value, scoping),
+                None => None,
+            },
+        )
+    }
 }
 
-/// A caller's object literal must not become exact property evidence after
-/// the wrapper exposes or changes it. Only direct callee/argument uses in the
-/// one forwarding invocation are accepted, including parenthesized references.
-fn parameter_is_direct(
-    symbol: SymbolId,
-    sink: Span,
-    semantic: &Semantic<'_>,
-    constants: &ProvenConstantEnvironment,
-    spread_safe: bool,
+struct ReturnedCallable {
+    callable: Callable,
+    witnesses: Vec<ApiBindingWitness>,
+    dependencies: BTreeSet<String>,
+}
+
+/// Recover functions returning an existing native callable through a
+/// confined straight-line value frame. Iterate over nested factory values
+/// and immutable aliases, rather than running arbitrary factory bodies.
+/// Async returns, closure creation and calls requiring a new environment
+/// are not interpreted as existing native callable values.
+fn resolve_returned_callable<'a>(
+    mut expr: &'a Expression<'a>,
+    semantic: &Semantic<'a>,
+    wrappers: &WrapperIndex<'a>,
+    collector: &Collector<'_, '_>,
     budget: &WorkBudget,
-) -> Result<bool> {
-    let scoping = semantic.scoping();
-    for reference_id in scoping.get_resolved_reference_ids(symbol) {
+) -> Result<Option<ReturnedCallable>> {
+    let mut witnesses = Vec::new();
+    let mut dependencies = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    loop {
         budget.consume(1)?;
-        let reference = scoping.get_reference(*reference_id);
-        if reference.is_write() || reference.flags().is_member_write_target() {
-            return Ok(false);
-        }
-        let mut current = semantic.nodes().get_node(reference.node_id()).span();
-        let mut dispatch_member = false;
-        let mut inside_array = false;
-        let mut accepted = false;
-        for id in semantic.nodes().ancestor_ids(reference.node_id()) {
-            budget.consume(1)?;
-            let kind = semantic.nodes().kind(id);
-            match kind {
-                AstKind::ParenthesizedExpression(_) => {}
-                AstKind::ArrayExpression(_) if !dispatch_member => {
-                    inside_array = true;
-                }
-                AstKind::SpreadElement(_) if !dispatch_member && (inside_array || spread_safe) => {}
-                AstKind::StaticMemberExpression(member)
-                    if !dispatch_member
-                        && !member.optional
-                        && member.object.span() == current
-                        && matches!(member.property.name.as_str(), "call" | "apply") =>
-                {
-                    dispatch_member = true;
-                }
-                AstKind::ComputedMemberExpression(member)
-                    if !dispatch_member
-                        && !member.optional
-                        && member.object.span() == current
-                        && static_string(&member.expression, scoping, constants)
-                            .as_deref()
-                            .is_some_and(|name| matches!(name, "call" | "apply")) =>
-                {
-                    dispatch_member = true;
-                }
-                AstKind::CallExpression(call) => {
-                    accepted =
-                        call.span == sink && (!dispatch_member || call.callee.span() == current);
-                    break;
-                }
-                AstKind::NewExpression(new) => {
-                    accepted = !dispatch_member && new.span == sink;
-                    break;
-                }
-                _ => break,
+        if !visited.is_empty() {
+            if let Some(mut callable) = collector.callables.resolve(
+                expr,
+                collector.source,
+                collector.scoping,
+                collector.constants,
+            ) {
+                callable.capture_as_argument();
+                return Ok(Some(ReturnedCallable {
+                    callable,
+                    witnesses,
+                    dependencies,
+                }));
             }
-            current = kind.span();
         }
-        if !accepted {
-            return Ok(false);
+        let Some(factory) =
+            wrappers.factory_call(expr, collector.scoping, budget, &mut witnesses)?
+        else {
+            return Ok(None);
+        };
+        if !visited.insert((factory.span.start, factory.span.end)) {
+            return Ok(None);
         }
+        let Some(wrapper) = wrappers.resolve(
+            &factory.callee,
+            collector.scoping,
+            budget,
+            &mut dependencies,
+            &mut witnesses,
+        )?
+        else {
+            return Ok(None);
+        };
+        if !wrapper.returns_value
+            || wrapper.invocation().is_some()
+            || wrappers.frame_has_dynamic_scope(&wrapper, collector.scoping, budget)?
+            || uses_arguments_object(wrapper.body)
+        {
+            return Ok(None);
+        }
+        let mut arguments = ValueBuilder::new(
+            None,
+            collector.scoping,
+            collector.constants,
+            wrappers.positional_limit,
+            budget,
+        );
+        let args = arguments.call(&factory.arguments)?;
+        if arguments.used_iterator {
+            dependencies.insert("rest_iterator".into());
+        }
+        let Some(mut builder) = instantiate(
+            &wrapper,
+            &args,
+            wrapper.body.span(),
+            semantic,
+            collector,
+            wrappers.positional_limit,
+            budget,
+        )?
+        else {
+            return Ok(None);
+        };
+        let Some(origin) = wrapper.returned_origin(&mut builder, collector)? else {
+            return Ok(None);
+        };
+        if builder.used_iterator {
+            dependencies.insert("rest_iterator".into());
+        }
+        witnesses.push(ApiBindingWitness {
+            kind: "wrapper_definition".into(),
+            start: wrapper.span.start,
+            end: wrapper.span.end,
+        });
+        append_local_witnesses(&wrapper, &mut witnesses);
+        witnesses.push(ApiBindingWitness {
+            kind: "wrapper_return".into(),
+            start: wrapper.body.span().start,
+            end: wrapper.body.span().end,
+        });
+        witnesses.push(ApiBindingWitness {
+            kind: "returned_callable".into(),
+            start: factory.span.start,
+            end: factory.span.end,
+        });
+        expr = origin;
     }
-    Ok(true)
 }
 
 /// Resolve the same native dispatch head used by direct calls, but from the
@@ -621,64 +420,87 @@ fn forwarded_dispatch<'a>(
 /// Follow a chain with concrete source argument origins. Each step has a
 /// unique function span and charges the analysis budget; cycles cannot grow
 /// the trace. Original syntactic API sites are emitted by the normal walker.
+pub(super) struct InvocationSite<'a> {
+    pub(super) callee: &'a Expression<'a>,
+    pub(super) arguments: &'a [Argument<'a>],
+    pub(super) span: Span,
+    pub(super) constructor: bool,
+}
+
 pub(super) fn specialize<'a>(
-    call: &'a CallExpression<'a>,
+    site: InvocationSite<'a>,
     semantic: &Semantic<'a>,
     wrappers: &WrapperIndex<'a>,
     collector: &mut Collector<'_, '_>,
     budget: &WorkBudget,
 ) -> Result<()> {
     let scoping = collector.scoping;
-    if call.optional || !wrappers.may_resolve(&call.callee, scoping) {
+    if !wrappers.may_resolve(site.callee, scoping) {
         return Ok(());
     }
-    let mut callee = &call.callee;
-    let mut builder = ValueBuilder::new(None, scoping, wrappers.positional_limit, budget);
-    let mut args = builder.call(&call.arguments)?;
+    let mut callee = site.callee;
+    let mut builder = ValueBuilder::new(
+        None,
+        scoping,
+        collector.constants,
+        wrappers.positional_limit,
+        budget,
+    );
+    let mut args = builder.call(site.arguments)?;
     let mut witnesses = Vec::new();
     let mut dependencies = BTreeSet::new();
     if builder.used_iterator {
         dependencies.insert("rest_iterator".into());
     }
     let mut visited = BTreeSet::new();
-    let mut constructor = false;
+    let mut constructor = site.constructor;
     let mut captured_target = false;
-    let mut sink = call.span;
+    let mut sink = site.span;
     loop {
         budget.consume(1)?;
-        if !visited.is_empty() {
-            if let Some(mut callable) =
-                collector
-                    .callables
-                    .resolve(callee, collector.source, scoping, collector.constants)
-            {
-                if captured_target {
-                    callable.capture_as_argument();
-                }
-                if callable.callable_as(constructor) {
-                    callable.prefix.append_forwarded(
-                        args.values,
-                        args.unknown_tail,
-                        collector.source,
-                        scoping,
-                        collector.constants,
-                    );
-                    callable.mark_forwarding(&witnesses, sink);
-                    collector.emit_forwarded(&call.callee, callable, call.span, &dependencies);
-                }
-                return Ok(());
+        let callable = if let Some(returned) =
+            resolve_returned_callable(callee, semantic, wrappers, collector, budget)?
+        {
+            witnesses.extend(returned.witnesses);
+            dependencies.extend(returned.dependencies);
+            Some(returned.callable)
+        } else if !visited.is_empty() {
+            collector
+                .callables
+                .resolve(callee, collector.source, scoping, collector.constants)
+                .map(|mut callable| {
+                    if captured_target {
+                        callable.capture_as_argument();
+                    }
+                    callable
+                })
+        } else {
+            None
+        };
+        if let Some(mut callable) = callable {
+            if callable.callable_as(constructor) {
+                callable.prefix.append_forwarded(
+                    args.values,
+                    args.unknown_tail,
+                    collector.source,
+                    scoping,
+                    collector.constants,
+                );
+                callable.mark_forwarding(&witnesses, sink);
+                collector.emit_forwarded(site.callee, callable, site.span, &dependencies);
             }
+            return Ok(());
         }
         if constructor {
             return Ok(());
         }
-        let Some(mut wrapper) =
+        let Some(wrapper) =
             wrappers.resolve(callee, scoping, budget, &mut dependencies, &mut witnesses)?
         else {
             return Ok(());
         };
         if !visited.insert((wrapper.span.start, wrapper.span.end))
-            || wrappers.parameters_have_dynamic_scope(&wrapper.params, scoping, budget)?
+            || wrappers.frame_has_dynamic_scope(&wrapper, scoping, budget)?
             || uses_arguments_object(wrapper.body)
         {
             return Ok(());
@@ -697,38 +519,19 @@ pub(super) fn specialize<'a>(
             end: sink_span.end,
         });
         sink = sink_span;
-        for (index, symbol) in wrapper
-            .params
-            .fixed
-            .iter()
-            .copied()
-            .chain(wrapper.params.rest)
-            .enumerate()
-        {
-            let spread_safe = wrapper.params.rest == Some(symbol)
-                || match args.value(index) {
-                    ForwardedValue::Array { .. } => true,
-                    ForwardedValue::Expression(expr) => {
-                        matches!(unparenthesized(expr), Expression::ArrayExpression(_))
-                    }
-                    _ => false,
-                };
-            if parameter_is_direct(
-                symbol,
-                sink,
-                semantic,
-                collector.constants,
-                spread_safe,
-                budget,
-            )? {
-                wrapper.params.forwardable.insert(symbol);
-            } else if wrapper.params.rest == Some(symbol) {
-                return Ok(());
-            }
-        }
-        let environment = Some((&wrapper.params, &args));
-        let mut builder =
-            ValueBuilder::new(environment, scoping, wrappers.positional_limit, budget);
+        let Some(mut builder) = instantiate(
+            &wrapper,
+            &args,
+            sink,
+            semantic,
+            collector,
+            wrappers.positional_limit,
+            budget,
+        )?
+        else {
+            return Ok(());
+        };
+        append_local_witnesses(&wrapper, &mut witnesses);
         let next_args = builder.call(forwarded)?;
         if !is_new {
             if let Some(mut callable) =
@@ -738,7 +541,7 @@ pub(super) fn specialize<'a>(
                     dependencies.insert("rest_iterator".into());
                 }
                 callable.mark_forwarding(&witnesses, sink);
-                collector.emit_forwarded(&call.callee, callable, call.span, &dependencies);
+                collector.emit_forwarded(site.callee, callable, site.span, &dependencies);
                 return Ok(());
             }
         }

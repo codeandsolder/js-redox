@@ -811,6 +811,64 @@ enum FetchInitMethod {
     Unknown,
 }
 
+/// Literal property keys use the same proven constant environment as
+/// native computed member accesses. A computed regular expression is not
+/// a primitive key: its coercion can execute user code.
+fn literal_property_name(
+    property: &oxc_ast::ast::ObjectProperty<'_>,
+    scoping: &Scoping,
+    constants: &ProvenConstantEnvironment,
+) -> Option<String> {
+    if property.computed {
+        let expression = property.key.as_expression()?;
+        if let Some(key) = static_string(expression, scoping, constants) {
+            return Some(key);
+        }
+        if !matches!(
+            expression,
+            Expression::NumericLiteral(_)
+                | Expression::BigIntLiteral(_)
+                | Expression::NullLiteral(_)
+        ) {
+            return None;
+        }
+    }
+    property
+        .key
+        .static_name()?
+        .into_cow_str()
+        .map(|key| key.into_owned())
+}
+
+fn literal_data_key(
+    property: &oxc_ast::ast::ObjectProperty<'_>,
+    scoping: &Scoping,
+    constants: &ProvenConstantEnvironment,
+) -> Option<String> {
+    let name = literal_property_name(property, scoping, constants)?;
+    if property.kind != PropertyKind::Init
+        || property.method
+        || (name == "__proto__" && !property.computed && !property.shorthand)
+    {
+        return None;
+    }
+    Some(name)
+}
+
+fn method_value_evidence(
+    source: &str,
+    value: &Expression<'_>,
+    scoping: &Scoping,
+    constants: &ProvenConstantEnvironment,
+) -> FetchInitMethod {
+    static_string(value, scoping, constants).map_or(FetchInitMethod::Unknown, |literal| {
+        FetchInitMethod::Literal {
+            value: effective_http_method(&literal),
+            expression: source_fragment(source, value.span()),
+        }
+    })
+}
+
 fn fetch_init_method(
     source: &str,
     expression: &Expression<'_>,
@@ -828,12 +886,7 @@ fn fetch_init_method(
             continue;
         };
 
-        let static_name = property.key.static_name();
-        if property.computed && static_name.is_none() {
-            state = FetchInitMethod::Unknown;
-            continue;
-        }
-        let Some(name) = static_name else {
+        let Some(name) = literal_property_name(property, scoping, constants) else {
             state = FetchInitMethod::Unknown;
             continue;
         };
@@ -859,13 +912,7 @@ fn fetch_init_method(
             continue;
         }
 
-        state = static_string(&property.value, scoping, constants).map_or(
-            FetchInitMethod::Unknown,
-            |value| FetchInitMethod::Literal {
-                value: effective_http_method(&value),
-                expression: source_fragment(source, property.value.span()),
-            },
-        );
+        state = method_value_evidence(source, &property.value, scoping, constants);
     }
     state
 }
@@ -1206,15 +1253,24 @@ pub fn analyze_api_surface(source: &str, budget: &WorkBudget) -> Result<ApiSurfa
         budget.checkpoint()?;
         for node in semantic.semantic.nodes().iter() {
             budget.consume(1)?;
-            if let oxc_ast::AstKind::CallExpression(call) = node.kind() {
-                forwarding::specialize(
-                    call,
-                    &semantic.semantic,
-                    &wrappers,
-                    &mut collector,
-                    budget,
-                )?;
-            }
+            let site = match node.kind() {
+                oxc_ast::AstKind::CallExpression(call) if !call.optional => {
+                    forwarding::InvocationSite {
+                        callee: &call.callee,
+                        arguments: &call.arguments,
+                        span: call.span,
+                        constructor: false,
+                    }
+                }
+                oxc_ast::AstKind::NewExpression(new) => forwarding::InvocationSite {
+                    callee: &new.callee,
+                    arguments: &new.arguments,
+                    span: new.span,
+                    constructor: true,
+                },
+                _ => continue,
+            };
+            forwarding::specialize(site, &semantic.semantic, &wrappers, &mut collector, budget)?;
         }
         budget.checkpoint()?;
         let mut callsites = collector.callsites.into_iter().collect::<Vec<_>>();
@@ -1279,6 +1335,219 @@ xhr.send(payload);
         assert_eq!(rows[5].kind, "xhr_open");
         assert_eq!(rows[5].method.as_deref(), Some("POST"));
         assert_eq!(rows[5].line, 8);
+        Ok(())
+    }
+
+    #[test]
+    fn wrapper_local_frames_propagate_aliases_and_private_record_fields() -> Result<()> {
+        let source = r#"
+function transport(fn, receiver, url, method) {
+    const verb = method;
+    const init = {method: "GET", ["me" + "thod"]: verb};
+    const args = [url, init];
+    const request = fn;
+    return request.apply(receiver, args);
+}
+transport(fetch, window, "/local", "PATCH");
+transport(fetch, window, "/other", "POST");
+"#;
+        let rows = analyze_api_surface(source)?;
+        assert_eq!(rows.len(), 2, "{rows:#?}");
+        for (row, (url, method)) in rows.iter().zip([("/local", "PATCH"), ("/other", "POST")]) {
+            assert_eq!(row.url.as_deref(), Some(url));
+            assert_eq!(row.method.as_deref(), Some(method));
+            assert_eq!(row.binding_status, "standard");
+            assert_eq!(
+                row.binding_witnesses
+                    .iter()
+                    .filter(|w| w.kind == "wrapper_local_binding")
+                    .count(),
+                4
+            );
+            let [start, end] = row
+                .forwarded_sink_span
+                .context("missing original invocation")?;
+            assert_eq!(
+                &source[start as usize..end as usize],
+                "request.apply(receiver, args)"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn local_aliases_retain_rest_arrays_and_record_origins_across_wrappers() -> Result<()> {
+        let source = r#"
+const leaf = (fn, items) => {
+    const copy = items;
+    return Reflect.apply(fn, window, copy);
+};
+const relay = (url, ...args) => {
+    const rest = args, list = [url, ...rest];
+    return leaf(fetch, list);
+};
+relay("/first", {method: "PUT"});
+relay("/second", ...unresolved, {method: "POST"});
+"#;
+        let rows = analyze_api_surface(source)?;
+        let specialized = rows
+            .iter()
+            .filter(|row| row.callee == "relay")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            specialized
+                .iter()
+                .map(|row| (
+                    row.url.as_deref(),
+                    row.method.as_deref(),
+                    row.method_status.as_deref()
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (Some("/first"), Some("PUT"), Some("exact")),
+                (Some("/second"), None, Some("unknown")),
+            ],
+            "{rows:#?}"
+        );
+        assert_eq!(
+            specialized[0]
+                .binding_witnesses
+                .iter()
+                .filter(|w| w.kind == "wrapper_local_binding")
+                .count(),
+            3
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn local_frame_proof_rejects_effectful_initializers_tdz_and_alias_escapes() -> Result<()> {
+        let source = r#"
+const escaped = (url, options) => {
+    const alias = options;
+    return fetch(url, options, mutate(alias));
+};
+escaped("/not-specialized", {method:"POST"});
+const tdz = (url) => {
+    const first = later, later = url;
+    return fetch(first);
+};
+tdz("/not-initialized");
+const sideEffect = (url, method) => {
+    const init = {method, extra: arbitrary()};
+    return fetch(url, init);
+};
+sideEffect("/not-proven", "PATCH");
+const dynamic = (url) => {
+    const init = {method:"POST"};
+    return fetch(url, init, eval("init.method = 'DELETE'"));
+};
+dynamic("/not-proven");
+const safe = (url, method) => {
+    const key = "me";
+    const init = {[key + "thod"]: method};
+    return fetch(url, init);
+};
+safe("/safe", "PATCH");
+"#;
+        let rows = analyze_api_surface(source)?;
+        let specialized = rows
+            .iter()
+            .filter(|row| row.invocation_form == "wrapper")
+            .collect::<Vec<_>>();
+        assert_eq!(specialized.len(), 1, "{rows:#?}");
+        assert_eq!(specialized[0].callee, "safe");
+        assert_eq!(specialized[0].url.as_deref(), Some("/safe"));
+        assert_eq!(specialized[0].method.as_deref(), Some("PATCH"));
+        Ok(())
+    }
+
+    #[test]
+    fn synchronous_callable_returns_preserve_receiver_and_constructor_requirements() -> Result<()> {
+        let source = r#"
+const identity = (fn) => {const selected = fn; return selected;};
+identity(fetch)("/inline", {method: "POST"});
+const req = identity(identity(fetch));
+const alias = req;
+alias("/alias");
+identity(navigator.sendBeacon)("/detached", payload);
+new (identity(WebSocket))("wss://example.test/live");
+identity(WebSocket)("wss://example.test/invalid");
+const asyncIdentity = async fn => fn;
+asyncIdentity(fetch)("/promise-not-function");
+"#;
+        let rows = analyze_api_surface(source)?;
+        assert_eq!(rows.len(), 3, "{rows:#?}");
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.url.as_deref())
+                .collect::<Vec<_>>(),
+            [
+                Some("/inline"),
+                Some("/alias"),
+                Some("wss://example.test/live")
+            ]
+        );
+        assert_eq!(rows[0].method.as_deref(), Some("POST"));
+        assert_eq!(rows[1].method.as_deref(), Some("GET"));
+        assert_eq!(
+            rows[1]
+                .binding_witnesses
+                .iter()
+                .filter(|w| w.kind == "returned_callable")
+                .count(),
+            2
+        );
+        assert_eq!(rows[2].kind, "websocket");
+        assert!(rows
+            .iter()
+            .all(|row| row.invocation_form == "wrapper" && row.binding_status == "standard"));
+        Ok(())
+    }
+
+    #[test]
+    fn returned_callable_keeps_factory_mutation_evidence() -> Result<()> {
+        let source = r#"
+function choose(fn) { return fn; }
+const req = choose(fetch);
+window.choose = replacement;
+req("/candidate");
+const safe = fn => fn;
+safe(fetch)("/standard");
+"#;
+        let analysis = super::analyze_api_surface(
+            source,
+            &WorkBudget::unlimited("returned-callable-mutations"),
+        )?;
+        assert_eq!(analysis.callsites.len(), 2, "{analysis:#?}");
+        assert_eq!(analysis.callsites[0].kind, "fetch_candidate");
+        assert_eq!(
+            analysis.callsites[0].method_status.as_deref(),
+            Some("conditional")
+        );
+        assert_eq!(analysis.callsites[0].mutation_site_ordinals, [0]);
+        assert!(analysis.mutation_sites[0]
+            .affected_families
+            .iter()
+            .any(|family| family.starts_with("wrapper_global:")));
+        assert_eq!(analysis.callsites[1].kind, "fetch");
+        assert!(analysis.callsites[1].mutation_site_ordinals.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn computed_literal_method_keys_share_constant_proof_with_local_records() -> Result<()> {
+        let source = r#"
+const key = "me" + "thod";
+fetch("/computed", {[key]: "PATCH"});
+fetch("/overwrite", {method:"PATCH", ["me" + "thod"]:"POST"});
+fetch("/unknown", {method:"PATCH", [dynamic()]: "POST"});
+"#;
+        let rows = analyze_api_surface(source)?;
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].method.as_deref(), Some("PATCH"));
+        assert_eq!(rows[1].method.as_deref(), Some("POST"));
+        assert_eq!(rows[2].method_status.as_deref(), Some("unknown"));
         Ok(())
     }
 
