@@ -19,13 +19,34 @@ use oxc_span::{GetSpan, Span};
 /// consume unlabeled breaks but not continues; nested iteration statements
 /// consume both. Named continues are resolved by their attached iteration
 /// statement's exact source span, including chains of labels on one loop.
-struct LoopBodyControl<'s> {
+pub(crate) struct LoopBodyControl<'s> {
     labels: &'s [(Span, String)],
     target: Span,
     breakable_depth: usize,
     iteration_depth: usize,
-    exits_loop: bool,
-    continues_loop: bool,
+    pub(crate) exits_loop: bool,
+    pub(crate) continues_loop: bool,
+}
+
+impl<'s> LoopBodyControl<'s> {
+    pub(crate) fn analyze(
+        statements: &[Statement<'_>],
+        target: Span,
+        labels: &'s [(Span, String)],
+    ) -> Self {
+        let mut control = Self {
+            labels,
+            target,
+            breakable_depth: 0,
+            iteration_depth: 0,
+            exits_loop: false,
+            continues_loop: false,
+        };
+        for statement in statements {
+            control.visit_statement(statement);
+        }
+        control
+    }
 }
 
 impl<'a> Visit<'a> for LoopBodyControl<'_> {
@@ -283,17 +304,7 @@ impl SingleIterationBody {
             return None;
         }
         let retained = &statements[..statements.len() - usize::from(tail.is_some())];
-        let mut control = LoopBodyControl {
-            labels,
-            target,
-            breakable_depth: 0,
-            iteration_depth: 0,
-            exits_loop: false,
-            continues_loop: false,
-        };
-        for statement in retained {
-            control.visit_statement(statement);
-        }
+        let control = LoopBodyControl::analyze(retained, target, labels);
         if control.continues_loop && !false_after_body {
             return None;
         }

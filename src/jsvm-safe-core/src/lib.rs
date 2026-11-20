@@ -16,6 +16,7 @@ mod empty_iife;
 mod if_ladder_structure;
 mod iteration_history;
 mod numeric;
+mod ordered_dispatch;
 mod proxy;
 mod pure_function;
 mod rewrite;
@@ -32,8 +33,8 @@ pub use browser_legacy::{
     BrowserLegacyOpaqueSpan,
 };
 use control_flow::{
-    collect_dispatch_bindings, collect_reference_spans, detect_reference_identity_tables,
-    reference_identity, ReferenceIdentityTable,
+    collect_reference_spans, detect_reference_identity_tables, reference_identity,
+    ReferenceIdentityTable,
 };
 use decoder::{analyze_decoders, decoder_call_rewrite, js_parse_int, static_decoder_pass, Decoder};
 pub use iteration_history::IterationCycle;
@@ -673,8 +674,6 @@ struct Collector<'s, 'c> {
     standard_numeric_builtins: bool,
     reference_identity_tables: &'c HashMap<SymbolId, ReferenceIdentityTable>,
     selector_dispatchers: &'c HashMap<SymbolId, SelectorDispatcher>,
-    dispatch_orders: &'c HashMap<SymbolId, Vec<String>>,
-    zero_counters: &'c HashSet<SymbolId>,
     var_number_initializers: &'c HashMap<SymbolId, VarNumberInitializer>,
     reference_spans: &'c HashMap<ReferenceId, Span>,
     protected_spans: &'c [(usize, usize)],
@@ -1531,24 +1530,26 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
             self.push(it.span, text, "single_iteration_for");
             return;
         }
-        if live {
-            walk::walk_for_statement(self, it);
-            return;
-        }
-        if let Some(text) = if_ladder_structure::reconstruct_for(it, self.source) {
-            self.push(it.span, text, "if_ladder_structured");
-            return;
-        }
-        if let Some(text) = self.reference_state_replacement(it) {
-            self.push(it.span, text, "reference_state_unflatten");
-            return;
-        }
-        if let Some((text, proof)) = self.arithmetic_state_replacement(it) {
-            self.push_arithmetic(it.span, text, proof);
-            return;
-        }
-        if let Some(text) = self.ordered_switch_for_replacement(it) {
+        if let Some(text) = self.bounded_dispatch_replacement(it) {
             self.push(it.span, text, "ordered_switch_unflatten");
+            return;
+        }
+        if !live {
+            if let Some(text) = if_ladder_structure::reconstruct_for(it, self.source) {
+                self.push(it.span, text, "if_ladder_structured");
+                return;
+            }
+            if let Some(text) = self.reference_state_replacement(it) {
+                self.push(it.span, text, "reference_state_unflatten");
+                return;
+            }
+            if let Some((text, proof)) = self.arithmetic_state_replacement(it) {
+                self.push_arithmetic(it.span, text, proof);
+                return;
+            }
+        }
+        if let Some((span, text)) = self.structure_dispatch_switch(&it.body, it.span) {
+            self.push(span, text, "dispatch_switch_structured");
             return;
         }
         walk::walk_for_statement(self, it);
@@ -1567,12 +1568,8 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
             self.push(it.span, text, "single_iteration_while");
             return;
         }
-        if live {
-            walk::walk_while_statement(self, it);
-            return;
-        }
-        if let Some(text) = self.ordered_switch_while_replacement(it) {
-            self.push(it.span, text, "ordered_switch_unflatten");
+        if let Some((span, text)) = self.structure_dispatch_switch(&it.body, it.span) {
+            self.push(span, text, "dispatch_switch_structured");
             return;
         }
         walk::walk_while_statement(self, it);
@@ -1586,6 +1583,10 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
             &self.active_labels,
         ) {
             self.push(it.span, text, "single_iteration_do_while");
+            return;
+        }
+        if let Some((span, text)) = self.structure_dispatch_switch(&it.body, it.span) {
+            self.push(span, text, "dispatch_switch_structured");
             return;
         }
         walk::walk_do_while_statement(self, it);
@@ -2055,7 +2056,6 @@ fn transform_once(
     let stable_var_numbers = collect_stable_var_numbers(&program, scoping);
     let var_number_initializers = collect_var_number_initializers(&program);
     let selector_dispatchers = collect_selector_dispatchers(&program, scoping, &stable_var_numbers);
-    let (dispatch_orders, zero_counters) = collect_dispatch_bindings(&program);
     budget.checkpoint()?;
     let direct_eval_present = has_direct_eval(&program);
     let mut numeric_state_risks = NumericStateAliasRisks::default();
@@ -2086,8 +2086,6 @@ fn transform_once(
         standard_numeric_builtins,
         reference_identity_tables: &reference_identity_tables,
         selector_dispatchers: &selector_dispatchers,
-        dispatch_orders: &dispatch_orders,
-        zero_counters: &zero_counters,
         var_number_initializers: &var_number_initializers,
         reference_spans: &reference_spans,
         protected_spans: &protected_spans,
