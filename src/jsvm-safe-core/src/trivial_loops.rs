@@ -2,33 +2,69 @@
 //! This is not an arbitrary bounded-loop evaluator: it recognizes loops
 //! whose precise number of iterations is established by their own AST.
 
-use crate::{fragment, statement_hazards::DeclarationHazard};
-use oxc_ast::ast::{
-    BlockStatement, Expression, ForStatement, IfStatement, SequenceExpression, Statement,
-    VariableDeclarationKind, WhileStatement,
+use crate::{
+    completion, fragment,
+    statement_hazards::DeclarationHazard,
+    value_eval::{inert_literal_value, known_bool},
 };
-use oxc_ast_visit::Visit;
+use oxc_ast::ast::{
+    BlockStatement, DoWhileStatement, Expression, ForStatement, ForStatementInit, IfStatement,
+    SequenceExpression, Statement, VariableDeclarationKind, WhileStatement,
+};
+use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::Scoping;
-use oxc_span::GetSpan;
+use oxc_span::{GetSpan, Span};
 
-#[derive(Default)]
-struct ControlTransfers {
-    present: bool,
+/// Only transfers targeting the loop being removed matter. Nested switches
+/// consume unlabeled breaks but not continues; nested iteration statements
+/// consume both. Named continues are resolved by their attached iteration
+/// statement's exact source span, including chains of labels on one loop.
+struct LoopBodyControl<'s> {
+    labels: &'s [(Span, String)],
+    target: Span,
+    breakable_depth: usize,
+    iteration_depth: usize,
+    exits_loop: bool,
+    continues_loop: bool,
 }
 
-impl<'a> Visit<'a> for ControlTransfers {
+impl<'a> Visit<'a> for LoopBodyControl<'_> {
+    fn visit_statement(&mut self, statement: &Statement<'a>) {
+        let iteration = matches!(
+            statement,
+            Statement::ForStatement(_)
+                | Statement::ForInStatement(_)
+                | Statement::ForOfStatement(_)
+                | Statement::WhileStatement(_)
+                | Statement::DoWhileStatement(_)
+        );
+        let breakable = iteration || matches!(statement, Statement::SwitchStatement(_));
+        self.iteration_depth += usize::from(iteration);
+        self.breakable_depth += usize::from(breakable);
+        walk::walk_statement(self, statement);
+        self.iteration_depth -= usize::from(iteration);
+        self.breakable_depth -= usize::from(breakable);
+    }
+
     fn visit_break_statement(&mut self, statement: &oxc_ast::ast::BreakStatement<'a>) {
-        // A named break continues to target its label after unwrapping a
-        // single-iteration loop. Only an unnamed break could have targeted
-        // this loop and would change meaning when lifted into a block.
-        if statement.label.is_none() {
-            self.present = true;
+        self.exits_loop |= statement.label.is_none() && self.breakable_depth == 0;
+    }
+
+    fn visit_continue_statement(&mut self, statement: &oxc_ast::ast::ContinueStatement<'a>) {
+        if let Some(label) = &statement.label {
+            self.continues_loop |= self
+                .labels
+                .iter()
+                .any(|(target, name)| *target == self.target && name == label.name.as_str());
+        } else {
+            self.continues_loop |= self.iteration_depth == 0;
         }
     }
 
-    fn visit_continue_statement(&mut self, _statement: &oxc_ast::ast::ContinueStatement<'a>) {
-        self.present = true;
+    fn visit_function(&mut self, _: &oxc_ast::ast::Function<'a>, _: oxc_syntax::scope::ScopeFlags) {
     }
+    fn visit_arrow_function_expression(&mut self, _: &oxc_ast::ast::ArrowFunctionExpression<'a>) {}
+    fn visit_class(&mut self, _: &oxc_ast::ast::Class<'a>) {}
 }
 
 /// Discard a primitive literal statement only if it cannot be a directive.
@@ -211,58 +247,175 @@ pub fn normalize_empty_if(
     ))
 }
 
-fn literal_bool(expr: &Expression<'_>, expected: bool) -> bool {
-    match expr {
-        Expression::BooleanLiteral(value) => value.value == expected,
-        Expression::ParenthesizedExpression(paren) => literal_bool(&paren.expression, expected),
-        _ => false,
-    }
-}
-
-/// Only literal false; this preserves JS var-hoisting and Annex-B function
-/// declarations by declining bodies where removing the syntax changes binding.
+/// A pure false test never enters the body. Preserve hoisted declarations
+/// rather than discarding binding effects along with unreachable statements.
 pub fn never_entered_while(it: &WhileStatement<'_>) -> Option<String> {
-    if !literal_bool(&it.test, false) {
+    if known_bool(&it.test) != Some(false) {
         return None;
     }
     (!DeclarationHazard::Discard.present(&[&it.body])).then_some("{}".to_owned())
 }
 
-/// For (0; true; true) { ...; break; } executes its body exactly once unless
-/// an earlier unlabeled break/continue targets the for statement. Require an
-/// immediate final unlabeled break, with no earlier unlabeled break or continue.
-/// Keep the original enclosing lexical block.
-pub fn single_iteration_for(it: &ForStatement<'_>, source: &str) -> Option<String> {
-    let init = it.init.as_ref()?.as_expression()?;
-    if !matches!(init, Expression::NumericLiteral(_))
-        || !literal_bool(it.test.as_ref()?, true)
-        || !literal_bool(it.update.as_ref()?, true)
+struct SingleIterationBody {
+    text: String,
+    needs_loop: bool,
+}
+
+impl SingleIterationBody {
+    /// Prove that the body either reaches a terminal local break or the
+    /// loop's test is pure false after the first iteration. Preserve every
+    /// earlier abrupt transfer and every original lexical block.
+    fn analyze(
+        body: &Statement<'_>,
+        source: &str,
+        false_after_body: bool,
+        target: Span,
+        labels: &[(Span, String)],
+    ) -> Option<Self> {
+        let statements = match body {
+            Statement::BlockStatement(block) => block.body.as_slice(),
+            _ => std::slice::from_ref(body),
+        };
+        let tail = statements
+            .last()
+            .filter(|stmt| matches!(stmt, Statement::BreakStatement(brk) if brk.label.is_none()));
+        if tail.is_none() && !false_after_body {
+            return None;
+        }
+        let retained = &statements[..statements.len() - usize::from(tail.is_some())];
+        let mut control = LoopBodyControl {
+            labels,
+            target,
+            breakable_depth: 0,
+            iteration_depth: 0,
+            exits_loop: false,
+            continues_loop: false,
+        };
+        for statement in retained {
+            control.visit_statement(statement);
+        }
+        if control.continues_loop && !false_after_body {
+            return None;
+        }
+        let needs_loop = control.exits_loop || control.continues_loop;
+        // An already single-iteration do-while with a necessary break/continue
+        // region has no control-flow simplification beyond its terminal break.
+        if false_after_body && tail.is_none() && needs_loop {
+            return None;
+        }
+        let text = match (body, tail) {
+            (Statement::BlockStatement(block), Some(last)) => {
+                let head = source.get(block.span.start as usize..last.span().start as usize)?;
+                let end = source.get(last.span().end as usize..block.span.end as usize)?;
+                format!("{head}{end}")
+            }
+            (Statement::BlockStatement(block), None) => fragment(source, block.span).to_owned(),
+            (_, Some(_)) => "{}".to_owned(),
+            // A direct Annex B declaration requires its original statement
+            // context. A block around ordinary statements is transparent.
+            (Statement::FunctionDeclaration(_), None) => return None,
+            (_, None) => format!("{{\n{}\n}}", fragment(source, body.span())),
+        };
+        Some(Self { text, needs_loop })
+    }
+
+    fn render(self, completion_live: bool) -> String {
+        if self.needs_loop {
+            // Retain the original local break/continue targets without
+            // inventing new labels or bindings. The omitted backedge is
+            // proven unreachable, and a pure false test adds no effects.
+            format!("do {} while (false);", self.text)
+        } else if completion_live {
+            completion::seed_undefined(&self.text)
+        } else {
+            self.text
+        }
+    }
+}
+
+pub fn single_iteration_for(
+    it: &ForStatement<'_>,
+    source: &str,
+    completion_live: bool,
+    labels: &[(Span, String)],
+) -> Option<String> {
+    if it
+        .test
+        .as_ref()
+        .is_some_and(|test| known_bool(test) != Some(true))
     {
         return None;
     }
-    let Statement::BlockStatement(block) = &it.body else {
-        return None;
+    let body = SingleIterationBody::analyze(&it.body, source, false, it.span, labels)?;
+    let init = match &it.init {
+        None => String::new(),
+        Some(ForStatementInit::VariableDeclaration(decl))
+            if decl.kind == VariableDeclarationKind::Var =>
+        {
+            format!("{};", fragment(source, decl.span))
+        }
+        Some(ForStatementInit::VariableDeclaration(decl)) => {
+            // `let` loop variables have a distinct first-iteration environment.
+            // In particular a closure created in the initializer observes the
+            // original binding, not its per-iteration clone. Keep this lexical
+            // loop, but remove the pure test and unreachable update.
+            if it.test.is_none() && it.update.is_none() {
+                return None;
+            }
+            return Some(format!(
+                "for ({};;) {}",
+                fragment(source, decl.span),
+                fragment(source, it.body.span())
+            ));
+        }
+        Some(init) => {
+            let expr = init.as_expression()?;
+            if inert_literal_value(expr) {
+                String::new()
+            } else {
+                format!("void ({});", fragment(source, expr.span()))
+            }
+        }
     };
-    let (last, prefix) = block.body.split_last()?;
-    let Statement::BreakStatement(last_break) = last else {
-        return None;
-    };
-    if last_break.label.is_some() {
+    let body = body.render(completion_live);
+    if init.is_empty() {
+        Some(body)
+    } else {
+        Some(format!("{{\n{init}\n{body}\n}}"))
+    }
+}
+
+pub fn single_iteration_while(
+    it: &WhileStatement<'_>,
+    source: &str,
+    completion_live: bool,
+    labels: &[(Span, String)],
+) -> Option<String> {
+    if known_bool(&it.test) != Some(true) {
         return None;
     }
-    let mut flow = ControlTransfers::default();
-    for stmt in prefix {
-        flow.visit_statement(stmt);
-    }
-    if flow.present {
-        return None;
-    }
-    let content = prefix
-        .iter()
-        .map(|stmt| fragment(source, stmt.span()))
-        .collect::<Vec<_>>()
-        .join("\n");
-    Some(format!("{{\n{content}\n}}"))
+    Some(
+        SingleIterationBody::analyze(&it.body, source, false, it.span, labels)?
+            .render(completion_live),
+    )
+}
+
+pub fn single_iteration_do_while(
+    it: &DoWhileStatement<'_>,
+    source: &str,
+    completion_live: bool,
+    labels: &[(Span, String)],
+) -> Option<String> {
+    Some(
+        SingleIterationBody::analyze(
+            &it.body,
+            source,
+            known_bool(&it.test) == Some(false),
+            it.span,
+            labels,
+        )?
+        .render(completion_live),
+    )
 }
 
 #[cfg(test)]
@@ -348,8 +501,51 @@ mod tests {
     }
 
     #[test]
-    fn unwraps_exactly_one_iteration_but_not_continue_or_inner_break() -> Result<(), BudgetExceeded>
-    {
+    fn single_iteration_proof_tracks_the_actual_break_and_continue_targets(
+    ) -> Result<(), BudgetExceeded> {
+        for input in [
+            "function f(x){while(1){switch(x){case 1:work();break;}break;}}",
+            "function f(){for(;;){for(var i=0;i<2;i++){continue;}work();break;}}",
+            "function f(){do {work();break;}while(effect());}",
+            "function f(){do {work();}while(0);}",
+            "function f(){while(true)break;}",
+            "function f(){outer:for(var i=0;i<2;i++){while(true){work();continue outer;break;}}}",
+            "function f(){again:do {if(check())continue again;break;}while(false);}",
+        ] {
+            let result = deobfuscate(input, 16, &WorkBudget::unlimited("single-iteration"))?
+                .unwrap_or_else(|| unreachable!());
+            assert!(
+                result
+                    .transforms
+                    .keys()
+                    .any(|kind| kind.starts_with("single_iteration_")),
+                "{input} -> {}",
+                result.source
+            );
+            assert!(result.analysis_complete, "{}", result.source);
+        }
+        for input in [
+            "function f(x){while(true){switch(x){case 1:continue;}break;}}",
+            "function f(x){again:for(;;){if(x)continue again;break;}}",
+            "function f(x){first:second:while(true){while(x){continue first;}break;}}",
+        ] {
+            let result = deobfuscate(input, 16, &WorkBudget::unlimited("single-iteration"))?
+                .unwrap_or_else(|| unreachable!());
+            assert!(
+                !result
+                    .transforms
+                    .keys()
+                    .any(|kind| kind.starts_with("single_iteration_")),
+                "{input} -> {}",
+                result.source
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unwraps_exactly_one_iteration_but_not_a_possible_second_iteration(
+    ) -> Result<(), BudgetExceeded> {
         let source = "function f(x){for(0;true;true){x++;break;}return x;}";
         let result = rewritten(source)?;
         assert!(!result.contains("for(0;"), "{result}");
@@ -361,14 +557,20 @@ mod tests {
         assert!(!labeled.contains("for("), "{labeled}");
         assert!(labeled.contains("break done"), "{labeled}");
 
-        for input in [
-            "function f(x){for(0;true;true){if(x)continue;x++;break;}return x;}",
-            "function f(x){for(0;true;true){if(x)break;x++;break;}return x;}",
-            "function f(x){for(x=0;true;true){x++;break;}return x;}",
-        ] {
-            let result = rewritten(input)?;
-            assert!(result.contains("for("), "{result}");
-        }
+        let repeated =
+            rewritten("function f(x){for(0;true;true){if(x)continue;x++;break;}return x;}")?;
+        assert!(repeated.contains("for("), "{repeated}");
+        let early_exit =
+            rewritten("function f(x){for(0;true;true){if(x)break;x++;break;}return x;}")?;
+        assert!(!early_exit.contains("for("), "{early_exit}");
+        assert!(early_exit.contains("while (false)"), "{early_exit}");
+        let effectful_init = rewritten("function f(x){for(x=0;true;true){x++;break;}return x;}")?;
+        assert!(!effectful_init.contains("for("), "{effectful_init}");
+        assert!(effectful_init.contains("x=0"), "{effectful_init}");
+        let lexical =
+            rewritten("function f(){for(let x=0,g=()=>x;true;effect()){x++;return g();break;}}")?;
+        assert!(lexical.contains("for (let x=0,g=()=>x;;)"), "{lexical}");
+        assert!(!lexical.contains("effect()"), "{lexical}");
         Ok(())
     }
 }

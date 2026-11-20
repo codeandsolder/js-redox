@@ -681,6 +681,7 @@ struct Collector<'s, 'c> {
     may_remove_dead_numeric_writes: bool,
     unsafe_numeric_functions: &'c HashSet<(u32, u32)>,
     function_context: FunctionContext,
+    active_labels: Vec<(Span, String)>,
     allow_effect_statements: bool,
     replacements: Vec<Replacement>,
 }
@@ -1511,14 +1512,22 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
         walk::walk_switch_statement(self, it);
     }
 
+    fn visit_labeled_statement(&mut self, it: &oxc_ast::ast::LabeledStatement<'a>) {
+        let mut target = &it.body;
+        while let Statement::LabeledStatement(inner) = target {
+            target = &inner.body;
+        }
+        self.active_labels
+            .push((target.span(), it.label.name.to_string()));
+        walk::walk_labeled_statement(self, it);
+        self.active_labels.pop();
+    }
+
     fn visit_for_statement(&mut self, it: &oxc_ast::ast::ForStatement<'a>) {
         let live = self.completion.needs_value(it.span);
-        if let Some(text) = trivial_loops::single_iteration_for(it, self.source) {
-            let text = if live {
-                completion::seed_undefined(&text)
-            } else {
-                text
-            };
+        if let Some(text) =
+            trivial_loops::single_iteration_for(it, self.source, live, &self.active_labels)
+        {
             self.push(it.span, text, "single_iteration_for");
             return;
         }
@@ -1552,6 +1561,12 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
             self.push(it.span, text, "never_entered_loop");
             return;
         }
+        if let Some(text) =
+            trivial_loops::single_iteration_while(it, self.source, live, &self.active_labels)
+        {
+            self.push(it.span, text, "single_iteration_while");
+            return;
+        }
         if live {
             walk::walk_while_statement(self, it);
             return;
@@ -1561,6 +1576,19 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
             return;
         }
         walk::walk_while_statement(self, it);
+    }
+
+    fn visit_do_while_statement(&mut self, it: &oxc_ast::ast::DoWhileStatement<'a>) {
+        if let Some(text) = trivial_loops::single_iteration_do_while(
+            it,
+            self.source,
+            self.completion.needs_value(it.span),
+            &self.active_labels,
+        ) {
+            self.push(it.span, text, "single_iteration_do_while");
+            return;
+        }
+        walk::walk_do_while_statement(self, it);
     }
 
     fn visit_function_body(&mut self, it: &oxc_ast::ast::FunctionBody<'a>) {
@@ -2069,6 +2097,7 @@ fn transform_once(
         may_remove_dead_numeric_writes: !numeric_state_risks.unsafe_top_level,
         unsafe_numeric_functions: &numeric_state_risks.unsafe_functions,
         function_context: FunctionContext::default(),
+        active_labels: Vec::new(),
         allow_effect_statements: false,
         replacements: Vec::new(),
     };
