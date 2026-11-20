@@ -3,6 +3,7 @@ use super::super::{
     callables::{ForwardedValue, PositionalArguments},
     *,
 };
+use jsvm_safe_core::eval_static_primitive_with_resolver;
 use oxc_ast::ast::{Argument, ArrayExpression, ArrayExpressionElement};
 use std::{collections::BTreeMap, rc::Rc};
 
@@ -40,6 +41,36 @@ impl<'s, 'a> ValueBuilder<'s, 'a> {
         }
     }
 
+    /// Resolve primitive facts against the original invocation environment.
+    /// Captured expressions retain the source context of their own origin.
+    pub(super) fn primitive(&self, expr: &Expression<'_>) -> Option<StaticPrimitiveValue> {
+        eval_static_primitive_with_resolver(expr, &|id| {
+            let reference = self.scoping.get_reference(id.reference_id.get()?);
+            if !reference.is_read()
+                || reference.is_write()
+                || reference.flags().is_member_write_target()
+            {
+                return None;
+            }
+            if let Some(value) = reference
+                .symbol_id()
+                .and_then(|symbol| self.frame.as_ref()?.get(&symbol))
+            {
+                return value.primitive().cloned();
+            }
+            self.constants
+                .resolve_identifier(id, self.scoping)
+                .or_else(|| {
+                    (reference.symbol_id().is_none() && id.name == "undefined")
+                        .then_some(StaticPrimitiveValue::Undefined)
+                })
+        })
+    }
+
+    pub(super) fn data_key(&self, property: &oxc_ast::ast::ObjectProperty<'_>) -> Option<String> {
+        literal_data_key(property, |expr| self.primitive(expr))
+    }
+
     pub(super) fn expression(
         &mut self,
         expr: &'a Expression<'a>,
@@ -51,6 +82,17 @@ impl<'s, 'a> ValueBuilder<'s, 'a> {
             {
                 return Ok(value.clone());
             }
+        }
+        if let Some(value) = self.primitive(expr) {
+            if let StaticPrimitiveValue::String(text) = &value {
+                self.budget.consume(text.len() as u64)?;
+            }
+            return Ok(ForwardedValue::Primitive {
+                value: Rc::new(value),
+                span: expr.span(),
+            });
+        }
+        if self.frame.is_some() {
             if let Expression::ArrayExpression(array) = unparenthesized(expr) {
                 let positions = self.array(array)?;
                 return Ok(ForwardedValue::Array {
@@ -64,7 +106,7 @@ impl<'s, 'a> ValueBuilder<'s, 'a> {
                     let ObjectPropertyKind::ObjectProperty(property) = item else {
                         return Ok(ForwardedValue::Expression(expr));
                     };
-                    let Some(key) = literal_data_key(property, self.scoping, self.constants) else {
+                    let Some(key) = self.data_key(property) else {
                         return Ok(ForwardedValue::Expression(expr));
                     };
                     fields.insert(key, self.expression(&property.value)?);

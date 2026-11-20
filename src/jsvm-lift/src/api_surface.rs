@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use jsvm_safe_core::ProvenConstantEnvironment;
+use jsvm_safe_core::{ProvenConstantEnvironment, StaticPrimitiveValue};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     BindingPattern, CallExpression, ComputedMemberExpression, Expression, NewExpression,
@@ -816,20 +816,15 @@ enum FetchInitMethod {
 /// a primitive key: its coercion can execute user code.
 fn literal_property_name(
     property: &oxc_ast::ast::ObjectProperty<'_>,
-    scoping: &Scoping,
-    constants: &ProvenConstantEnvironment,
+    primitive: impl FnOnce(&Expression<'_>) -> Option<StaticPrimitiveValue>,
 ) -> Option<String> {
     if property.computed {
         let expression = property.key.as_expression()?;
-        if let Some(key) = static_string(expression, scoping, constants) {
-            return Some(key);
+        if let Some(key) = primitive(expression) {
+            return key.js_string();
         }
-        if !matches!(
-            expression,
-            Expression::NumericLiteral(_)
-                | Expression::BigIntLiteral(_)
-                | Expression::NullLiteral(_)
-        ) {
+        // The shared primitive domain deliberately excludes BigInt.
+        if !matches!(expression, Expression::BigIntLiteral(_)) {
             return None;
         }
     }
@@ -842,10 +837,9 @@ fn literal_property_name(
 
 fn literal_data_key(
     property: &oxc_ast::ast::ObjectProperty<'_>,
-    scoping: &Scoping,
-    constants: &ProvenConstantEnvironment,
+    primitive: impl FnOnce(&Expression<'_>) -> Option<StaticPrimitiveValue>,
 ) -> Option<String> {
-    let name = literal_property_name(property, scoping, constants)?;
+    let name = literal_property_name(property, primitive)?;
     if property.kind != PropertyKind::Init
         || property.method
         || (name == "__proto__" && !property.computed && !property.shorthand)
@@ -855,6 +849,13 @@ fn literal_data_key(
     Some(name)
 }
 
+fn literal_method_evidence(source: &str, literal: &str, span: Span) -> FetchInitMethod {
+    FetchInitMethod::Literal {
+        value: effective_http_method(literal),
+        expression: source_fragment(source, span),
+    }
+}
+
 fn method_value_evidence(
     source: &str,
     value: &Expression<'_>,
@@ -862,10 +863,7 @@ fn method_value_evidence(
     constants: &ProvenConstantEnvironment,
 ) -> FetchInitMethod {
     static_string(value, scoping, constants).map_or(FetchInitMethod::Unknown, |literal| {
-        FetchInitMethod::Literal {
-            value: effective_http_method(&literal),
-            expression: source_fragment(source, value.span()),
-        }
+        literal_method_evidence(source, &literal, value.span())
     })
 }
 
@@ -886,7 +884,9 @@ fn fetch_init_method(
             continue;
         };
 
-        let Some(name) = literal_property_name(property, scoping, constants) else {
+        let Some(name) =
+            literal_property_name(property, |expr| constants.exact_primitive(expr, scoping))
+        else {
             state = FetchInitMethod::Unknown;
             continue;
         };
@@ -1196,6 +1196,7 @@ pub fn analyze_api_surface(source: &str, budget: &WorkBudget) -> Result<ApiSurfa
         let semantic = SemanticBuilder::new()
             .with_check_syntax_error(true)
             .with_build_nodes(true)
+            .with_cfg(true)
             .build(&program);
         if !semantic.diagnostics.is_empty() {
             continue;
@@ -1335,6 +1336,203 @@ xhr.send(payload);
         assert_eq!(rows[5].kind, "xhr_open");
         assert_eq!(rows[5].method.as_deref(), Some("POST"));
         assert_eq!(rows[5].line, 8);
+        Ok(())
+    }
+
+    #[test]
+    fn frame_primitives_compose_urls_data_keys_and_request_methods() -> Result<()> {
+        let source = r#"
+const transport = (base, path, key, select) => {
+    const endpoint = base + path;
+    const verb = select ? "PATCH" : "DELETE";
+    const init = {[key]: verb};
+    return fetch(endpoint, init);
+};
+transport("https://example.test", "/one", "method", true);
+transport("https://example.test", "/two", "method", false);
+transport("https://example.test", "/three", "other", false);
+"#;
+        let rows = analyze_api_surface(source)?;
+        let wrappers = rows
+            .iter()
+            .filter(|row| row.invocation_form == "wrapper")
+            .collect::<Vec<_>>();
+        let evidence = wrappers
+            .iter()
+            .map(|row| {
+                (
+                    row.url.as_deref(),
+                    row.method.as_deref(),
+                    row.method_status.as_deref(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            evidence,
+            [
+                (
+                    Some("https://example.test/one"),
+                    Some("PATCH"),
+                    Some("exact")
+                ),
+                (
+                    Some("https://example.test/two"),
+                    Some("DELETE"),
+                    Some("exact")
+                ),
+                (
+                    Some("https://example.test/three"),
+                    Some("GET"),
+                    Some("exact")
+                ),
+            ],
+            "{rows:#?}"
+        );
+        assert!(wrappers
+            .iter()
+            .all(|row| row.url_expression.as_deref() == Some("base + path")));
+        assert_eq!(
+            wrappers[0].method_expression.as_deref(),
+            Some(r#"select ? "PATCH" : "DELETE""#)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cached_frame_requirements_are_independent_of_incoming_value_types() -> Result<()> {
+        let source = r#"
+const send = (base, path, options) => fetch(base + path, options);
+send({toString() { sideEffect(); return "/object"; }}, "/unsafe", {method:"POST"});
+send("/known", "/first", {method:"PUT"});
+send(unknown, "/unresolved", {method:"DELETE"});
+send("/known", "/second", {method:"PATCH"});
+const spread = (url, options) => fetch(...[url, options]);
+spread("/materialized", {method:"POST"});
+"#;
+        let rows = analyze_api_surface(source)?;
+        let evidence = rows
+            .iter()
+            .filter(|row| row.invocation_form == "wrapper")
+            .map(|row| (row.url.as_deref(), row.method.as_deref()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            evidence,
+            [
+                (Some("/known/first"), Some("PUT")),
+                (Some("/known/second"), Some("PATCH")),
+                (Some("/materialized"), Some("POST")),
+            ],
+            "{rows:#?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn frame_primitives_preserve_lexical_origins_and_missing_value_semantics() -> Result<()> {
+        let source = r#"
+const base = "https://example.test";
+const relay = (suffix, verb) => {
+    const path = base + suffix;
+    return leaf(path, verb);
+};
+relay("/before-initialization", "POST");
+const leaf = (base, choose) => {
+    const url = base + "/data";
+    return fetch(url, {method: choose ?? "PATCH"});
+};
+relay("/one", "PUT");
+relay("/two");
+const templated = (name, count) => fetch("https://api.test/" + name + "/" + count, {method: count === 0 ? "POST" : "DELETE"});
+templated("widget", 0);
+templated("other", 2);
+"#;
+        let rows = analyze_api_surface(source)?;
+        let selected = rows
+            .iter()
+            .filter(|row| matches!(row.callee.as_str(), "relay" | "templated"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|row| (row.url.as_deref(), row.method.as_deref()))
+                .collect::<Vec<_>>(),
+            [
+                (Some("https://example.test/one/data"), Some("PUT")),
+                (Some("https://example.test/two/data"), Some("PATCH")),
+                (Some("https://api.test/widget/0"), Some("POST")),
+                (Some("https://api.test/other/2"), Some("DELETE")),
+            ],
+            "{rows:#?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn deferred_lookup_does_not_move_alias_initialization_to_invocation_time() -> Result<()> {
+        let source = r#"
+const invoke = url => alias(url);
+const alias = later;
+const later = url => fetch(url);
+invoke("/initializer-in-tdz");
+const early = url => future(url);
+early("/before-initialization");
+const future = url => fetch(url);
+early("/after-initialization");
+const validAlias = future;
+const throughAlias = url => validAlias(url);
+throughAlias("/initialized-alias");
+"#;
+        let rows = analyze_api_surface(source)?;
+        let urls = rows
+            .iter()
+            .filter(|row| row.invocation_form == "wrapper")
+            .filter_map(|row| row.url.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            urls,
+            ["/after-initialization", "/initialized-alias"],
+            "{rows:#?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn computed_apply_values_follow_native_nullish_and_primitive_rules() -> Result<()> {
+        let source = r#"
+const bound = fetch.bind(window, "/bound");
+const invoke = (fn, empty) => fn.apply(empty ? null : 123, empty ? void 0 : 4);
+invoke(bound, true);
+invoke(bound, false);
+const reflected = (fn, empty) => Reflect.apply(fn, null, empty ? null : 1);
+reflected(bound, true);
+reflected(bound, false);
+"#;
+        let rows = analyze_api_surface(source)?;
+        assert_eq!(rows.len(), 1, "{rows:#?}");
+        assert_eq!(rows[0].url.as_deref(), Some("/bound"));
+        assert_eq!(rows[0].method.as_deref(), Some("GET"));
+        assert_eq!(rows[0].invocation_form, "wrapper");
+        Ok(())
+    }
+
+    #[test]
+    fn primitive_template_interpolation_reuses_ecmascript_coercion() -> Result<()> {
+        let source = r#"
+const render = (name, count, flag) => fetch(`/${name}/${count}/${flag}`);
+render("name", 12, true);
+render("other", -0, false);
+"#;
+        let rows = analyze_api_surface(source)?;
+        let urls = rows
+            .iter()
+            .filter(|row| row.invocation_form == "wrapper")
+            .map(|row| row.url.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            urls,
+            [Some("/name/12/true"), Some("/other/0/false")],
+            "{rows:#?}"
+        );
         Ok(())
     }
 

@@ -116,6 +116,14 @@ pub(super) fn uses_arguments_object(expression: &Expression<'_>) -> bool {
 }
 
 impl<'a> Wrapper<'a> {
+    pub(super) fn uses_arguments_object(&self) -> bool {
+        uses_arguments_object(self.body)
+            || self
+                .locals
+                .iter()
+                .any(|local| uses_arguments_object(local.expression))
+    }
+
     pub(super) fn symbols(&self) -> impl Iterator<Item = SymbolId> + '_ {
         self.params
             .fixed
@@ -192,78 +200,117 @@ impl<'a> Wrapper<'a> {
     }
 }
 
-/// A caller's object literal must not become exact property evidence after
-/// the wrapper exposes or changes it. Only direct callee/argument uses in the
-/// one forwarding invocation are accepted, including parenthesized references.
-fn parameter_is_direct(
+/// Requirements imposed by all references to a symbol in this frame.
+/// Coercions and computed data keys require primitive values; spreads
+/// require known private array origins. Neither grants arbitrary reads.
+#[derive(Clone, Copy, Debug, Default)]
+struct ReferenceRequirements {
+    primitive: bool,
+    array: bool,
+    confined: bool,
+}
+
+pub(super) struct FrameProof {
+    references: std::collections::BTreeMap<SymbolId, ReferenceRequirements>,
+}
+
+impl FrameProof {
+    pub(super) fn collect(
+        wrapper: &Wrapper<'_>,
+        sink: Span,
+        semantic: &Semantic<'_>,
+        constants: &ProvenConstantEnvironment,
+        budget: &WorkBudget,
+    ) -> Result<Self> {
+        let references = wrapper
+            .symbols()
+            .map(|symbol| {
+                Ok((
+                    symbol,
+                    reference_requirements(
+                        symbol,
+                        sink,
+                        &wrapper.locals,
+                        semantic,
+                        constants,
+                        budget,
+                    )?,
+                ))
+            })
+            .collect::<Result<_>>()?;
+        Ok(Self { references })
+    }
+
+    fn requirements(&self, symbol: SymbolId) -> ReferenceRequirements {
+        self.references.get(&symbol).copied().unwrap_or_default()
+    }
+}
+
+fn reference_requirements(
     symbol: SymbolId,
     sink: Span,
     locals: &[LocalInitializer<'_>],
     semantic: &Semantic<'_>,
     constants: &ProvenConstantEnvironment,
-    spread_safe: bool,
     budget: &WorkBudget,
-) -> Result<bool> {
+) -> Result<ReferenceRequirements> {
     let scoping = semantic.scoping();
+    let mut requirements = ReferenceRequirements {
+        confined: true,
+        ..ReferenceRequirements::default()
+    };
     for reference_id in scoping.get_resolved_reference_ids(symbol) {
         budget.consume(1)?;
         let reference = scoping.get_reference(*reference_id);
         if reference.is_write() || reference.flags().is_member_write_target() {
-            return Ok(false);
+            requirements.confined = false;
+            break;
         }
         let mut current = semantic.nodes().get_node(reference.node_id()).span();
-        let used_in_final_value = current == sink;
-        if used_in_final_value {
+        if current == sink {
             continue;
         }
-        let mut key_owner = None;
-        for id in semantic.nodes().ancestor_ids(reference.node_id()) {
-            budget.consume(1)?;
-            match semantic.nodes().kind(id) {
-                AstKind::ObjectProperty(property) => {
-                    let span = property.key.span();
-                    if property.computed
-                        && span.start <= current.start
-                        && current.end <= span.end
-                        && literal_data_key(property, scoping, constants).is_some()
-                    {
-                        key_owner = Some(id);
-                    }
-                    break;
-                }
-                AstKind::CallExpression(_)
-                | AstKind::NewExpression(_)
-                | AstKind::VariableDeclarator(_)
-                | AstKind::Function(_)
-                | AstKind::ArrowFunctionExpression(_) => break,
-                _ => {}
-            }
-        }
         let mut dispatch_member = false;
-        let mut inside_array = false;
+        let mut in_materialized_array = false;
         let mut accepted = false;
         for id in semantic.nodes().ancestor_ids(reference.node_id()) {
             budget.consume(1)?;
             let kind = semantic.nodes().kind(id);
-            if let Some(owner) = key_owner {
-                if owner == id {
-                    current = kind.span();
-                    key_owner = None;
-                }
-                continue;
-            }
             match kind {
                 AstKind::ParenthesizedExpression(_) => {}
-                AstKind::ArrayExpression(_) if !dispatch_member => {
-                    inside_array = true;
+                AstKind::UnaryExpression(_)
+                | AstKind::BinaryExpression(_)
+                | AstKind::LogicalExpression(_)
+                | AstKind::ConditionalExpression(_)
+                | AstKind::TemplateLiteral(_)
+                    if !dispatch_member =>
+                {
+                    requirements.primitive = true;
                 }
+                AstKind::ArrayExpression(_) if !dispatch_member => in_materialized_array = true,
+                AstKind::ObjectExpression(_) if !dispatch_member => in_materialized_array = false,
                 AstKind::ObjectProperty(property)
                     if !dispatch_member
-                        && property.value.span() == current
-                        && literal_data_key(property, scoping, constants).is_some() => {}
-                AstKind::ObjectExpression(_) if !dispatch_member => {}
-
-                AstKind::SpreadElement(_) if !dispatch_member && (inside_array || spread_safe) => {}
+                        && property.kind == PropertyKind::Init
+                        && !property.method =>
+                {
+                    if property.computed && property.key.span() == current {
+                        requirements.primitive = true;
+                    } else if property.value.span() != current
+                        || (!property.computed
+                            && literal_data_key(property, |expr| {
+                                constants.exact_primitive(expr, scoping)
+                            })
+                            .is_none())
+                    {
+                        break;
+                    }
+                }
+                AstKind::SpreadElement(_) if !dispatch_member => {
+                    if !in_materialized_array {
+                        requirements.array = true;
+                    }
+                }
                 AstKind::StaticMemberExpression(member)
                     if !dispatch_member
                         && !member.optional
@@ -307,10 +354,19 @@ fn parameter_is_direct(
             }
         }
         if !accepted {
-            return Ok(false);
+            requirements.confined = false;
+            break;
         }
     }
-    Ok(true)
+    Ok(requirements)
+}
+
+impl ReferenceRequirements {
+    fn accepts(self, value: &ForwardedValue<'_, '_>) -> bool {
+        self.confined
+            && (!self.primitive || value.primitive().is_some())
+            && (!self.array || known_array(value))
+    }
 }
 
 /// The local frame only evaluates transparent reads, pure constants and
@@ -372,7 +428,7 @@ fn pure_initializer<'a>(
                 let ObjectPropertyKind::ObjectProperty(property) = item else {
                     return Ok(false);
                 };
-                if literal_data_key(property, scoping, constants).is_none()
+                if builder.data_key(property).is_none()
                     || !pure_initializer(&property.value, builder, all_locals, collector)?
                 {
                     return Ok(false);
@@ -382,7 +438,7 @@ fn pure_initializer<'a>(
         }
         // Only side-effect-free statically proven primitive expressions
         // and recognized native/namespace reads beyond the literal cases.
-        _ => Ok(static_string(expr, scoping, constants).is_some()
+        _ => Ok(builder.primitive(expr).is_some()
             || global_path(scoping, constants, expr).as_deref() == Some("undefined")
             || (!matches!(expr, Expression::CallExpression(_))
                 && (collector
@@ -396,34 +452,13 @@ fn pure_initializer<'a>(
     }
 }
 
-fn uses_confined_value(
-    symbol: SymbolId,
-    value: &ForwardedValue<'_, '_>,
-    wrapper: &Wrapper<'_>,
-    sink: Span,
-    semantic: &Semantic<'_>,
-    constants: &ProvenConstantEnvironment,
-    budget: &WorkBudget,
-) -> Result<bool> {
-    parameter_is_direct(
-        symbol,
-        sink,
-        &wrapper.locals,
-        semantic,
-        constants,
-        known_array(value),
-        budget,
-    )
-}
-
 /// Construct one invocation frame in source order. Every forwarded alias
 /// must have confined references, and no initializer may call arbitrary
 /// code. A failed frame is discarded as a unit (aliases can share objects).
 pub(super) fn instantiate<'a, 's>(
     wrapper: &Wrapper<'a>,
     args: &ArgumentList<'a>,
-    sink: Span,
-    semantic: &Semantic<'a>,
+    proof: &FrameProof,
     collector: &Collector<'_, 's>,
     limit: usize,
     budget: &'s WorkBudget,
@@ -454,40 +489,26 @@ pub(super) fn instantiate<'a, 's>(
         } else {
             args.value(index)
         };
-        if uses_confined_value(
-            symbol,
-            &value,
-            wrapper,
-            sink,
-            semantic,
-            collector.constants,
-            budget,
-        )? {
+        let requirement = proof.requirements(symbol);
+        if requirement.accepts(&value) {
             if let Some(frame) = &mut builder.frame {
                 frame.insert(symbol, value);
             }
-        } else if wrapper.params.rest == Some(symbol) || !wrapper.locals.is_empty() {
+        } else if requirement.primitive
+            || wrapper.params.rest == Some(symbol)
+            || !wrapper.locals.is_empty()
+        {
             return Ok(None);
         }
     }
     // A parameter omitted from the frame above is not a transparent
     // origin. It must not be accidentally recovered via an alias.
     for local in &wrapper.locals {
-        if uses_arguments_object(local.expression)
-            || !pure_initializer(local.expression, &mut builder, &all_locals, collector)?
-        {
+        if !pure_initializer(local.expression, &mut builder, &all_locals, collector)? {
             return Ok(None);
         }
         let value = builder.expression(local.expression)?;
-        if !uses_confined_value(
-            local.symbol,
-            &value,
-            wrapper,
-            sink,
-            semantic,
-            collector.constants,
-            budget,
-        )? {
+        if !proof.requirements(local.symbol).accepts(&value) {
             return Ok(None);
         }
         if let Some(frame) = &mut builder.frame {

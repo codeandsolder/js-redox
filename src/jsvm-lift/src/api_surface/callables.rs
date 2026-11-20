@@ -83,6 +83,11 @@ impl ApiKind {
 #[derive(Clone, Debug)]
 pub(super) enum ForwardedValue<'e, 'a> {
     Expression(&'e Expression<'a>),
+    /// Computed primitive captured in its actual invocation environment.
+    Primitive {
+        value: Rc<StaticPrimitiveValue>,
+        span: Span,
+    },
     Array {
         span: Span,
         positions: Rc<PositionalArguments<'e, 'a>>,
@@ -100,6 +105,34 @@ impl<'e, 'a> ForwardedValue<'e, 'a> {
         match self {
             Self::Expression(expression) => Some(expression),
             _ => None,
+        }
+    }
+    /// Primitive facts are captured once in their originating frame.
+    /// An unresolved expression must never be re-evaluated with another
+    /// invocation's lexical bindings.
+    pub(super) fn primitive(&self) -> Option<&StaticPrimitiveValue> {
+        match self {
+            Self::Primitive { value, .. } => Some(value.as_ref()),
+            Self::Missing => Some(&StaticPrimitiveValue::Undefined),
+            _ => None,
+        }
+    }
+
+    fn init_method(
+        &self,
+        source: &str,
+        scoping: &Scoping,
+        constants: &ProvenConstantEnvironment,
+    ) -> FetchInitMethod {
+        match self {
+            Self::Primitive { value, span } => match value.as_ref() {
+                StaticPrimitiveValue::String(literal) => {
+                    literal_method_evidence(source, literal, *span)
+                }
+                _ => FetchInitMethod::Unknown,
+            },
+            Self::Expression(expr) => method_value_evidence(source, expr, scoping, constants),
+            _ => FetchInitMethod::Unknown,
         }
     }
 }
@@ -138,6 +171,12 @@ fn apply_array_source<'e, 'a>(
 ) -> Option<ArraySource<'e, 'a>> {
     match value {
         ForwardedValue::Missing => (!mode.reflect()).then_some(ArraySource::Empty),
+        ForwardedValue::Primitive { value, .. } => (!mode.reflect()
+            && matches!(
+                value.as_ref(),
+                StaticPrimitiveValue::Null | StaticPrimitiveValue::Undefined
+            ))
+        .then_some(ArraySource::Empty),
         ForwardedValue::Array { positions, .. } => Some(ArraySource::Forwarded(positions)),
         ForwardedValue::Object { span, .. } => Some(ArraySource::Unknown(span)),
         ForwardedValue::Unknown(span) => Some(ArraySource::Unknown(span.unwrap_or(fallback))),
@@ -223,6 +262,16 @@ impl ApiArguments {
                 ForwardedValue::Expression(expr) => {
                     self.push_expression(expr, source, scoping, constants)
                 }
+                ForwardedValue::Primitive { value, span } => {
+                    self.prefix.push(Rc::new(ArgumentEvidence {
+                        string: match value.as_ref() {
+                            StaticPrimitiveValue::String(text) => Some(text.clone()),
+                            _ => None,
+                        },
+                        expression: Some(source_fragment(source, span)),
+                        init: FetchInitMethod::Unknown,
+                    }))
+                }
                 ForwardedValue::Array { span, .. } => self.prefix.push(Rc::new(ArgumentEvidence {
                     string: None,
                     expression: Some(source_fragment(source, span)),
@@ -235,9 +284,7 @@ impl ApiArguments {
                         init: fields
                             .get("method")
                             .map_or(FetchInitMethod::NoOwnMethod, |value| {
-                                value.expression().map_or(FetchInitMethod::Unknown, |expr| {
-                                    method_value_evidence(source, expr, scoping, constants)
-                                })
+                                value.init_method(source, scoping, constants)
                             }),
                     }))
                 }
@@ -943,7 +990,16 @@ impl CallableIndex {
         let receiver = match operands.args.value(offset) {
             ForwardedValue::Expression(expr) => Some(expr),
             ForwardedValue::Missing => None,
+            ForwardedValue::Primitive { value, .. }
+                if matches!(
+                    value.as_ref(),
+                    StaticPrimitiveValue::Null | StaticPrimitiveValue::Undefined
+                ) =>
+            {
+                None
+            }
             // A bound function ignores its new receiver altogether.
+            ForwardedValue::Primitive { .. } if callable.bound => None,
             ForwardedValue::Array { .. }
             | ForwardedValue::Object { .. }
             | ForwardedValue::Unknown(_)

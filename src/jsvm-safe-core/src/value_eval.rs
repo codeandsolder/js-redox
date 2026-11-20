@@ -154,11 +154,15 @@ where
         Expression::NumericLiteral(v) => Some(Value::Number(v.value)),
         Expression::BooleanLiteral(v) => Some(Value::Bool(v.value)),
         Expression::NullLiteral(_) => Some(Value::Null),
-        Expression::TemplateLiteral(v) if v.expressions.is_empty() => v
-            .quasis
-            .first()
-            .and_then(template_element_value)
-            .map(Value::String),
+        Expression::TemplateLiteral(v) => {
+            let mut quasis = v.quasis.iter();
+            let mut text = template_element_value(quasis.next()?)?;
+            for expression in &v.expressions {
+                text.push_str(&eval_with_resolver(expression, resolve)?.js_string()?);
+                text.push_str(&template_element_value(quasis.next()?)?);
+            }
+            Some(Value::String(text))
+        }
         Expression::ParenthesizedExpression(v) => eval_with_resolver(&v.expression, resolve),
         Expression::UnaryExpression(v) => eval_unary_with_resolver(v, resolve),
         Expression::BinaryExpression(v) => eval_binary(
