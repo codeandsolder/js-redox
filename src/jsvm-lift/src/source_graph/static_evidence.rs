@@ -147,7 +147,7 @@ pub(super) fn seed_browser_api_callsites(
                 "operation": field(row, "operation"),
                 "certainty": field(row, "certainty"),
                 "target_pattern": field(row, "target_pattern"),
-                "bound_function_start": field(row, "bound_function_start"),
+                "bound_function_span": field(row, "bound_function_span"),
                 "affected_families": field(row, "affected_families"),
                 "expression": field(row, "expression"),
             }),
