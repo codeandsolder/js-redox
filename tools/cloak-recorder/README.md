@@ -110,9 +110,9 @@ target/session.
 ## Execution observation modes
 
 By default the recorder queries **best-effort V8 function coverage** once per
-attached CDP session at capture completion. It reads V8's existing invocation
-counters without calling `Profiler.startPreciseCoverage` or disabling the
-optimizing compiler. The observer still attaches Debugger/Network and drives
+attached CDP session at capture completion. It enables the Profiler domain
+only at that final snapshot, reading V8's existing invocation counters without
+calling `Profiler.startPreciseCoverage` or disabling the optimizing compiler. The observer still attaches Debugger/Network and drives
 consent and scrolling, so this is not an unmodified browser experiment.
 
 ```bash

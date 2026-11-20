@@ -51,8 +51,8 @@ assert.deepEqual(await collectExecutionCoverage(disabled, within, 100), {
 });
 assert.equal(calls.length, 0, "coverage disabled must issue no profiler commands");
 const bestEffort = await enableExecutionCoverage(session, "best-effort");
-assert.equal(bestEffort.status, "started");
-assert.deepEqual(calls.map(([method]) => method), ["Profiler.enable"]);
+assert.equal(bestEffort.status, "ready");
+assert.equal(calls.length, 0, "best-effort must not enable Profiler before capture completes");
 const bestEffortResult = await collectExecutionCoverage(bestEffort, within, 100);
 assert.equal(bestEffortResult.scripts[0].positiveFunctions, 1);
 assert.deepEqual(calls.map(([method]) => method), [
@@ -67,8 +67,11 @@ assert.deepEqual(calls.slice(-2), [
 const preciseResult = await collectExecutionCoverage(precise, within, 100);
 assert.equal(preciseResult.scripts[0].functions[0].isBlockCoverage, true);
 assert.equal(calls.at(-1)[0], "Profiler.takePreciseCoverage");
-assert.deepEqual(await enableExecutionCoverage({send: async () => {
-  throw new Error("unavailable");
-}}, "best-effort"), {status: "unavailable", mode: "best-effort", error: "Error: unavailable"});
+const unavailableSession = { send: async () => { throw new Error("unavailable"); } };
+assert.deepEqual(await enableExecutionCoverage(unavailableSession, "precise"), {
+  status: "unavailable", mode: "precise", error: "Error: unavailable",
+});
+const late = await enableExecutionCoverage(unavailableSession, "best-effort");
+assert.equal((await collectExecutionCoverage(late, within, 100)).status, "unavailable");
 assert.throws(() => coverageSnapshotMethod("unknown"), /no snapshot/);
 console.log("execution coverage mode and normalization tests passed");

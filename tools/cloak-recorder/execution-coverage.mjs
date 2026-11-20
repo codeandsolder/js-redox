@@ -60,11 +60,12 @@ export function coverageSnapshotMethod(mode) {
 export async function enableExecutionCoverage(session, mode) {
   if (!COVERAGE_MODES.includes(mode)) throw new TypeError(`unknown coverage mode: ${mode}`);
   if (mode === "none") return { status: "disabled", mode };
+  // Existing V8 function counters predate Profiler attachment, so enabling
+  // the domain at the final snapshot is sufficient for best-effort collection.
+  if (mode === "best-effort") return { status: "ready", mode, session };
   try {
     await session.send("Profiler.enable");
-    if (mode === "precise") {
-      await session.send("Profiler.startPreciseCoverage", { callCount: true, detailed: true });
-    }
+    await session.send("Profiler.startPreciseCoverage", { callCount: true, detailed: true });
     return { status: "started", mode, session };
   } catch (error) {
     return { status: "unavailable", mode, error: String(error) };
@@ -73,8 +74,13 @@ export async function enableExecutionCoverage(session, mode) {
 
 export async function collectExecutionCoverage(state, withTimeout, timeoutMs) {
   const { mode, status } = state;
-  if (status !== "started") return { status, error: state.error ?? null, scripts: [] };
+  if (status !== "ready" && status !== "started") {
+    return { status, error: state.error ?? null, scripts: [] };
+  }
   try {
+    if (mode === "best-effort") {
+      await withTimeout(state.session.send("Profiler.enable"), timeoutMs, "Profiler.enable");
+    }
     const method = coverageSnapshotMethod(mode);
     const snapshot = await withTimeout(state.session.send(method), timeoutMs, method);
     return {

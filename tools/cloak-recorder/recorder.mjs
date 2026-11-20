@@ -1138,8 +1138,9 @@ async function main() {
         }
       }
     }
-    // Best-effort reads V8's existing function counters without forcing
-    // unoptimized execution. Precise coverage is strictly opt-in.
+    // Best-effort reads V8's existing function counters at shutdown: don't
+    // even enable the Profiler domain until that final snapshot. Precise
+    // coverage is opt-in and must start before navigation/worker resume.
     // Both modes stay scoped to the exact CDP target session.
     coverageSessions.set(
       cdpSessionName,
