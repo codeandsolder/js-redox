@@ -985,7 +985,9 @@ impl Collector<'_, '_> {
         else {
             return;
         };
-        if !callable.callable_as(constructor) {
+        // Returned function invocations use the same positional value
+        // builder as wrappers, retaining known spread origins.
+        if callable.is_returned() || !callable.callable_as(constructor) {
             return;
         }
         let mut callable = callable;
@@ -1769,6 +1771,36 @@ one();
         assert!(rows[1..]
             .iter()
             .all(|row| row.mutation_site_ordinals.is_empty()));
+        Ok(())
+    }
+
+    #[test]
+    fn returned_callable_spreads_retain_positions_and_iterator_dependency() -> Result<()> {
+        let source = r#"
+const identity = fn => fn;
+const send = identity(fetch);
+send(...["/spread", {method:"POST"}]);
+identity(fetch)(...["/inline", {method:"PUT"}]);
+Array.prototype[Symbol.iterator] = replacement;
+"#;
+        let analysis =
+            super::analyze_api_surface(source, &WorkBudget::unlimited("returned-spread"))?;
+        assert_eq!(
+            analysis
+                .callsites
+                .iter()
+                .map(|row| (row.url.as_deref(), row.method.as_deref(), row.kind.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (Some("/spread"), Some("POST"), "fetch_candidate"),
+                (Some("/inline"), Some("PUT"), "fetch_candidate"),
+            ],
+            "{analysis:#?}"
+        );
+        assert!(analysis
+            .callsites
+            .iter()
+            .all(|row| row.mutation_site_ordinals == [0]));
         Ok(())
     }
 
