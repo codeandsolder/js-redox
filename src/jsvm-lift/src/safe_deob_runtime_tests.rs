@@ -5,7 +5,7 @@ use tempfile::TempDir;
 use work_budget::{run_command, BudgetLimits, WorkBudget};
 
 const FIXTURE_DIR: &str = "corpus/generated/reversible-obfuscation";
-const MAIN_FIXTURES: [&str; 40] = [
+const MAIN_FIXTURES: [&str; 41] = [
     "obscura-split-strings.js",
     "obscura-number-expressions.js",
     "obscura-unicode-escape.js",
@@ -27,6 +27,7 @@ const MAIN_FIXTURES: [&str; 40] = [
     "reference-identity-table-sync.js",
     "ordered-switch.js",
     "ordered-switch-for.js",
+    "ordered-switch-bounded.js",
     "arithmetic-state.js",
     "arithmetic-state-external.js",
     "arithmetic-state-registers.js",
@@ -192,7 +193,12 @@ fn assert_main_contract(file: &str, outcome: &SafeDeobOutcome) {
             assert!(count(report, "reference_state_unflatten") >= 1);
         }
         "ordered-switch.js" | "ordered-switch-for.js" => {
-            assert!(count(report, "ordered_switch_unflatten") >= 1);
+            assert!(count(report, "dispatch_switch_structured") >= 1);
+            assert_eq!(count(report, "ordered_switch_unflatten"), 0);
+        }
+        "ordered-switch-bounded.js" => {
+            assert_eq!(count(report, "ordered_switch_unflatten"), 1);
+            assert!(!outcome.source.contains("switch ("));
         }
         "arithmetic-state.js"
         | "arithmetic-state-external.js"
@@ -406,6 +412,35 @@ fn depythonify_safe_deob_script_completion_runtime_equivalence() -> Result<()> {
         "first:second:for(var i=0;true;events.push('update')){if(i++<1)continue first;events.push(i);break;}",
         "again:do {if(events.push('once'))continue again;break;}while(false);",
         "outer:for(var i=0;i<2;i++){while(true){events.push(i);if(i===0)continue outer;break;}events.push('tail');}",
+        r#"const order=["0","1"];let index=0;while(true){switch(order[index++]){case 0:events.push("zero");continue;case 1:events.push("one");continue;}break;}events.join(',');"#,
+        r#"const order=["0","1"];const index=0;while(true){switch(order[index++]){case "0":events.push("zero");continue;case "1":events.push("one");continue;}break;}events.join(',');"#,
+        r#"if(false){var order=["0","1"];};let index=0;while(true){switch(order[index++]){case "0":events.push("zero");continue;case "1":events.push("one");continue;}break;}events.join(',');"#,
+        r#"Array.prototype[2]="0";const order=["0","1"];let index=0;while(true){switch(order[index++]){case "0":events.push("zero");continue;case "1":events.push("one");continue;}break;}events.join(',');"#,
+        r#"String.prototype.split=function(){return ["1","0"]};const order="0|1".split("|");let index=0;while(true){switch(order[index++]){case "0":events.push("zero");continue;case "1":events.push("one");continue;}break;}events.join(',');"#,
+        "for(let a=[1,'1',true,0],i=0;;){switch(a[i++]){case '1':events.push('string');continue;case 1:events.push('number');continue;case true:events.push('bool');continue;case 0:7;break;}break;}",
+        "for(let a=[1,2],i=0;;){switch(a[i++]){case 1:7;continue;case 2:break;}break;}",
+        "9;for(let a=[1,2],i=0;;){switch(a[i++]){case 1:7;continue;case 3:8;continue;}break;}",
+        "for(let a=[1,2],i=0;;){switch(a[i++]){case 1:events.push('a');continue;case 2:events.push('b');continue;}break;}",
+        "for(let a=[1,1,2],i=0;;){switch(a[i++]){case 1:events.push('a');continue;case 2:8;break;}break;}",
+        "for(let a=[-0,1],i=0;;){switch(a[i++]){case 0:events.push('zero');continue;case 1:7;break;}break;}",
+        "for(let a=[0/0,1],i=0;;){switch(a[i++]){case 0/0:events.push('bad');continue;case 1:8;break;}break;}",
+        "for(let a=[1,2],i=0;;){switch(a[i++]){case 1:events.push('a');continue;case 1:events.push('bad');continue;case 2:8;break;}break;}",
+        "for(let a=[1,2],i=0;;){switch(a[i++]){case 1:events.push('a');continue;case 2:throw 7;case 3:var unused=9;break;}break;}",
+        "var i=0;while(true){switch(i++){case (events.push('test0'),0):events.push('hit0');continue;default:events.push('default');break;case (events.push('test1'),1):7;continue;}break;}",
+        "var i=0;while(true){switch(i++){case 0:7;continue;case 1:try{8;break;}finally{events.push('finally');}}break;}",
+        "var i=0;while(true){switch(i++){case 0:if(events.push('break'))break;continue;case 1:9;continue;}break;}",
+        "var i=0;outer:while(true){switch(i++){case 0:events.push('zero');continue outer;case 1:events.push('one');break outer;}break;}",
+        "const a=new Proxy([0,1],{get(t,k){events.push(String(k));return t[k]}});let i=0;while(true){switch(a[i++]){case 0:7;continue;case 1:8;continue;}break;}i;",
+        "for(var i=0,extra=events.push('init');i<3;events.push('update')){switch(i++){case 0:7;continue;case 1:8;break;}break;}extra;",
+        "var i=0;do{switch(i++){case 0:7;continue;case 1:8;break;}break;}while(events.push('test'));",
+        "var i=0;while(true){switch(i++){case 0:let a=5;continue;case 1:a;break;}break;}",
+        "var i=0;while(true){switch(i++){case 0:(eval)('events.push(1)');continue;case 1:8;break;}break;}",
+        "for(let a=[1,2],i=0;;){switch(a[i++]){case 1:events.push(i);continue;case 2:8;break;}break;}",
+        "var i=0;while(true){switch(i++){case 0:events.push('a');case 1:events.push('b');continue;case 2:break;}break;}",
+        "var i=0;while(true){switch(i++){case 0:var x=events.push('var');continue;case 1:8;break;}break;}x;",
+        "for(let a=[1,2],i=0;;){switch(a[i++]){case 1:inner:for(let j=0;j<2;j++){if(j===0)continue inner;events.push(j);}continue;case 2:9;break;}break;}",
+        "outer:for(let a=[1,2],i=0;;){switch(a[i++]){case 1:if(events.push('break'))break outer;continue;case 2:9;break;}break;}",
+
     ];
     for (index, source) in sources.iter().enumerate() {
         let label = format!("script-completion-{index}");
@@ -414,7 +449,7 @@ fn depythonify_safe_deob_script_completion_runtime_equivalence() -> Result<()> {
         let runner = |text: &str| -> Result<String> {
             let encoded = serde_json::to_string(text)?;
             Ok(format!(
-                r#"const vm=require('node:vm');const events=[];try{{const value=vm.runInNewContext({encoded},{{events}});console.log(JSON.stringify([typeof value,String(value),events]));}}catch(e){{console.log(JSON.stringify(['throw',String(e),events]));}}"#
+                r#"const vm=require('node:vm');const events=[];try{{const value=vm.runInNewContext({encoded},{{events}},{{timeout:1000}});console.log(JSON.stringify([typeof value,String(value),events]));}}catch(e){{console.log(JSON.stringify(['throw',String(e),events]));}}"#
             ))
         };
         runtime_equivalent(
@@ -824,6 +859,7 @@ fn depythonify_safe_deob_generated_runtime_equivalence() -> Result<()> {
         ("reference_identity_compare", 4),
         ("reference_state_unflatten", 1),
         ("ordered_switch_unflatten", 1),
+        ("dispatch_switch_structured", 2),
         ("arithmetic_state_unflatten", 1),
     ] {
         assert!(
