@@ -1,6 +1,7 @@
 //! Proof-bounded correspondence between a concrete debugger pause and an AST
 //! control guard in the exact original script. Never specialize the shared JS.
 use super::{verified_sha, RuntimeIdentityIndex};
+use crate::trace_identity::same_observed_call_stack;
 use anyhow::Result;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
@@ -127,22 +128,6 @@ fn top_frame(step: &Value) -> Option<&Value> {
     step.get("frames")?.as_array()?.first()
 }
 
-fn same_frame(first: &Value, second: &Value) -> bool {
-    let (Some(a), Some(b)) = (
-        first.get("frames").and_then(Value::as_array),
-        second.get("frames").and_then(Value::as_array),
-    ) else {
-        return false;
-    };
-    !a.is_empty()
-        && a.len() == b.len()
-        && a.iter().zip(b).all(|(a, b)| {
-            a.get("functionLocation").is_some_and(|location| {
-                !location.is_null() && b.get("functionLocation") == Some(location)
-            }) && a.get("sourceSha256") == b.get("sourceSha256")
-        })
-}
-
 /// Only the original captured source, exact (CDP session, script, SHA), and
 /// observations at the guard's executing pause can produce a guard witness.
 /// A next pause in an AST arm is additional evidence, never a claim about all
@@ -253,7 +238,7 @@ pub(super) fn observe(
             let mut next_pause_arm = None;
             if let Some(next) = steps
                 .get(step_index + 1)
-                .filter(|next| same_frame(step, next))
+                .filter(|next| same_observed_call_stack(step, next))
             {
                 if let Some(next_frame) = top_frame(next) {
                     let next_script = next_frame

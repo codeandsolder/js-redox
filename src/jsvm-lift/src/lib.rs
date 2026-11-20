@@ -70,6 +70,7 @@ pub mod source_tree_reflow;
 pub mod source_tree_return_flow;
 pub mod source_tree_specialize;
 pub mod tool_environment;
+mod trace_identity;
 pub mod vm_materialize;
 pub mod wasm_materialize;
 pub mod wasm_resource_provenance;
