@@ -59,7 +59,7 @@ fn attach_source_identity(
 }
 
 /// Analyze every selected JavaScript view in a capture project and persist the
-/// canonical `capture-api-surface/v5` artifact.
+/// canonical `capture-api-surface/v6` artifact.
 ///
 /// # Errors
 ///
@@ -285,9 +285,12 @@ mod tests {
     fn project_artifact_links_reflective_mutation_sites_to_candidates() -> anyhow::Result<()> {
         let (summary, document) = analyze_single_source_project(
             r#"
-const submit = fetch.bind(window, "https://api.test/data");
-Object.defineProperty(globalThis, "fetch", {value: replacement});
-submit({method: "POST"});
+const root = globalThis;
+const {fetch: request} = root;
+const submit = request.bind(root, "https://api.test/data");
+const O = root.Object;
+O.defineProperty(root, "fetch", {value: replacement});
+submit.apply(null, [{method: "POST"}]);
 new WebSocket("wss://api.test/live");
 "#,
             7,
@@ -297,7 +300,7 @@ new WebSocket("wss://api.test/live");
         assert_eq!(summary["callsites"], 2);
         assert_eq!(summary["candidates"], 1);
         assert_eq!(summary["mutation_sites"], 1);
-        assert_eq!(document["schema"], "capture-api-surface/v5");
+        assert_eq!(document["schema"], "capture-api-surface/v6");
         let site = &document["mutation_sites"][0];
         assert_eq!(site["source_index_ordinal"], 0);
         assert_eq!(site["mutation_site_ordinal"], 0);
@@ -307,11 +310,13 @@ new WebSocket("wss://api.test/live");
         assert_eq!(site["certainty"], "possible");
         let call = &document["callsites"][0];
         assert_eq!(call["kind"], "fetch_candidate");
-        assert_eq!(call["callee"], "submit");
+        assert_eq!(call["callee"], "submit.apply");
         assert_eq!(call["api_origin"], "fetch");
-        assert_eq!(call["invocation_form"], "bound");
-        assert_eq!(call["binding_witnesses"][0]["kind"], "bind");
-        assert_eq!(call["binding_witnesses"][1]["kind"], "const_alias");
+        assert_eq!(call["invocation_form"], "apply");
+        assert_eq!(call["binding_witnesses"][0]["kind"], "const_alias");
+        assert_eq!(call["binding_witnesses"][1]["kind"], "destructure");
+        assert_eq!(call["binding_witnesses"][2]["kind"], "bind");
+        assert_eq!(call["binding_witnesses"][4]["kind"], "apply");
         assert_eq!(call["url"], "https://api.test/data");
         assert_eq!(call["mutation_site_ordinals"], json!([0]));
         assert_eq!(call["method"], "POST");
@@ -340,7 +345,7 @@ navigator.sendBeacon("https://api.example.test/events", payload);
         assert_eq!(summary["candidates"], 2);
         assert_eq!(summary["kinds"]["fetch_candidate"], 1);
         assert_eq!(summary["kinds"]["send_beacon_candidate"], 1);
-        assert_eq!(doc["schema"], "capture-api-surface/v5");
+        assert_eq!(doc["schema"], "capture-api-surface/v6");
         let rows = doc["callsites"]
             .as_array()
             .context("api surface callsites missing")?;
