@@ -3,6 +3,7 @@ mod capture_evidence;
 mod generated_evidence;
 mod reference_evidence;
 mod runtime_evidence;
+mod runtime_wasm_evidence;
 mod sourcemap_evidence;
 mod static_evidence;
 mod wasm_evidence;
@@ -22,7 +23,7 @@ use capture_evidence::InlineSourceIndex;
 use runtime_evidence::{seed_runtime_script_evidence, RuntimeInstances, RuntimeSourceGraphIndex};
 use serde_json::{json, Map, Value};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, HashSet},
     path::Path,
 };
 
@@ -545,142 +546,6 @@ fn seed_selective_trace_witnesses(
     Ok(())
 }
 
-/// Resolve observed WASM request initiators in the existing evidence order:
-/// exact same-session script instance, captured resource IDs, then URL candidates.
-/// A URL fallback may create an explicitly external node, never execution proof.
-fn runtime_wasm_initiator_nodes(
-    graph: &mut GraphBuilder,
-    observation: &Value,
-    primary: &Value,
-    runtime_instances: &RuntimeInstances,
-) -> Result<Vec<String>> {
-    let mut source_nodes = Vec::<String>::new();
-    if let Some(runtime_node) = primary.get("script_id").and_then(|script_id| {
-        runtime_instances.observed_node(
-            nonempty_string_field(observation, "cdp_session").unwrap_or("main"),
-            script_id,
-        )
-    }) {
-        source_nodes.push(runtime_node);
-    }
-    if source_nodes.is_empty() {
-        source_nodes.extend(
-            array_field(observation, "initiator_resource_ids")
-                .iter()
-                .filter_map(Value::as_u64)
-                .map(|resource_id| format!("resource:{resource_id}")),
-        );
-    }
-    if source_nodes.is_empty() {
-        if let Some(url) = nonempty_string_field(primary, "url") {
-            source_nodes.extend(graph.targets_for(url)?);
-        }
-    }
-    Ok(source_nodes)
-}
-
-/// A captured response occurrence is unique only when exactly one resource
-/// ID is present. Multiple response IDs must remain separate candidate edges.
-fn add_runtime_wasm_response_edges(
-    graph: &mut GraphBuilder,
-    observation: &Value,
-    observation_id: &str,
-) -> Result<()> {
-    let resource_ids = array_field(observation, "wasm_resource_ids")
-        .iter()
-        .filter_map(Value::as_u64)
-        .collect::<Vec<_>>();
-    let exact_resource_occurrence = resource_ids.len() == 1;
-    for resource_id in resource_ids {
-        graph.add_edge(
-            observation_id,
-            &format!("resource:{resource_id}"),
-            if exact_resource_occurrence {
-                "runtime_observed_wasm_response"
-            } else {
-                "runtime_observed_wasm_response_candidate"
-            },
-            json!({
-                "sha256":field(observation,"sha256"),
-                "url":field(observation,"url"),
-                "exact_response_identity":true,
-                "exact_resource_occurrence":exact_resource_occurrence,
-                "response_identity_basis":field(observation,"response_identity_basis"),
-            }),
-        )?;
-    }
-    Ok(())
-}
-
-/// Record WASM request observations separately from static WASM module origins.
-/// CDP initiator evidence and the captured response candidates are independent.
-fn seed_runtime_wasm_observations(
-    graph: &mut GraphBuilder,
-    wasm_resource_provenance: &Value,
-    runtime_instances: &RuntimeInstances,
-    budget: &work_budget::WorkBudget,
-) -> Result<()> {
-    // Runtime-observed WASM requests are capture evidence, not universal static control flow.
-    for observation in array_field(wasm_resource_provenance, "observations") {
-        budget.checkpoint()?;
-        let key = compact_key((
-            nonempty_string_field(observation, "cdp_session").unwrap_or("main"),
-            field(observation, "request_id"),
-            field(observation, "url"),
-            field(observation, "sha256"),
-        ))?;
-        let observation_id = digest_id("runtime-wasm-request:", &key);
-        let primary = observation.get("primary_initiator").unwrap_or(&Value::Null);
-        graph.add_node(
-            observation_id.clone(),
-            json!({
-                "type":"runtime_wasm_request",
-                "cdp_session":field(observation,"cdp_session"),
-                "request_id":field(observation,"request_id"),
-                "url":field(observation,"url"),
-                "sha256":field(observation,"sha256"),
-                "bytes":field(observation,"byte_len"),
-                "initiator_type":field(observation,"initiator_type"),
-                "initiator_function":field(primary,"function_name"),
-                "initiator_script_id":field(primary,"script_id"),
-                "initiator_url":field(primary,"url"),
-                "line_number":field(primary,"line_number"),
-                "column_number":field(primary,"column_number"),
-                "runtime_observed":true,
-                "exact_response_identity":bool_field(observation,"exact_response_identity"),
-                "response_identity_basis":field(observation,"response_identity_basis"),
-                "matching_resource_count":array_field(observation,"wasm_resource_ids").len(),
-            }),
-        )?;
-
-        let source_nodes =
-            runtime_wasm_initiator_nodes(graph, observation, primary, runtime_instances)?;
-        let mut seen_sources = BTreeSet::new();
-        for source_node in source_nodes {
-            if !seen_sources.insert(source_node.clone()) {
-                continue;
-            }
-            graph.add_edge(
-                &source_node,
-                &observation_id,
-                "runtime_wasm_request_initiator",
-                json!({
-                    "evidence":field(observation,"evidence"),
-                    "function_name":field(primary,"function_name"),
-                    "script_id":field(primary,"script_id"),
-                    "line_number":field(primary,"line_number"),
-                    "column_number":field(primary,"column_number"),
-                    "runtime_observed":true,
-                }),
-            )?;
-        }
-
-        add_runtime_wasm_response_edges(graph, observation, &observation_id)?;
-    }
-
-    Ok(())
-}
-
 /// Build the project source/provenance graph from indexed capture evidence.
 ///
 /// # Errors
@@ -753,7 +618,7 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
         &budget,
     )?;
 
-    seed_runtime_wasm_observations(
+    runtime_wasm_evidence::seed_runtime_wasm_observations(
         &mut graph,
         &wasm_resource_provenance,
         &runtime_index.instances,
@@ -806,6 +671,7 @@ mod tests {
         analysis_artifacts::{load_artifact, write_artifact, JS_REFERENCES, SOURCE_GRAPH},
         capture_project::{write_manifest, CaptureManifest, CaptureSource, MANIFEST_NAME},
     };
+    use std::collections::BTreeSet;
 
     fn seeded_capture_fixture() -> CaptureManifest {
         let shared = "https://fixture.invalid/shared.js";
@@ -919,125 +785,6 @@ mod tests {
         Ok(())
     }
 
-    fn runtime_wasm_observation_fixture() -> Value {
-        json!({"observations": [
-            {
-                "cdp_session":"worker","request_id":"exact","url":"https://w.test/a.wasm",
-                "sha256":"a","exact_response_identity":true,
-                "primary_initiator":{"script_id":"17","url":"https://w.test/ambiguous.js"},
-                "initiator_resource_ids":[1],
-                "wasm_resource_ids":[20],"response_identity_basis":"cdp_body_sha256"
-            },
-            {
-                "cdp_session":"other","request_id":"resource-fallback","url":"https://w.test/b.wasm",
-                "sha256":"b","exact_response_identity":false,
-                "primary_initiator":{"script_id":"17","url":"https://w.test/ambiguous.js"},
-                "initiator_resource_ids":[1,1,2],"wasm_resource_ids":[30,31],
-                "response_identity_basis":"ambiguous_response"
-            },
-            {
-                "cdp_session":"other","request_id":"url-fallback","url":"https://w.test/c.wasm",
-                "primary_initiator":{"url":"https://w.test/ambiguous.js"},
-                "wasm_resource_ids":[]
-            },
-            {
-                "cdp_session":"other","request_id":"external","url":"https://w.test/d.wasm",
-                "primary_initiator":{"url":"https://w.test/unseen.js"},
-                "wasm_resource_ids":[]
-            }
-        ]})
-    }
-
-    #[test]
-    fn runtime_wasm_observations_preserve_evidence_priority_and_response_ambiguity() -> Result<()> {
-        let budget = work_budget::WorkBudget::new(
-            "wasm-request-graph-identity",
-            work_budget::BudgetLimits::unlimited(),
-        );
-        let mut graph = GraphBuilder::default();
-        let shared = "https://w.test/ambiguous.js";
-        for id in ["resource:1", "resource:2"] {
-            graph.add_node(id, json!({"type":"resource","url":shared}))?;
-            graph.register_resource_url(shared, id);
-        }
-        let mut instances = RuntimeInstances::default();
-        instances.register("worker", "17", "worker");
-        seed_runtime_wasm_observations(
-            &mut graph,
-            &runtime_wasm_observation_fixture(),
-            &instances,
-            &budget,
-        )?;
-        let observation = |request_id: &str| -> Result<&str> {
-            graph
-                .nodes
-                .values()
-                .find(|node| node["request_id"] == request_id)
-                .and_then(|node| node["id"].as_str())
-                .with_context(|| format!("missing request {request_id}"))
-        };
-        let sources = |request_id: &str| -> Result<BTreeSet<&str>> {
-            let target = observation(request_id)?;
-            Ok(graph
-                .edges
-                .iter()
-                .filter(|edge| {
-                    edge["kind"] == "runtime_wasm_request_initiator" && edge["to"] == target
-                })
-                .filter_map(|edge| edge["from"].as_str())
-                .collect())
-        };
-        assert_eq!(sources("exact")?, BTreeSet::from(["runtime:worker"]));
-        assert_eq!(
-            sources("resource-fallback")?,
-            BTreeSet::from(["resource:1", "resource:2"])
-        );
-        assert_eq!(
-            sources("url-fallback")?,
-            BTreeSet::from(["resource:1", "resource:2"])
-        );
-        let external = sources("external")?;
-        assert_eq!(external.len(), 1);
-        assert!(external.iter().all(|node| node.starts_with("external:")));
-        assert_eq!(graph.external_nodes.len(), 1);
-
-        let exact = observation("exact")?;
-        let response = graph
-            .edges
-            .iter()
-            .filter(|edge| edge["from"] == exact)
-            .collect::<Vec<_>>();
-        assert_eq!(response.len(), 1);
-        assert_eq!(response[0]["to"], "resource:20");
-        assert_eq!(response[0]["kind"], "runtime_observed_wasm_response");
-        assert_eq!(response[0]["exact_resource_occurrence"], true);
-
-        let ambiguous = observation("resource-fallback")?;
-        let candidates = graph
-            .edges
-            .iter()
-            .filter(|edge| edge["from"] == ambiguous)
-            .collect::<Vec<_>>();
-        assert_eq!(candidates.len(), 2);
-        assert_eq!(
-            candidates
-                .iter()
-                .map(|edge| edge["to"].as_str().unwrap_or_default())
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::from(["resource:30", "resource:31"])
-        );
-        assert!(candidates.iter().all(|edge| edge["kind"]
-            == "runtime_observed_wasm_response_candidate"
-            && edge["exact_resource_occurrence"] == false));
-        assert_eq!(graph.nodes[ambiguous]["exact_response_identity"], false);
-        assert!(graph.edges.iter().all(|edge| {
-            edge["kind"] != "runtime_wasm_request_initiator"
-                || edge["from"] != "runtime:worker"
-                || edge["to"] == exact
-        }));
-        Ok(())
-    }
-
     fn conflicting_runtime_instance_fixture() -> (String, Value, Value) {
         let first = "a".repeat(64);
         let second = "b".repeat(64);
@@ -1100,9 +847,11 @@ mod tests {
             &budget,
         )?;
         let instances = &runtime_index.instances;
-        assert!(instances.observed_node("worker", &json!("7")).is_none());
+        assert!(instances
+            .observed_node("worker", &json!("7"), None)
+            .is_none());
         assert_eq!(
-            instances.observed_node("other", &json!("7")),
+            instances.observed_node("other", &json!("7"), None),
             Some(format!("runtime:{}", &second[..20]))
         );
         seed_selective_trace_witnesses(&mut graph, &trace, instances, &budget)?;
