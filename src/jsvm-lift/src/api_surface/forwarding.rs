@@ -1,15 +1,14 @@
-//! Specialize single-expression local forwarding chains using existing lexical
+//! Specialize straight-line local forwarding chains using existing lexical
 //! parameter proof and native callable evidence. Separate original body sink
 //! sites from their call-specific specializations. No AST rewriting/evaluation.
 use super::{
     callables::{member_parts, DispatchOperands, ForwardedValue, PositionalArguments},
     *,
 };
-use crate::source_tree_callflow::stable_parameter_index;
 use oxc_ast::{
     ast::{
         Argument, ArrayExpression, ArrayExpressionElement, FormalParameters, Function,
-        FunctionBody, Statement,
+        FunctionBody, Statement, VariableDeclarationKind,
     },
     AstKind,
 };
@@ -18,13 +17,14 @@ use oxc_syntax::scope::ScopeId;
 use std::{collections::BTreeMap, rc::Rc};
 
 type ArgumentList<'a> = PositionalArguments<'a, 'a>;
+type ValueFrame<'a> = BTreeMap<SymbolId, ForwardedValue<'a, 'a>>;
 
 /// Carry value origins rather than copying syntax into a different scope.
 /// Materialized arrays share their positional contents; spreading a known
 /// array or rest value consumes those positions, while apply uses indexed
 /// contents without depending on Array.prototype[Symbol.iterator].
 struct ValueBuilder<'s, 'a> {
-    parameters: Option<(&'s Parameters, &'s ArgumentList<'a>)>,
+    frame: Option<ValueFrame<'a>>,
     scoping: &'s Scoping,
     limit: usize,
     budget: &'s WorkBudget,
@@ -33,13 +33,13 @@ struct ValueBuilder<'s, 'a> {
 
 impl<'s, 'a> ValueBuilder<'s, 'a> {
     fn new(
-        parameters: Option<(&'s Parameters, &'s ArgumentList<'a>)>,
+        frame: Option<ValueFrame<'a>>,
         scoping: &'s Scoping,
         limit: usize,
         budget: &'s WorkBudget,
     ) -> Self {
         Self {
-            parameters,
+            frame,
             scoping,
             limit,
             budget,
@@ -49,25 +49,11 @@ impl<'s, 'a> ValueBuilder<'s, 'a> {
 
     fn expression(&mut self, expr: &'a Expression<'a>) -> Result<ForwardedValue<'a, 'a>> {
         self.budget.consume(1)?;
-        if let Some((params, origin)) = self.parameters {
-            if let Some(symbol) = expression_symbol(self.scoping, expr) {
-                if params.forwardable.contains(&symbol) {
-                    if params.rest == Some(symbol) {
-                        let mut positions = ArgumentList::default();
-                        self.extend(&mut positions, origin, params.fixed.len(), expr.span())?;
-                        return Ok(ForwardedValue::Array {
-                            span: expr.span(),
-                            positions: Rc::new(positions),
-                        });
-                    }
-                    if let Some(index) = stable_parameter_index(
-                        self.scoping,
-                        symbol,
-                        params.fixed.iter().copied().map(Some),
-                    ) {
-                        return Ok(origin.value(index));
-                    }
-                }
+        if let Some(frame) = &self.frame {
+            if let Some(value) =
+                expression_symbol(self.scoping, expr).and_then(|symbol| frame.get(&symbol))
+            {
+                return Ok(value.clone());
             }
             if let Expression::ArrayExpression(array) = unparenthesized(expr) {
                 let positions = self.array(array)?;
@@ -190,7 +176,6 @@ impl<'s, 'a> ValueBuilder<'s, 'a> {
 struct Parameters {
     fixed: Vec<SymbolId>,
     rest: Option<SymbolId>,
-    forwardable: BTreeSet<SymbolId>,
 }
 
 impl Parameters {
@@ -226,26 +211,55 @@ impl Parameters {
         if !all.into_iter().all(|symbol| unique.insert(symbol)) {
             return None;
         }
-        Some(Self {
-            fixed,
-            rest,
-            forwardable: BTreeSet::new(),
-        })
+        Some(Self { fixed, rest })
     }
+}
+
+#[derive(Clone, Copy)]
+struct LocalInitializer<'a> {
+    symbol: SymbolId,
+    span: Span,
+    expression: &'a Expression<'a>,
 }
 
 struct Wrapper<'a> {
     span: Span,
     params: Parameters,
+    locals: Vec<LocalInitializer<'a>>,
     body: &'a Expression<'a>,
+    returns_value: bool,
 }
 
-fn single_expression<'a>(body: &'a FunctionBody<'a>) -> Option<&'a Expression<'a>> {
-    match body.statements.as_slice() {
-        [Statement::ReturnStatement(statement)] => statement.argument.as_ref(),
-        [Statement::ExpressionStatement(statement)] => Some(&statement.expression),
-        _ => None,
+/// Admit an ordered sequence of immutable identifier initializers and a
+/// final invocation/value expression. Initializer purity and reference
+/// confinement are checked against the specializing frame, not guessed
+/// from the declaration keyword.
+fn straight_line_body<'a>(
+    body: &'a FunctionBody<'a>,
+) -> Option<(Vec<LocalInitializer<'a>>, &'a Expression<'a>, bool)> {
+    let (last, initializers) = body.statements.split_last()?;
+    let (expression, returns_value) = match last {
+        Statement::ReturnStatement(statement) => (statement.argument.as_ref()?, true),
+        Statement::ExpressionStatement(statement) => (&statement.expression, false),
+        _ => return None,
+    };
+    let mut locals = Vec::new();
+    for statement in initializers {
+        let Statement::VariableDeclaration(declaration) = statement else {
+            return None;
+        };
+        if declaration.kind != VariableDeclarationKind::Const {
+            return None;
+        }
+        for declarator in &declaration.declarations {
+            locals.push(LocalInitializer {
+                symbol: declarator.id.get_binding_identifier()?.symbol_id.get()?,
+                span: declarator.span,
+                expression: declarator.init.as_ref()?,
+            });
+        }
     }
+    Some((locals, expression, returns_value))
 }
 
 #[derive(Default)]
@@ -268,10 +282,13 @@ impl<'a> Wrapper<'a> {
         if fun.generator {
             return None;
         }
+        let (locals, body, returns_value) = straight_line_body(fun.body.as_ref()?)?;
         Some(Self {
             span: fun.span,
             params: Parameters::from_formals(&fun.params, scoping)?,
-            body: single_expression(fun.body.as_ref()?)?,
+            locals,
+            body,
+            returns_value: returns_value && !fun.r#async,
         })
     }
 
@@ -279,14 +296,18 @@ impl<'a> Wrapper<'a> {
         match unparenthesized(expr) {
             Expression::FunctionExpression(fun) => Self::function(fun, scoping),
             Expression::ArrowFunctionExpression(fun) => {
-                let body = match &fun.body {
-                    oxc_ast::ast::ArrowFunctionBody::FunctionBody(body) => single_expression(body)?,
-                    body => body.as_expression()?,
+                let (locals, body, returns_value) = match &fun.body {
+                    oxc_ast::ast::ArrowFunctionBody::FunctionBody(body) => {
+                        straight_line_body(body)?
+                    }
+                    body => (Vec::new(), body.as_expression()?, true),
                 };
                 Some(Self {
                     span: fun.span,
                     params: Parameters::from_formals(&fun.params, scoping)?,
+                    locals,
                     body,
+                    returns_value: returns_value && !fun.r#async,
                 })
             }
             _ => None,
@@ -358,9 +379,9 @@ impl<'a> WrapperIndex<'a> {
             budget.consume(1)?;
             let (symbol, binding) = match node.kind() {
                 AstKind::Function(fun) if fun.is_declaration() => {
-                    if !Wrapper::function(fun, scoping)
-                        .is_some_and(|wrapper| wrapper.invocation().is_some())
-                    {
+                    if !Wrapper::function(fun, scoping).is_some_and(|wrapper| {
+                        wrapper.invocation().is_some() || wrapper.returns_value
+                    }) {
                         continue;
                     }
                     let Some(symbol) = fun.id.as_ref().and_then(|id| id.symbol_id.get()) else {
@@ -387,6 +408,7 @@ impl<'a> WrapperIndex<'a> {
                         Expression::Identifier(_)
                             | Expression::FunctionExpression(_)
                             | Expression::ArrowFunctionExpression(_)
+                            | Expression::CallExpression(_)
                     ) {
                         continue;
                     }
@@ -518,6 +540,7 @@ impl<'a> WrapperIndex<'a> {
 fn parameter_is_direct(
     symbol: SymbolId,
     sink: Span,
+    locals: &[LocalInitializer<'_>],
     semantic: &Semantic<'_>,
     constants: &ProvenConstantEnvironment,
     spread_safe: bool,
@@ -531,6 +554,10 @@ fn parameter_is_direct(
             return Ok(false);
         }
         let mut current = semantic.nodes().get_node(reference.node_id()).span();
+        let used_in_final_value = current == sink;
+        if used_in_final_value {
+            continue;
+        }
         let mut dispatch_member = false;
         let mut inside_array = false;
         let mut accepted = false;
@@ -570,15 +597,214 @@ fn parameter_is_direct(
                     accepted = !dispatch_member && new.span == sink;
                     break;
                 }
+                AstKind::VariableDeclarator(declaration) => {
+                    accepted = !dispatch_member
+                        && locals.iter().any(|local| {
+                            declaration.span == local.span && local.expression.span() == current
+                        });
+                    break;
+                }
                 _ => break,
             }
             current = kind.span();
+            if current == sink && !dispatch_member {
+                accepted = true;
+                break;
+            }
         }
         if !accepted {
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+fn known_array(value: &ForwardedValue<'_, '_>) -> bool {
+    match value {
+        ForwardedValue::Array { .. } => true,
+        ForwardedValue::Expression(expr) => {
+            matches!(unparenthesized(expr), Expression::ArrayExpression(_))
+        }
+        _ => false,
+    }
+}
+
+/// The local frame only evaluates transparent reads, pure constants and
+/// private literal construction. A native property read uses the existing
+/// browser identity assumptions; arbitrary property reads/calls may execute
+/// user code, so must not be silently moved across initializer boundaries.
+fn pure_initializer<'a>(
+    expression: &'a Expression<'a>,
+    builder: &mut ValueBuilder<'_, 'a>,
+    all_locals: &BTreeSet<SymbolId>,
+    collector: &Collector<'_, '_>,
+) -> Result<bool> {
+    builder.budget.consume(1)?;
+    let expr = unparenthesized(expression);
+    let scoping = collector.scoping;
+    let constants = collector.constants;
+    if let Some(symbol) = expression_symbol(scoping, expr) {
+        if all_locals.contains(&symbol) {
+            return Ok(builder
+                .frame
+                .as_ref()
+                .is_some_and(|frame| frame.contains_key(&symbol)));
+        }
+        // Reads of other lexical bindings are non-effectful, but a
+        // value origin needs its own static proof at the use site.
+        return Ok(true);
+    }
+    match expr {
+        Expression::StringLiteral(_)
+        | Expression::NumericLiteral(_)
+        | Expression::BooleanLiteral(_)
+        | Expression::NullLiteral(_)
+        | Expression::BigIntLiteral(_) => Ok(true),
+        Expression::ArrayExpression(array) => {
+            for element in &array.elements {
+                match element {
+                    ArrayExpressionElement::Elision(_) => {}
+                    ArrayExpressionElement::SpreadElement(spread) => {
+                        if !pure_initializer(&spread.argument, builder, all_locals, collector)?
+                            || !known_array(&builder.expression(&spread.argument)?)
+                        {
+                            return Ok(false);
+                        }
+                    }
+                    _ => {
+                        let Some(expr) = element.as_expression() else {
+                            return Ok(false);
+                        };
+                        if !pure_initializer(expr, builder, all_locals, collector)? {
+                            return Ok(false);
+                        }
+                    }
+                }
+            }
+            Ok(true)
+        }
+        // Only side-effect-free statically proven primitive expressions
+        // and recognized native/namespace reads beyond the literal cases.
+        _ => Ok(static_string(expr, scoping, constants).is_some()
+            || global_path(scoping, constants, expr).as_deref() == Some("undefined")
+            || (!matches!(expr, Expression::CallExpression(_))
+                && (collector
+                    .callables
+                    .resolve(expr, collector.source, scoping, constants)
+                    .is_some()
+                    || collector
+                        .callables
+                        .namespace_path(expr, scoping, constants)
+                        .is_some()))),
+    }
+}
+
+fn uses_confined_value(
+    symbol: SymbolId,
+    value: &ForwardedValue<'_, '_>,
+    wrapper: &Wrapper<'_>,
+    sink: Span,
+    semantic: &Semantic<'_>,
+    constants: &ProvenConstantEnvironment,
+    budget: &WorkBudget,
+) -> Result<bool> {
+    parameter_is_direct(
+        symbol,
+        sink,
+        &wrapper.locals,
+        semantic,
+        constants,
+        known_array(value),
+        budget,
+    )
+}
+
+/// Construct one invocation frame in source order. Every forwarded alias
+/// must have confined references, and no initializer may call arbitrary
+/// code. A failed frame is discarded as a unit (aliases can share objects).
+fn instantiate<'a, 's>(
+    wrapper: &Wrapper<'a>,
+    args: &ArgumentList<'a>,
+    sink: Span,
+    semantic: &Semantic<'a>,
+    collector: &Collector<'_, 's>,
+    limit: usize,
+    budget: &'s WorkBudget,
+    witnesses: &mut Vec<ApiBindingWitness>,
+) -> Result<Option<ValueBuilder<'s, 'a>>> {
+    let mut builder = ValueBuilder::new(Some(ValueFrame::new()), collector.scoping, limit, budget);
+    let all_locals = wrapper
+        .params
+        .fixed
+        .iter()
+        .copied()
+        .chain(wrapper.params.rest)
+        .chain(wrapper.locals.iter().map(|local| local.symbol))
+        .collect::<BTreeSet<_>>();
+    for (index, symbol) in wrapper
+        .params
+        .fixed
+        .iter()
+        .copied()
+        .chain(wrapper.params.rest)
+        .enumerate()
+    {
+        let value = if wrapper.params.rest == Some(symbol) {
+            let mut positions = ArgumentList::default();
+            builder.extend(&mut positions, args, index, wrapper.span)?;
+            ForwardedValue::Array {
+                span: wrapper.span,
+                positions: Rc::new(positions),
+            }
+        } else {
+            args.value(index)
+        };
+        if uses_confined_value(
+            symbol,
+            &value,
+            wrapper,
+            sink,
+            semantic,
+            collector.constants,
+            budget,
+        )? {
+            if let Some(frame) = &mut builder.frame {
+                frame.insert(symbol, value);
+            }
+        } else if wrapper.params.rest == Some(symbol) || !wrapper.locals.is_empty() {
+            return Ok(None);
+        }
+    }
+    // A parameter omitted from the frame above is not a transparent
+    // origin. It must not be accidentally recovered via an alias.
+    for local in &wrapper.locals {
+        if uses_arguments_object(local.expression)
+            || !pure_initializer(local.expression, &mut builder, &all_locals, collector)?
+        {
+            return Ok(None);
+        }
+        let value = builder.expression(local.expression)?;
+        if !uses_confined_value(
+            local.symbol,
+            &value,
+            wrapper,
+            sink,
+            semantic,
+            collector.constants,
+            budget,
+        )? {
+            return Ok(None);
+        }
+        if let Some(frame) = &mut builder.frame {
+            frame.insert(local.symbol, value);
+        }
+        witnesses.push(ApiBindingWitness {
+            kind: "wrapper_local_binding".into(),
+            start: local.span.start,
+            end: local.span.end,
+        });
+    }
+    Ok(Some(builder))
 }
 
 /// Resolve the same native dispatch head used by direct calls, but from the
@@ -672,7 +898,7 @@ pub(super) fn specialize<'a>(
         if constructor {
             return Ok(());
         }
-        let Some(mut wrapper) =
+        let Some(wrapper) =
             wrappers.resolve(callee, scoping, budget, &mut dependencies, &mut witnesses)?
         else {
             return Ok(());
@@ -697,38 +923,19 @@ pub(super) fn specialize<'a>(
             end: sink_span.end,
         });
         sink = sink_span;
-        for (index, symbol) in wrapper
-            .params
-            .fixed
-            .iter()
-            .copied()
-            .chain(wrapper.params.rest)
-            .enumerate()
-        {
-            let spread_safe = wrapper.params.rest == Some(symbol)
-                || match args.value(index) {
-                    ForwardedValue::Array { .. } => true,
-                    ForwardedValue::Expression(expr) => {
-                        matches!(unparenthesized(expr), Expression::ArrayExpression(_))
-                    }
-                    _ => false,
-                };
-            if parameter_is_direct(
-                symbol,
-                sink,
-                semantic,
-                collector.constants,
-                spread_safe,
-                budget,
-            )? {
-                wrapper.params.forwardable.insert(symbol);
-            } else if wrapper.params.rest == Some(symbol) {
-                return Ok(());
-            }
-        }
-        let environment = Some((&wrapper.params, &args));
-        let mut builder =
-            ValueBuilder::new(environment, scoping, wrappers.positional_limit, budget);
+        let Some(mut builder) = instantiate(
+            &wrapper,
+            &args,
+            sink,
+            semantic,
+            collector,
+            wrappers.positional_limit,
+            budget,
+            &mut witnesses,
+        )?
+        else {
+            return Ok(());
+        };
         let next_args = builder.call(forwarded)?;
         if !is_new {
             if let Some(mut callable) =
