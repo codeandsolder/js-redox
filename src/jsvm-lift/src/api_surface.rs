@@ -361,16 +361,25 @@ fn normalized_mutation_path(path: &[Option<String>]) -> &[Option<String>] {
     }
 }
 
-const MUTATION_TARGETS: &[(&str, &[&str])] = &[
-    ("fetch", &["fetch"]),
-    ("send_beacon", &["navigator", "sendBeacon"]),
-    ("websocket", &["WebSocket"]),
-    ("xhr", &["XMLHttpRequest"]),
-    ("xhr_open_method", &["XMLHttpRequest", "prototype", "open"]),
-    ("function_bind", &["Function", "prototype", "bind"]),
+// The minimum depth distinguishes replacing a global binding from
+// modifying an existing object's property. In particular, global
+// XMLHttpRequest/Function/Object replacement does not itself mutate the
+// original constructor's prototype object.
+const MUTATION_TARGETS: &[(&str, &[&str], usize)] = &[
+    ("fetch", &["fetch"], 1),
+    ("send_beacon", &["navigator", "sendBeacon"], 1),
+    ("websocket", &["WebSocket"], 1),
+    ("xhr", &["XMLHttpRequest"], 1),
+    (
+        "xhr_open_method",
+        &["XMLHttpRequest", "prototype", "open"],
+        2,
+    ),
+    ("function_bind", &["Function", "prototype", "bind"], 2),
     (
         "request_init_method_prototype",
         &["Object", "prototype", "method"],
+        2,
     ),
 ];
 
@@ -457,8 +466,10 @@ impl SinkMutations {
         match path {
             MutationPath::Global(path) => {
                 let normalized = normalized_mutation_path(path);
-                for &(family, target) in MUTATION_TARGETS {
-                    if mutation_prefix_matches(normalized, target) {
+                for &(family, target, minimum_depth) in MUTATION_TARGETS {
+                    if normalized.len() >= minimum_depth
+                        && mutation_prefix_matches(normalized, target)
+                    {
                         affected.push(family.to_owned());
                     }
                 }
@@ -912,7 +923,8 @@ impl Collector<'_, '_> {
         let mut mutated = false;
         // Captured function values may outlive replacement of their original
         // global property. Do not discard their potentially real invocation.
-        let mut binding_families = vec![(family, callable.captured)];
+        let mut binding_families =
+            vec![(family, callable.captured || callable.constructor_captured)];
         if callable.kind == ApiKind::XhrOpen {
             binding_families.push(("xhr", callable.constructor_captured));
         }
@@ -1317,6 +1329,12 @@ xhr.open("GET", "https://example.test/maybe-xhr");
             source,
             &WorkBudget::unlimited("captured-binding-mutations"),
         )?;
+        let constructor_write = analysis
+            .mutation_sites
+            .iter()
+            .find(|site| site.target_pattern == [Some("XMLHttpRequest".into())])
+            .context("missing constructor replacement")?;
+        assert_eq!(constructor_write.affected_families, ["xhr"]);
         let rows = analysis.callsites;
         assert_eq!(rows.len(), 3, "{rows:#?}");
         assert_eq!(
