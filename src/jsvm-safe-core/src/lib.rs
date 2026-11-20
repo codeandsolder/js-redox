@@ -8287,7 +8287,7 @@ console.log(d(0x10,"k"),d(0x11,"k"));
 
     #[test]
     fn semantic_rewrites_precede_presentation_on_shared_source_snapshot() {
-        let source = "function f(flag){sink(1+2);flag && work();}";
+        let source = "function f(flag,obj){sink(1+2);flag && (obj.value = work());}";
         let first = deobfuscate(source, 1).unwrap_or_else(|| unreachable!());
         assert!(first.transforms.contains_key("constant_fold"));
         assert!(!first.transforms.contains_key("effect_statement_lowering"));
