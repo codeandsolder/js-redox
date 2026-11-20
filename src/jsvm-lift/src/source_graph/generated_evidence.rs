@@ -33,6 +33,10 @@ pub(super) fn seed_generated_and_vm_evidence(
         let parent_scan_id = required_u64(dynamic, "parent_scan_id", "dynamic code unit")?;
         let ordinal = required_u64(dynamic, "ordinal", "dynamic code unit")?;
         let node_id = format!("dynamic:{parent_scan_id}:{ordinal}");
+        anyhow::ensure!(
+            !sources.contains_key(&(parent_scan_id, ordinal)),
+            "duplicate dynamic source identity ({parent_scan_id}, {ordinal})"
+        );
         graph.insert_node(
             node_id.clone(),
             json!({
@@ -87,17 +91,12 @@ pub(super) fn seed_generated_and_vm_evidence(
                 "multiple generated sources claim child scan id {child_scan_id}"
             );
         }
-        anyhow::ensure!(
-            sources
-                .insert(
-                    (parent_scan_id, ordinal),
-                    DynamicSource {
-                        analysis_parent,
-                        child_scan_id,
-                    }
-                )
-                .is_none(),
-            "duplicate dynamic source identity ({parent_scan_id}, {ordinal})"
+        sources.insert(
+            (parent_scan_id, ordinal),
+            DynamicSource {
+                analysis_parent,
+                child_scan_id,
+            },
         );
     }
 
@@ -253,18 +252,18 @@ mod tests {
         let mut graph = GraphBuilder::default();
         seed_generated_and_vm_evidence(&mut graph, &jsvm, &BTreeMap::new(), &budget())?;
         assert_eq!(
-            graph.nodes()["dynamic:1:1"]["type"],
+            graph.node_value("dynamic:1:1")["type"],
             "generated_dynamic_code"
         );
         assert_eq!(
-            graph.nodes()["dynamic:2:2"]["type"],
+            graph.node_value("dynamic:2:2")["type"],
             "generated_dynamic_code"
         );
         assert_eq!(
-            graph.nodes()["generated-recovery:1:1"]["recovery_stage"],
+            graph.node_value("generated-recovery:1:1")["recovery_stage"],
             "safe_deobfuscation"
         );
-        assert!(!graph.nodes().contains_key("generated-recovery:2:2"));
+        assert!(!graph.has_node("generated-recovery:2:2"));
         for (kind, from, to) in [
             ("generated_code", "resource:7", "dynamic:1:1"),
             (
@@ -329,11 +328,11 @@ mod tests {
             .values()
             .any(|edge| edge["kind"] == "devirtualized_vm"));
         assert_eq!(
-            graph.nodes()["dynamic:88:1"]["type"],
+            graph.node_value("dynamic:88:1")["type"],
             "generated_dynamic_code"
         );
         assert_eq!(
-            graph.nodes()["devirtualized:88:table:1"]["type"],
+            graph.node_value("devirtualized:88:table:1")["type"],
             "devirtualized_vm"
         );
         Ok(())
@@ -368,7 +367,7 @@ mod tests {
             .any(|edge| edge["from"] == "resource:8"
                 || edge["to"] == "dynamic:2:3"
                 || edge["kind"] == "devirtualized_vm"));
-        assert!(graph.nodes().contains_key("dynamic:2:3"));
+        assert!(graph.has_node("dynamic:2:3"));
         Ok(())
     }
 

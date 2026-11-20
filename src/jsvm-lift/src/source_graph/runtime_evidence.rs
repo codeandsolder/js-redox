@@ -120,7 +120,7 @@ pub(super) fn add_runtime_network_source_edges(
     let exact = hash_matches
         .iter()
         .filter(|node| {
-            graph.nodes().get(*node).is_some_and(|resource| {
+            graph.node(*node).is_some_and(|resource| {
                 nonempty_string_field(resource, "kind") == Some("javascript")
                     && nonempty_string_field(resource, "url").is_some_and(|url| urls.contains(url))
             })
@@ -134,7 +134,7 @@ pub(super) fn add_runtime_network_source_edges(
             hash_matches
                 .iter()
                 .filter(|node| {
-                    graph.nodes().get(*node).is_some_and(|resource| {
+                    graph.node(*node).is_some_and(|resource| {
                         nonempty_string_field(resource, "kind") == Some("javascript")
                     })
                 })
@@ -147,9 +147,9 @@ pub(super) fn add_runtime_network_source_edges(
         // script bytes. Preserve all URL candidates without asserting execution.
         (
             urls.iter()
-                .flat_map(|url| graph.resource_urls().get(*url).into_iter().flatten())
+                .flat_map(|url| graph.captured_targets(*url).into_iter().flatten())
                 .filter(|node| {
-                    graph.nodes().get(*node).is_some_and(|resource| {
+                    graph.node(*node).is_some_and(|resource| {
                         nonempty_string_field(resource, "kind") == Some("javascript")
                     })
                 })
@@ -161,8 +161,7 @@ pub(super) fn add_runtime_network_source_edges(
     let uniquely_verified = basis == "sha256_and_url" && parents.len() == 1;
     for parent in &parents {
         let parent_url = graph
-            .nodes()
-            .get(parent)
+            .node(parent)
             .and_then(|resource| nonempty_string_field(resource, "url"));
         let execution_observed = parent_url.is_some_and(|url| {
             array_field(runtime, "script_instances")
@@ -489,7 +488,7 @@ pub(super) fn seed_runtime_script_evidence(
         let runtime_node = runtime_node_id(digest);
         // Abbreviated graph IDs are presentation identifiers, never a proof
         // that two different full digests denote the same source.
-        if let Some(existing) = graph.nodes().get(&runtime_node) {
+        if let Some(existing) = graph.node(&runtime_node) {
             anyhow::ensure!(
                 string_field(existing, "sha256") == Some(digest),
                 "runtime graph node ID collision for {runtime_node}"

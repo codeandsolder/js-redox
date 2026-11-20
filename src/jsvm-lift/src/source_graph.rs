@@ -267,19 +267,21 @@ mod tests {
 
         assert_eq!(resources["same-digest"], ["resource:3", "resource:9"]);
         assert_eq!(
-            graph.resource_urls()["https://fixture.invalid/shared.js"],
-            BTreeSet::from(["resource:3".into(), "resource:9".into()])
+            graph
+                .captured_targets("https://fixture.invalid/shared.js")
+                .context("captured URL missing")?,
+            &BTreeSet::from(["resource:3".into(), "resource:9".into()])
         );
         assert_eq!(
-            graph.nodes()["resource:3"]["source_paths"],
+            graph.node_value("resource:3")["source_paths"],
             json!(["src/a.js"])
         );
         assert_eq!(
-            graph.nodes()["resource:9"]["source_paths"],
+            graph.node_value("resource:9")["source_paths"],
             json!(["src/b.js"])
         );
         assert_eq!(
-            graph.nodes()["resource:9"]["saved_page_reference_roles"],
+            graph.node_value("resource:9")["saved_page_reference_roles"],
             json!(["css", "javascript"])
         );
         for kind in ["observed_navigation", "script_src", "redirect"] {

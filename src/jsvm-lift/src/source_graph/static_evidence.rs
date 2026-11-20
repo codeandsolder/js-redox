@@ -31,7 +31,7 @@ pub(super) fn seed_safe_deobfuscation_sources(
         if unit.get("exit").and_then(Value::as_i64).unwrap_or(0) != 0 {
             continue;
         }
-        let ordinal = u64_field(unit, "ordinal").unwrap_or(0);
+        let ordinal = required_u64(unit, "ordinal", "deobfuscation unit")?;
         let node_id = format!("deobfuscated:{ordinal}");
         deob_nodes.insert(ordinal, node_id.clone());
         graph.insert_node(
@@ -346,10 +346,7 @@ mod tests {
             .iter()
             .any(|edge| { edge["from"] == "resource:13" && edge["to"] == "deobfuscated:8" }));
         assert_eq!(
-            graph
-                .nodes()
-                .get("deobfuscated:4")
-                .context("missing deob node")?["safe_static_only"],
+            graph.node("deobfuscated:4").context("missing deob node")?["safe_static_only"],
             Value::Bool(true)
         );
         Ok(())
@@ -398,17 +395,11 @@ mod tests {
             &InlineSourceIndex::default(),
             &budget,
         )?;
-        let mutation = graph
-            .nodes()
-            .get("api-mutation:2:0")
-            .context("missing mutation")?;
+        let mutation = graph.node("api-mutation:2:0").context("missing mutation")?;
         assert_eq!(mutation["operation"], "Object.defineProperty");
         assert_eq!(mutation["certainty"], "possible");
         assert_eq!(mutation["target_pattern"], json!(["window", "fetch"]));
-        let call = graph
-            .nodes()
-            .get("api-call:2:0")
-            .context("missing candidate")?;
+        let call = graph.node("api-call:2:0").context("missing candidate")?;
         assert_eq!(call["mutation_site_ordinals"], json!([0]));
         assert_eq!(call["api_origin"], "fetch");
         assert_eq!(call["invocation_form"], "bound");
@@ -543,7 +534,7 @@ mod tests {
         assert_eq!(target_edges[0]["from"], "api-call:7:2");
         for ordinal in 0..2 {
             let id = format!("api-call:7:{ordinal}");
-            let node = graph.nodes().get(&id).context("candidate node missing")?;
+            let node = graph.node(&id).context("candidate node missing")?;
             assert_eq!(node["binding_status"], "candidate");
             assert_eq!(node["url"], "https://app.test/api");
             assert!(graph
@@ -615,10 +606,7 @@ mod tests {
         assert_eq!(targets[0]["from"], "api-call:1:1");
         assert_eq!(targets[0]["to"], "resource:99");
         assert_eq!(
-            graph
-                .nodes()
-                .get("api-call:1:1")
-                .context("missing callsite")?["source_index_ordinal"],
+            graph.node("api-call:1:1").context("missing callsite")?["source_index_ordinal"],
             1
         );
         Ok(())

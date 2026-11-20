@@ -272,8 +272,7 @@ mod tests {
         )?;
         let observation = |request_id: &str| -> Result<&str> {
             graph
-                .nodes()
-                .values()
+                .node_values()
                 .find(|node| node["request_id"] == request_id)
                 .and_then(|node| node["id"].as_str())
                 .with_context(|| format!("missing request {request_id}"))
@@ -332,7 +331,10 @@ mod tests {
             == "runtime_observed_wasm_response_candidate"
             && edge["exact_resource_occurrence"] == false
             && edge["exact_response_identity"] == false));
-        assert_eq!(graph.nodes()[ambiguous]["exact_response_identity"], false);
+        assert_eq!(
+            graph.node_value(ambiguous)["exact_response_identity"],
+            false
+        );
         assert!(graph.edges().values().all(|edge| {
             edge["kind"] != "runtime_wasm_request_initiator"
                 || edge["from"] != "runtime:worker"

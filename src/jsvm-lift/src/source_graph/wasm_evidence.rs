@@ -104,7 +104,7 @@ mod tests {
         }]});
         seed_static_wasm_modules(&mut graph, &wasm, &budget())?;
         let wasm_id = format!("wasm:{}", "a".repeat(20));
-        assert_eq!(graph.nodes()[&wasm_id]["sha256"], sha);
+        assert_eq!(graph.node_value(&wasm_id)["sha256"], sha);
         assert_eq!(graph.edges().len(), 5);
         for (from, kind) in [
             ("resource:7", "wasm_resource"),
@@ -143,7 +143,7 @@ mod tests {
             }]}),
             &budget(),
         )?;
-        assert_eq!(graph.nodes().len(), 1);
+        assert_eq!(graph.node_count(), 1);
         assert!(graph.edges().is_empty());
         assert!(seed_static_wasm_modules(
             &mut GraphBuilder::default(),
