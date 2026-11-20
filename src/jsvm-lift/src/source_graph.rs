@@ -267,10 +267,8 @@ mod tests {
 
         assert_eq!(resources["same-digest"], ["resource:3", "resource:9"]);
         assert_eq!(
-            graph
-                .captured_targets("https://fixture.invalid/shared.js")
-                .context("captured URL missing")?,
-            &BTreeSet::from(["resource:3".into(), "resource:9".into()])
+            graph.captured_targets("https://fixture.invalid/shared.js"),
+            Some(&BTreeSet::from(["resource:3".into(), "resource:9".into()]))
         );
         assert_eq!(
             graph.node_value("resource:3")["source_paths"],

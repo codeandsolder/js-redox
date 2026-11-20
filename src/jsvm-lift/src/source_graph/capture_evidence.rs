@@ -357,10 +357,8 @@ mod tests {
             ["resource:7", "resource:19"]
         );
         assert_eq!(
-            graph
-                .captured_targets(url)
-                .context("captured URL missing")?,
-            &BTreeSet::from(["resource:7".into(), "resource:19".into()])
+            graph.captured_targets(url),
+            Some(&BTreeSet::from(["resource:7".into(), "resource:19".into()]))
         );
         assert_eq!(
             graph.node_value("resource:7")["source_paths"],
