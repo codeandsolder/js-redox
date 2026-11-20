@@ -776,6 +776,19 @@ impl Collector<'_, '_> {
         let (method, method_expression, method_status) = method;
         let (url, url_expression) = url;
         let (line, column) = self.lines.line_column(span.start);
+        let mut affected_families = match kind {
+            "fetch_candidate" => vec!["fetch"],
+            "send_beacon_candidate" => vec!["send_beacon"],
+            "websocket_candidate" => vec!["websocket"],
+            "xhr_open_candidate" => vec!["xhr", "xhr_open_method"],
+            _ => Vec::new(),
+        };
+        // Explicit own methods do not depend on Object.prototype.method.
+        if matches!(kind, "fetch" | "fetch_candidate")
+            && method_status.as_deref() == Some("unknown")
+        {
+            affected_families.push("request_init_method_prototype");
+        }
         self.callsites.insert(ApiCallsite {
             kind: kind.to_string(),
             start: span.start,
@@ -790,13 +803,7 @@ impl Collector<'_, '_> {
                 "standard".to_owned()
             },
             standard_browser_api_semantics_required: true,
-            mutation_site_ordinals: self.mutations.relevant_ordinals(match kind {
-                "fetch_candidate" | "fetch" => &["fetch", "request_init_method_prototype"],
-                "send_beacon_candidate" => &["send_beacon"],
-                "websocket_candidate" => &["websocket"],
-                "xhr_open_candidate" => &["xhr", "xhr_open_method"],
-                _ => &[],
-            }),
+            mutation_site_ordinals: self.mutations.relevant_ordinals(&affected_families),
             method,
             method_expression,
             method_status,
@@ -1283,7 +1290,10 @@ xhr.open("POST", "https://api.example.test/xhr");
             Some("unknown")
         );
         assert_eq!(result.callsites[1].method.as_deref(), Some("PATCH"));
+        assert!(result.callsites[1].mutation_site_ordinals.is_empty());
+        assert_eq!(result.callsites[0].mutation_site_ordinals.len(), 1);
         assert_eq!(result.callsites[2].method.as_deref(), Some("GET"));
+        assert!(result.callsites[2].mutation_site_ordinals.is_empty());
         assert_eq!(result.callsites[3].kind, "xhr_open_candidate");
         assert_eq!(
             result.callsites[3].method_status.as_deref(),
