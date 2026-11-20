@@ -110,14 +110,13 @@ impl<'a> Visit<'a> for SafeMemberReferenceCollector<'_> {
     }
 
     fn visit_computed_member_expression(&mut self, member: &ComputedMemberExpression<'a>) {
-        if !member.optional {
-            if static_string(&member.expression, self.scoping, self.constants)
+        if !member.optional
+            && static_string(&member.expression, self.scoping, self.constants)
                 .as_deref()
                 .is_some_and(safe_xhr_member_name)
-            {
-                if let Some(reference_id) = direct_reference_id(&member.object) {
-                    self.refs.insert(reference_id);
-                }
+        {
+            if let Some(reference_id) = direct_reference_id(&member.object) {
+                self.refs.insert(reference_id);
             }
         }
         walk::walk_computed_member_expression(self, member);
