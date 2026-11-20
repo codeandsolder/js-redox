@@ -10,13 +10,11 @@
 use crate::{
     fragment,
     if_ladder_structure::exception_state_is_unaliased,
+    statement_hazards::DeclarationHazard,
     statically_resolved_symbol,
     value_eval::{eval, inert_literal_value, Value},
 };
-use oxc_ast::ast::{
-    AssignmentTarget, Expression, Statement, VariableDeclaration, VariableDeclarationKind,
-};
-use oxc_ast_visit::{walk, Visit};
+use oxc_ast::ast::{AssignmentTarget, Expression, Statement};
 use oxc_semantic::Scoping;
 use oxc_span::{GetSpan, Span};
 use oxc_syntax::symbol::SymbolId;
@@ -92,40 +90,6 @@ fn numeric_guard_label(test: &Expression<'_>, scoping: &Scoping) -> Option<(Symb
     None
 }
 
-#[derive(Default)]
-struct AnnexBFunctionDeclarations {
-    found: bool,
-}
-
-impl<'a> Visit<'a> for AnnexBFunctionDeclarations {
-    fn visit_variable_declaration(&mut self, decl: &VariableDeclaration<'a>) {
-        // Explicit Resource Management executes Symbol.dispose at the end
-        // of the arm block. That can throw or change the state *after* its
-        // final textual assignment, so the following guard is not constant.
-        if !matches!(
-            decl.kind,
-            VariableDeclarationKind::Var
-                | VariableDeclarationKind::Let
-                | VariableDeclarationKind::Const
-        ) {
-            self.found = true;
-        }
-        walk::walk_variable_declaration(self, decl);
-    }
-
-    fn visit_statement(&mut self, stmt: &Statement<'a>) {
-        if matches!(stmt, Statement::FunctionDeclaration(_)) {
-            self.found = true;
-        } else {
-            walk::walk_statement(self, stmt);
-        }
-    }
-    fn visit_function(&mut self, _: &oxc_ast::ast::Function<'a>, _: oxc_syntax::scope::ScopeFlags) {
-    }
-    fn visit_arrow_function_expression(&mut self, _: &oxc_ast::ast::ArrowFunctionExpression<'a>) {}
-    fn visit_class(&mut self, _: &oxc_ast::ast::Class<'a>) {}
-}
-
 /// Return a source interval and its replacement plus the exact state binding.
 /// The caller separately checks function-local binding safety and edit overlap.
 ///
@@ -164,11 +128,7 @@ pub fn fold_adjacent_state_guard(
     if match_yes == match_no {
         return None;
     }
-    let mut unsafe_functions = AnnexBFunctionDeclarations::default();
-    unsafe_functions.visit_statement(&branch.consequent);
-    unsafe_functions.visit_statement(alternate);
-    unsafe_functions.visit_statement(&guard.consequent);
-    if unsafe_functions.found {
+    if DeclarationHazard::Relocate.present(&[&branch.consequent, alternate, &guard.consequent]) {
         return None;
     }
     let test = fragment(source, branch.test.span());

@@ -106,7 +106,7 @@ pub fn select_constant_switch(node: &SwitchStatement<'_>, source: &str) -> Optio
     }
     // Retain switch lexical scoping and run-time block position, but discard
     // the already-evaluated discriminant and structurally unreachable arms.
-    Some(format!("{{\n{}\n}}", retained.join("\n")))
+    Some(format!("{{\n{}\n}}", retained.join("\n;\n")))
 }
 
 /// A JavaScript switch with a provably boolean discriminant and pure boolean
@@ -182,7 +182,7 @@ fn boolean_switch_branch(
                     if position + 1 != case.consequent.len() {
                         return None;
                     }
-                    return Some(statements.join("\n"));
+                    return Some(statements.join("\n;\n"));
                 }
             }
             // A conditional break targeting the removed switch cannot be
@@ -195,7 +195,7 @@ fn boolean_switch_branch(
             statements.push(fragment(source, statement.span()));
         }
     }
-    Some(statements.join("\n"))
+    Some(statements.join("\n;\n"))
 }
 
 /// Proof of the *result after evaluation*, not proof that the expression is pure.
@@ -256,6 +256,7 @@ fn value_after_evaluation(expr: &Expression<'_>) -> Option<crate::value_eval::Va
 fn structure_boolean_switch_with_effectful_known_labels(
     node: &SwitchStatement<'_>,
     source: &str,
+    completion_live: bool,
 ) -> Option<String> {
     use crate::value_eval::Value;
 
@@ -300,6 +301,11 @@ fn structure_boolean_switch_with_effectful_known_labels(
             })
         });
         let mut instructions = evaluated_labels.collect::<Vec<_>>();
+        if completion_live {
+            // Case-label evaluation is not part of the switch's value. Reset
+            // after evaluating the labels and before executing the case body.
+            instructions.push("void 0;".to_owned());
+        }
         instructions.push(boolean_switch_branch(node, selected, source)?);
         bodies.push(instructions.join("\n"));
     }
@@ -383,11 +389,17 @@ fn structure_boolean_switch_with_dynamic_suffix(
     ))
 }
 
-pub fn structure_boolean_switch(node: &SwitchStatement<'_>, source: &str) -> Option<String> {
+pub fn structure_boolean_switch(
+    node: &SwitchStatement<'_>,
+    source: &str,
+    completion_live: bool,
+) -> Option<String> {
     if !is_boolean_valued(&node.discriminant) || node.cases.is_empty() {
         return None;
     }
-    if let Some(recovered) = structure_boolean_switch_with_effectful_known_labels(node, source) {
+    if let Some(recovered) =
+        structure_boolean_switch_with_effectful_known_labels(node, source, completion_live)
+    {
         return Some(recovered);
     }
     if node.cases.iter().any(|case| {
