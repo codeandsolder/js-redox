@@ -22,8 +22,44 @@ fn string_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value.get(key).and_then(Value::as_str)
 }
 
+/// Preserve identical source identity on both callsites and mutating
+/// expressions so provenance graph parent selection cannot drift.
+fn attach_source_identity(
+    object: &mut Map<String, Value>,
+    source_index_ordinal: usize,
+    unit: &Value,
+    raw_path: Option<&str>,
+    analysis_path: &str,
+    deob: Option<&Value>,
+) {
+    object.insert("source_index_ordinal".into(), json!(source_index_ordinal));
+    object.insert(
+        "resource_id".into(),
+        unit.get("resource_id").cloned().unwrap_or(Value::Null),
+    );
+    object.insert(
+        "resource_url".into(),
+        unit.get("url").cloned().unwrap_or(Value::Null),
+    );
+    object.insert(
+        "raw_path".into(),
+        raw_path.map_or(Value::Null, |raw| json!(raw)),
+    );
+    object.insert(
+        "source_path".into(),
+        unit.get("source_path").cloned().unwrap_or(Value::Null),
+    );
+    object.insert("analysis_path".into(), json!(analysis_path));
+    object.insert(
+        "deobfuscation_ordinal".into(),
+        deob.and_then(|entry| entry.get("ordinal"))
+            .cloned()
+            .unwrap_or(Value::Null),
+    );
+}
+
 /// Analyze every selected JavaScript view in a capture project and persist the
-/// canonical `capture-api-surface/v3` artifact.
+/// canonical `capture-api-surface/v4` artifact.
 ///
 /// # Errors
 ///
@@ -58,6 +94,7 @@ pub fn analyze_project_api_surface(project: &Path, budgets: &AnalysisBudgets) ->
         .and_then(Value::as_array)
         .context("source index units must be an array")?;
     let mut callsites = Vec::new();
+    let mut mutation_sites = Vec::new();
     let mut failures = Vec::new();
     let mut analyzed_units = 0_usize;
 
@@ -123,37 +160,36 @@ pub fn analyze_project_api_surface(project: &Path, budgets: &AnalysisBudgets) ->
             }
         };
 
-        for (callsite_ordinal, row) in rows.into_iter().enumerate() {
+        for (mutation_site_ordinal, row) in rows.mutation_sites.into_iter().enumerate() {
             let value = serde_json::to_value(row)?;
-            let mut object = match value {
-                Value::Object(object) => object,
-                _ => Map::new(),
-            };
-            object.insert("source_index_ordinal".into(), json!(source_index_ordinal));
+            let mut object = value
+                .as_object()
+                .cloned()
+                .context("invalid mutation site")?;
+            attach_source_identity(
+                &mut object,
+                source_index_ordinal,
+                unit,
+                raw_path,
+                analysis_path,
+                deob,
+            );
+            object.insert("mutation_site_ordinal".into(), json!(mutation_site_ordinal));
+            mutation_sites.push(Value::Object(object));
+        }
+
+        for (callsite_ordinal, row) in rows.callsites.into_iter().enumerate() {
+            let value = serde_json::to_value(row)?;
+            let mut object = value.as_object().cloned().context("invalid API callsite")?;
+            attach_source_identity(
+                &mut object,
+                source_index_ordinal,
+                unit,
+                raw_path,
+                analysis_path,
+                deob,
+            );
             object.insert("callsite_ordinal".into(), json!(callsite_ordinal));
-            object.insert(
-                "resource_id".into(),
-                unit.get("resource_id").cloned().unwrap_or(Value::Null),
-            );
-            object.insert(
-                "resource_url".into(),
-                unit.get("url").cloned().unwrap_or(Value::Null),
-            );
-            object.insert(
-                "raw_path".into(),
-                raw_path.map_or(Value::Null, |v| json!(v)),
-            );
-            object.insert(
-                "source_path".into(),
-                unit.get("source_path").cloned().unwrap_or(Value::Null),
-            );
-            object.insert("analysis_path".into(), json!(analysis_path));
-            object.insert(
-                "deobfuscation_ordinal".into(),
-                deob.and_then(|row| row.get("ordinal"))
-                    .cloned()
-                    .unwrap_or(Value::Null),
-            );
             let absolute = absolute_network_url(object.get("url"));
             object.insert("absolute_network_url".into(), Value::Bool(absolute));
             callsites.push(Value::Object(object));
@@ -169,6 +205,7 @@ pub fn analyze_project_api_surface(project: &Path, budgets: &AnalysisBudgets) ->
     let summary = json!({
         "units": analyzed_units,
         "callsites": callsites.len(),
+        "mutation_sites": mutation_sites.len(),
         "candidates": callsites.iter().filter(|row| string_field(row, "binding_status") == Some("candidate")).count(),
         "failures": failures.len(),
         "kinds": kinds,
@@ -180,6 +217,7 @@ pub fn analyze_project_api_surface(project: &Path, budgets: &AnalysisBudgets) ->
     let document = json!({
         "schema": API_SURFACE.schema,
         "callsites": callsites,
+        "mutation_sites": mutation_sites,
         "failures": failures,
         "summary": summary,
     });
@@ -198,7 +236,7 @@ mod tests {
     };
     use crate::analysis_budget::AnalysisBudgets;
     use anyhow::Context;
-    use serde_json::{json, Map};
+    use serde_json::{json, Map, Value};
     use std::{
         collections::BTreeMap,
         fs,
@@ -214,20 +252,15 @@ mod tests {
         std::env::temp_dir().join(format!("jsvm-api-surface-{}-{ordinal}", process::id()))
     }
 
-    #[test]
-    fn project_artifact_retains_candidate_identity_and_argument_proof() -> anyhow::Result<()> {
+    fn analyze_single_source_project(
+        source: &str,
+        resource_id: u64,
+        label: &str,
+    ) -> anyhow::Result<(Value, Value)> {
         let temp = tempfile::tempdir()?;
         let project = temp.path();
         fs::create_dir_all(project.join("src"))?;
-        fs::write(
-            project.join("src/app.js"),
-            r#"
-let key = location.hash;
-globalThis[key] = replacement;
-fetch("https://api.example.test/data", {method: "PATCH"});
-navigator.sendBeacon("https://api.example.test/events", payload);
-"#,
-        )?;
+        fs::write(project.join("src/app.js"), source)?;
         write_artifact(
             project,
             SOURCE_INDEX,
@@ -236,24 +269,71 @@ navigator.sendBeacon("https://api.example.test/events", payload);
                 "summary": {},
                 "units": [{
                     "kind": "javascript",
-                    "resource_id": 8,
-                    "raw_path": "resources/app.js",
+                    "resource_id": resource_id,
                     "source_path": "src/app.js",
-                    "url": "https://app.example.test/app.js"
+                    "raw_path": "resources/app.js",
+                    "url": "https://app.test/app.js"
                 }]
             }),
         )?;
-        let summary = analyze_project_api_surface(
-            project,
-            &AnalysisBudgets::standard("dynamic-api-candidate-artifact"),
+        let summary = analyze_project_api_surface(project, &AnalysisBudgets::standard(label))?;
+        let document = read_artifact(&project.join(API_SURFACE.relative_path), API_SURFACE)?;
+        Ok((summary, document))
+    }
+
+    #[test]
+    fn project_artifact_links_reflective_mutation_sites_to_candidates() -> anyhow::Result<()> {
+        let (summary, document) = analyze_single_source_project(
+            r#"
+Object.defineProperty(globalThis, "fetch", {value: replacement});
+fetch("https://api.test/data", {method: "POST"});
+new WebSocket("wss://api.test/live");
+"#,
+            7,
+            "project-reflective-api-provenance",
+        )?;
+        assert_eq!(summary["units"], 1);
+        assert_eq!(summary["callsites"], 2);
+        assert_eq!(summary["candidates"], 1);
+        assert_eq!(summary["mutation_sites"], 1);
+        assert_eq!(document["schema"], "capture-api-surface/v4");
+        let site = &document["mutation_sites"][0];
+        assert_eq!(site["source_index_ordinal"], 0);
+        assert_eq!(site["mutation_site_ordinal"], 0);
+        assert_eq!(site["resource_id"], 7);
+        assert_eq!(site["operation"], "Object.defineProperty");
+        assert_eq!(site["target_pattern"], json!(["globalThis", "fetch"]));
+        assert_eq!(site["certainty"], "possible");
+        let call = &document["callsites"][0];
+        assert_eq!(call["kind"], "fetch_candidate");
+        assert_eq!(call["mutation_site_ordinals"], json!([0]));
+        assert_eq!(call["method"], "POST");
+        assert_eq!(call["method_status"], "conditional");
+        assert_eq!(document["callsites"][1]["kind"], "websocket");
+        assert!(document["callsites"][1]
+            .get("mutation_site_ordinals")
+            .is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn project_artifact_retains_candidate_identity_and_argument_proof() -> anyhow::Result<()> {
+        let (summary, doc) = analyze_single_source_project(
+            r#"
+let key = location.hash;
+globalThis[key] = replacement;
+fetch("https://api.example.test/data", {method: "PATCH"});
+navigator.sendBeacon("https://api.example.test/events", payload);
+"#,
+            8,
+            "dynamic-api-candidate-artifact",
         )?;
         assert_eq!(summary["units"], 1);
         assert_eq!(summary["callsites"], 2);
         assert_eq!(summary["candidates"], 2);
         assert_eq!(summary["kinds"]["fetch_candidate"], 1);
         assert_eq!(summary["kinds"]["send_beacon_candidate"], 1);
-        let doc = read_artifact(&project.join(API_SURFACE.relative_path), API_SURFACE)?;
-        assert_eq!(doc["schema"], "capture-api-surface/v3");
+        assert_eq!(doc["schema"], "capture-api-surface/v4");
         let rows = doc["callsites"]
             .as_array()
             .context("api surface callsites missing")?;
