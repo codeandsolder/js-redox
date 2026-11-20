@@ -61,8 +61,7 @@ impl GraphBuilder {
 
     #[cfg(test)]
     pub(super) fn node_value(&self, id: &str) -> &Value {
-        self.node(id)
-            .unwrap_or_else(|| panic!("missing graph node {id}"))
+        self.nodes[id].value()
     }
 
     #[cfg(test)]
