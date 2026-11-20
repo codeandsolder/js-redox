@@ -405,10 +405,14 @@ mod tests {
         ];
         for (jsvm, expected_error) in cases {
             let mut graph = GraphBuilder::default();
-            let error =
-                seed_generated_and_vm_evidence(&mut graph, &jsvm, &BTreeMap::new(), &budget())
-                    .expect_err(expected_error);
-            assert!(error.to_string().contains(expected_error), "{error}");
+            let result =
+                seed_generated_and_vm_evidence(&mut graph, &jsvm, &BTreeMap::new(), &budget());
+            assert!(
+                result
+                    .as_ref()
+                    .is_err_and(|error| error.to_string().contains(expected_error)),
+                "expected {expected_error}, got {result:?}"
+            );
         }
     }
 
