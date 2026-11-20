@@ -26,6 +26,7 @@ type ValueFrame<'a> = BTreeMap<SymbolId, ForwardedValue<'a, 'a>>;
 struct ValueBuilder<'s, 'a> {
     frame: Option<ValueFrame<'a>>,
     scoping: &'s Scoping,
+    constants: &'s ProvenConstantEnvironment,
     limit: usize,
     budget: &'s WorkBudget,
     used_iterator: bool,
@@ -35,12 +36,14 @@ impl<'s, 'a> ValueBuilder<'s, 'a> {
     fn new(
         frame: Option<ValueFrame<'a>>,
         scoping: &'s Scoping,
+        constants: &'s ProvenConstantEnvironment,
         limit: usize,
         budget: &'s WorkBudget,
     ) -> Self {
         Self {
             frame,
             scoping,
+            constants,
             limit,
             budget,
             used_iterator: false,
@@ -60,6 +63,22 @@ impl<'s, 'a> ValueBuilder<'s, 'a> {
                 return Ok(ForwardedValue::Array {
                     span: expr.span(),
                     positions: Rc::new(positions),
+                });
+            }
+            if let Expression::ObjectExpression(object) = unparenthesized(expr) {
+                let mut fields = BTreeMap::new();
+                for item in &object.properties {
+                    let ObjectPropertyKind::ObjectProperty(property) = item else {
+                        return Ok(ForwardedValue::Expression(expr));
+                    };
+                    let Some(key) = literal_data_key(property, self.scoping, self.constants) else {
+                        return Ok(ForwardedValue::Expression(expr));
+                    };
+                    fields.insert(key, self.expression(&property.value)?);
+                }
+                return Ok(ForwardedValue::Object {
+                    span: expr.span(),
+                    fields: Rc::new(fields),
                 });
             }
         }
@@ -106,7 +125,8 @@ impl<'s, 'a> ValueBuilder<'s, 'a> {
                 if let Expression::ArrayExpression(array) = unparenthesized(expr) {
                     // An expression captured in a preceding caller is not
                     // evaluated in the current wrapper's lexical frame.
-                    let mut captured = Self::new(None, self.scoping, self.limit, self.budget);
+                    let mut captured =
+                        Self::new(None, self.scoping, self.constants, self.limit, self.budget);
                     let positions = captured.array(array)?;
                     self.used_iterator = true;
                     self.extend(result, &positions, 0, span)?;
@@ -339,6 +359,11 @@ enum LocalBinding<'a> {
     },
 }
 
+enum BindingOrigin<'a> {
+    Declaration(SymbolId, &'a Function<'a>),
+    Expression(&'a Expression<'a>),
+}
+
 /// Reuse the already validated semantic AST, rather than reparsing the source
 /// or textually resolving names. Mutable lexical definitions and direct eval
 /// in a visible scope preclude an exact local target.
@@ -380,7 +405,14 @@ impl<'a> WrapperIndex<'a> {
             let (symbol, binding) = match node.kind() {
                 AstKind::Function(fun) if fun.is_declaration() => {
                     if !Wrapper::function(fun, scoping).is_some_and(|wrapper| {
-                        wrapper.invocation().is_some() || wrapper.returns_value
+                        wrapper.invocation().is_some()
+                            || (wrapper.returns_value
+                                && matches!(
+                                    unparenthesized(wrapper.body),
+                                    Expression::Identifier(_)
+                                        | Expression::StaticMemberExpression(_)
+                                        | Expression::ComputedMemberExpression(_)
+                                ))
                     }) {
                         continue;
                     }
@@ -462,13 +494,20 @@ impl<'a> WrapperIndex<'a> {
             .map(|(symbol, name)| (name.as_str(), format!("wrapper_global:{symbol:?}")))
     }
 
-    fn parameters_have_dynamic_scope(
+    fn frame_has_dynamic_scope(
         &self,
-        parameters: &Parameters,
+        wrapper: &Wrapper<'_>,
         scoping: &Scoping,
         budget: &WorkBudget,
     ) -> Result<bool> {
-        for symbol in parameters.fixed.iter().copied().chain(parameters.rest) {
+        for symbol in wrapper
+            .params
+            .fixed
+            .iter()
+            .copied()
+            .chain(wrapper.params.rest)
+            .chain(wrapper.locals.iter().map(|local| local.symbol))
+        {
             for scope in &self.eval_scopes {
                 budget.consume(1)?;
                 if scoping.find_binding(*scope, scoping.symbol_name(symbol).into()) == Some(symbol)
@@ -484,46 +523,42 @@ impl<'a> WrapperIndex<'a> {
         expression_symbol(scoping, expr).is_some_and(|symbol| self.bindings.contains_key(&symbol))
             || matches!(
                 unparenthesized(expr),
-                Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_)
+                Expression::FunctionExpression(_)
+                    | Expression::ArrowFunctionExpression(_)
+                    | Expression::CallExpression(_)
             )
     }
 
-    fn resolve(
+    fn binding_origin(
         &self,
         mut expr: &'a Expression<'a>,
         scoping: &Scoping,
         budget: &WorkBudget,
-        dependencies: &mut BTreeSet<String>,
         witnesses: &mut Vec<ApiBindingWitness>,
-    ) -> Result<Option<Wrapper<'a>>> {
+        alias_kind: &str,
+    ) -> Result<Option<BindingOrigin<'a>>> {
         let mut visited = BTreeSet::new();
         loop {
             budget.consume(1)?;
-            if let Some(wrapper) = Wrapper::expression(expr, scoping) {
-                return Ok(Some(wrapper));
-            }
             let Some(symbol) = expression_symbol(scoping, expr) else {
-                return Ok(None);
+                return Ok(Some(BindingOrigin::Expression(expr)));
+            };
+            let Some(binding) = self.bindings.get(&symbol) else {
+                return Ok(Some(BindingOrigin::Expression(expr)));
             };
             if !visited.insert(symbol) {
                 return Ok(None);
             }
-            let Some(binding) = self.bindings.get(&symbol) else {
-                return Ok(None);
-            };
             match binding {
                 LocalBinding::Function(fun) => {
-                    if self.script_root_functions.contains_key(&symbol) {
-                        dependencies.insert(format!("wrapper_global:{symbol:?}"));
-                    }
-                    return Ok(Wrapper::function(fun, scoping));
+                    return Ok(Some(BindingOrigin::Declaration(symbol, fun)))
                 }
                 LocalBinding::Initializer { value, after } => {
                     if expr.span().start < *after {
                         return Ok(None);
                     }
                     witnesses.push(ApiBindingWitness {
-                        kind: "wrapper_alias".into(),
+                        kind: alias_kind.into(),
                         start: value.span().start,
                         end: value.span().end,
                     });
@@ -531,6 +566,46 @@ impl<'a> WrapperIndex<'a> {
                 }
             }
         }
+    }
+
+    fn factory_call(
+        &self,
+        expr: &'a Expression<'a>,
+        scoping: &Scoping,
+        budget: &WorkBudget,
+        witnesses: &mut Vec<ApiBindingWitness>,
+    ) -> Result<Option<&'a CallExpression<'a>>> {
+        let Some(BindingOrigin::Expression(expr)) =
+            self.binding_origin(expr, scoping, budget, witnesses, "wrapper_return_alias")?
+        else {
+            return Ok(None);
+        };
+        Ok(match unparenthesized(expr) {
+            Expression::CallExpression(call) if !call.optional => Some(call),
+            _ => None,
+        })
+    }
+
+    fn resolve(
+        &self,
+        expr: &'a Expression<'a>,
+        scoping: &Scoping,
+        budget: &WorkBudget,
+        dependencies: &mut BTreeSet<String>,
+        witnesses: &mut Vec<ApiBindingWitness>,
+    ) -> Result<Option<Wrapper<'a>>> {
+        Ok(
+            match self.binding_origin(expr, scoping, budget, witnesses, "wrapper_alias")? {
+                Some(BindingOrigin::Declaration(symbol, fun)) => {
+                    if self.script_root_functions.contains_key(&symbol) {
+                        dependencies.insert(format!("wrapper_global:{symbol:?}"));
+                    }
+                    Wrapper::function(fun, scoping)
+                }
+                Some(BindingOrigin::Expression(value)) => Wrapper::expression(value, scoping),
+                None => None,
+            },
+        )
     }
 }
 
@@ -569,6 +644,12 @@ fn parameter_is_direct(
                 AstKind::ArrayExpression(_) if !dispatch_member => {
                     inside_array = true;
                 }
+                AstKind::ObjectProperty(property)
+                    if !dispatch_member
+                        && property.value.span() == current
+                        && literal_data_key(property, scoping, constants).is_some() => {}
+                AstKind::ObjectExpression(_) if !dispatch_member => {}
+
                 AstKind::SpreadElement(_) if !dispatch_member && (inside_array || spread_safe) => {}
                 AstKind::StaticMemberExpression(member)
                     if !dispatch_member
@@ -683,6 +764,19 @@ fn pure_initializer<'a>(
             }
             Ok(true)
         }
+        Expression::ObjectExpression(object) => {
+            for item in &object.properties {
+                let ObjectPropertyKind::ObjectProperty(property) = item else {
+                    return Ok(false);
+                };
+                if literal_data_key(property, scoping, constants).is_none()
+                    || !pure_initializer(&property.value, builder, all_locals, collector)?
+                {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
         // Only side-effect-free statically proven primitive expressions
         // and recognized native/namespace reads beyond the literal cases.
         _ => Ok(static_string(expr, scoping, constants).is_some()
@@ -730,9 +824,14 @@ fn instantiate<'a, 's>(
     collector: &Collector<'_, 's>,
     limit: usize,
     budget: &'s WorkBudget,
-    witnesses: &mut Vec<ApiBindingWitness>,
 ) -> Result<Option<ValueBuilder<'s, 'a>>> {
-    let mut builder = ValueBuilder::new(Some(ValueFrame::new()), collector.scoping, limit, budget);
+    let mut builder = ValueBuilder::new(
+        Some(ValueFrame::new()),
+        collector.scoping,
+        collector.constants,
+        limit,
+        budget,
+    );
     let all_locals = wrapper
         .params
         .fixed
@@ -798,13 +897,139 @@ fn instantiate<'a, 's>(
         if let Some(frame) = &mut builder.frame {
             frame.insert(local.symbol, value);
         }
-        witnesses.push(ApiBindingWitness {
-            kind: "wrapper_local_binding".into(),
-            start: local.span.start,
-            end: local.span.end,
-        });
     }
     Ok(Some(builder))
+}
+
+fn append_local_witnesses(wrapper: &Wrapper<'_>, witnesses: &mut Vec<ApiBindingWitness>) {
+    witnesses.extend(wrapper.locals.iter().map(|local| ApiBindingWitness {
+        kind: "wrapper_local_binding".into(),
+        start: local.span.start,
+        end: local.span.end,
+    }));
+}
+
+struct ReturnedCallable {
+    callable: Callable,
+    witnesses: Vec<ApiBindingWitness>,
+    dependencies: BTreeSet<String>,
+}
+
+/// Recover functions returning an existing native callable through a
+/// confined straight-line value frame. Iterate over nested factory values
+/// and immutable aliases, rather than running arbitrary factory bodies.
+/// Async returns, closure creation and calls requiring a new environment
+/// are not interpreted as existing native callable values.
+fn resolve_returned_callable<'a>(
+    mut expr: &'a Expression<'a>,
+    semantic: &Semantic<'a>,
+    wrappers: &WrapperIndex<'a>,
+    collector: &Collector<'_, '_>,
+    budget: &WorkBudget,
+) -> Result<Option<ReturnedCallable>> {
+    let mut witnesses = Vec::new();
+    let mut dependencies = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    loop {
+        budget.consume(1)?;
+        if !visited.is_empty() {
+            if let Some(mut callable) = collector.callables.resolve(
+                expr,
+                collector.source,
+                collector.scoping,
+                collector.constants,
+            ) {
+                callable.capture_as_argument();
+                return Ok(Some(ReturnedCallable {
+                    callable,
+                    witnesses,
+                    dependencies,
+                }));
+            }
+        }
+        let Some(factory) =
+            wrappers.factory_call(expr, collector.scoping, budget, &mut witnesses)?
+        else {
+            return Ok(None);
+        };
+        if !visited.insert((factory.span.start, factory.span.end)) {
+            return Ok(None);
+        }
+        let Some(wrapper) = wrappers.resolve(
+            &factory.callee,
+            collector.scoping,
+            budget,
+            &mut dependencies,
+            &mut witnesses,
+        )?
+        else {
+            return Ok(None);
+        };
+        if !wrapper.returns_value
+            || wrapper.invocation().is_some()
+            || wrappers.frame_has_dynamic_scope(&wrapper, collector.scoping, budget)?
+            || uses_arguments_object(wrapper.body)
+        {
+            return Ok(None);
+        }
+        let mut arguments = ValueBuilder::new(
+            None,
+            collector.scoping,
+            collector.constants,
+            wrappers.positional_limit,
+            budget,
+        );
+        let args = arguments.call(&factory.arguments)?;
+        if arguments.used_iterator {
+            dependencies.insert("rest_iterator".into());
+        }
+        let Some(mut builder) = instantiate(
+            &wrapper,
+            &args,
+            wrapper.body.span(),
+            semantic,
+            collector,
+            wrappers.positional_limit,
+            budget,
+        )?
+        else {
+            return Ok(None);
+        };
+        let locals = wrapper
+            .params
+            .fixed
+            .iter()
+            .copied()
+            .chain(wrapper.params.rest)
+            .chain(wrapper.locals.iter().map(|local| local.symbol))
+            .collect::<BTreeSet<_>>();
+        if !pure_initializer(wrapper.body, &mut builder, &locals, collector)? {
+            return Ok(None);
+        }
+        let Some(origin) = builder.expression(wrapper.body)?.expression() else {
+            return Ok(None);
+        };
+        if builder.used_iterator {
+            dependencies.insert("rest_iterator".into());
+        }
+        witnesses.push(ApiBindingWitness {
+            kind: "wrapper_definition".into(),
+            start: wrapper.span.start,
+            end: wrapper.span.end,
+        });
+        append_local_witnesses(&wrapper, &mut witnesses);
+        witnesses.push(ApiBindingWitness {
+            kind: "wrapper_return".into(),
+            start: wrapper.body.span().start,
+            end: wrapper.body.span().end,
+        });
+        witnesses.push(ApiBindingWitness {
+            kind: "returned_callable".into(),
+            start: factory.span.start,
+            end: factory.span.end,
+        });
+        expr = origin;
+    }
 }
 
 /// Resolve the same native dispatch head used by direct calls, but from the
@@ -847,53 +1072,76 @@ fn forwarded_dispatch<'a>(
 /// Follow a chain with concrete source argument origins. Each step has a
 /// unique function span and charges the analysis budget; cycles cannot grow
 /// the trace. Original syntactic API sites are emitted by the normal walker.
+pub(super) struct InvocationSite<'a> {
+    pub(super) callee: &'a Expression<'a>,
+    pub(super) arguments: &'a [Argument<'a>],
+    pub(super) span: Span,
+    pub(super) constructor: bool,
+}
+
 pub(super) fn specialize<'a>(
-    call: &'a CallExpression<'a>,
+    site: InvocationSite<'a>,
     semantic: &Semantic<'a>,
     wrappers: &WrapperIndex<'a>,
     collector: &mut Collector<'_, '_>,
     budget: &WorkBudget,
 ) -> Result<()> {
     let scoping = collector.scoping;
-    if call.optional || !wrappers.may_resolve(&call.callee, scoping) {
+    if !wrappers.may_resolve(site.callee, scoping) {
         return Ok(());
     }
-    let mut callee = &call.callee;
-    let mut builder = ValueBuilder::new(None, scoping, wrappers.positional_limit, budget);
-    let mut args = builder.call(&call.arguments)?;
+    let mut callee = site.callee;
+    let mut builder = ValueBuilder::new(
+        None,
+        scoping,
+        collector.constants,
+        wrappers.positional_limit,
+        budget,
+    );
+    let mut args = builder.call(site.arguments)?;
     let mut witnesses = Vec::new();
     let mut dependencies = BTreeSet::new();
     if builder.used_iterator {
         dependencies.insert("rest_iterator".into());
     }
     let mut visited = BTreeSet::new();
-    let mut constructor = false;
+    let mut constructor = site.constructor;
     let mut captured_target = false;
-    let mut sink = call.span;
+    let mut sink = site.span;
     loop {
         budget.consume(1)?;
-        if !visited.is_empty() {
-            if let Some(mut callable) =
-                collector
-                    .callables
-                    .resolve(callee, collector.source, scoping, collector.constants)
-            {
-                if captured_target {
-                    callable.capture_as_argument();
-                }
-                if callable.callable_as(constructor) {
-                    callable.prefix.append_forwarded(
-                        args.values,
-                        args.unknown_tail,
-                        collector.source,
-                        scoping,
-                        collector.constants,
-                    );
-                    callable.mark_forwarding(&witnesses, sink);
-                    collector.emit_forwarded(&call.callee, callable, call.span, &dependencies);
-                }
-                return Ok(());
+        let callable = if let Some(returned) =
+            resolve_returned_callable(callee, semantic, wrappers, collector, budget)?
+        {
+            witnesses.extend(returned.witnesses);
+            dependencies.extend(returned.dependencies);
+            Some(returned.callable)
+        } else if !visited.is_empty() {
+            collector
+                .callables
+                .resolve(callee, collector.source, scoping, collector.constants)
+                .map(|mut callable| {
+                    if captured_target {
+                        callable.capture_as_argument();
+                    }
+                    callable
+                })
+        } else {
+            None
+        };
+        if let Some(mut callable) = callable {
+            if callable.callable_as(constructor) {
+                callable.prefix.append_forwarded(
+                    args.values,
+                    args.unknown_tail,
+                    collector.source,
+                    scoping,
+                    collector.constants,
+                );
+                callable.mark_forwarding(&witnesses, sink);
+                collector.emit_forwarded(site.callee, callable, site.span, &dependencies);
             }
+            return Ok(());
         }
         if constructor {
             return Ok(());
@@ -904,7 +1152,7 @@ pub(super) fn specialize<'a>(
             return Ok(());
         };
         if !visited.insert((wrapper.span.start, wrapper.span.end))
-            || wrappers.parameters_have_dynamic_scope(&wrapper.params, scoping, budget)?
+            || wrappers.frame_has_dynamic_scope(&wrapper, scoping, budget)?
             || uses_arguments_object(wrapper.body)
         {
             return Ok(());
@@ -931,11 +1179,11 @@ pub(super) fn specialize<'a>(
             collector,
             wrappers.positional_limit,
             budget,
-            &mut witnesses,
         )?
         else {
             return Ok(());
         };
+        append_local_witnesses(&wrapper, &mut witnesses);
         let next_args = builder.call(forwarded)?;
         if !is_new {
             if let Some(mut callable) =
@@ -945,7 +1193,7 @@ pub(super) fn specialize<'a>(
                     dependencies.insert("rest_iterator".into());
                 }
                 callable.mark_forwarding(&witnesses, sink);
-                collector.emit_forwarded(&call.callee, callable, call.span, &dependencies);
+                collector.emit_forwarded(site.callee, callable, site.span, &dependencies);
                 return Ok(());
             }
         }

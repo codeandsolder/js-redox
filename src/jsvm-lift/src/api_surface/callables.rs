@@ -87,6 +87,10 @@ pub(super) enum ForwardedValue<'e, 'a> {
         span: Span,
         positions: Rc<PositionalArguments<'e, 'a>>,
     },
+    Object {
+        span: Span,
+        fields: Rc<BTreeMap<String, ForwardedValue<'e, 'a>>>,
+    },
     Unknown(Option<Span>),
     Missing,
 }
@@ -135,6 +139,7 @@ fn apply_array_source<'e, 'a>(
     match value {
         ForwardedValue::Missing => (!mode.reflect()).then_some(ArraySource::Empty),
         ForwardedValue::Array { positions, .. } => Some(ArraySource::Forwarded(positions)),
+        ForwardedValue::Object { span, .. } => Some(ArraySource::Unknown(span)),
         ForwardedValue::Unknown(span) => Some(ArraySource::Unknown(span.unwrap_or(fallback))),
         ForwardedValue::Expression(expr) => {
             let expr = unparenthesized(expr);
@@ -223,6 +228,19 @@ impl ApiArguments {
                     expression: Some(source_fragment(source, span)),
                     init: FetchInitMethod::Unknown,
                 })),
+                ForwardedValue::Object { span, fields } => {
+                    self.prefix.push(Rc::new(ArgumentEvidence {
+                        string: None,
+                        expression: Some(source_fragment(source, span)),
+                        init: fields
+                            .get("method")
+                            .map_or(FetchInitMethod::NoOwnMethod, |value| {
+                                value.expression().map_or(FetchInitMethod::Unknown, |expr| {
+                                    method_value_evidence(source, expr, scoping, constants)
+                                })
+                            }),
+                    }))
+                }
                 ForwardedValue::Unknown(span) => self.prefix.push(Rc::new(ArgumentEvidence {
                     string: None,
                     expression: span.map(|span| source_fragment(source, span)),
@@ -926,7 +944,13 @@ impl CallableIndex {
             ForwardedValue::Expression(expr) => Some(expr),
             ForwardedValue::Missing => None,
             // A bound function ignores its new receiver altogether.
-            ForwardedValue::Array { .. } | ForwardedValue::Unknown(_) if callable.bound => None,
+            ForwardedValue::Array { .. }
+            | ForwardedValue::Object { .. }
+            | ForwardedValue::Unknown(_)
+                if callable.bound =>
+            {
+                None
+            }
             _ => return None,
         };
         let mut dispatch =
