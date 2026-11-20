@@ -1394,11 +1394,21 @@ relay("/second", ...unresolved, {method: "POST"});
             .iter()
             .filter(|row| row.callee == "relay")
             .collect::<Vec<_>>();
-        assert_eq!(specialized.len(), 2, "{rows:#?}");
-        assert_eq!(specialized[0].url.as_deref(), Some("/first"));
-        assert_eq!(specialized[0].method.as_deref(), Some("PUT"));
-        assert_eq!(specialized[1].url.as_deref(), Some("/second"));
-        assert_eq!(specialized[1].method_status.as_deref(), Some("unknown"));
+        assert_eq!(
+            specialized
+                .iter()
+                .map(|row| (
+                    row.url.as_deref(),
+                    row.method.as_deref(),
+                    row.method_status.as_deref()
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (Some("/first"), Some("PUT"), Some("exact")),
+                (Some("/second"), None, Some("unknown")),
+            ],
+            "{rows:#?}"
+        );
         assert_eq!(
             specialized[0]
                 .binding_witnesses
@@ -1434,8 +1444,8 @@ const dynamic = (url) => {
 };
 dynamic("/not-proven");
 const safe = (url, method) => {
-    const key = "me" + "thod";
-    const init = {[key]: method};
+    const key = "me";
+    const init = {[key + "thod"]: method};
     return fetch(url, init);
 };
 safe("/safe", "PATCH");
