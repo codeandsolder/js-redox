@@ -156,12 +156,39 @@ pub(super) fn seed_browser_api_callsites(
             graph.add_edge(&parent, &node_id, "api_mutation_site", json!({}))?;
         }
     }
+    // An original sink expression can have many specializing wrapper
+    // invocations. Join by source identity, span and native API origin, never
+    // by URL or text. Higher-order wrappers may have no direct sink row.
+    type SinkKey = (u64, u64, u64, String);
+    let mut direct_sites = BTreeMap::<SinkKey, Vec<String>>::new();
+    let mut forwarded_sites = Vec::<(SinkKey, String)>::new();
     // Static browser API callsites hang off the exact selected source derivative.
     for row in array_field(api_surface, "callsites") {
         budget.checkpoint()?;
         let source_index_ordinal = required_u64(row, "source_index_ordinal", "api callsite")?;
         let callsite_ordinal = required_u64(row, "callsite_ordinal", "api callsite")?;
         let node_id = format!("api-call:{source_index_ordinal}:{callsite_ordinal}");
+        if let Some(origin) = string_field(row, "api_origin") {
+            if let Some(span) = row.get("forwarded_sink_span") {
+                let Some((start, end)) = span.as_array().and_then(|values| {
+                    let [start, end] = values.as_slice() else {
+                        return None;
+                    };
+                    Some((start.as_u64()?, end.as_u64()?))
+                }) else {
+                    bail!("invalid forwarded sink span for {node_id}");
+                };
+                forwarded_sites.push((
+                    (source_index_ordinal, start, end, origin.to_owned()),
+                    node_id.clone(),
+                ));
+            } else if let Some((start, end)) = u64_field(row, "start").zip(u64_field(row, "end")) {
+                direct_sites
+                    .entry((source_index_ordinal, start, end, origin.to_owned()))
+                    .or_default()
+                    .push(node_id.clone());
+            }
+        }
         graph.add_node(
             node_id.clone(),
             json!({
@@ -178,6 +205,7 @@ pub(super) fn seed_browser_api_callsites(
                 "callee":field(row,"callee"),
                 "api_origin":field(row,"api_origin"),
                 "invocation_form":field(row,"invocation_form"),
+                "forwarded_sink_span":field(row,"forwarded_sink_span"),
                 "binding_witnesses":field(row,"binding_witnesses"),
                 "proof":field(row,"proof"),
                 "binding_status":field(row,"binding_status"),
@@ -242,6 +270,15 @@ pub(super) fn seed_browser_api_callsites(
                         }),
                     )?;
                 }
+            }
+        }
+    }
+
+    for (key, node_id) in forwarded_sites {
+        budget.checkpoint()?;
+        if let Some(targets) = direct_sites.get(&key) {
+            if let [target] = targets.as_slice() {
+                graph.add_edge(&node_id, target, "api_forwarded_invocation", json!({}))?;
             }
         }
     }
@@ -387,6 +424,44 @@ mod tests {
                 && edge["kind"] == "api_mutation_evidence"
         }));
         assert!(!graph.edges.iter().any(|edge| edge["kind"] == "api_target"));
+        Ok(())
+    }
+
+    #[test]
+    fn wrapper_provenance_links_only_exact_original_source_sink() -> Result<()> {
+        let mut graph = GraphBuilder::default();
+        graph.register_resource_url("https://api.test/data", "resource:99");
+        let doc = json!({"callsites": [
+            {"source_index_ordinal":2,"callsite_ordinal":0,"start":10,"end":30,"api_origin":"fetch","kind":"fetch","invocation_form":"direct"},
+            {"source_index_ordinal":3,"callsite_ordinal":0,"start":10,"end":30,"api_origin":"fetch","kind":"fetch","invocation_form":"direct"},
+            {"source_index_ordinal":2,"callsite_ordinal":1,"start":40,"end":80,"api_origin":"fetch","kind":"fetch","invocation_form":"wrapper","forwarded_sink_span":[10,30],"url":"https://api.test/data","absolute_network_url":true,"method":"GET","method_status":"exact","binding_status":"standard"},
+            {"source_index_ordinal":2,"callsite_ordinal":2,"start":90,"end":120,"api_origin":"fetch","kind":"fetch_candidate","invocation_form":"wrapper","forwarded_sink_span":[10,30],"url":"https://api.test/data","absolute_network_url":true,"binding_status":"candidate"},
+            {"source_index_ordinal":4,"callsite_ordinal":0,"start":40,"end":80,"api_origin":"fetch","kind":"fetch","invocation_form":"wrapper","forwarded_sink_span":[10,30]}
+        ]});
+        let budget = AnalysisBudgets::standard("wrapper-graph")
+            .operation(AnalysisOperation::SourceGraph, "forwarded");
+        seed_browser_api_callsites(
+            &mut graph,
+            &doc,
+            &BTreeMap::new(),
+            &InlineSourceIndex::default(),
+            &budget,
+        )?;
+        let forwarding = graph
+            .edges
+            .iter()
+            .filter(|edge| edge["kind"] == "api_forwarded_invocation")
+            .collect::<Vec<_>>();
+        assert_eq!(forwarding.len(), 2);
+        assert!(forwarding.iter().all(|edge| edge["to"] == "api-call:2:0"));
+        assert!(graph
+            .edges
+            .iter()
+            .any(|edge| edge["kind"] == "api_target" && edge["from"] == "api-call:2:1"));
+        assert!(!graph
+            .edges
+            .iter()
+            .any(|edge| edge["kind"] == "api_target" && edge["from"] == "api-call:2:2"));
         Ok(())
     }
 

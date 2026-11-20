@@ -164,7 +164,7 @@ artifact!(
     API_SURFACE,
     "static API surface",
     "analysis/api-surface.json",
-    "capture-api-surface/v6",
+    "capture-api-surface/v7",
     arrays = ["callsites", "mutation_sites", "failures"],
     objects = ["summary"]
 );

@@ -381,6 +381,26 @@ impl<'a> Visit<'a> for CallPropertyWrites<'_> {
     }
 }
 
+/// Parameter forwarding is only exact when the referenced original binding
+/// has not been reassigned. Both caller views and API specialization use this
+/// semantic-symbol proof rather than matching parameter names.
+pub(crate) fn stable_parameter_index(
+    scoping: &Scoping,
+    symbol: SymbolId,
+    parameters: impl IntoIterator<Item = Option<SymbolId>>,
+) -> Option<usize> {
+    if scoping
+        .get_resolved_reference_ids(symbol)
+        .iter()
+        .any(|reference| scoping.get_reference(*reference).is_write())
+    {
+        return None;
+    }
+    parameters
+        .into_iter()
+        .position(|parameter| parameter == Some(symbol))
+}
+
 struct Calls<'s> {
     source: &'s str,
     scoping: &'s Scoping,
@@ -474,18 +494,11 @@ impl Calls<'_> {
                         .and_then(|reference| self.scoping.get_reference(reference).symbol_id())
                     {
                         if let Some(original) = self.original_symbol(symbol) {
-                            if !self
-                                .scoping
-                                .get_resolved_reference_ids(original)
-                                .iter()
-                                .any(|reference| self.scoping.get_reference(*reference).is_write())
-                            {
-                                forward = origin_definition.params.iter().enumerate().find_map(
-                                    |(index, (_, target))| {
-                                        (*target == Some(original)).then_some(index)
-                                    },
-                                );
-                            }
+                            forward = stable_parameter_index(
+                                self.scoping,
+                                original,
+                                origin_definition.params.iter().map(|(_, symbol)| *symbol),
+                            );
                         }
                     }
                 }

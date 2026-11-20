@@ -77,6 +77,13 @@ impl ApiKind {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(super) enum ForwardedValue<'e, 'a> {
+    Expression(&'e Expression<'a>),
+    Unknown(Option<Span>),
+    Missing,
+}
+
 #[derive(Clone, Debug)]
 struct ArgumentEvidence {
     string: Option<String>,
@@ -100,15 +107,54 @@ impl ApiArguments {
         scoping: &Scoping,
         constants: &ProvenConstantEnvironment,
     ) {
-        for arg in args {
+        let args = &args[..args.len().min(2usize.saturating_sub(self.prefix.len()))];
+        let first_spread = args
+            .iter()
+            .position(|arg| matches!(arg, Argument::SpreadElement(_)));
+        let values = args
+            .iter()
+            .take(first_spread.unwrap_or(args.len()))
+            .filter_map(Argument::as_expression)
+            .map(ForwardedValue::Expression);
+        self.append_forwarded(
+            values,
+            first_spread.map(|index| args[index].span()),
+            source,
+            scoping,
+            constants,
+        );
+    }
+
+    pub(super) fn append_forwarded<'e, 'a: 'e>(
+        &mut self,
+        values: impl IntoIterator<Item = ForwardedValue<'e, 'a>>,
+        unknown_tail: Option<Span>,
+        source: &str,
+        scoping: &Scoping,
+        constants: &ProvenConstantEnvironment,
+    ) {
+        for value in values {
             if self.complete() {
-                break;
+                return;
             }
-            if let Some(expr) = arg.as_expression() {
-                self.push_expression(expr, source, scoping, constants);
-            } else {
-                self.unknown_tail = Some(Rc::from(source_fragment(source, arg.span())));
+            match value {
+                ForwardedValue::Expression(expr) => {
+                    self.push_expression(expr, source, scoping, constants)
+                }
+                ForwardedValue::Unknown(span) => self.prefix.push(Rc::new(ArgumentEvidence {
+                    string: None,
+                    expression: span.map(|span| source_fragment(source, span)),
+                    init: FetchInitMethod::Unknown,
+                })),
+                ForwardedValue::Missing => self.prefix.push(Rc::new(ArgumentEvidence {
+                    string: None,
+                    expression: None,
+                    init: FetchInitMethod::Missing,
+                })),
             }
+        }
+        if !self.complete() {
+            self.unknown_tail = unknown_tail.map(|span| Rc::from(source_fragment(source, span)));
         }
     }
 
@@ -238,6 +284,7 @@ pub(super) struct Callable {
     witness: Option<Rc<WitnessLink>>,
     bound_object: Option<u32>,
     dispatch: Option<&'static str>,
+    pub(super) forwarded_sink_span: Option<[u32; 2]>,
     namespace_dependencies: BTreeSet<&'static str>,
 }
 
@@ -254,6 +301,7 @@ impl Callable {
             witness: None,
             bound_object: None,
             dispatch: None,
+            forwarded_sink_span: None,
             namespace_dependencies: BTreeSet::new(),
         }
     }
@@ -268,6 +316,19 @@ impl Callable {
             },
             dependency,
         }));
+    }
+
+    pub(super) fn mark_forwarding(&mut self, witnesses: &[ApiBindingWitness], sink: Span) {
+        self.dispatch = Some("wrapper");
+        self.forwarded_sink_span = Some([sink.start, sink.end]);
+        for witness in witnesses {
+            self.add_witness(&witness.kind, Span::new(witness.start, witness.end), None);
+        }
+    }
+
+    pub(super) fn capture_as_argument(&mut self) {
+        self.captured = true;
+        self.detached = !self.bound && self.kind.needs_receiver();
     }
 
     pub(super) fn witnesses(&self) -> Vec<ApiBindingWitness> {
@@ -379,7 +440,7 @@ impl Namespace {
         let canonical = match relative {
             "window" | "globalThis" | "self" => "globalThis",
             "navigator" | "Object" | "Reflect" | "Function" | "Object.prototype"
-            | "Function.prototype" => relative,
+            | "Function.prototype" | "Array" | "Array.prototype" => relative,
             _ => return None,
         };
         Some(Self {

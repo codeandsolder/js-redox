@@ -59,7 +59,7 @@ fn attach_source_identity(
 }
 
 /// Analyze every selected JavaScript view in a capture project and persist the
-/// canonical `capture-api-surface/v6` artifact.
+/// canonical `capture-api-surface/v7` artifact.
 ///
 /// # Errors
 ///
@@ -205,6 +205,7 @@ pub fn analyze_project_api_surface(project: &Path, budgets: &AnalysisBudgets) ->
     let summary = json!({
         "units": analyzed_units,
         "callsites": callsites.len(),
+        "forwarded_callsites": callsites.iter().filter(|row| string_field(row, "invocation_form") == Some("wrapper")).count(),
         "mutation_sites": mutation_sites.len(),
         "candidates": callsites.iter().filter(|row| string_field(row, "binding_status") == Some("candidate")).count(),
         "failures": failures.len(),
@@ -282,6 +283,37 @@ mod tests {
     }
 
     #[test]
+    fn project_artifact_retains_wrapper_sink_and_specialized_arguments() -> anyhow::Result<()> {
+        let (summary, doc) = analyze_single_source_project(
+            r#"
+const send = (url, init) => fetch(url, init);
+send("https://api.test/one", {method: "POST"});
+"#,
+            7,
+            "project-wrapper-forwarding",
+        )?;
+        assert_eq!(summary["callsites"], 2);
+        assert_eq!(summary["forwarded_callsites"], 1);
+        assert_eq!(doc["schema"], "capture-api-surface/v7");
+        let original = &doc["callsites"][0];
+        let forwarded = &doc["callsites"][1];
+        assert_eq!(forwarded["invocation_form"], "wrapper");
+        assert_eq!(
+            forwarded["forwarded_sink_span"],
+            json!([original["start"], original["end"]])
+        );
+        assert_eq!(forwarded["resource_id"], original["resource_id"]);
+        assert_eq!(
+            forwarded["source_index_ordinal"],
+            original["source_index_ordinal"]
+        );
+        assert_eq!(forwarded["url"], "https://api.test/one");
+        assert_eq!(forwarded["method"], "POST");
+        assert_eq!(forwarded["binding_status"], "standard");
+        Ok(())
+    }
+
+    #[test]
     fn project_artifact_links_reflective_mutation_sites_to_candidates() -> anyhow::Result<()> {
         let (summary, document) = analyze_single_source_project(
             r#"
@@ -300,7 +332,7 @@ new WebSocket("wss://api.test/live");
         assert_eq!(summary["callsites"], 2);
         assert_eq!(summary["candidates"], 1);
         assert_eq!(summary["mutation_sites"], 1);
-        assert_eq!(document["schema"], "capture-api-surface/v6");
+        assert_eq!(document["schema"], "capture-api-surface/v7");
         let site = &document["mutation_sites"][0];
         assert_eq!(site["source_index_ordinal"], 0);
         assert_eq!(site["mutation_site_ordinal"], 0);
@@ -345,7 +377,7 @@ navigator.sendBeacon("https://api.example.test/events", payload);
         assert_eq!(summary["candidates"], 2);
         assert_eq!(summary["kinds"]["fetch_candidate"], 1);
         assert_eq!(summary["kinds"]["send_beacon_candidate"], 1);
-        assert_eq!(doc["schema"], "capture-api-surface/v6");
+        assert_eq!(doc["schema"], "capture-api-surface/v7");
         let rows = doc["callsites"]
             .as_array()
             .context("api surface callsites missing")?;
