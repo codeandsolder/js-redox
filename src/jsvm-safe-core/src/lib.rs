@@ -2034,7 +2034,7 @@ fn transform_once(
             continue;
         }
         let Some(next) = apply(
-            source,
+            &program,
             replacements,
             counts,
             arithmetic_state_proofs,
@@ -2100,7 +2100,7 @@ fn recover_static_decoders_with_mode(
             break;
         }
         let Some(next) = apply(
-            &current,
+            &program,
             pass.replacements,
             &mut counts,
             &mut Vec::new(),
@@ -7407,6 +7407,40 @@ mod tests {
                 .unwrap_or_default()
                 >= 1
         );
+    }
+
+    #[test]
+    fn statement_cleanup_preserves_asi_and_directive_boundaries() {
+        let fixtures = [
+            "function f(){a()\n{ (b)() }}",
+            "function f(){ {a()} (b)() }",
+            "function f(){a()\n{}\n(b)()}",
+            "function f(){a()\n0;\n(b)()}",
+        ];
+        for input in fixtures {
+            let result = deobfuscate(input, 32).unwrap_or_else(|| unreachable!());
+            let compact: String = result
+                .source
+                .chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect();
+            assert!(compact.contains("a();(b)()"), "{}", result.source);
+        }
+        for input in [
+            "function f(){; 'use strict'; return this;}",
+            "function f(){{} 'use strict'; return this;}",
+            "function f(){0; 'use strict'; return this;}",
+            "function f(){if(true) 'use strict'; return this;}",
+            "function f(){'use ' + 'strict'; return this;}",
+        ] {
+            let result = deobfuscate(input, 32).unwrap_or_else(|| unreachable!());
+            let compact: String = result
+                .source
+                .chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect();
+            assert!(compact.starts_with("functionf(){;"), "{}", result.source);
+        }
     }
 
     #[test]

@@ -7,7 +7,10 @@
 //! JavaScript tokens into a different token.
 
 use crate::ArithmeticStateProof;
-use std::collections::BTreeMap;
+use oxc_ast::ast::{FunctionBody, Program, Statement};
+use oxc_ast_visit::{walk, Visit};
+use oxc_span::GetSpan;
+use std::collections::{BTreeMap, HashSet};
 use string_wizard::{MagicString, TextEdit};
 
 #[derive(Debug, Clone)]
@@ -169,7 +172,108 @@ fn lexically_safe_texts(source: &str, selected: &[Replacement]) -> Option<Vec<St
     Some(adjusted)
 }
 
+/// The first ordinary statement of a script or function terminates its
+/// directive prologue, even when that statement has no observable effects.
+/// Deleting a statement can also expose an ASI-sensitive token boundary.
+/// Record those syntactic contexts from the actual input AST, not text guesses.
+#[derive(Default)]
+struct StatementBoundaries {
+    prologue_ends: HashSet<usize>,
+    nonempty_statements: HashSet<(usize, usize)>,
+}
+
+impl StatementBoundaries {
+    fn record_prologue_end(&mut self, body: &[Statement<'_>]) {
+        if let Some(first) = body.first() {
+            self.prologue_ends.insert(first.span().start as usize);
+        }
+    }
+
+    fn protect(&self, source: &str, replacements: &mut Vec<Replacement>) {
+        for replacement in &mut *replacements {
+            if replacement.text.is_empty()
+                && self
+                    .nonempty_statements
+                    .contains(&(replacement.start, replacement.end))
+            {
+                // A semicolon either explicitly terminates the previous
+                // statement or becomes an empty statement. Only the latter
+                // is eligible for ordinary empty-statement cleanup later.
+                replacement.text.push(';');
+            }
+            if self.prologue_ends.contains(&replacement.start)
+                && replacement
+                    .text
+                    .trim_start()
+                    .chars()
+                    .next()
+                    .is_none_or(|first| matches!(first, '\'' | '"' | '/' | '\u{feff}'))
+            {
+                // Keep the first non-directive position non-directive even
+                // if a later edit exposes a string or this edit folds one.
+                // A leading comment may hide a string; preserve that case too.
+                replacement.text.insert_str(0, ";\n");
+            }
+        }
+        // Do not count or repeat an attempted deletion of an existing
+        // prologue barrier. Ignore whitespace introduced solely by the guard.
+        replacements.retain(|replacement| {
+            source
+                .get(replacement.start..replacement.end)
+                .is_none_or(|original| {
+                    original != replacement.text
+                        && !(original == ";" && replacement.text.trim() == ";")
+                })
+        });
+    }
+}
+
+impl<'a> Visit<'a> for StatementBoundaries {
+    fn visit_program(&mut self, program: &Program<'a>) {
+        self.record_prologue_end(&program.body);
+        walk::walk_program(self, program);
+    }
+
+    fn visit_function_body(&mut self, body: &FunctionBody<'a>) {
+        self.record_prologue_end(&body.statements);
+        walk::walk_function_body(self, body);
+    }
+
+    fn visit_statements(&mut self, statements: &oxc_allocator::Vec<'a, Statement<'a>>) {
+        for statement in statements {
+            if !matches!(statement, Statement::EmptyStatement(_)) {
+                let span = statement.span();
+                self.nonempty_statements
+                    .insert((span.start as usize, span.end as usize));
+            }
+            self.visit_statement(statement);
+        }
+    }
+}
+
 pub fn apply(
+    program: &Program<'_>,
+    mut replacements: Vec<Replacement>,
+    counts: &mut Counts,
+    arithmetic_state_proofs: &mut Vec<ArithmeticStateProof>,
+    iteration: usize,
+) -> Option<String> {
+    let mut boundaries = StatementBoundaries::default();
+    boundaries.visit_program(program);
+    boundaries.protect(program.source_text, &mut replacements);
+    if replacements.is_empty() {
+        return Some(program.source_text.to_owned());
+    }
+    apply_raw(
+        program.source_text,
+        replacements,
+        counts,
+        arithmetic_state_proofs,
+        iteration,
+    )
+}
+
+fn apply_raw(
     source: &str,
     replacements: Vec<Replacement>,
     counts: &mut Counts,
@@ -216,7 +320,7 @@ mod tests {
     }
 
     fn rewrite(source: &str, replacements: Vec<Replacement>) -> String {
-        let rewritten = apply(
+        let rewritten = apply_raw(
             source,
             replacements,
             &mut Counts::default(),
@@ -319,7 +423,7 @@ mod tests {
     fn malformed_spans_fail_before_accounting() {
         let mut counts = Counts::default();
         let mut proofs = Vec::new();
-        assert!(apply(
+        assert!(apply_raw(
             "πx",
             vec![replacement(1, 2, "y")],
             &mut counts,

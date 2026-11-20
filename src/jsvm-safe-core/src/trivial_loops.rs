@@ -187,7 +187,10 @@ pub fn flatten_standalone_block(
         return None;
     }
     let inner = source.get(block.span.start as usize + 1..block.span.end as usize - 1)?;
-    Some(format!("\n{inner}\n"))
+    // Both original braces separated statements even where no semicolon
+    // was present. Preserve that boundary when an adjacent `(`, `[`,
+    // template or other continuation token would otherwise change the parse.
+    Some(format!("\n;{inner}\n;\n"))
 }
 
 /// Turn empty `if` branches into ordinary, readable control flow while still

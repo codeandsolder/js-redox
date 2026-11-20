@@ -327,6 +327,65 @@ fn assert_main_contract(file: &str, outcome: &SafeDeobOutcome) {
 
 #[test]
 #[ignore = "requires Node; run the focused test explicitly"]
+fn statement_boundary_and_directive_runtime_equivalence() -> Result<()> {
+    let source = r#"
+function example1(log) {
+ function a(){log.push('a');return ()=>log.push('bad');}
+ function b(){log.push('b');}
+ { a() } (b)()
+}
+function example2(log) {
+ function a(){log.push('a');return ()=>log.push('bad');}
+ function b(){log.push('b');}
+ a()
+ { (b)() }
+}
+function example3(){ ; 'use strict'; return this === undefined; }
+function example4(){ {} 'use strict'; return this === undefined; }
+function example5(){ { {} } 'use strict'; return this === undefined; }
+function example6(log) {
+ function a(){log.push('a');return ()=>log.push('bad');}
+ function b(){log.push('b');}
+ a()
+ {}
+ (b)()
+}
+function example7(log) {
+ function a(){log.push('a');return ()=>log.push('bad');}
+ function b(){log.push('b');}
+ a()
+ 0;
+ (b)()
+}
+function example8(){0; 'use strict'; return this === undefined;}
+function example9(){if(true) 'use strict'; return this === undefined;}
+function example10(){'use ' + 'strict'; return this === undefined;}
+function example11(){'use strict'; return this === undefined;}
+const results=[];for(const example of [example1,example2,example6,example7]){const events=[];try{example(events)}catch(e){events.push(e.name)}results.push(events)}
+console.log(JSON.stringify([results,example3(),example4(),example5(),example8(),example9(),example10(),example11()]));
+"#;
+    let scratch = TempDir::new()?;
+    let result = deobfuscate_source(
+        source,
+        "statement-boundaries",
+        SourceMode::Auto,
+        32,
+        false,
+        &budget("statement-boundaries"),
+    )?;
+    assert!(result.report.changed);
+    assert!(count(&result.report, "flatten_redundant_block") > 0);
+    assert!(count(&result.report, "constant_fold") > 0);
+    runtime_equivalent(
+        scratch.path(),
+        "statement-boundaries",
+        source,
+        &result.source,
+    )
+}
+
+#[test]
+#[ignore = "requires Node; run the focused test explicitly"]
 fn nested_member_target_reassociation_runtime_equivalence() -> Result<()> {
     let source = r"
 function execute(mode) {

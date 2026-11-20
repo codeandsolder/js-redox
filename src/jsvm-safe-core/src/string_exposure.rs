@@ -210,7 +210,7 @@ fn expose_static_strings_with_mode(
             break;
         }
         let Some(next) = apply(
-            &current,
+            &program,
             replacements,
             &mut counts,
             &mut Vec::new(),
@@ -283,7 +283,7 @@ mod tests {
         assert_eq!(replacements.len(), 1);
 
         let rewritten = apply(
-            source,
+            &program,
             replacements,
             &mut Counts::default(),
             &mut Vec::new(),
