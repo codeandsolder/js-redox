@@ -1106,7 +1106,9 @@ impl Collector<'_, '_> {
             callee: callee_text,
             api_origin: callable.kind.canonical_path().to_owned(),
             invocation_form: callable.invocation_form().to_owned(),
-            forwarded_sink_span: callable.forwarded_sink_span,
+            forwarded_sink_span: callable
+                .forwarded_sink_span
+                .or_else(|| callable.is_returned().then_some([span.start, span.end])),
             binding_witnesses: callable.witnesses(),
             proof: proof.to_owned(),
             binding_status: if candidate { "candidate" } else { "standard" }.to_owned(),
@@ -1206,10 +1208,18 @@ pub fn analyze_api_surface(source: &str, budget: &WorkBudget) -> Result<ApiSurfa
         let constants = ProvenConstantEnvironment::collect(&program, scoping);
         budget.checkpoint()?;
 
-        let callables = CallableIndex::collect(&program, source, scoping, &constants);
+        let mut callables = CallableIndex::collect(&program, source, scoping, &constants);
         budget.checkpoint()?;
 
         let wrappers = forwarding::WrapperIndex::collect(&semantic.semantic, budget)?;
+        forwarding::collect_returned_values(
+            &semantic.semantic,
+            &wrappers,
+            &mut callables,
+            source,
+            &constants,
+            budget,
+        )?;
         let wrapper_globals = wrappers
             .root_mutation_targets()
             .map(|(name, family)| (name.to_owned(), family))
@@ -1657,6 +1667,149 @@ safe("/safe", "PATCH");
         assert_eq!(specialized[0].callee, "safe");
         assert_eq!(specialized[0].url.as_deref(), Some("/safe"));
         assert_eq!(specialized[0].method.as_deref(), Some("PATCH"));
+        Ok(())
+    }
+
+    #[test]
+    fn native_bind_factories_capture_arguments_and_preserve_receivers() -> Result<()> {
+        let source = r#"
+const make = (fn, receiver, base, path) => {
+    const url = base + path;
+    return fn.bind(receiver, url);
+};
+const send = make(fetch, window, "/api", "/one");
+send({method:"PATCH"});
+make(navigator.sendBeacon, navigator, "/beacon", "/two")(payload);
+make(navigator.sendBeacon, window, "/invalid", "/receiver")(payload);
+const socket = make(WebSocket, null, "wss://example.test", "/socket");
+new socket();
+socket();
+"#;
+        let rows = analyze_api_surface(source)?;
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.kind.as_str(), row.url.as_deref(), row.method.as_deref()))
+                .collect::<Vec<_>>(),
+            [
+                ("fetch", Some("/api/one"), Some("PATCH")),
+                ("send_beacon", Some("/beacon/two"), Some("POST")),
+                ("websocket", Some("wss://example.test/socket"), None),
+            ],
+            "{rows:#?}"
+        );
+        assert!(rows.iter().all(|row| row.invocation_form == "wrapper"
+            && row.binding_witnesses.iter().any(|w| w.kind == "bind")));
+        Ok(())
+    }
+
+    #[test]
+    fn returned_native_values_support_all_explicit_dispatch_modes() -> Result<()> {
+        let source = r#"
+const identity = fn => fn;
+const beacon = identity(navigator.sendBeacon);
+beacon.call(navigator, "/call", payload);
+beacon.apply(navigator, ["/apply", payload]);
+Reflect.apply(identity(navigator.sendBeacon), navigator, ["/reflect", payload]);
+identity(navigator.sendBeacon)("/detached", payload);
+beacon.call(window, "/invalid", payload);
+const bind = (fn, recv, ...args) => fn.bind(recv, ...args);
+bind(fetch, window, "/bound").apply({}, [{method:"PUT"}]);
+"#;
+        let rows = analyze_api_surface(source)?;
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.url.as_deref())
+                .collect::<Vec<_>>(),
+            [
+                Some("/call"),
+                Some("/apply"),
+                Some("/reflect"),
+                Some("/bound")
+            ],
+            "{rows:#?}"
+        );
+        assert_eq!(rows[3].method.as_deref(), Some("PUT"));
+        for (row, op) in rows.iter().zip(["call", "apply", "reflect_apply", "apply"]) {
+            assert!(row.binding_witnesses.iter().any(|w| w.kind == op));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn returned_bind_allocations_and_aliases_have_independent_mutation_identity() -> Result<()> {
+        let source = r#"
+const make = url => fetch.bind(window, url);
+const one = make("/one");
+const two = make("/two");
+const alias = one;
+alias.call = replacement;
+one.call(window, {method:"POST"});
+two.call(window, {method:"PUT"});
+one();
+"#;
+        let analysis =
+            super::analyze_api_surface(source, &WorkBudget::unlimited("factory-bound-mutations"))?;
+        let rows = &analysis.callsites;
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.kind.as_str(), row.url.as_deref()))
+                .collect::<Vec<_>>(),
+            [
+                ("fetch_candidate", Some("/one")),
+                ("fetch", Some("/two")),
+                ("fetch", Some("/one")),
+            ],
+            "{analysis:#?}"
+        );
+        let site = &analysis.mutation_sites[rows[0].mutation_site_ordinals[0]];
+        let [start, end] = site
+            .bound_function_span
+            .context("missing bound allocation")?;
+        assert_eq!(&source[start as usize..end as usize], r#"make("/one")"#);
+        assert!(rows[1..]
+            .iter()
+            .all(|row| row.mutation_site_ordinals.is_empty()));
+        Ok(())
+    }
+
+    #[test]
+    fn factory_mutation_provenance_flows_through_returned_explicit_dispatch() -> Result<()> {
+        let source = r#"
+function make(fn, r, url) { return fn.bind(r, url); }
+const send = make(fetch, window, "/candidate");
+window.make = replacement;
+send.apply(null, [{method:"POST"}]);
+const identity = fn => fn;
+const request = identity(fetch);
+request.call = replacement;
+Reflect.apply(request, window, ["/reflect"]);
+request.call(window, "/call");
+"#;
+        let analysis = super::analyze_api_surface(
+            source,
+            &WorkBudget::unlimited("factory-dispatch-mutations"),
+        )?;
+        assert_eq!(
+            analysis
+                .callsites
+                .iter()
+                .map(|row| row.kind.as_str())
+                .collect::<Vec<_>>(),
+            ["fetch_candidate", "fetch", "fetch_candidate"],
+            "{analysis:#?}"
+        );
+        assert!(analysis.callsites[0]
+            .mutation_site_ordinals
+            .iter()
+            .any(|i| analysis.mutation_sites[*i]
+                .affected_families
+                .iter()
+                .any(|family| family.starts_with("wrapper_global:"))));
+        assert!(analysis.callsites[1].mutation_site_ordinals.is_empty());
+        assert_eq!(
+            analysis.callsites[2].method_status.as_deref(),
+            Some("conditional")
+        );
         Ok(())
     }
 
