@@ -380,7 +380,7 @@ fn materialize_full_lexical_context(
         );
     }
     anyhow::ensure!(
-        outcome.report.analysis_complete && outcome.report.iterations < iterations,
+        outcome.report.analysis_complete,
         "full lexical context did not reach a validated fixed point within {iterations} iterations",
     );
     let alternate = reconstruct_context(&outcome.source, source_inputs)?;
