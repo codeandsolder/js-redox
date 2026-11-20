@@ -7416,6 +7416,7 @@ mod tests {
             "function f(){ {a()} (b)() }",
             "function f(){a()\n{}\n(b)()}",
             "function f(){a()\n0;\n(b)()}",
+            "function f(){a()\nif(true) (b)()}",
         ];
         for input in fixtures {
             let result = deobfuscate(input, 32).unwrap_or_else(|| unreachable!());
@@ -7441,6 +7442,22 @@ mod tests {
                 .collect();
             assert!(compact.starts_with("functionf(){;"), "{}", result.source);
         }
+    }
+
+    #[test]
+    fn statement_rewrite_retains_an_existing_implicit_directive_terminator() {
+        let source = "function f(){'use strict'\nif(true) (work)()\nreturn this;}";
+        let result = deobfuscate(source, 32).unwrap_or_else(|| unreachable!());
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert!(
+            compact.contains("'usestrict';(work)()"),
+            "{}",
+            result.source
+        );
     }
 
     #[test]

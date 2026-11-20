@@ -361,8 +361,18 @@ function example8(){0; 'use strict'; return this === undefined;}
 function example9(){if(true) 'use strict'; return this === undefined;}
 function example10(){'use ' + 'strict'; return this === undefined;}
 function example11(){'use strict'; return this === undefined;}
-const results=[];for(const example of [example1,example2,example6,example7]){const events=[];try{example(events)}catch(e){events.push(e.name)}results.push(events)}
-console.log(JSON.stringify([results,example3(),example4(),example5(),example8(),example9(),example10(),example11()]));
+function example12(log){
+ function a(){log.push('a');return ()=>log.push('bad');}
+ function b(){log.push('b');}
+ a()
+ if(true) (b)()
+}
+function example13(){'use strict'
+ if(true) (function(){})()
+ return this === undefined;
+}
+const results=[];for(const example of [example1,example2,example6,example7,example12]){const events=[];try{example(events)}catch(e){events.push(e.name)}results.push(events)}
+console.log(JSON.stringify([results,example3(),example4(),example5(),example8(),example9(),example10(),example11(),example13()]));
 "#;
     let scratch = TempDir::new()?;
     let result = deobfuscate_source(

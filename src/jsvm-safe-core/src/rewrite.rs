@@ -172,21 +172,45 @@ fn lexically_safe_texts(source: &str, selected: &[Replacement]) -> Option<Vec<St
     Some(adjusted)
 }
 
-/// The first ordinary statement of a script or function terminates its
-/// directive prologue, even when that statement has no observable effects.
-/// Deleting a statement can also expose an ASI-sensitive token boundary.
-/// Record those syntactic contexts from the actual input AST, not text guesses.
+/// Statement-list source boundaries and true ECMAScript directive prologues.
+/// Removing a statement or changing its leading token can invalidate a
+/// previously implicit semicolon, even though the new program still parses.
 #[derive(Default)]
 struct StatementBoundaries {
     prologue_ends: HashSet<usize>,
+    implicit_left: HashSet<usize>,
     nonempty_statements: HashSet<(usize, usize)>,
 }
 
 impl StatementBoundaries {
-    fn record_prologue_end(&mut self, body: &[Statement<'_>]) {
+    fn record_prologue_end(
+        &mut self,
+        directives: &[oxc_ast::ast::Directive<'_>],
+        body: &[Statement<'_>],
+        source: &str,
+    ) {
         if let Some(first) = body.first() {
-            self.prologue_ends.insert(first.span().start as usize);
+            let start = first.span().start as usize;
+            self.prologue_ends.insert(start);
+            if let Some(last) = directives.last() {
+                if !crate::fragment(source, last.span())
+                    .trim_end()
+                    .ends_with(';')
+                {
+                    self.implicit_left.insert(start);
+                }
+            }
         }
+    }
+
+    fn possible_directive(text: &str) -> bool {
+        let text = text.trim_start();
+        text.starts_with("<!--")
+            || text.starts_with("-->")
+            || text
+                .chars()
+                .next()
+                .is_none_or(|first| matches!(first, '\'' | '"' | '/' | '\u{feff}'))
     }
 
     fn protect(&self, source: &str, replacements: &mut Vec<Replacement>) {
@@ -196,27 +220,23 @@ impl StatementBoundaries {
                     .nonempty_statements
                     .contains(&(replacement.start, replacement.end))
             {
-                // A semicolon either explicitly terminates the previous
-                // statement or becomes an empty statement. Only the latter
-                // is eligible for ordinary empty-statement cleanup later.
+                // This either terminates the preceding statement or becomes
+                // an empty statement, which can be cleaned up on a later pass.
                 replacement.text.push(';');
             }
-            if self.prologue_ends.contains(&replacement.start)
-                && replacement
-                    .text
-                    .trim_start()
-                    .chars()
-                    .next()
-                    .is_none_or(|first| matches!(first, '\'' | '"' | '/' | '\u{feff}'))
-            {
-                // Keep the first non-directive position non-directive even
-                // if a later edit exposes a string or this edit folds one.
-                // A leading comment may hide a string; preserve that case too.
+            let prologue_risk = self.prologue_ends.contains(&replacement.start)
+                && Self::possible_directive(&replacement.text);
+            let left_risk = self.implicit_left.contains(&replacement.start)
+                && !replacement.text.is_empty()
+                && !replacement.text.trim_start().starts_with(';');
+            if prologue_risk || left_risk {
+                // The new first token may join the preceding expression, or
+                // create/destroy a directive. Source spans establish the
+                // insertion is before an actual direct-list statement.
                 replacement.text.insert_str(0, ";\n");
             }
         }
-        // Do not count or repeat an attempted deletion of an existing
-        // prologue barrier. Ignore whitespace introduced solely by the guard.
+        // Do not repeat an attempted removal of a prologue terminator.
         replacements.retain(|replacement| {
             source
                 .get(replacement.start..replacement.end)
@@ -228,24 +248,39 @@ impl StatementBoundaries {
     }
 }
 
-impl<'a> Visit<'a> for StatementBoundaries {
+struct BoundaryCollector<'s> {
+    source: &'s str,
+    boundaries: StatementBoundaries,
+}
+
+impl<'a> Visit<'a> for BoundaryCollector<'_> {
     fn visit_program(&mut self, program: &Program<'a>) {
-        self.record_prologue_end(&program.body);
+        self.boundaries
+            .record_prologue_end(&program.directives, &program.body, self.source);
         walk::walk_program(self, program);
     }
 
     fn visit_function_body(&mut self, body: &FunctionBody<'a>) {
-        self.record_prologue_end(&body.statements);
+        self.boundaries
+            .record_prologue_end(&body.directives, &body.statements, self.source);
         walk::walk_function_body(self, body);
     }
 
     fn visit_statements(&mut self, statements: &oxc_allocator::Vec<'a, Statement<'a>>) {
+        let mut previous = None;
         for statement in statements {
+            let span = statement.span();
+            if previous
+                .is_some_and(|span| !crate::fragment(self.source, span).trim_end().ends_with(';'))
+            {
+                self.boundaries.implicit_left.insert(span.start as usize);
+            }
             if !matches!(statement, Statement::EmptyStatement(_)) {
-                let span = statement.span();
-                self.nonempty_statements
+                self.boundaries
+                    .nonempty_statements
                     .insert((span.start as usize, span.end as usize));
             }
+            previous = Some(span);
             self.visit_statement(statement);
         }
     }
@@ -258,9 +293,14 @@ pub fn apply(
     arithmetic_state_proofs: &mut Vec<ArithmeticStateProof>,
     iteration: usize,
 ) -> Option<String> {
-    let mut boundaries = StatementBoundaries::default();
-    boundaries.visit_program(program);
-    boundaries.protect(program.source_text, &mut replacements);
+    let mut collector = BoundaryCollector {
+        source: program.source_text,
+        boundaries: StatementBoundaries::default(),
+    };
+    collector.visit_program(program);
+    collector
+        .boundaries
+        .protect(program.source_text, &mut replacements);
     if replacements.is_empty() {
         return Some(program.source_text.to_owned());
     }
