@@ -120,7 +120,7 @@ pub(super) fn add_runtime_network_source_edges(
     let exact = hash_matches
         .iter()
         .filter(|node| {
-            graph.node(*node).is_some_and(|resource| {
+            graph.node(node).is_some_and(|resource| {
                 nonempty_string_field(resource, "kind") == Some("javascript")
                     && nonempty_string_field(resource, "url").is_some_and(|url| urls.contains(url))
             })
@@ -134,7 +134,7 @@ pub(super) fn add_runtime_network_source_edges(
             hash_matches
                 .iter()
                 .filter(|node| {
-                    graph.node(*node).is_some_and(|resource| {
+                    graph.node(node).is_some_and(|resource| {
                         nonempty_string_field(resource, "kind") == Some("javascript")
                     })
                 })
@@ -147,9 +147,9 @@ pub(super) fn add_runtime_network_source_edges(
         // script bytes. Preserve all URL candidates without asserting execution.
         (
             urls.iter()
-                .flat_map(|url| graph.captured_targets(*url).into_iter().flatten())
+                .flat_map(|url| graph.captured_targets(url).into_iter().flatten())
                 .filter(|node| {
-                    graph.node(*node).is_some_and(|resource| {
+                    graph.node(node).is_some_and(|resource| {
                         nonempty_string_field(resource, "kind") == Some("javascript")
                     })
                 })
