@@ -1,3 +1,4 @@
+mod builder;
 mod bundle_evidence;
 mod capture_evidence;
 mod generated_evidence;
@@ -11,22 +12,20 @@ mod wasm_evidence;
 
 use crate::{
     analysis_artifacts::{
-        load_artifact, write_artifact, API_SURFACE, BUNDLES, DEOBFUSCATION, IMPORT_MAPS,
-        JSVM_INDEX, JS_REFERENCES, RUNTIME_SCRIPTS, SELECTIVE_TRACE, SOURCEMAPS, SOURCE_GRAPH,
-        SOURCE_INDEX, WASM_INDEX, WASM_RESOURCE_PROVENANCE,
+        load_artifact, API_SURFACE, BUNDLES, DEOBFUSCATION, IMPORT_MAPS, JSVM_INDEX, JS_REFERENCES,
+        RUNTIME_SCRIPTS, SELECTIVE_TRACE, SOURCEMAPS, SOURCE_INDEX, WASM_INDEX,
+        WASM_RESOURCE_PROVENANCE,
     },
     analysis_budget::{AnalysisBudgets, AnalysisOperation},
-    capture_project::{load_manifest, CaptureManifest},
+    capture_project::load_manifest,
     sha256_hex,
 };
 use anyhow::{Context, Result};
+use builder::GraphBuilder;
 use capture_evidence::InlineSourceIndex;
 use runtime_evidence::{seed_runtime_script_evidence, RuntimeSourceGraphIndex};
 use serde_json::{json, Map, Value};
-use std::{
-    collections::{BTreeMap, HashSet},
-    path::Path,
-};
+use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SourceGraphSummary {
@@ -78,157 +77,12 @@ fn digest_id(prefix: &str, text: &str) -> String {
     format!("{prefix}{}", &sha256_hex(text.as_bytes())[..20])
 }
 
-#[derive(Default)]
-struct GraphBuilder {
-    nodes: BTreeMap<String, Value>,
-    edges: Vec<Value>,
-    edge_seen: HashSet<String>,
-    url_to_resources: BTreeMap<String, Vec<String>>,
-    external_nodes: BTreeMap<String, String>,
-}
-
-impl GraphBuilder {
-    fn add_node(&mut self, id: impl Into<String>, fields: Value) -> Result<String> {
-        let id = id.into();
-        let Value::Object(fields) = fields else {
-            anyhow::bail!("graph node fields must be a JSON object");
-        };
-        anyhow::ensure!(
-            !fields.contains_key("id"),
-            "graph node fields must not override the node id"
-        );
-        if let Some(existing) = self.nodes.get_mut(&id) {
-            let existing = existing
-                .as_object_mut()
-                .context("stored graph node must be an object")?;
-            for (key, value) in fields {
-                if !value.is_null() && !existing.contains_key(&key) {
-                    existing.insert(key, value);
-                }
-            }
-        } else {
-            let mut node = fields;
-            node.insert("id".into(), Value::String(id.clone()));
-            self.nodes.insert(id.clone(), Value::Object(node));
-        }
-        Ok(id)
-    }
-
-    fn add_edge(&mut self, from: &str, to: &str, kind: &str, fields: Value) -> Result<()> {
-        let Value::Object(fields) = fields else {
-            anyhow::bail!("graph edge fields must be a JSON object");
-        };
-        anyhow::ensure!(
-            !["from", "to", "kind"]
-                .iter()
-                .any(|key| fields.contains_key(*key)),
-            "graph edge fields must not override the edge endpoints or kind"
-        );
-        let frozen = format!("{from}\0{to}\0{kind}\0{}", serde_json::to_string(&fields)?);
-        if !self.edge_seen.insert(frozen) {
-            return Ok(());
-        }
-        let mut edge = fields;
-        edge.insert("from".into(), Value::String(from.to_string()));
-        edge.insert("to".into(), Value::String(to.to_string()));
-        edge.insert("kind".into(), Value::String(kind.to_string()));
-        self.edges.push(Value::Object(edge));
-        Ok(())
-    }
-
-    fn register_resource_url(&mut self, url: &str, node_id: &str) {
-        self.url_to_resources
-            .entry(url.to_string())
-            .or_default()
-            .push(node_id.to_string());
-    }
-
-    fn targets_for(&mut self, url: &str) -> Result<Vec<String>> {
-        if let Some(captured) = self.url_to_resources.get(url) {
-            return Ok(captured.clone());
-        }
-        if let Some(existing) = self.external_nodes.get(url) {
-            return Ok(vec![existing.clone()]);
-        }
-        let node_id = digest_id("external:", url);
-        self.add_node(
-            node_id.clone(),
-            json!({"type":"external_url", "url":url, "captured":false}),
-        )?;
-        self.external_nodes.insert(url.to_string(), node_id.clone());
-        Ok(vec![node_id])
-    }
-}
-
 fn optional_artifact(
     project: &Path,
     spec: crate::analysis_artifacts::ArtifactSpec,
     fallback: Value,
 ) -> Result<Value> {
     Ok(load_artifact(project, spec, true)?.unwrap_or(fallback))
-}
-
-fn finish_source_graph(
-    project: &Path,
-    manifest: &CaptureManifest,
-    mut graph: GraphBuilder,
-    budget: &work_budget::WorkBudget,
-) -> Result<SourceGraphSummary> {
-    let mut edge_counts = BTreeMap::<String, usize>::new();
-    for edge in &graph.edges {
-        budget.checkpoint()?;
-        if let Some(kind) = string_field(edge, "kind") {
-            *edge_counts.entry(kind.to_string()).or_default() += 1;
-        }
-    }
-    let mut node_counts = BTreeMap::<String, usize>::new();
-    for node in graph.nodes.values() {
-        budget.checkpoint()?;
-        if let Some(kind) = string_field(node, "type") {
-            *node_counts.entry(kind.to_string()).or_default() += 1;
-        }
-    }
-
-    graph.edges.sort_by(|left, right| {
-        let left_key = (
-            string_field(left, "from").unwrap_or(""),
-            string_field(left, "kind").unwrap_or(""),
-            string_field(left, "to").unwrap_or(""),
-        );
-        let right_key = (
-            string_field(right, "from").unwrap_or(""),
-            string_field(right, "kind").unwrap_or(""),
-            string_field(right, "to").unwrap_or(""),
-        );
-        left_key.cmp(&right_key)
-    });
-    let nodes = graph.nodes.into_values().collect::<Vec<_>>();
-    let external_urls = nodes
-        .iter()
-        .filter(|node| string_field(node, "type") == Some("external_url"))
-        .count();
-    let summary = SourceGraphSummary {
-        nodes: nodes.len(),
-        edges: graph.edges.len(),
-        external_urls,
-    };
-    let document = json!({
-        "schema":SOURCE_GRAPH.schema,
-        "project":project.display().to_string(),
-        "capture_salvaged":manifest.source.salvaged,
-        "nodes":nodes,
-        "edges":graph.edges,
-        "summary":{
-            "nodes":summary.nodes,
-            "edges":summary.edges,
-            "node_types":node_counts,
-            "edge_kinds":edge_counts,
-            "external_urls":summary.external_urls,
-        },
-    });
-    budget.checkpoint()?;
-    write_artifact(project, SOURCE_GRAPH, &document)?;
-    Ok(summary)
 }
 
 /// Build the project source/provenance graph from indexed capture evidence.
@@ -341,7 +195,7 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
 
     wasm_evidence::seed_static_wasm_modules(&mut graph, &wasm, &budget)?;
 
-    finish_source_graph(&project, &manifest, graph, &budget)
+    graph.finish(&project, &manifest, &budget)
 }
 
 #[cfg(test)]
@@ -356,7 +210,7 @@ mod tests {
         analysis_artifacts::{load_artifact, write_artifact, JS_REFERENCES, SOURCE_GRAPH},
         capture_project::{write_manifest, CaptureManifest, CaptureSource, MANIFEST_NAME},
     };
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     fn seeded_capture_fixture() -> CaptureManifest {
         let shared = "https://fixture.invalid/shared.js";
@@ -413,25 +267,25 @@ mod tests {
 
         assert_eq!(resources["same-digest"], ["resource:3", "resource:9"]);
         assert_eq!(
-            graph.url_to_resources["https://fixture.invalid/shared.js"],
-            ["resource:3", "resource:9"]
+            graph.resource_urls()["https://fixture.invalid/shared.js"],
+            BTreeSet::from(["resource:3".into(), "resource:9".into()])
         );
         assert_eq!(
-            graph.nodes["resource:3"]["source_paths"],
+            graph.nodes()["resource:3"]["source_paths"],
             json!(["src/a.js"])
         );
         assert_eq!(
-            graph.nodes["resource:9"]["source_paths"],
+            graph.nodes()["resource:9"]["source_paths"],
             json!(["src/b.js"])
         );
         assert_eq!(
-            graph.nodes["resource:9"]["saved_page_reference_roles"],
+            graph.nodes()["resource:9"]["saved_page_reference_roles"],
             json!(["css", "javascript"])
         );
         for kind in ["observed_navigation", "script_src", "redirect"] {
             let matching = graph
-                .edges
-                .iter()
+                .edges()
+                .values()
                 .filter(|edge| {
                     edge["kind"] == kind
                         && matches!(edge["to"].as_str(), Some("resource:3" | "resource:9"))
@@ -441,8 +295,8 @@ mod tests {
         }
         assert_eq!(
             graph
-                .edges
-                .iter()
+                .edges()
+                .values()
                 .filter(|edge| edge["kind"] == "requested_navigation")
                 .count(),
             1,
@@ -459,7 +313,7 @@ mod tests {
             .for_record(&json!({"raw_path":"resources/inline.js"}))
             .is_none());
         let destination = tempfile::tempdir()?;
-        let summary = finish_source_graph(destination.path(), &manifest, graph, &budget)?;
+        let summary = graph.finish(destination.path(), &manifest, &budget)?;
         assert_eq!(summary.external_urls, 1);
         let artifact = load_artifact(destination.path(), SOURCE_GRAPH, false)?
             .context("finalized graph artifact missing")?;
@@ -478,7 +332,7 @@ mod tests {
             ("resource:2", "https://fixture.invalid/app.js", "beta"),
             ("resource:3", "https://fixture.invalid/copy.js", "alpha"),
         ] {
-            graph.add_node(
+            graph.insert_node(
                 id,
                 json!({
                     "type":"resource","kind":"javascript","url":url,"sha256":digest
@@ -508,8 +362,8 @@ mod tests {
         });
         add_runtime_network_source_edges(&mut graph, &runtime, "runtime:parsed", &hashes)?;
         let parsed = graph
-            .edges
-            .iter()
+            .edges()
+            .values()
             .filter(|edge| edge["to"] == "runtime:parsed")
             .collect::<Vec<_>>();
         assert_eq!(parsed.len(), 1);
@@ -524,8 +378,8 @@ mod tests {
         confirmed["script_instances"][0]["script_url"] = json!("https://fixture.invalid/app.js");
         add_runtime_network_source_edges(&mut graph, &confirmed, "runtime:executed", &hashes)?;
         let executed = graph
-            .edges
-            .iter()
+            .edges()
+            .values()
             .filter(|edge| edge["to"] == "runtime:executed")
             .collect::<Vec<_>>();
         assert_eq!(executed.len(), 1);
@@ -549,8 +403,8 @@ mod tests {
         });
         add_runtime_network_source_edges(&mut graph, &runtime, "runtime:url-only", &hashes)?;
         let url_edges = graph
-            .edges
-            .iter()
+            .edges()
+            .values()
             .filter(|edge| edge["to"] == "runtime:url-only")
             .collect::<Vec<_>>();
         assert_eq!(url_edges.len(), 2);
@@ -570,8 +424,8 @@ mod tests {
         let sha_only = json!({"sha256":"alpha","urls":[],"observed_executed":true});
         add_runtime_network_source_edges(&mut graph, &sha_only, "runtime:sha-only", &hashes)?;
         let hash_edges = graph
-            .edges
-            .iter()
+            .edges()
+            .values()
             .filter(|edge| edge["to"] == "runtime:sha-only")
             .collect::<Vec<_>>();
         assert_eq!(hash_edges.len(), 2);
@@ -616,84 +470,6 @@ mod tests {
         assert!(sources
             .insert("resources/shared.js", 7, 2, "other".into())
             .is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn graph_builder_moves_evidence_without_overwriting_identity_or_existing_fields() -> Result<()>
-    {
-        let mut graph = GraphBuilder::default();
-        assert_eq!(
-            graph.add_node(
-                "source:a",
-                json!({"type":"resource","metadata":{"items":[1,2]},"empty":null}),
-            )?,
-            "source:a"
-        );
-        graph.add_node(
-            "source:a",
-            json!({"type":"not-a-resource","metadata":{"items":[3]},"new_field":42,"empty":"not-empty"}),
-        )?;
-        let node = &graph.nodes["source:a"];
-        assert_eq!(node["id"], "source:a");
-        assert_eq!(node["type"], "resource");
-        assert_eq!(node["metadata"]["items"], json!([1, 2]));
-        assert_eq!(node["new_field"], 42);
-        assert_eq!(node["empty"], Value::Null);
-
-        assert!(graph.add_node("source:a", json!({"id":"spoofed"})).is_err());
-        assert!(graph.add_node("source:b", json!([])).is_err());
-        assert_eq!(graph.nodes.len(), 1);
-
-        graph.add_edge(
-            "source:a",
-            "source:b",
-            "reference",
-            json!({"metadata":{"items":[1,2]}}),
-        )?;
-        graph.add_edge(
-            "source:a",
-            "source:b",
-            "reference",
-            json!({"metadata":{"items":[1,2]}}),
-        )?;
-        assert_eq!(graph.edges.len(), 1);
-        let edge = &graph.edges[0];
-        assert_eq!(edge["from"], "source:a");
-        assert_eq!(edge["to"], "source:b");
-        assert_eq!(edge["kind"], "reference");
-        assert_eq!(edge["metadata"]["items"], json!([1, 2]));
-        assert!(graph
-            .add_edge(
-                "source:a",
-                "source:b",
-                "reference",
-                json!({"from":"spoofed"})
-            )
-            .is_err());
-        assert!(graph
-            .add_edge("source:a", "source:b", "reference", json!({"to":"spoofed"}))
-            .is_err());
-        assert!(graph
-            .add_edge(
-                "source:a",
-                "source:b",
-                "reference",
-                json!({"kind":"spoofed"})
-            )
-            .is_err());
-        assert!(graph
-            .add_edge("source:a", "source:b", "reference", Value::Null)
-            .is_err());
-        assert_eq!(graph.edges.len(), 1);
-
-        graph.add_edge(
-            "source:a",
-            "source:b",
-            "reference",
-            json!({"metadata":{"items":[3]}}),
-        )?;
-        assert_eq!(graph.edges.len(), 2);
         Ok(())
     }
 
