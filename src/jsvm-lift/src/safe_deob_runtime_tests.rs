@@ -403,6 +403,9 @@ fn depythonify_safe_deob_script_completion_runtime_equivalence() -> Result<()> {
         "1;do 'use strict';while(false);",
         "1;for(;;){let secret=7;events.push(()=>secret);break;} events[0]();",
         "for(var i=0;;){switch(i++){case 0:continue;}break;}",
+        "first:second:for(var i=0;true;events.push('update')){if(i++<1)continue first;events.push(i);break;}",
+        "again:do {if(events.push('once'))continue again;break;}while(false);",
+        "outer:for(var i=0;i<2;i++){while(true){events.push(i);if(i===0)continue outer;break;}events.push('tail');}",
     ];
     for (index, source) in sources.iter().enumerate() {
         let label = format!("script-completion-{index}");

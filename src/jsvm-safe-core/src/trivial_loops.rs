@@ -13,23 +13,22 @@ use oxc_ast::ast::{
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::Scoping;
-use oxc_span::GetSpan;
+use oxc_span::{GetSpan, Span};
 
 /// Only transfers targeting the loop being removed matter. Nested switches
 /// consume unlabeled breaks but not continues; nested iteration statements
-/// consume both. A named continue to a label outside this body may target
-/// the original loop itself, so keep that loop unless its target is known.
-#[derive(Default)]
-struct LoopBodyControl {
+/// consume both. Named continues are resolved by their attached iteration
+/// statement's exact source span, including chains of labels on one loop.
+struct LoopBodyControl<'s> {
+    labels: &'s [(Span, String)],
+    target: Span,
     breakable_depth: usize,
     iteration_depth: usize,
-    internal_labels: Vec<String>,
     exits_loop: bool,
     continues_loop: bool,
-    external_continue: bool,
 }
 
-impl<'a> Visit<'a> for LoopBodyControl {
+impl<'a> Visit<'a> for LoopBodyControl<'_> {
     fn visit_statement(&mut self, statement: &Statement<'a>) {
         let iteration = matches!(
             statement,
@@ -42,13 +41,7 @@ impl<'a> Visit<'a> for LoopBodyControl {
         let breakable = iteration || matches!(statement, Statement::SwitchStatement(_));
         self.iteration_depth += usize::from(iteration);
         self.breakable_depth += usize::from(breakable);
-        if let Statement::LabeledStatement(label) = statement {
-            self.internal_labels.push(label.label.name.to_string());
-        }
         walk::walk_statement(self, statement);
-        if matches!(statement, Statement::LabeledStatement(_)) {
-            self.internal_labels.pop();
-        }
         self.iteration_depth -= usize::from(iteration);
         self.breakable_depth -= usize::from(breakable);
     }
@@ -59,10 +52,10 @@ impl<'a> Visit<'a> for LoopBodyControl {
 
     fn visit_continue_statement(&mut self, statement: &oxc_ast::ast::ContinueStatement<'a>) {
         if let Some(label) = &statement.label {
-            self.external_continue |= !self
-                .internal_labels
+            self.continues_loop |= self
+                .labels
                 .iter()
-                .any(|name| name == label.name.as_str());
+                .any(|(target, name)| *target == self.target && name == label.name.as_str());
         } else {
             self.continues_loop |= self.iteration_depth == 0;
         }
@@ -272,7 +265,13 @@ impl SingleIterationBody {
     /// Prove that the body either reaches a terminal local break or the
     /// loop's test is pure false after the first iteration. Preserve every
     /// earlier abrupt transfer and every original lexical block.
-    fn analyze(body: &Statement<'_>, source: &str, false_after_body: bool) -> Option<Self> {
+    fn analyze(
+        body: &Statement<'_>,
+        source: &str,
+        false_after_body: bool,
+        target: Span,
+        labels: &[(Span, String)],
+    ) -> Option<Self> {
         let statements = match body {
             Statement::BlockStatement(block) => block.body.as_slice(),
             _ => std::slice::from_ref(body),
@@ -284,11 +283,18 @@ impl SingleIterationBody {
             return None;
         }
         let retained = &statements[..statements.len() - usize::from(tail.is_some())];
-        let mut control = LoopBodyControl::default();
+        let mut control = LoopBodyControl {
+            labels,
+            target,
+            breakable_depth: 0,
+            iteration_depth: 0,
+            exits_loop: false,
+            continues_loop: false,
+        };
         for statement in retained {
             control.visit_statement(statement);
         }
-        if control.external_continue || (control.continues_loop && !false_after_body) {
+        if control.continues_loop && !false_after_body {
             return None;
         }
         let needs_loop = control.exits_loop || control.continues_loop;
@@ -331,6 +337,7 @@ pub fn single_iteration_for(
     it: &ForStatement<'_>,
     source: &str,
     completion_live: bool,
+    labels: &[(Span, String)],
 ) -> Option<String> {
     if it
         .test
@@ -339,7 +346,7 @@ pub fn single_iteration_for(
     {
         return None;
     }
-    let body = SingleIterationBody::analyze(&it.body, source, false)?;
+    let body = SingleIterationBody::analyze(&it.body, source, false, it.span, labels)?;
     let init = match &it.init {
         None => String::new(),
         Some(ForStatementInit::VariableDeclaration(decl))
@@ -382,21 +389,32 @@ pub fn single_iteration_while(
     it: &WhileStatement<'_>,
     source: &str,
     completion_live: bool,
+    labels: &[(Span, String)],
 ) -> Option<String> {
     if known_bool(&it.test) != Some(true) {
         return None;
     }
-    Some(SingleIterationBody::analyze(&it.body, source, false)?.render(completion_live))
+    Some(
+        SingleIterationBody::analyze(&it.body, source, false, it.span, labels)?
+            .render(completion_live),
+    )
 }
 
 pub fn single_iteration_do_while(
     it: &DoWhileStatement<'_>,
     source: &str,
     completion_live: bool,
+    labels: &[(Span, String)],
 ) -> Option<String> {
     Some(
-        SingleIterationBody::analyze(&it.body, source, known_bool(&it.test) == Some(false))?
-            .render(completion_live),
+        SingleIterationBody::analyze(
+            &it.body,
+            source,
+            known_bool(&it.test) == Some(false),
+            it.span,
+            labels,
+        )?
+        .render(completion_live),
     )
 }
 
@@ -491,6 +509,8 @@ mod tests {
             "function f(){do {work();break;}while(effect());}",
             "function f(){do {work();}while(0);}",
             "function f(){while(true)break;}",
+            "function f(){outer:for(var i=0;i<2;i++){while(true){work();continue outer;break;}}}",
+            "function f(){again:do {if(check())continue again;break;}while(false);}",
         ] {
             let result = deobfuscate(input, 16, &WorkBudget::unlimited("single-iteration"))?
                 .unwrap_or_else(|| unreachable!());
@@ -507,6 +527,7 @@ mod tests {
         for input in [
             "function f(x){while(true){switch(x){case 1:continue;}break;}}",
             "function f(x){again:for(;;){if(x)continue again;break;}}",
+            "function f(x){first:second:while(true){while(x){continue first;}break;}}",
         ] {
             let result = deobfuscate(input, 16, &WorkBudget::unlimited("single-iteration"))?
                 .unwrap_or_else(|| unreachable!());
