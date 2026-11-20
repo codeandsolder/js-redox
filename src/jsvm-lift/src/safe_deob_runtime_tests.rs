@@ -326,6 +326,79 @@ fn assert_main_contract(file: &str, outcome: &SafeDeobOutcome) {
 }
 
 #[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_script_completion_runtime_equivalence() -> Result<()> {
+    let scratch = TempDir::new()?;
+    let sources = [
+        "1;",
+        "1;2;",
+        "1;var x;",
+        "1;{let x;}",
+        "1;{2;}",
+        "1;if (true) {}",
+        "1;if (false) 2;",
+        "1;if (true) {let x;}",
+        "1;if (true) {2; ;}",
+        "{let x;x=7;}",
+        "{let x;x=7;3;}",
+        "outer:{1;break outer;2;}",
+        "outer:{1;{break outer;}2;}",
+        "outer:{1;if (true) break outer;2;}",
+        "var i=0; while(i++<2){i;}",
+        "1;while(false){2;}",
+        "1;for(0;true;true){break;}",
+        "1;for(0;true;true){2;break;}",
+        "1;switch(1){case 2:2;break;}",
+        "1;switch(0){case 0:2;case 1:3;break;}",
+        "1;switch(1){case 1:break;}",
+        "var flag=false;switch(!flag){case (events.push('test'),true):break;case false:2;}",
+        "var flag=false;switch(!flag){case (events.push('test'),true):7;break;case false:2;}",
+        "try {1;} finally {2;}",
+        "try {throw 3;} catch(e){e;} finally{2;}",
+        "outer:try{3;}finally{2;break outer;}",
+        "outer:try{3;}finally{break outer;}",
+        "outer:{1;try{break outer;}finally{}}",
+        "function f(){if(false){var x=2;}return x;} f();",
+        "let x=0; x++; if(x){}",
+        "var i=0; while(i++<2){ if(i===2)continue; 7;}",
+        "1; try { throw 7; } finally { 2; }",
+        "1; switch(0){case 0:events.push('a');case 1:(events.push)('b');break;}",
+        "{x=7;let x;}",
+        "{let x=(function(){x=7;})()}",
+        "function f(){const inner=()=>{x=7;};inner();let x;} f();",
+        "switch(1){case 0:let x;case 1:x=7;break;}",
+        "function f(){if(true){x=7;}let x;} f();",
+        "function f(a=class{static{b=7;}},b){} f();",
+        "for(let x of [class{static{x=7;}}]){}",
+        "{let x;{x=7;}}",
+        "function f(){x=7;var x;} f();",
+        "function f(x){x=7;} f();",
+        "function f(){let x,y=class{static{x=7;}};} f();",
+        "for(let x of [0]){x=7;}",
+        "for(let x in {a:1}){x=7;}",
+        "switch(1){case 1:let x;x=7;break;}",
+    ];
+    for (index, source) in sources.iter().enumerate() {
+        let label = format!("script-completion-{index}");
+        let result =
+            deobfuscate_source(source, &label, SourceMode::Auto, 48, false, &budget(&label))?;
+        let runner = |text: &str| -> Result<String> {
+            let encoded = serde_json::to_string(text)?;
+            Ok(format!(
+                r#"const vm=require('node:vm');const events=[];try{{const value=vm.runInNewContext({encoded},{{events}});console.log(JSON.stringify([typeof value,String(value),events]));}}catch(e){{console.log(JSON.stringify(['throw',String(e),events]));}}"#
+            ))
+        };
+        runtime_equivalent(
+            scratch.path(),
+            &label,
+            &runner(source)?,
+            &runner(&result.source)?,
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires Node; run the focused test explicitly"]
 fn depythonify_safe_deob_statement_boundary_and_directive_runtime_equivalence() -> Result<()> {
     let source = r#"

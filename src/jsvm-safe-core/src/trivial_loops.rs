@@ -24,14 +24,25 @@ impl<'a> Visit<'a> for HoistingHazards {
         walk::walk_variable_declaration(self, declaration);
     }
 
-    fn visit_function(
-        &mut self,
-        _function: &oxc_ast::ast::Function<'a>,
-        _flags: oxc_syntax::scope::ScopeFlags,
-    ) {
-        // A dead function declaration can be observable under Annex B.
-        self.present = true;
+    fn visit_statement(&mut self, statement: &Statement<'a>) {
+        if matches!(statement, Statement::FunctionDeclaration(_)) {
+            // A dead function declaration can be observable under Annex B.
+            self.present = true;
+        } else {
+            walk::walk_statement(self, statement);
+        }
     }
+
+    fn visit_function(&mut self, _: &oxc_ast::ast::Function<'a>, _: oxc_syntax::scope::ScopeFlags) {
+    }
+    fn visit_arrow_function_expression(&mut self, _: &oxc_ast::ast::ArrowFunctionExpression<'a>) {}
+    fn visit_class(&mut self, _: &oxc_ast::ast::Class<'a>) {}
+}
+
+pub(crate) fn has_hoisting_hazards(statement: &Statement<'_>) -> bool {
+    let mut hazards = HoistingHazards::default();
+    hazards.visit_statement(statement);
+    hazards.present
 }
 
 #[derive(Default)]
@@ -198,7 +209,11 @@ pub fn flatten_standalone_block(
 /// this statement is the consequent of another `if`: otherwise removing an
 /// `else` creates a different dangling-else parse. A retained branch keeps its
 /// original braces, lexical bindings, and control transfers.
-pub fn normalize_empty_if(stmt: &IfStatement<'_>, source: &str) -> Option<String> {
+pub fn normalize_empty_if(
+    stmt: &IfStatement<'_>,
+    source: &str,
+    completion_live: bool,
+) -> Option<String> {
     let then_empty = empty_statement(&stmt.consequent);
     let else_empty = stmt
         .alternate
@@ -209,7 +224,11 @@ pub fn normalize_empty_if(stmt: &IfStatement<'_>, source: &str) -> Option<String
     }
     let test = fragment(source, stmt.test.span());
     if then_empty && (stmt.alternate.is_none() || else_empty) {
-        return Some(format!("({test});"));
+        return Some(if completion_live {
+            format!("({test}, void 0);")
+        } else {
+            format!("({test});")
+        });
     }
     if then_empty {
         let alternative = stmt.alternate.as_ref()?;
@@ -240,9 +259,7 @@ pub fn never_entered_while(it: &WhileStatement<'_>) -> Option<String> {
     if !literal_bool(&it.test, false) {
         return None;
     }
-    let mut hazards = HoistingHazards::default();
-    hazards.visit_statement(&it.body);
-    (!hazards.present).then_some("{}".to_owned())
+    (!has_hoisting_hazards(&it.body)).then_some("{}".to_owned())
 }
 
 /// For (0; true; true) { ...; break; } executes its body exactly once unless
