@@ -252,6 +252,7 @@ fn add_runtime_network_source_edges(
                 "candidate_count":parents.len(),
                 "exact_response_identity":uniquely_verified,
                 "runtime_execution_observed":execution_observed,
+                "coverage_mode":field(runtime,"coverage_mode"),
             }),
         )?;
     }
@@ -687,6 +688,7 @@ fn add_runtime_classification_edges(
                             "candidate_count":parents.len(),
                             "exact_response_identity":false,
                             "runtime_execution_observed":bool_field(source,"observed_executed"),
+                            "coverage_mode":field(source,"coverage_mode"),
                         }),
                     )?;
                 }
@@ -796,6 +798,7 @@ fn seed_runtime_script_evidence(
                 "execution_context_ids":source.get("execution_context_ids").cloned().unwrap_or_else(|| json!([])),
                 "script_instances":source.get("script_instances").cloned().unwrap_or_else(|| json!([])),
                 "observed_executed":field(source,"observed_executed"),
+                "coverage_mode":field(source,"coverage_mode"),
                 "observed_source_path":field(source,"observed_source_path"),
                 "general_source_path":runtime_general_paths.get(digest),
                 "safe_readable_source_path":runtime_readable_paths.get(digest),
@@ -2477,6 +2480,7 @@ mod tests {
         let runtime = json!({
             "sha256":"alpha","urls":["https://fixture.invalid/app.js"],
             "observed_executed":true,
+            "coverage_mode":"best-effort",
             "script_instances":[{
                 "script_url":"https://fixture.invalid/copy.js",
                 "execution":{"status":"positive"}
@@ -2494,6 +2498,7 @@ mod tests {
         assert_eq!(parsed[0]["identity_basis"], "sha256_and_url");
         assert_eq!(parsed[0]["exact_response_identity"], true);
         assert_eq!(parsed[0]["runtime_execution_observed"], false);
+        assert_eq!(parsed[0]["coverage_mode"], "best-effort");
 
         let mut confirmed = runtime;
         confirmed["script_instances"][0]["script_url"] = json!("https://fixture.invalid/app.js");
@@ -2507,6 +2512,7 @@ mod tests {
         assert_eq!(executed[0]["from"], "resource:1");
         assert_eq!(executed[0]["kind"], "runtime_execution");
         assert_eq!(executed[0]["runtime_execution_observed"], true);
+        assert_eq!(executed[0]["coverage_mode"], "best-effort");
         Ok(())
     }
 

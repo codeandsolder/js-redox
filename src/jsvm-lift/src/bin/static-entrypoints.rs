@@ -145,8 +145,15 @@ fn main() -> Result<()> {
         load_artifact(&project, EXECUTION_COVERAGE, true)?,
         load_artifact(&project, RUNTIME_SCRIPTS, true)?,
     ) {
-        (Some(_), Some(runtime_sources)) => json!({
+        (Some(coverage), Some(_)) if coverage["mode"] == "none" => json!({
+            "status":"disabled",
+            "coverage_mode":"none",
+            "reason":"V8 execution observation was disabled; parsed scripts do not prove execution",
+        }),
+        (Some(coverage), Some(runtime_sources)) => json!({
             "status":"available",
+            "coverage_mode":coverage.get("mode"),
+
             "analysis":join_initial_source_coverage(&documents, &runtime_sources, &budget)?,
             "runtime_schema":RUNTIME_SCRIPTS.schema,
             "coverage_schema":EXECUTION_COVERAGE.schema,

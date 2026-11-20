@@ -138,9 +138,9 @@ artifact!(
 );
 artifact!(
     EXECUTION_COVERAGE,
-    "precise browser execution coverage",
+    "browser execution coverage with explicit observation mode",
     "analysis/execution-coverage.json",
-    "capture-execution-coverage/v1",
+    "capture-execution-coverage/v2",
     arrays = ["scripts"],
     objects = ["summary"]
 );

@@ -107,18 +107,44 @@ them. Observed events remain exact evidence. Playwright response capture remains
 the cross-target byte fallback when Chromium does not expose a corresponding
 target/session.
 
-## Observed execution evidence
+## Execution observation modes
 
-The recorder samples precise V8 function/block coverage from each CDP session,
-starting before page navigation or worker resume and finishing before browser
-shutdown. execution-coverage.json contains per-script source ranges (UTF-16
-code unit offsets), counters and capture availability. Positive counters show
-that code executed during the observed interval; missing or zero counters do
-not imply that other code cannot execute. The Rust project stage joins script
-IDs and CDP sessions to exact body hashes and emits src/_observed/ for
-counter-positive JavaScript plus analysis/observed-source.json.
+By default the recorder queries **best-effort V8 function coverage** once per
+attached CDP session at capture completion. It enables the Profiler domain
+only at that final snapshot, reading V8's existing invocation counters without
+calling `Profiler.startPreciseCoverage` or disabling the optimizing compiler. The observer still attaches Debugger/Network and drives
+consent and scrolling, so this is not an unmodified browser experiment.
 
-## Selective concrete execution trace
+```bash
+npm run record -- https://example.com --coverage best-effort # default
+npm run record -- https://example.com --coverage none        # no V8 coverage
+npm run record -- https://example.com --coverage precise     # disables optimizing compiler
+```
+
+- `best-effort` collects `Profiler.getBestEffortCoverage` at the end. Positive
+  function counters witness execution, but GC and JIT optimization can hide
+  earlier calls. No block-level completeness is claimed.
+- `none` never enables the Profiler domain or requests V8 coverage. The script
+  inventory still captures `Debugger.scriptParsed` and script sources; parsing
+  does not prove execution. Use `--no-consent --keep-cache --scroll-passes 0`
+  when a minimally driven experiment is preferable, though CDP and worker
+  auto-attach remain active.
+- `precise` deliberately starts `Profiler.startPreciseCoverage` before
+  navigation/worker resume, with function counts and block-level counters.
+  V8 disables optimizing compilation in this mode; results are evidence for
+  this instrumented run, not an invisible view of optimized production behavior.
+
+The capture's `execution-coverage.json` uses
+`js-redox/execution-coverage/v2` and records its exact mode, CDP session,
+script IDs, UTF-16 function/block ranges, counters and capture availability.
+The Rust importer carries `coverage_mode` into runtime script instances,
+source-graph edges and `src/_observed/` proof records. Only positive
+counters count as execution witnesses. Zero, missing or unavailable coverage
+never proves non-execution. `recorder-manifest.json` separately records the
+coverage mode, debugger attachment, worker waiting, cache policy and optional
+consent/trace instrumentation.
+
+## Optional selective debugger trace (second-pass only)
 
 Use --trace-points PATH with a JSON configuration containing 1-24 points.
 Each point specifies a zero-based lineNumber, one of url, urlRegex, or
