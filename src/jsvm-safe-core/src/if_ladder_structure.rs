@@ -1332,7 +1332,7 @@ impl<'a> Visit<'a> for ExceptionStateWrites<'_> {
     }
 
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
-        if matches!(unparen(&call.callee), Expression::Identifier(id) if id.name=="eval") {
+        if crate::is_potential_direct_eval(call) {
             self.unsafe_write = true;
         }
         walk::walk_call_expression(self, call);
@@ -1596,10 +1596,7 @@ impl SequentialExceptionScan<'_> {
         incoming: BTreeSet<u64>,
         within_chain: bool,
     ) -> Option<BTreeSet<u64>> {
-        if matches!(
-            unparen(&call.callee),
-            Expression::Identifier(id) if id.name == "eval"
-        ) {
+        if crate::is_potential_direct_eval(call) {
             return None;
         }
         let after_callee = self.expression(&call.callee, incoming)?;

@@ -2231,10 +2231,7 @@ impl<'a> Visit<'a> for RotationDynamicScopeProbe {
     }
 
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
-        if matches!(
-            &call.callee,
-            Expression::Identifier(identifier) if identifier.name.as_str() == "eval"
-        ) {
+        if crate::is_potential_direct_eval(call) {
             self.found = true;
             return;
         }
