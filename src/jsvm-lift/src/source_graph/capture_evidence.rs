@@ -143,7 +143,7 @@ pub(super) fn seed_captured_resources(
         if let Some(roles) = resource.get("saved_page_reference_roles") {
             node["saved_page_reference_roles"] = roles.clone();
         }
-        graph.add_node(node_id.clone(), node)?;
+        graph.insert_node(node_id.clone(), node)?;
         if let Some(url) = nonempty_string_field(resource, "url") {
             graph.register_resource_url(url, &node_id);
         }
@@ -172,7 +172,7 @@ pub(super) fn seed_navigation_roots(
             continue;
         }
         let page_id = format!("page:{index}");
-        graph.add_node(
+        graph.insert_node(
             page_id.clone(),
             json!({
                 "type": "browser_entrypoint",
@@ -185,7 +185,7 @@ pub(super) fn seed_navigation_roots(
             ("final_url", "observed_navigation"),
         ] {
             if let Some(url) = nonempty_string_field(page, key) {
-                for target in graph.targets_for(url)? {
+                for target in graph.targets_for(url, budget)? {
                     graph.add_edge(&page_id, &target, edge_kind, json!({"url":url}))?;
                 }
             }
@@ -209,7 +209,7 @@ pub(super) fn seed_captured_reference_edges(
                 continue;
             };
             let kind = nonempty_string_field(reference, "kind").unwrap_or("reference");
-            for dst in graph.targets_for(url)? {
+            for dst in graph.targets_for(url, budget)? {
                 graph.add_edge(
                     &src,
                     &dst,
@@ -228,7 +228,7 @@ pub(super) fn seed_captured_reference_edges(
             .and_then(|header| nonempty_string_field(header, "value"));
         if let (Some(location), Some(base)) = (location, nonempty_string_field(resource, "url")) {
             let resolved = resolve_url(base, location);
-            for dst in graph.targets_for(&resolved)? {
+            for dst in graph.targets_for(&resolved, budget)? {
                 graph.add_edge(
                     &src,
                     &dst,
@@ -265,7 +265,8 @@ pub(super) fn seed_captured_inline_scripts(
             &format!("manifest.inline_scripts[{index}]"),
         )?;
         let node_id = format!("inline:{parent}:{ordinal}");
-        graph.add_node(
+        inline_nodes.insert(output_path, parent, ordinal, node_id.clone())?;
+        graph.insert_node(
             node_id.clone(),
             json!({
                 "type":"inline_script",
@@ -283,7 +284,6 @@ pub(super) fn seed_captured_inline_scripts(
             "inline_script",
             json!({"ordinal":ordinal}),
         )?;
-        inline_nodes.insert(output_path, parent, ordinal, node_id.clone())?;
         if let Some(sha) = nonempty_string_field(item, "sha256") {
             inline_nodes_by_sha
                 .entry(sha.to_string())
@@ -356,13 +356,16 @@ mod tests {
             captured.resource_nodes_by_sha["same-bytes"],
             ["resource:7", "resource:19"]
         );
-        assert_eq!(graph.url_to_resources[url], ["resource:7", "resource:19"]);
         assert_eq!(
-            graph.nodes["resource:7"]["source_paths"],
+            graph.captured_targets(url),
+            Some(&BTreeSet::from(["resource:7".into(), "resource:19".into()]))
+        );
+        assert_eq!(
+            graph.node_value("resource:7")["source_paths"],
             json!(["src/a.js", "src/a-readable.js"])
         );
         assert_eq!(
-            graph.nodes["resource:19"]["source_paths"],
+            graph.node_value("resource:19")["source_paths"],
             json!(["src/b.js"])
         );
         assert_eq!(
@@ -390,8 +393,8 @@ mod tests {
         );
         for kind in ["requested_navigation", "observed_navigation", "script_src"] {
             let edges = graph
-                .edges
-                .iter()
+                .edges()
+                .values()
                 .filter(|edge| edge["kind"] == kind)
                 .collect::<Vec<_>>();
             assert_eq!(edges.len(), 2, "{kind} must retain each captured instance");
@@ -421,12 +424,12 @@ mod tests {
             "expected duplicate resource error: {result:?}"
         );
         assert_eq!(
-            graph.nodes["resource:4"]["url"],
+            graph.node_value("resource:4")["url"],
             "https://example.test/first.js"
         );
-        assert!(!graph
-            .url_to_resources
-            .contains_key("https://example.test/second.js"));
+        assert!(graph
+            .captured_targets("https://example.test/second.js")
+            .is_none());
     }
 
     #[test]
@@ -492,8 +495,8 @@ mod tests {
         let mut graph = GraphBuilder::default();
         let _ = seed_capture_evidence(&mut graph, &manifest, &json!({"units":[]}), &budget())?;
         let redirects = graph
-            .edges
-            .iter()
+            .edges()
+            .values()
             .filter(|edge| edge["kind"] == "redirect")
             .collect::<Vec<_>>();
         assert_eq!(redirects.len(), 2);

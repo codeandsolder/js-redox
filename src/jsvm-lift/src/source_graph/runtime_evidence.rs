@@ -120,7 +120,7 @@ pub(super) fn add_runtime_network_source_edges(
     let exact = hash_matches
         .iter()
         .filter(|node| {
-            graph.nodes.get(*node).is_some_and(|resource| {
+            graph.node(node).is_some_and(|resource| {
                 nonempty_string_field(resource, "kind") == Some("javascript")
                     && nonempty_string_field(resource, "url").is_some_and(|url| urls.contains(url))
             })
@@ -134,7 +134,7 @@ pub(super) fn add_runtime_network_source_edges(
             hash_matches
                 .iter()
                 .filter(|node| {
-                    graph.nodes.get(*node).is_some_and(|resource| {
+                    graph.node(node).is_some_and(|resource| {
                         nonempty_string_field(resource, "kind") == Some("javascript")
                     })
                 })
@@ -147,9 +147,9 @@ pub(super) fn add_runtime_network_source_edges(
         // script bytes. Preserve all URL candidates without asserting execution.
         (
             urls.iter()
-                .flat_map(|url| graph.url_to_resources.get(*url).into_iter().flatten())
+                .flat_map(|url| graph.captured_targets(url).into_iter().flatten())
                 .filter(|node| {
-                    graph.nodes.get(*node).is_some_and(|resource| {
+                    graph.node(node).is_some_and(|resource| {
                         nonempty_string_field(resource, "kind") == Some("javascript")
                     })
                 })
@@ -161,8 +161,7 @@ pub(super) fn add_runtime_network_source_edges(
     let uniquely_verified = basis == "sha256_and_url" && parents.len() == 1;
     for parent in &parents {
         let parent_url = graph
-            .nodes
-            .get(parent)
+            .node(parent)
             .and_then(|resource| nonempty_string_field(resource, "url"));
         let execution_observed = parent_url.is_some_and(|url| {
             array_field(runtime, "script_instances")
@@ -221,6 +220,7 @@ fn add_runtime_generated_code_edges(
     graph: &mut GraphBuilder,
     generated: &Value,
     runtime_node: &str,
+    budget: &work_budget::WorkBudget,
 ) -> Result<()> {
     for origin in array_field(generated, "origins") {
         let chain = array_field(origin, "chain");
@@ -244,7 +244,7 @@ fn add_runtime_generated_code_edges(
                 edge_fields,
             )?;
         } else if let Some(url) = nonempty_string_field(parent, "url") {
-            let candidates = graph.targets_for(url)?;
+            let candidates = graph.targets_for(url, budget)?;
             for parent_node in &candidates {
                 let mut fields = edge_fields.clone();
                 fields["identity_basis"] = json!("url_only");
@@ -273,7 +273,7 @@ fn add_runtime_document_inline_edges(
             field(origin, "frame_id"),
         ))?;
         let document_node = digest_id("runtime-document:", &document_key);
-        graph.add_node(
+        graph.intern_node(
             document_node.clone(),
             json!({
                 "type":"runtime_document",
@@ -306,7 +306,7 @@ fn add_runtime_alpine_edges(
 ) -> Result<()> {
     if let Some(shape) = nonempty_string_field(alpine, "shape") {
         let family_node = digest_id("runtime-family:", shape);
-        graph.add_node(
+        graph.intern_node(
             family_node.clone(),
             json!({
                 "type":"runtime_expression_family",
@@ -325,7 +325,7 @@ fn add_runtime_alpine_edges(
     for dom_match in array_field(alpine, "dom_matches") {
         let snapshot_key = compact_key((field(dom_match, "source"), field(dom_match, "path")))?;
         let snapshot_node = digest_id("dom-snapshot:", &snapshot_key);
-        graph.add_node(
+        graph.intern_node(
                         snapshot_node.clone(),
                         json!({"type":"dom_snapshot", "source":field(dom_match,"source"), "path":field(dom_match,"path")}),
                     )?;
@@ -337,7 +337,7 @@ fn add_runtime_alpine_edges(
             field(dom_match, "attribute"),
         ))?;
         let directive_node = digest_id("dom-directive:", &directive_key);
-        graph.add_node(
+        graph.intern_node(
                         directive_node.clone(),
                         json!({
                             "type":"dom_directive", "source":field(dom_match,"source"), "path":field(dom_match,"path"),
@@ -409,7 +409,7 @@ fn add_runtime_classification_edges(
             if let Some(shape) = nonempty_string_field(gtm, "shape") {
                 let family_node =
                     digest_id("runtime-family:", &format!("google_tag_manager\0{shape}"));
-                graph.add_node(
+                graph.intern_node(
                         family_node.clone(),
                         json!({
                             "type":"runtime_expression_family", "framework":"google_tag_manager", "shape":shape,
@@ -488,7 +488,7 @@ pub(super) fn seed_runtime_script_evidence(
         let runtime_node = runtime_node_id(digest);
         // Abbreviated graph IDs are presentation identifiers, never a proof
         // that two different full digests denote the same source.
-        if let Some(existing) = graph.nodes.get(&runtime_node) {
+        if let Some(existing) = graph.node(&runtime_node) {
             anyhow::ensure!(
                 string_field(existing, "sha256") == Some(digest),
                 "runtime graph node ID collision for {runtime_node}"
@@ -496,7 +496,7 @@ pub(super) fn seed_runtime_script_evidence(
         }
         let classification = string_field(source, "classification");
         let generated = source.get("generated").unwrap_or(&Value::Null);
-        graph.add_node(
+        graph.insert_node(
             runtime_node.clone(),
             json!({
                 "type":"runtime_script",
@@ -524,7 +524,7 @@ pub(super) fn seed_runtime_script_evidence(
         )?;
 
         instances.register_source(source, digest);
-        add_runtime_generated_code_edges(graph, generated, &runtime_node)?;
+        add_runtime_generated_code_edges(graph, generated, &runtime_node, budget)?;
         add_runtime_classification_edges(graph, source, digest, &runtime_node, &context)?;
     }
     Ok(RuntimeSourceGraphIndex {
