@@ -147,6 +147,7 @@ pub(super) fn seed_browser_api_callsites(
                 "operation": field(row, "operation"),
                 "certainty": field(row, "certainty"),
                 "target_pattern": field(row, "target_pattern"),
+                "bound_function_start": field(row, "bound_function_start"),
                 "affected_families": field(row, "affected_families"),
                 "expression": field(row, "expression"),
             }),
@@ -175,6 +176,9 @@ pub(super) fn seed_browser_api_callsites(
                 "line":field(row,"line"),
                 "column":field(row,"column"),
                 "callee":field(row,"callee"),
+                "api_origin":field(row,"api_origin"),
+                "invocation_form":field(row,"invocation_form"),
+                "binding_witnesses":field(row,"binding_witnesses"),
                 "proof":field(row,"proof"),
                 "binding_status":field(row,"binding_status"),
                 "mutation_site_ordinals":field(row,"mutation_site_ordinals"),
@@ -340,6 +344,8 @@ mod tests {
                     "resource_id": 7, "deobfuscation_ordinal": 3,
                     "analysis_path": "src/_deobfuscated/app.js",
                     "kind": "fetch_candidate", "binding_status": "candidate",
+                    "api_origin": "fetch", "invocation_form": "bound",
+                    "binding_witnesses": [{"kind":"bind","start":0,"end":8}],
                     "method": "GET", "method_status": "conditional",
                     "mutation_site_ordinals": [0],
                     "url": "https://api.test/data", "absolute_network_url": true
@@ -367,6 +373,9 @@ mod tests {
             .get("api-call:2:0")
             .context("missing candidate")?;
         assert_eq!(call["mutation_site_ordinals"], json!([0]));
+        assert_eq!(call["api_origin"], "fetch");
+        assert_eq!(call["invocation_form"], "bound");
+        assert_eq!(call["binding_witnesses"][0]["kind"], "bind");
         assert!(graph.edges.iter().any(|edge| {
             edge["from"] == "deobfuscated:3"
                 && edge["to"] == "api-mutation:2:0"
