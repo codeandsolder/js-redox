@@ -25,3 +25,6 @@ sha2.workspace = true
 string_wizard.workspace = true
 
 work-budget.workspace = true
+
+[dev-dependencies]
+oxc_compat.workspace = true

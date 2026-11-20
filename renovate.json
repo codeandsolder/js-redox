@@ -6,7 +6,13 @@
   "separateMultipleMajor": true,
   "packageRules": [
     {
-      "description": "Group Oxc crates so one type/version universe moves together",
+      "description": "Vendored upstream crate manifests are immutable backport baselines",
+      "matchManagers": ["cargo"],
+      "matchFileNames": ["vendor/oxc_compat/**", "vendor/oxc_semantic/**"],
+      "enabled": false
+    },
+    {
+      "description": "Group Oxc crates so one type/version universe moves together; review both local Oxc backports before upgrading",
       "matchManagers": [
         "cargo"
       ],

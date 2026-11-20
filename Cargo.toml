@@ -7,6 +7,7 @@ members = [
     "src/work-budget",
 ]
 resolver = "2"
+exclude = ["vendor/oxc_compat", "vendor/oxc_semantic"]
 
 [workspace.package]
 edition = "2021"
@@ -38,6 +39,7 @@ oxc_allocator = "0.158.0"
 oxc_ast = "0.158.0"
 oxc_ast_visit = "0.158.0"
 oxc_codegen = "0.158.0"
+oxc_compat = "0.158.0"
 oxc_cfg = "0.158.0"
 oxc_diagnostics = "0.158.0"
 oxc_ecmascript = "0.158.0"
@@ -60,3 +62,10 @@ wasmparser = "0.263.0"
 wasmprinter = "0.263.0"
 waffle = { git = "https://github.com/codeandsolder/waffle.git", rev = "682bfdb45653246f981a93978d3990bdcae70ce9" }
 work-budget = { path = "src/work-budget" }
+
+# Temporary backport of oxc-project/oxc#28542 to the 0.158.0 release.
+[patch.crates-io]
+oxc_semantic = { path = "vendor/oxc_semantic" }
+
+# Temporary backport of oxc-project/oxc#29927.
+oxc_compat = { path = "vendor/oxc_compat" }
