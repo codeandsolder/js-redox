@@ -8,7 +8,7 @@ use super::{
     array_field, bool_field, compact_key, digest_id, field, nonempty_string_field, string_field,
     GraphBuilder,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -25,17 +25,25 @@ enum InstanceSource {
 }
 
 pub(super) fn runtime_node_id(digest: &str) -> String {
-    format!("runtime:{}", &digest[..digest.len().min(20)])
+    format!("runtime:{}", digest.get(..20).unwrap_or(digest))
+}
+
+/// A display ID is only a lookup hint; the complete captured digest must agree.
+pub(super) fn captured_runtime_source(graph: &GraphBuilder, digest: &str) -> Option<String> {
+    let node = runtime_node_id(digest);
+    let record = graph.node(&node)?;
+    (string_field(record, "type") == Some("runtime_script")
+        && string_field(record, "sha256") == Some(digest))
+    .then_some(node)
 }
 
 fn script_id_text(value: &Value) -> Option<std::borrow::Cow<'_, str>> {
-    if value.is_null() {
-        return None;
+    use std::borrow::Cow;
+    match value {
+        Value::String(id) if !id.is_empty() => Some(Cow::Borrowed(id)),
+        Value::Number(id) if id.is_u64() => Some(Cow::Owned(id.to_string())),
+        _ => None,
     }
-    Some(value.as_str().map_or_else(
-        || std::borrow::Cow::Owned(value.to_string()),
-        std::borrow::Cow::Borrowed,
-    ))
 }
 
 impl RuntimeInstances {
@@ -68,8 +76,12 @@ impl RuntimeInstances {
         }
     }
 
+    fn lookup(&self, session: &str, script_id: &str) -> Option<&InstanceSource> {
+        self.sessions.get(session)?.get(script_id)
+    }
+
     fn digest(&self, session: &str, script_id: &str) -> Option<&str> {
-        match self.sessions.get(session)?.get(script_id)? {
+        match self.lookup(session, script_id)? {
             InstanceSource::Unique(digest) => Some(digest),
             InstanceSource::Conflict => None,
         }
@@ -216,43 +228,137 @@ fn runtime_family_counts(runtime: &Value, field_name: &str) -> BTreeMap<String, 
         .collect()
 }
 
+/// A generation claim refers to a recorded parent frame, not a new execution
+/// observation. Resolve source content and session-local instance independently.
+struct GenerationParent<'a> {
+    frame: &'a Value,
+    session: &'a str,
+}
+
+impl GenerationParent<'_> {
+    fn claimed_digest(&self) -> Option<&str> {
+        nonempty_string_field(self.frame, "sha256")
+    }
+
+    fn resolve(
+        &self,
+        graph: &GraphBuilder,
+        instances: &RuntimeInstances,
+    ) -> GenerationParentResolution {
+        let registered = self
+            .frame
+            .get("script_id")
+            .and_then(script_id_text)
+            .and_then(|id| instances.lookup(self.session, &id));
+        let claimed = self.claimed_digest();
+        let (digest, basis) = match (registered, claimed) {
+            (Some(InstanceSource::Conflict), _) => {
+                return GenerationParentResolution::Unresolved("conflicting_script_instance")
+            }
+            (Some(InstanceSource::Unique(registered)), Some(claimed)) if registered != claimed => {
+                return GenerationParentResolution::Unresolved("conflicting_parent_digest")
+            }
+            (Some(InstanceSource::Unique(registered)), _) => {
+                (registered.as_str(), "session_script_id_and_captured_digest")
+            }
+            (None, Some(claimed)) => (claimed, "captured_digest_only"),
+            (None, None) => {
+                return if nonempty_string_field(self.frame, "url").is_some() {
+                    GenerationParentResolution::UrlOnly
+                } else {
+                    GenerationParentResolution::Unresolved("parent_source_unavailable")
+                }
+            }
+        };
+        captured_runtime_source(graph, digest).map_or(
+            GenerationParentResolution::Unresolved("parent_source_unavailable"),
+            |node| GenerationParentResolution::Captured { node, basis },
+        )
+    }
+}
+
+enum GenerationParentResolution {
+    Captured { node: String, basis: &'static str },
+    UrlOnly,
+    Unresolved(&'static str),
+}
+
 fn add_runtime_generated_code_edges(
     graph: &mut GraphBuilder,
     generated: &Value,
     runtime_node: &str,
+    instances: &RuntimeInstances,
     budget: &work_budget::WorkBudget,
 ) -> Result<()> {
-    for origin in array_field(generated, "origins") {
+    for (ordinal, origin) in array_field(generated, "origins").iter().enumerate() {
+        budget.consume(1)?;
         let chain = array_field(origin, "chain");
-        let Some(parent) = chain.first() else {
+        let Some(frame) = chain.first() else {
             continue;
         };
-        let edge_fields = json!({
-            "cdp_session": nonempty_string_field(origin,"cdp_session").or_else(|| nonempty_string_field(parent,"cdp_session")).unwrap_or("main"),
+        let child_session = nonempty_string_field(origin, "cdp_session").unwrap_or("main");
+        let parent = GenerationParent {
+            frame,
+            session: nonempty_string_field(frame, "cdp_session").unwrap_or(child_session),
+        };
+        let mut fields = json!({
+            "origin_ordinal":ordinal,
+            "cdp_session":child_session,
+            "parent_cdp_session":parent.session,
             "child_script_id":field(origin,"child_script_id"),
-            "parent_script_id":field(parent,"script_id"),
-            "function_name":field(parent,"function_name"),
-            "line_number":field(parent,"line_number"),
-            "column_number":field(parent,"column_number"),
+            "parent_script_id":field(frame,"script_id"),
+            "claimed_parent_sha256":parent.claimed_digest(),
+            "parent_url":field(frame,"url"),
+            "function_name":field(frame,"function_name"),
+            "line_number":field(frame,"line_number"),
+            "column_number":field(frame,"column_number"),
             "generation_depth":chain.len(),
         });
-        if let Some(parent_sha) = nonempty_string_field(parent, "sha256") {
-            graph.add_edge(
-                &runtime_node_id(parent_sha),
-                runtime_node,
-                "runtime_generated_code",
-                edge_fields,
-            )?;
-        } else if let Some(url) = nonempty_string_field(parent, "url") {
-            let candidates = graph.targets_for(url, budget)?;
-            for parent_node in &candidates {
-                let mut fields = edge_fields.clone();
+        match parent.resolve(graph, instances) {
+            GenerationParentResolution::Captured { node, basis } => {
+                fields["identity_basis"] = json!(basis);
+                fields["exact_parent_source_identity"] = json!(true);
+                fields["exact_parent_runtime_instance"] =
+                    json!(basis == "session_script_id_and_captured_digest");
+                graph.add_edge(&node, runtime_node, "runtime_generated_code", fields)?;
+            }
+            GenerationParentResolution::UrlOnly => {
+                let url =
+                    nonempty_string_field(frame, "url").context("URL-only parent requires URL")?;
+                let candidates = graph.targets_for(url, budget)?;
                 fields["identity_basis"] = json!("url_only");
                 fields["candidate_count"] = json!(candidates.len());
+                fields["exact_parent_source_identity"] = json!(false);
+                fields["exact_parent_runtime_instance"] = json!(false);
+                for node in &candidates {
+                    graph.add_edge(
+                        node,
+                        runtime_node,
+                        "runtime_generated_code_candidate",
+                        fields.clone(),
+                    )?;
+                }
+            }
+            GenerationParentResolution::Unresolved(reason) => {
+                let reference = format!("runtime-parent-reference:{runtime_node}:{ordinal}");
+                graph.insert_node(
+                    reference.clone(),
+                    json!({
+                        "type":"runtime_parent_reference",
+                        "captured":false,
+                        "child_runtime_node":runtime_node,
+                        "parent_claim":frame,
+                        "parent_cdp_session":parent.session,
+                        "resolution":reason,
+                    }),
+                )?;
+                fields["identity_basis"] = json!(reason);
+                fields["exact_parent_source_identity"] = json!(false);
+                fields["exact_parent_runtime_instance"] = json!(false);
                 graph.add_edge(
-                    parent_node,
+                    &reference,
                     runtime_node,
-                    "runtime_generated_code_candidate",
+                    "runtime_generated_code_unresolved",
                     fields,
                 )?;
             }
@@ -429,13 +535,6 @@ fn add_runtime_classification_edges(
     Ok(())
 }
 
-/// Identity and source-path indices shared with later observed and derived
-/// graph stages. The source-path index is not evidence of script execution.
-pub(super) struct RuntimeSourceGraphIndex {
-    pub(super) instances: RuntimeInstances,
-    pub(super) general_paths: BTreeMap<String, String>,
-}
-
 /// Register runtime script observations without treating URL/SHA coincidence as execution proof.
 /// Conflicting (CDP session, script ID) assertions cannot identify any runtime source.
 pub(super) fn seed_runtime_script_evidence(
@@ -446,7 +545,7 @@ pub(super) fn seed_runtime_script_evidence(
     resource_nodes_by_sha: &BTreeMap<String, Vec<String>>,
     inline_nodes_by_sha: &BTreeMap<String, Vec<String>>,
     budget: &work_budget::WorkBudget,
-) -> Result<RuntimeSourceGraphIndex> {
+) -> Result<RuntimeInstances> {
     // Debugger-observed runtime scripts are provenance, not independent resources.
     let family_counts = runtime_family_counts(runtime, "alpine_families");
     let gtm_family_counts = runtime_family_counts(runtime, "gtm_families");
@@ -524,13 +623,20 @@ pub(super) fn seed_runtime_script_evidence(
         )?;
 
         instances.register_source(source, digest);
-        add_runtime_generated_code_edges(graph, generated, &runtime_node, budget)?;
+    }
+    // Resolve only against the complete source and instance inventory. A parent
+    // may occur later in artifact order; a late conflict must invalidate proof.
+    for source in array_field(runtime, "sources") {
+        budget.checkpoint()?;
+        let Some(digest) = nonempty_string_field(source, "sha256") else {
+            continue;
+        };
+        let runtime_node = runtime_node_id(digest);
+        let generated = source.get("generated").unwrap_or(&Value::Null);
+        add_runtime_generated_code_edges(graph, generated, &runtime_node, &instances, budget)?;
         add_runtime_classification_edges(graph, source, digest, &runtime_node, &context)?;
     }
-    Ok(RuntimeSourceGraphIndex {
-        instances,
-        general_paths: runtime_general_paths,
-    })
+    Ok(instances)
 }
 
 #[cfg(test)]
@@ -563,6 +669,15 @@ mod tests {
             Some(runtime_node_id(&second))
         );
         assert!(index.observed_node("worker", &Value::Null, None).is_none());
+        for invalid in [
+            json!(""),
+            json!(true),
+            json!({"id":7}),
+            json!(-7),
+            json!(7.5),
+        ] {
+            assert!(script_id_text(&invalid).is_none());
+        }
     }
 
     #[test]
@@ -587,5 +702,72 @@ mod tests {
         assert!(result.err().is_some_and(|error| error
             .to_string()
             .contains("runtime graph node ID collision")));
+    }
+    #[test]
+    fn generation_resolution_uses_complete_runtime_inventory_and_full_digest() -> Result<()> {
+        let parent = format!("{}{}", "a".repeat(20), "b".repeat(44));
+        let absent = format!("{}{}", "a".repeat(20), "c".repeat(44));
+        let child = "d".repeat(64);
+        let other = "e".repeat(64);
+        let origin = |session: &str, script: &str, sha: Value| json!({"cdp_session":session,"child_script_id":"9","chain":[{"cdp_session":session,"script_id":script,"sha256":sha,"url":"https://fixture.test/parent.js"}]});
+        let artifact = json!({"sources":[
+            {"sha256":child,"generated":{"origins":[origin("main","1",json!(parent)),origin("other","1",json!(absent)),origin("main","1",json!(other)),origin("main","2",json!(parent)),origin("main","1",Value::Null),origin("unknown","1",Value::Null),origin("unknown","1",json!(parent))]}},
+            {"sha256":parent,"script_instances":[{"cdp_session":"main","script_id":"1"},{"cdp_session":"main","script_id":"2"}]},
+            {"sha256":other,"script_instances":[{"cdp_session":"main","script_id":"2"}]}
+        ]});
+        let mut graph = GraphBuilder::default();
+        let budget = work_budget::WorkBudget::unlimited("generated-parent-inventory");
+        seed_runtime_script_evidence(
+            &mut graph,
+            &artifact,
+            &json!({}),
+            &json!({}),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &budget,
+        )?;
+        let parent_node = runtime_node_id(&parent);
+        let child_node = runtime_node_id(&child);
+        let edges = graph
+            .edges()
+            .values()
+            .filter(|edge| edge["to"] == child_node)
+            .collect::<Vec<_>>();
+        assert_eq!(edges.len(), 7);
+        let proven = edges
+            .iter()
+            .filter(|edge| edge["kind"] == "runtime_generated_code")
+            .collect::<Vec<_>>();
+        assert_eq!(proven.len(), 3);
+        assert!(proven.iter().all(
+            |edge| edge["from"] == parent_node && edge["exact_parent_source_identity"] == true
+        ));
+        assert_eq!(
+            proven
+                .iter()
+                .filter(|edge| edge["exact_parent_runtime_instance"] == true)
+                .count(),
+            2
+        );
+        for (ordinal, reason) in [
+            (1, "parent_source_unavailable"),
+            (2, "conflicting_parent_digest"),
+            (3, "conflicting_script_instance"),
+        ] {
+            let id = format!("runtime-parent-reference:{child_node}:{ordinal}");
+            assert_eq!(graph.node_value(&id)["resolution"], reason);
+            assert!(edges.iter().any(|edge| edge["from"] == id
+                && edge["kind"] == "runtime_generated_code_unresolved"
+                && edge["exact_parent_source_identity"] == false));
+        }
+        assert!(edges
+            .iter()
+            .any(|edge| edge["kind"] == "runtime_generated_code_candidate"
+                && edge["identity_basis"] == "url_only"));
+        assert!(edges
+            .iter()
+            .all(|edge| edge["from"].as_str().is_some_and(|id| graph.has_node(id))));
+        assert!(captured_runtime_source(&graph, &absent).is_none());
+        Ok(())
     }
 }
