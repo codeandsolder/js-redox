@@ -23,7 +23,7 @@ use crate::{
 use anyhow::{Context, Result};
 use builder::GraphBuilder;
 use capture_evidence::InlineSourceIndex;
-use runtime_evidence::{seed_runtime_script_evidence, RuntimeSourceGraphIndex};
+use runtime_evidence::seed_runtime_script_evidence;
 use serde_json::{json, Map, Value};
 use std::path::Path;
 
@@ -141,7 +141,7 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
         inline_nodes_by_sha,
     } = capture_evidence::seed_capture_evidence(&mut graph, &manifest, &source_index, &budget)?;
 
-    let runtime_index = seed_runtime_script_evidence(
+    let runtime_instances = seed_runtime_script_evidence(
         &mut graph,
         &runtime,
         &source_index,
@@ -153,14 +153,14 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
     trace_evidence::seed_selective_trace_witnesses(
         &mut graph,
         &selective_trace,
-        &runtime_index.instances,
+        &runtime_instances,
         &budget,
     )?;
 
     runtime_wasm_evidence::seed_runtime_wasm_observations(
         &mut graph,
         &wasm_resource_provenance,
-        &runtime_index.instances,
+        &runtime_instances,
         &budget,
     )?;
 
@@ -168,7 +168,6 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
         &mut graph,
         &deobfuscation,
         &inline_nodes,
-        &runtime_index,
         &budget,
     )?;
     static_evidence::seed_browser_api_callsites(
