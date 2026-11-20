@@ -2,9 +2,7 @@
 //! parameter proof and native callable evidence. Separate original body sink
 //! sites from their call-specific specializations. No AST rewriting/evaluation.
 use super::{
-    callables::{
-        apply_array_source, member_parts, DispatchMode, ForwardedValue, PositionalArguments,
-    },
+    callables::{member_parts, DispatchOperands, ForwardedValue, PositionalArguments},
     *,
 };
 use crate::source_tree_callflow::stable_parameter_index;
@@ -522,6 +520,7 @@ fn parameter_is_direct(
     sink: Span,
     semantic: &Semantic<'_>,
     constants: &ProvenConstantEnvironment,
+    spread_safe: bool,
     budget: &WorkBudget,
 ) -> Result<bool> {
     let scoping = semantic.scoping();
@@ -533,13 +532,17 @@ fn parameter_is_direct(
         }
         let mut current = semantic.nodes().get_node(reference.node_id()).span();
         let mut dispatch_member = false;
+        let mut inside_array = false;
         let mut accepted = false;
         for id in semantic.nodes().ancestor_ids(reference.node_id()) {
             budget.consume(1)?;
             let kind = semantic.nodes().kind(id);
             match kind {
                 AstKind::ParenthesizedExpression(_) => {}
-                AstKind::SpreadElement(_) | AstKind::ArrayExpression(_) if !dispatch_member => {}
+                AstKind::ArrayExpression(_) if !dispatch_member => {
+                    inside_array = true;
+                }
+                AstKind::SpreadElement(_) if !dispatch_member && (inside_array || spread_safe) => {}
                 AstKind::StaticMemberExpression(member)
                     if !dispatch_member
                         && !member.optional
@@ -591,77 +594,28 @@ fn forwarded_dispatch<'a>(
 ) -> Result<Option<Callable>> {
     let scoping = collector.scoping;
     let constants = collector.constants;
-    let Some((object, key)) = member_parts(callee, scoping, constants) else {
+    let Some((original_object, key)) = member_parts(callee, scoping, constants) else {
         return Ok(None);
     };
-    let Some(resolved_object) = builder.expression(object)?.expression() else {
+    let Some(object) = builder.expression(original_object)?.expression() else {
         return Ok(None);
     };
-    let Some(head) = collector
+    Ok(collector
         .callables
-        .dispatch_head(resolved_object, &key, scoping, constants)
-    else {
-        return Ok(None);
-    };
-    let mode = head.mode;
-    let (target, captured) = if mode.reflect() {
-        let Some(target) = args.value(0).expression() else {
-            return Ok(None);
-        };
-        let original = original_args.first().and_then(Argument::as_expression);
-        (
-            target,
-            !original.is_some_and(|expr| std::ptr::eq(expr, target)),
-        )
-    } else {
-        (resolved_object, !std::ptr::eq(object, resolved_object))
-    };
-    let Some(mut callable) =
-        collector
-            .callables
-            .resolve(target, collector.source, scoping, constants)
-    else {
-        return Ok(None);
-    };
-    if captured {
-        callable.capture_as_argument();
-    }
-    let offset = mode.receiver_index();
-    let receiver_value = args.value(offset);
-    let receiver = match receiver_value {
-        ForwardedValue::Expression(expr) => Some(expr),
-        ForwardedValue::Missing => None,
-        _ => return Ok(None),
-    };
-    if mode.reflect() && matches!(receiver_value, ForwardedValue::Missing) {
-        return Ok(None);
-    }
-    let Some(mut dispatch) = collector
-        .callables
-        .prepare_dispatch(head, callable, receiver, span, scoping, constants)
-    else {
-        return Ok(None);
-    };
-    if mode == DispatchMode::Call {
-        dispatch.callable.prefix.append_forwarded(
-            args.values.iter().skip(offset + 1).cloned(),
-            args.unknown_tail,
+        .resolve_dispatch_values(
+            DispatchOperands {
+                original_object,
+                object,
+                key: &key,
+                original_args,
+                args,
+                span,
+            },
             collector.source,
             scoping,
             constants,
-        );
-    } else {
-        let Some(array) =
-            apply_array_source(args.value(offset + 1), mode, scoping, constants, span)
-        else {
-            return Ok(None);
-        };
-        dispatch
-            .callable
-            .prefix
-            .append_array_source(array, collector.source, scoping, constants);
-    }
-    Ok(Some(dispatch.callable))
+        )
+        .map(|dispatch| dispatch.callable))
 }
 
 /// Follow a chain with concrete source argument origins. Each step has a
@@ -743,14 +697,30 @@ pub(super) fn specialize<'a>(
             end: sink_span.end,
         });
         sink = sink_span;
-        for symbol in wrapper
+        for (index, symbol) in wrapper
             .params
             .fixed
             .iter()
             .copied()
             .chain(wrapper.params.rest)
+            .enumerate()
         {
-            if parameter_is_direct(symbol, sink, semantic, collector.constants, budget)? {
+            let spread_safe = wrapper.params.rest == Some(symbol)
+                || match args.value(index) {
+                    ForwardedValue::Array { .. } => true,
+                    ForwardedValue::Expression(expr) => {
+                        matches!(unparenthesized(expr), Expression::ArrayExpression(_))
+                    }
+                    _ => false,
+                };
+            if parameter_is_direct(
+                symbol,
+                sink,
+                semantic,
+                collector.constants,
+                spread_safe,
+                budget,
+            )? {
                 wrapper.params.forwardable.insert(symbol);
             } else if wrapper.params.rest == Some(symbol) {
                 return Ok(());

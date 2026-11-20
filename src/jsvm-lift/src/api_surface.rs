@@ -1283,6 +1283,222 @@ xhr.send(payload);
     }
 
     #[test]
+    fn forwarded_native_dispatch_recovers_receivers_and_bound_arguments() -> Result<()> {
+        let source = r#"
+const invoke = (fn, receiver, url, init) => fn.call(receiver, url, init);
+const apply = (fn, receiver, list) => fn.apply(receiver, list);
+const bound = fetch.bind(window, "/bound");
+invoke(fetch, window, "/call", {method: "PATCH"});
+invoke(navigator.sendBeacon, navigator, "/beacon", payload);
+invoke(navigator.sendBeacon, window, "/invalid", payload);
+apply(bound, {}, [{method: "PUT"}]);
+apply(navigator.sendBeacon, navigator, ["/apply", payload]);
+"#;
+        let rows = analyze_api_surface(source)?;
+        assert_eq!(rows.len(), 4, "{rows:#?}");
+        assert!(rows
+            .iter()
+            .all(|row| row.invocation_form == "wrapper" && row.binding_status == "standard"));
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.url.as_deref())
+                .collect::<Vec<_>>(),
+            [
+                Some("/call"),
+                Some("/beacon"),
+                Some("/bound"),
+                Some("/apply")
+            ]
+        );
+        assert_eq!(rows[0].method.as_deref(), Some("PATCH"));
+        assert_eq!(rows[2].method.as_deref(), Some("PUT"));
+        for row in &rows {
+            let [start, end] = row.forwarded_sink_span.context("missing forwarded span")?;
+            let origin = &source[start as usize..end as usize];
+            assert!(origin.starts_with("fn.call(") || origin.starts_with("fn.apply("));
+            assert!(row
+                .binding_witnesses
+                .iter()
+                .any(|w| matches!(w.kind.as_str(), "call" | "apply")));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn forwarded_array_values_survive_multiple_wrapper_frames_and_reflect_namespace_aliases(
+    ) -> Result<()> {
+        let source = r#"
+const dispatch = (R, fn, receiver, list) => R["ap" + "ply"](fn, receiver, list);
+const relay = (init, url, fn) => dispatch(Reflect, fn, window, [url, init]);
+relay({method: "POST"}, "https://example.test/data", fetch);
+const uncertain = (fn, receiver, url, init) => Reflect.apply(fn, receiver, [url, ...unknown, init]);
+uncertain(fetch, window, "/unknown-tail", {method: "DELETE"});
+"#;
+        let rows = analyze_api_surface(source)?;
+        assert_eq!(rows.len(), 2, "{rows:#?}");
+        assert_eq!(rows[0].url.as_deref(), Some("https://example.test/data"));
+        assert_eq!(rows[0].method.as_deref(), Some("POST"));
+        assert_eq!(
+            rows[0]
+                .binding_witnesses
+                .iter()
+                .filter(|w| w.kind == "wrapper_definition")
+                .count(),
+            2
+        );
+        assert!(rows[0]
+            .binding_witnesses
+            .iter()
+            .any(|w| w.kind == "reflect_apply"));
+        assert_eq!(rows[1].url.as_deref(), Some("/unknown-tail"));
+        assert_eq!(rows[1].method_status.as_deref(), Some("unknown"));
+        Ok(())
+    }
+
+    #[test]
+    fn rest_array_indexing_does_not_depend_on_native_array_iteration() -> Result<()> {
+        let source = r#"
+const call = (fn, recv, ...args) => fn.call(recv, ...args);
+const apply = (fn, recv, ...args) => fn.apply(recv, args);
+const reflect = (fn, recv, ...args) => Reflect.apply(fn, recv, args);
+Array.prototype[Symbol.iterator] = replacement;
+call(fetch, window, "/call", {method: "POST"});
+apply(fetch, window, "/apply", {method: "PUT"});
+reflect(fetch, window, "/reflect", {method: "PATCH"});
+"#;
+        let analysis =
+            super::analyze_api_surface(source, &WorkBudget::unlimited("forwarded-rest-dispatch"))?;
+        let rows = &analysis.callsites;
+        assert_eq!(rows.len(), 3, "{rows:#?}");
+        assert_eq!(rows[0].kind, "fetch_candidate");
+        assert_eq!(rows[0].method_status.as_deref(), Some("conditional"));
+        assert_eq!(
+            analysis.mutation_sites[rows[0].mutation_site_ordinals[0]].affected_families,
+            ["rest_iterator"]
+        );
+        assert!(rows[1..]
+            .iter()
+            .all(|row| row.kind == "fetch" && row.mutation_site_ordinals.is_empty()));
+        assert_eq!(rows[1].method.as_deref(), Some("PUT"));
+        assert_eq!(rows[2].method.as_deref(), Some("PATCH"));
+        Ok(())
+    }
+
+    #[test]
+    fn forwarded_dispatch_respects_missing_and_invalid_array_like_inputs() -> Result<()> {
+        let source = r#"
+const bound = fetch.bind(window, "/bound");
+const apply = (fn, args) => fn.apply(null, args);
+const reflect = (fn, r, args) => Reflect.apply(fn, r, args);
+apply(bound, null);
+apply(bound, 12);
+reflect(bound, window, null);
+reflect(fetch, undefined, ["/undefined-receiver"]);
+reflect(fetch, window, unresolvedArray);
+const omitted = (r) => Reflect.apply(fetch, r, ["/omitted-receiver"]);
+omitted();
+const badReceiver = (r, url) => fetch.call(r, url);
+badReceiver({}, "/invalid-receiver");
+"#;
+        let rows = analyze_api_surface(source)?;
+        assert_eq!(rows.len(), 4, "{rows:#?}");
+        assert_eq!(rows[0].url.as_deref(), Some("/bound"));
+        assert_eq!(rows[0].method.as_deref(), Some("GET"));
+        assert_eq!(rows[1].url.as_deref(), Some("/undefined-receiver"));
+        assert!(rows[2].url.is_none());
+        assert_eq!(rows[3].url.as_deref(), Some("/omitted-receiver"));
+        assert!(rows.iter().all(|row| row.invocation_form == "wrapper"));
+        Ok(())
+    }
+
+    #[test]
+    fn forwarded_dispatch_does_not_promote_escaped_objects_or_invalidated_callable_values(
+    ) -> Result<()> {
+        let source = r#"
+const mutate = (fn, r, url, init) => fn.apply(r, [url, (modify(init), init)]);
+mutate(fetch, window, "/unknown-method", {method: "POST"});
+const invalid = (fn, r, url) => fn.call((fn.call = replacement, r), url);
+invalid(fetch, window, "/not-proven");
+const customIterator = (url, init) => fetch(url, init, ...init);
+customIterator("/iterator", {method: "PATCH"});
+"#;
+        let rows = analyze_api_surface(source)?;
+        let wrappers = rows
+            .iter()
+            .filter(|row| row.invocation_form == "wrapper")
+            .collect::<Vec<_>>();
+        assert_eq!(wrappers.len(), 2, "{rows:#?}");
+        assert_eq!(wrappers[0].url.as_deref(), Some("/unknown-method"));
+        assert_eq!(wrappers[0].method_status.as_deref(), Some("unknown"));
+        assert_eq!(wrappers[1].url.as_deref(), Some("/iterator"));
+        assert_eq!(wrappers[1].method_status.as_deref(), Some("unknown"));
+        Ok(())
+    }
+
+    #[test]
+    fn forwarded_dispatch_preserves_operation_specific_mutation_provenance() -> Result<()> {
+        let source = r#"
+const call = (fn, receiver, url) => fn.call(receiver, url);
+const apply = (fn, receiver, args) => fn.apply(receiver, args);
+const reflect = (R, fn, receiver, args) => R.apply(fn, receiver, args);
+const request = fetch;
+request.call = replacement;
+Reflect.apply = replacement;
+call(request, window, "/call");
+apply(request, window, ["/apply"]);
+reflect(Reflect, request, window, ["/reflect"]);
+"#;
+        let analysis = super::analyze_api_surface(
+            source,
+            &WorkBudget::unlimited("forwarded-native-mutations"),
+        )?;
+        let rows = &analysis.callsites;
+        assert_eq!(rows.len(), 3, "{rows:#?}");
+        assert_eq!(
+            rows.iter().map(|row| row.kind.as_str()).collect::<Vec<_>>(),
+            ["fetch_candidate", "fetch", "fetch_candidate"]
+        );
+        for (row, family) in [(&rows[0], "fetch_call"), (&rows[2], "reflect_apply")] {
+            assert_eq!(row.mutation_site_ordinals.len(), 1);
+            assert_eq!(
+                analysis.mutation_sites[row.mutation_site_ordinals[0]].affected_families,
+                [family]
+            );
+        }
+        assert!(rows[1].mutation_site_ordinals.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn nested_bind_objects_with_identical_start_offsets_keep_distinct_identity() -> Result<()> {
+        let source = r#"
+const chain = fetch.bind(window).bind(window, "/chain");
+chain.bind = replacement;
+chain();
+const alias = chain.bind(null);
+alias();
+"#;
+        let analysis =
+            super::analyze_api_surface(source, &WorkBudget::unlimited("nested-bind-identity"))?;
+        assert_eq!(analysis.callsites.len(), 2, "{analysis:#?}");
+        let direct = &analysis.callsites[0];
+        let rebound = &analysis.callsites[1];
+        assert_eq!(direct.kind, "fetch");
+        assert_eq!(direct.url.as_deref(), Some("/chain"));
+        assert!(direct.mutation_site_ordinals.is_empty());
+        assert_eq!(rebound.kind, "fetch_candidate");
+        let site = &analysis.mutation_sites[rebound.mutation_site_ordinals[0]];
+        let [start, end] = site
+            .bound_function_span
+            .context("missing bound object origin")?;
+        assert_eq!(
+            &source[start as usize..end as usize],
+            r#"fetch.bind(window).bind(window, "/chain")"#
+        );
+        Ok(())
+    }
+
+    #[test]
     fn wrapper_chains_specialize_reordered_arguments_without_losing_original_sink() -> Result<()> {
         let source = r#"
 function send(url, init) { return fetch(url, init); }

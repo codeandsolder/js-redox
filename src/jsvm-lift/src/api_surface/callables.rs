@@ -116,7 +116,7 @@ impl<'e, 'a> PositionalArguments<'e, 'a> {
     }
 }
 
-pub(super) enum ArraySource<'e, 'a> {
+enum ArraySource<'e, 'a> {
     Empty,
     Literal(&'e ArrayExpression<'a>),
     Forwarded(Rc<PositionalArguments<'e, 'a>>),
@@ -125,7 +125,7 @@ pub(super) enum ArraySource<'e, 'a> {
 
 /// Classify CreateListFromArrayLike inputs for both ordinary and forwarded
 /// dispatch. Only Function.prototype.apply treats null/undefined as empty.
-pub(super) fn apply_array_source<'e, 'a>(
+fn apply_array_source<'e, 'a>(
     value: ForwardedValue<'e, 'a>,
     mode: DispatchMode,
     scoping: &Scoping,
@@ -258,7 +258,7 @@ impl ApiArguments {
         }));
     }
 
-    pub(super) fn append_array_source(
+    fn append_array_source(
         &mut self,
         array: ArraySource<'_, '_>,
         source: &str,
@@ -557,18 +557,18 @@ enum NamespaceValue {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum DispatchMode {
+enum DispatchMode {
     Call,
     Apply,
     ReflectApply,
 }
 
 impl DispatchMode {
-    pub(super) fn reflect(self) -> bool {
+    fn reflect(self) -> bool {
         self == Self::ReflectApply
     }
 
-    pub(super) fn receiver_index(self) -> usize {
+    fn receiver_index(self) -> usize {
         usize::from(self.reflect())
     }
 
@@ -581,8 +581,17 @@ impl DispatchMode {
     }
 }
 
-pub(super) struct DispatchHead {
-    pub(super) mode: DispatchMode,
+pub(super) struct DispatchOperands<'s, 'e, 'a> {
+    pub(super) original_object: &'e Expression<'a>,
+    pub(super) object: &'e Expression<'a>,
+    pub(super) key: &'s str,
+    pub(super) original_args: &'e [Argument<'a>],
+    pub(super) args: &'s PositionalArguments<'e, 'a>,
+    pub(super) span: Span,
+}
+
+struct DispatchHead {
+    mode: DispatchMode,
     reflective_namespace: Option<Namespace>,
 }
 
@@ -815,7 +824,7 @@ impl CallableIndex {
         }
     }
 
-    pub(super) fn dispatch_head(
+    fn dispatch_head(
         &self,
         object: &Expression<'_>,
         key: &str,
@@ -840,7 +849,7 @@ impl CallableIndex {
         })
     }
 
-    pub(super) fn prepare_dispatch(
+    fn prepare_dispatch(
         &self,
         head: DispatchHead,
         mut callable: Callable,
@@ -880,6 +889,72 @@ impl CallableIndex {
         })
     }
 
+    /// Resolve a native dispatch from positional value origins. Both the
+    /// syntax-only path and wrapper specialization use this exact routing:
+    /// receiver, target (Reflect), bound prefixes and array-like arguments.
+    pub(super) fn resolve_dispatch_values(
+        &self,
+        operands: DispatchOperands<'_, '_, '_>,
+        source: &str,
+        scoping: &Scoping,
+        constants: &ProvenConstantEnvironment,
+    ) -> Option<DispatchInvocation> {
+        let head = self.dispatch_head(operands.object, operands.key, scoping, constants)?;
+        let mode = head.mode;
+        let (target, captured) = if mode.reflect() {
+            let target = operands.args.value(0).expression()?;
+            let original = operands
+                .original_args
+                .first()
+                .and_then(Argument::as_expression);
+            (
+                target,
+                !original.is_some_and(|expr| std::ptr::eq(expr, target)),
+            )
+        } else {
+            (
+                operands.object,
+                !std::ptr::eq(operands.original_object, operands.object),
+            )
+        };
+        let mut callable = self.resolve(target, source, scoping, constants)?;
+        if captured {
+            callable.capture_as_argument();
+        }
+        let offset = mode.receiver_index();
+        let receiver = match operands.args.value(offset) {
+            ForwardedValue::Expression(expr) => Some(expr),
+            ForwardedValue::Missing => None,
+            // A bound function ignores its new receiver altogether.
+            ForwardedValue::Array { .. } | ForwardedValue::Unknown(_) if callable.bound => None,
+            _ => return None,
+        };
+        let mut dispatch =
+            self.prepare_dispatch(head, callable, receiver, operands.span, scoping, constants)?;
+        if mode == DispatchMode::Call {
+            dispatch.callable.prefix.append_forwarded(
+                operands.args.values.iter().skip(offset + 1).cloned(),
+                operands.args.unknown_tail,
+                source,
+                scoping,
+                constants,
+            );
+        } else {
+            let array = apply_array_source(
+                operands.args.value(offset + 1),
+                mode,
+                scoping,
+                constants,
+                operands.span,
+            )?;
+            dispatch
+                .callable
+                .prefix
+                .append_array_source(array, source, scoping, constants);
+        }
+        Some(dispatch)
+    }
+
     pub(super) fn resolve_dispatch(
         &self,
         call: &CallExpression<'_>,
@@ -891,39 +966,30 @@ impl CallableIndex {
             return None;
         }
         let (object, key) = member_parts(&call.callee, scoping, constants)?;
-        let head = self.dispatch_head(object, &key, scoping, constants)?;
-        let mode = head.mode;
-        let target = if mode.reflect() {
-            call.arguments.first()?.as_expression()?
-        } else {
-            object
-        };
-        let callable = self.resolve(target, source, scoping, constants)?;
-        let offset = mode.receiver_index();
-        let receiver = match call.arguments.get(offset) {
-            Some(arg) => Some(arg.as_expression()?),
-            None => None,
-        };
-        let mut dispatch =
-            self.prepare_dispatch(head, callable, receiver, call.span, scoping, constants)?;
-        let args = call.arguments.get(offset + 1..).unwrap_or_default();
-        if mode == DispatchMode::Call {
-            dispatch
-                .callable
-                .prefix
-                .append(args, source, scoping, constants);
-        } else {
-            let array = match args.first() {
-                Some(arg) => ForwardedValue::Expression(arg.as_expression()?),
-                None => ForwardedValue::Missing,
-            };
-            let array = apply_array_source(array, mode, scoping, constants, call.span)?;
-            dispatch
-                .callable
-                .prefix
-                .append_array_source(array, source, scoping, constants);
+        let mut args = PositionalArguments::default();
+        // The Reflect target, receiver and two sink positions are sufficient.
+        // Unknown-length spreads stop the prefix, never becoming fixed slots.
+        for arg in call.arguments.iter().take(4) {
+            if let Some(expr) = arg.as_expression() {
+                args.values.push(ForwardedValue::Expression(expr));
+            } else {
+                args.unknown_tail = Some(arg.span());
+                break;
+            }
         }
-        Some(dispatch)
+        self.resolve_dispatch_values(
+            DispatchOperands {
+                original_object: object,
+                object,
+                key: &key,
+                original_args: &call.arguments,
+                args: &args,
+                span: call.span,
+            },
+            source,
+            scoping,
+            constants,
+        )
     }
 }
 
