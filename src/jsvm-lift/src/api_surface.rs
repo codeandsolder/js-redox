@@ -285,16 +285,6 @@ fn allowed_xhr_path(path: &str) -> bool {
     )
 }
 
-fn allowed_request_init_method_prototype_path(path: &str) -> bool {
-    matches!(
-        path,
-        "Object.prototype.method"
-            | "window.Object.prototype.method"
-            | "globalThis.Object.prototype.method"
-            | "self.Object.prototype.method"
-    )
-}
-
 /// Global aliases refer to the same object for property writes. Retain the
 /// path components so an unknown key cannot masquerade as a known segment.
 fn normalized_mutation_path(path: &[Option<String>]) -> &[Option<String>] {
