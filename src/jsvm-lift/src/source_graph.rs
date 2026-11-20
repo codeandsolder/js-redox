@@ -31,6 +31,7 @@ use std::path::Path;
 pub struct SourceGraphSummary {
     pub nodes: usize,
     pub edges: usize,
+    pub unresolved_edges: usize,
     pub external_urls: usize,
 }
 
@@ -767,6 +768,52 @@ mod tests {
                     && edge["to"] == "resource:42"
                     && edge["kind"] == "redirect"
             })));
+        Ok(())
+    }
+    #[test]
+    fn graph_publication_separates_links_from_incomplete_endpoint_claims() -> Result<()> {
+        let destination = tempfile::tempdir()?;
+        let manifest = seeded_capture_fixture();
+        let mut graph = GraphBuilder::default();
+        let budget = work_budget::WorkBudget::unlimited("graph-endpoint-closure");
+        graph.insert_node("a", json!({"type":"resource"}))?;
+        graph.add_edge("a", "b", "forward", json!({"witness":1}))?;
+        graph.add_edge("a", "missing", "claim", json!({"witness":2}))?;
+        graph.add_edge("other", "b", "claim", json!({"witness":3}))?;
+        graph.add_edge("other", "missing", "claim", json!({"witness":4}))?;
+        graph.add_edge("missing", "missing", "self", json!({"witness":5}))?;
+        graph.insert_node("b", json!({"type":"resource"}))?;
+        let summary = graph.finish(destination.path(), &manifest, &budget)?;
+        assert_eq!(summary.nodes, 2);
+        assert_eq!(summary.edges, 1);
+        assert_eq!(summary.unresolved_edges, 4);
+        let artifact =
+            load_artifact(destination.path(), SOURCE_GRAPH, false)?.context("missing graph")?;
+        assert_eq!(artifact["schema"], "source-graph/v2");
+        assert_eq!(
+            artifact["edges"],
+            json!([{"from":"a","to":"b","kind":"forward","witness":1}])
+        );
+        let claims = artifact["unresolved_edges"]
+            .as_array()
+            .context("missing claims")?;
+        for (witness, missing) in [
+            (2, json!(["to"])),
+            (3, json!(["from"])),
+            (4, json!(["from", "to"])),
+            (5, json!(["from", "to"])),
+        ] {
+            let claim = claims
+                .iter()
+                .find(|claim| claim["edge"]["witness"] == witness)
+                .context("missing original edge claim")?;
+            assert_eq!(claim["missing_endpoints"], missing);
+        }
+        assert_eq!(artifact["summary"]["edge_kinds"], json!({"forward":1}));
+        assert_eq!(
+            artifact["summary"]["unresolved_edge_kinds"],
+            json!({"claim":3,"self":1})
+        );
         Ok(())
     }
 }
