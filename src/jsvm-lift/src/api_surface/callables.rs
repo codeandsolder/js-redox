@@ -6,7 +6,7 @@
 //! argument into a falsely proven position.
 use super::*;
 use oxc_ast::ast::{
-    Argument, ArrayExpressionElement, VariableDeclaration, VariableDeclarationKind,
+    Argument, ArrayExpression, ArrayExpressionElement, VariableDeclaration, VariableDeclarationKind,
 };
 use std::{collections::BTreeMap, rc::Rc};
 
@@ -77,11 +77,88 @@ impl ApiKind {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+/// A captured argument can include a privately constructed array whose
+/// elements originate in different forwarding frames. Preserve that value
+/// rather than substituting source text or evaluating JavaScript.
+#[derive(Clone, Debug)]
 pub(super) enum ForwardedValue<'e, 'a> {
     Expression(&'e Expression<'a>),
+    Array {
+        span: Span,
+        positions: Rc<PositionalArguments<'e, 'a>>,
+    },
     Unknown(Option<Span>),
     Missing,
+}
+
+impl<'e, 'a> ForwardedValue<'e, 'a> {
+    pub(super) fn expression(&self) -> Option<&'e Expression<'a>> {
+        match self {
+            Self::Expression(expression) => Some(expression),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct PositionalArguments<'e, 'a> {
+    pub(super) values: Vec<ForwardedValue<'e, 'a>>,
+    pub(super) unknown_tail: Option<Span>,
+}
+
+impl<'e, 'a> PositionalArguments<'e, 'a> {
+    pub(super) fn value(&self, index: usize) -> ForwardedValue<'e, 'a> {
+        self.values.get(index).cloned().unwrap_or_else(|| {
+            self.unknown_tail.map_or(ForwardedValue::Missing, |span| {
+                ForwardedValue::Unknown(Some(span))
+            })
+        })
+    }
+}
+
+pub(super) enum ArraySource<'e, 'a> {
+    Empty,
+    Literal(&'e ArrayExpression<'a>),
+    Forwarded(Rc<PositionalArguments<'e, 'a>>),
+    Unknown(Span),
+}
+
+/// Classify CreateListFromArrayLike inputs for both ordinary and forwarded
+/// dispatch. Only Function.prototype.apply treats null/undefined as empty.
+pub(super) fn apply_array_source<'e, 'a>(
+    value: ForwardedValue<'e, 'a>,
+    mode: DispatchMode,
+    scoping: &Scoping,
+    constants: &ProvenConstantEnvironment,
+    fallback: Span,
+) -> Option<ArraySource<'e, 'a>> {
+    match value {
+        ForwardedValue::Missing => (!mode.reflect()).then_some(ArraySource::Empty),
+        ForwardedValue::Array { positions, .. } => Some(ArraySource::Forwarded(positions)),
+        ForwardedValue::Unknown(span) => Some(ArraySource::Unknown(span.unwrap_or(fallback))),
+        ForwardedValue::Expression(expr) => {
+            let expr = unparenthesized(expr);
+            if matches!(expr, Expression::NullLiteral(_))
+                || global_path(scoping, constants, expr).as_deref() == Some("undefined")
+            {
+                return (!mode.reflect()).then_some(ArraySource::Empty);
+            }
+            if matches!(
+                expr,
+                Expression::StringLiteral(_)
+                    | Expression::NumericLiteral(_)
+                    | Expression::BooleanLiteral(_)
+                    | Expression::BigIntLiteral(_)
+            ) || static_string(expr, scoping, constants).is_some()
+            {
+                return None;
+            }
+            match expr {
+                Expression::ArrayExpression(array) => Some(ArraySource::Literal(array)),
+                _ => Some(ArraySource::Unknown(expr.span())),
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -141,6 +218,11 @@ impl ApiArguments {
                 ForwardedValue::Expression(expr) => {
                     self.push_expression(expr, source, scoping, constants)
                 }
+                ForwardedValue::Array { span, .. } => self.prefix.push(Rc::new(ArgumentEvidence {
+                    string: None,
+                    expression: Some(source_fragment(source, span)),
+                    init: FetchInitMethod::Unknown,
+                })),
                 ForwardedValue::Unknown(span) => self.prefix.push(Rc::new(ArgumentEvidence {
                     string: None,
                     expression: span.map(|span| source_fragment(source, span)),
@@ -176,57 +258,53 @@ impl ApiArguments {
         }));
     }
 
-    fn append_array(
+    pub(super) fn append_array_source(
         &mut self,
-        arg: Option<&Argument<'_>>,
+        array: ArraySource<'_, '_>,
         source: &str,
         scoping: &Scoping,
         constants: &ProvenConstantEnvironment,
-        reflect: bool,
-    ) -> Option<()> {
-        let Some(arg) = arg else {
-            return (!reflect).then_some(());
-        };
-        let expr = unparenthesized(arg.as_expression()?);
-        if matches!(expr, Expression::NullLiteral(_))
-            || global_path(scoping, constants, expr).as_deref() == Some("undefined")
-        {
-            return (!reflect).then_some(());
-        }
-        if matches!(
-            expr,
-            Expression::StringLiteral(_)
-                | Expression::NumericLiteral(_)
-                | Expression::BooleanLiteral(_)
-                | Expression::BigIntLiteral(_)
-        ) || static_string(expr, scoping, constants).is_some()
-        {
-            return None;
-        }
-        if self.complete() {
-            return Some(());
-        }
-        let Expression::ArrayExpression(array) = expr else {
-            self.unknown_tail = Some(Rc::from(source_fragment(source, expr.span())));
-            return Some(());
-        };
-        for element in &array.elements {
-            if self.complete() {
-                break;
-            }
-            match element {
-                ArrayExpressionElement::Elision(_) => self.prefix.push(Rc::new(ArgumentEvidence {
-                    string: None,
-                    expression: None,
-                    init: FetchInitMethod::Unknown,
-                })),
-                ArrayExpressionElement::SpreadElement(_) => {
-                    self.unknown_tail = Some(Rc::from(source_fragment(source, element.span())));
+    ) {
+        match array {
+            ArraySource::Empty => {}
+            ArraySource::Literal(array) => {
+                for element in &array.elements {
+                    if self.complete() {
+                        break;
+                    }
+                    match element {
+                        ArrayExpressionElement::Elision(_) => {
+                            self.prefix.push(Rc::new(ArgumentEvidence {
+                                string: None,
+                                expression: None,
+                                init: FetchInitMethod::Unknown,
+                            }))
+                        }
+                        ArrayExpressionElement::SpreadElement(_) => {
+                            self.unknown_tail =
+                                Some(Rc::from(source_fragment(source, element.span())));
+                        }
+                        _ => {
+                            if let Some(expr) = element.as_expression() {
+                                self.push_expression(expr, source, scoping, constants);
+                            }
+                        }
+                    }
                 }
-                _ => self.push_expression(element.as_expression()?, source, scoping, constants),
+            }
+            ArraySource::Forwarded(positions) => self.append_forwarded(
+                positions.values.iter().cloned(),
+                positions.unknown_tail,
+                source,
+                scoping,
+                constants,
+            ),
+            ArraySource::Unknown(span) => {
+                if !self.complete() {
+                    self.unknown_tail = Some(Rc::from(source_fragment(source, span)));
+                }
             }
         }
-        Some(())
     }
 
     pub(super) fn exact(&self, index: usize) -> (Option<String>, Option<String>) {
@@ -282,7 +360,7 @@ pub(super) struct Callable {
     detached: bool,
     pub(super) prefix: ApiArguments,
     witness: Option<Rc<WitnessLink>>,
-    bound_object: Option<u32>,
+    bound_object: Option<Span>,
     dispatch: Option<&'static str>,
     pub(super) forwarded_sink_span: Option<[u32; 2]>,
     namespace_dependencies: BTreeSet<&'static str>,
@@ -364,15 +442,15 @@ impl Callable {
     fn dispatch_member_family(&self, operation: &str) -> String {
         self.bound_object.map_or_else(
             || format!("{}_{operation}", self.kind.family()),
-            |start| format!("bound_{operation}:{start}"),
+            |span| format!("bound_{operation}:{}:{}", span.start, span.end),
         )
     }
 
     /// A bound function is a distinct object, not an alias of its target.
     pub(super) fn mutation_object_path(&self) -> MutationPath {
-        if let Some(function_start) = self.bound_object {
+        if let Some(function_span) = self.bound_object {
             return MutationPath::Bound {
-                function_start,
+                function_span,
                 members: Vec::new(),
             };
         }
@@ -478,6 +556,36 @@ enum NamespaceValue {
     Callable(Callable),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum DispatchMode {
+    Call,
+    Apply,
+    ReflectApply,
+}
+
+impl DispatchMode {
+    pub(super) fn reflect(self) -> bool {
+        self == Self::ReflectApply
+    }
+
+    pub(super) fn receiver_index(self) -> usize {
+        usize::from(self.reflect())
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Call => "call",
+            Self::Apply => "apply",
+            Self::ReflectApply => "reflect_apply",
+        }
+    }
+}
+
+pub(super) struct DispatchHead {
+    pub(super) mode: DispatchMode,
+    reflective_namespace: Option<Namespace>,
+}
+
 pub(super) struct DispatchInvocation {
     pub(super) callable: Callable,
     pub(super) receiver_ref: Option<ReferenceId>,
@@ -490,7 +598,7 @@ pub(super) struct CallableIndex {
     xhr: BTreeMap<SymbolId, Available<Callable>>,
 }
 
-fn member_parts<'a, 'e>(
+pub(super) fn member_parts<'a, 'e>(
     expr: &'e Expression<'a>,
     scoping: &Scoping,
     constants: &ProvenConstantEnvironment,
@@ -657,7 +765,7 @@ impl CallableIndex {
         callable.bound = true;
         callable.captured = true;
         callable.detached = false;
-        callable.bound_object = Some(call.span.start);
+        callable.bound_object = Some(call.span);
         Some(callable)
     }
     fn valid_receiver(
@@ -707,6 +815,71 @@ impl CallableIndex {
         }
     }
 
+    pub(super) fn dispatch_head(
+        &self,
+        object: &Expression<'_>,
+        key: &str,
+        scoping: &Scoping,
+        constants: &ProvenConstantEnvironment,
+    ) -> Option<DispatchHead> {
+        let reflective_namespace = self
+            .namespace(object, scoping, constants)
+            .filter(|namespace| key == "apply" && namespace.path == "Reflect");
+        let mode = if reflective_namespace.is_some() {
+            DispatchMode::ReflectApply
+        } else {
+            match key {
+                "call" => DispatchMode::Call,
+                "apply" => DispatchMode::Apply,
+                _ => return None,
+            }
+        };
+        Some(DispatchHead {
+            mode,
+            reflective_namespace,
+        })
+    }
+
+    pub(super) fn prepare_dispatch(
+        &self,
+        head: DispatchHead,
+        mut callable: Callable,
+        receiver: Option<&Expression<'_>>,
+        span: Span,
+        scoping: &Scoping,
+        constants: &ProvenConstantEnvironment,
+    ) -> Option<DispatchInvocation> {
+        if callable.kind.is_constructor()
+            || !self.valid_receiver(&callable, receiver, scoping, constants)
+        {
+            return None;
+        }
+        self.add_receiver_dependencies(&mut callable, receiver, scoping, constants);
+        if let Some(namespace) = head.reflective_namespace {
+            callable
+                .namespace_dependencies
+                .extend(namespace.dependencies);
+        }
+        let receiver_ref = receiver
+            .filter(|expr| {
+                callable.receiver.is_some() && expression_symbol(scoping, expr) == callable.receiver
+            })
+            .and_then(direct_reference_id);
+        let operation = head.mode.name();
+        let dependency = if head.mode.reflect() {
+            operation.to_owned()
+        } else {
+            callable.dispatch_member_family(operation)
+        };
+        callable.detached = false;
+        callable.dispatch = Some(operation);
+        callable.add_witness(operation, span, Some(dependency));
+        Some(DispatchInvocation {
+            callable,
+            receiver_ref,
+        })
+    }
+
     pub(super) fn resolve_dispatch(
         &self,
         call: &CallExpression<'_>,
@@ -718,60 +891,39 @@ impl CallableIndex {
             return None;
         }
         let (object, key) = member_parts(&call.callee, scoping, constants)?;
-        let reflective_namespace = self
-            .namespace(object, scoping, constants)
-            .filter(|namespace| key == "apply" && namespace.path == "Reflect");
-        let reflection = reflective_namespace.is_some();
-        let (mut callable, offset, operation, dependency) = if reflection {
-            let target = call.arguments.first()?.as_expression()?;
-            let callable = self.resolve(target, source, scoping, constants)?;
-            (callable, 1, "reflect_apply", "reflect_apply".to_owned())
+        let head = self.dispatch_head(object, &key, scoping, constants)?;
+        let mode = head.mode;
+        let target = if mode.reflect() {
+            call.arguments.first()?.as_expression()?
         } else {
-            let operation = match key.as_str() {
-                "call" => "call",
-                "apply" => "apply",
-                _ => return None,
-            };
-            let callable = self.resolve(object, source, scoping, constants)?;
-            let dependency = callable.dispatch_member_family(operation);
-            (callable, 0, operation, dependency)
+            object
         };
-        if callable.kind.is_constructor() {
-            return None;
-        }
+        let callable = self.resolve(target, source, scoping, constants)?;
+        let offset = mode.receiver_index();
         let receiver = match call.arguments.get(offset) {
             Some(arg) => Some(arg.as_expression()?),
             None => None,
         };
-        if !self.valid_receiver(&callable, receiver, scoping, constants) {
-            return None;
-        }
-        self.add_receiver_dependencies(&mut callable, receiver, scoping, constants);
-        if let Some(namespace) = reflective_namespace {
-            callable
-                .namespace_dependencies
-                .extend(namespace.dependencies);
-        }
-        let receiver_ref = receiver
-            .filter(|expr| {
-                callable.receiver.is_some() && expression_symbol(scoping, expr) == callable.receiver
-            })
-            .and_then(direct_reference_id);
+        let mut dispatch =
+            self.prepare_dispatch(head, callable, receiver, call.span, scoping, constants)?;
         let args = call.arguments.get(offset + 1..).unwrap_or_default();
-        if operation == "call" {
-            callable.prefix.append(args, source, scoping, constants);
-        } else {
-            callable
+        if mode == DispatchMode::Call {
+            dispatch
+                .callable
                 .prefix
-                .append_array(args.first(), source, scoping, constants, reflection)?;
+                .append(args, source, scoping, constants);
+        } else {
+            let array = match args.first() {
+                Some(arg) => ForwardedValue::Expression(arg.as_expression()?),
+                None => ForwardedValue::Missing,
+            };
+            let array = apply_array_source(array, mode, scoping, constants, call.span)?;
+            dispatch
+                .callable
+                .prefix
+                .append_array_source(array, source, scoping, constants);
         }
-        callable.detached = false;
-        callable.dispatch = Some(operation);
-        callable.add_witness(operation, call.span, Some(dependency));
-        Some(DispatchInvocation {
-            callable,
-            receiver_ref,
-        })
+        Some(dispatch)
     }
 }
 

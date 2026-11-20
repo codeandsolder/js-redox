@@ -75,7 +75,7 @@ pub struct ApiMutationSite {
     pub certainty: String,
     pub target_pattern: Vec<Option<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub bound_function_start: Option<u32>,
+    pub bound_function_span: Option<[u32; 2]>,
     pub affected_families: Vec<String>,
     pub expression: String,
 }
@@ -418,7 +418,7 @@ const DISPATCH_MEMBERS: &[&str] = &["bind", "call", "apply"];
 enum MutationPath {
     Global(Vec<Option<String>>),
     Bound {
-        function_start: u32,
+        function_span: Span,
         members: Vec<Option<String>>,
     },
 }
@@ -434,10 +434,10 @@ impl MutationPath {
         let mut path = match self {
             Self::Global(path) => Self::Global(path.clone()),
             Self::Bound {
-                function_start,
+                function_span,
                 members,
             } => Self::Bound {
-                function_start: *function_start,
+                function_span: *function_span,
                 members: members.clone(),
             },
         };
@@ -472,12 +472,12 @@ impl SinkMutations {
         source: &str,
         lines: &LineIndex,
     ) {
-        let (target_pattern, bound_function_start) = match path {
+        let (target_pattern, bound_function_span) = match path {
             MutationPath::Global(path) => (path, None),
             MutationPath::Bound {
-                function_start,
+                function_span,
                 members,
-            } => (members, Some(*function_start)),
+            } => (members, Some([function_span.start, function_span.end])),
         };
         let mut affected = Vec::new();
         let possible = reflective || target_pattern.iter().any(Option::is_none);
@@ -516,13 +516,16 @@ impl SinkMutations {
                 }
             }
             MutationPath::Bound {
-                function_start,
+                function_span,
                 members,
             } => {
                 if let [key] = members.as_slice() {
                     for &operation in DISPATCH_MEMBERS {
                         if key.as_deref().is_none_or(|key| key == operation) {
-                            affected.push(format!("bound_{operation}:{function_start}"));
+                            affected.push(format!(
+                                "bound_{operation}:{}:{}",
+                                function_span.start, function_span.end
+                            ));
                         }
                     }
                 }
@@ -545,7 +548,7 @@ impl SinkMutations {
             operation: operation.to_owned(),
             certainty: if possible { "possible" } else { "definite" }.to_owned(),
             target_pattern: target_pattern.clone(),
-            bound_function_start,
+            bound_function_span,
             affected_families: affected,
             expression: source_fragment(source, span),
         });
@@ -1683,7 +1686,7 @@ a("/direct");
         assert_eq!(result.callsites[1].kind, "fetch");
         assert_eq!(result.callsites[2].kind, "fetch");
         let site = &result.mutation_sites[0];
-        assert!(site.bound_function_start.is_some());
+        assert!(site.bound_function_span.is_some());
         assert_eq!(site.target_pattern, [Some("call".into())]);
         Ok(())
     }

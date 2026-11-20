@@ -1,113 +1,192 @@
 //! Specialize single-expression local forwarding chains using existing lexical
 //! parameter proof and native callable evidence. Separate original body sink
 //! sites from their call-specific specializations. No AST rewriting/evaluation.
-use super::{callables::ForwardedValue, *};
+use super::{
+    callables::{
+        apply_array_source, member_parts, DispatchMode, ForwardedValue, PositionalArguments,
+    },
+    *,
+};
 use crate::source_tree_callflow::stable_parameter_index;
 use oxc_ast::{
-    ast::{Argument, FormalParameters, Function, FunctionBody, Statement},
+    ast::{
+        Argument, ArrayExpression, ArrayExpressionElement, FormalParameters, Function,
+        FunctionBody, Statement,
+    },
     AstKind,
 };
 use oxc_semantic::Semantic;
 use oxc_syntax::scope::ScopeId;
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, rc::Rc};
 
-#[derive(Clone, Debug, Default)]
-struct ArgumentList<'a> {
-    values: Vec<ForwardedValue<'a, 'a>>,
-    unknown_tail: Option<Span>,
+type ArgumentList<'a> = PositionalArguments<'a, 'a>;
+
+/// Carry value origins rather than copying syntax into a different scope.
+/// Materialized arrays share their positional contents; spreading a known
+/// array or rest value consumes those positions, while apply uses indexed
+/// contents without depending on Array.prototype[Symbol.iterator].
+struct ValueBuilder<'s, 'a> {
+    parameters: Option<(&'s Parameters, &'s ArgumentList<'a>)>,
+    scoping: &'s Scoping,
+    limit: usize,
+    budget: &'s WorkBudget,
+    used_iterator: bool,
 }
 
-impl<'a> ArgumentList<'a> {
-    fn value(&self, index: usize) -> ForwardedValue<'a, 'a> {
-        self.values.get(index).copied().unwrap_or_else(|| {
-            self.unknown_tail.map_or(ForwardedValue::Missing, |span| {
-                ForwardedValue::Unknown(Some(span))
-            })
-        })
+impl<'s, 'a> ValueBuilder<'s, 'a> {
+    fn new(
+        parameters: Option<(&'s Parameters, &'s ArgumentList<'a>)>,
+        scoping: &'s Scoping,
+        limit: usize,
+        budget: &'s WorkBudget,
+    ) -> Self {
+        Self {
+            parameters,
+            scoping,
+            limit,
+            budget,
+            used_iterator: false,
+        }
     }
 
-    fn extend_rest(
-        &mut self,
-        origin: &Self,
+    fn expression(&mut self, expr: &'a Expression<'a>) -> Result<ForwardedValue<'a, 'a>> {
+        self.budget.consume(1)?;
+        if let Some((params, origin)) = self.parameters {
+            if let Some(symbol) = expression_symbol(self.scoping, expr) {
+                if params.forwardable.contains(&symbol) {
+                    if params.rest == Some(symbol) {
+                        let mut positions = ArgumentList::default();
+                        self.extend(&mut positions, origin, params.fixed.len(), expr.span())?;
+                        return Ok(ForwardedValue::Array {
+                            span: expr.span(),
+                            positions: Rc::new(positions),
+                        });
+                    }
+                    if let Some(index) = stable_parameter_index(
+                        self.scoping,
+                        symbol,
+                        params.fixed.iter().copied().map(Some),
+                    ) {
+                        return Ok(origin.value(index));
+                    }
+                }
+            }
+            if let Expression::ArrayExpression(array) = unparenthesized(expr) {
+                let positions = self.array(array)?;
+                return Ok(ForwardedValue::Array {
+                    span: expr.span(),
+                    positions: Rc::new(positions),
+                });
+            }
+        }
+        Ok(ForwardedValue::Expression(expr))
+    }
+
+    fn extend(
+        &self,
+        result: &mut ArgumentList<'a>,
+        origin: &ArgumentList<'a>,
         start: usize,
-        limit: usize,
-        spread: Span,
-        budget: &WorkBudget,
+        span: Span,
     ) -> Result<()> {
-        let remaining = limit.saturating_sub(self.values.len());
         let available = origin.values.len().saturating_sub(start);
-        let count = remaining.min(available);
-        budget.consume(count as u64)?;
-        self.values
-            .extend(origin.values.iter().skip(start).take(count).copied());
-        self.unknown_tail = if count < available {
-            Some(spread)
+        let count = self
+            .limit
+            .saturating_sub(result.values.len())
+            .min(available);
+        self.budget.consume(count as u64)?;
+        result
+            .values
+            .extend(origin.values.iter().skip(start).take(count).cloned());
+        result.unknown_tail = if count < available {
+            Some(span)
         } else {
             origin.unknown_tail
         };
         Ok(())
     }
 
-    fn from_call(
-        args: &'a [Argument<'a>],
-        parameters: Option<(&Parameters, &Self)>,
-        scoping: &Scoping,
-        limit: usize,
-        budget: &WorkBudget,
-    ) -> Result<Self> {
-        let mut result = Self::default();
-        budget.consume(args.len() as u64)?;
+    fn spread(
+        &mut self,
+        result: &mut ArgumentList<'a>,
+        expression: &'a Expression<'a>,
+        span: Span,
+    ) -> Result<()> {
+        let value = self.expression(expression)?;
+        match value {
+            ForwardedValue::Array { positions, .. } => {
+                self.used_iterator = true;
+                self.extend(result, &positions, 0, span)?;
+            }
+            ForwardedValue::Expression(expr) => {
+                if let Expression::ArrayExpression(array) = unparenthesized(expr) {
+                    // An expression captured in a preceding caller is not
+                    // evaluated in the current wrapper's lexical frame.
+                    let mut captured = Self::new(None, self.scoping, self.limit, self.budget);
+                    let positions = captured.array(array)?;
+                    self.used_iterator = true;
+                    self.extend(result, &positions, 0, span)?;
+                } else {
+                    result.unknown_tail = Some(span);
+                }
+            }
+            _ => result.unknown_tail = Some(span),
+        }
+        Ok(())
+    }
+
+    fn full(&self, result: &mut ArgumentList<'a>, span: Span) -> bool {
+        if result.values.len() >= self.limit {
+            result.unknown_tail = Some(span);
+        }
+        result.unknown_tail.is_some()
+    }
+
+    fn call(&mut self, args: &'a [Argument<'a>]) -> Result<ArgumentList<'a>> {
+        let mut result = ArgumentList::default();
+        self.budget.consume(args.len() as u64)?;
         for arg in args {
-            if result.values.len() >= limit {
-                result.unknown_tail = Some(arg.span());
+            if self.full(&mut result, arg.span()) {
                 break;
             }
             if let Argument::SpreadElement(spread) = arg {
-                if let Some((params, origin)) = parameters {
-                    if let Some(symbol) = expression_symbol(scoping, &spread.argument) {
-                        if params.rest == Some(symbol) {
-                            result.extend_rest(
-                                origin,
-                                params.fixed.len(),
-                                limit,
-                                arg.span(),
-                                budget,
-                            )?;
-                            if result.unknown_tail.is_some() {
-                                break;
-                            }
-                            continue;
-                        }
-                    }
-                }
-                result.unknown_tail = Some(arg.span());
-                break;
+                self.spread(&mut result, &spread.argument, arg.span())?;
+            } else if let Some(expr) = arg.as_expression() {
+                result.values.push(self.expression(expr)?);
             }
-            if let Some(expr) = arg.as_expression() {
-                result.values.push(substitute(expr, parameters, scoping));
+            if result.unknown_tail.is_some() {
+                break;
             }
         }
         Ok(result)
     }
-}
 
-fn substitute<'a>(
-    expr: &'a Expression<'a>,
-    parameters: Option<(&Parameters, &ArgumentList<'a>)>,
-    scoping: &Scoping,
-) -> ForwardedValue<'a, 'a> {
-    if let Some((params, origin)) = parameters {
-        if let Some(symbol) = expression_symbol(scoping, expr) {
-            if params.forwardable.contains(&symbol) {
-                if let Some(index) =
-                    stable_parameter_index(scoping, symbol, params.fixed.iter().copied().map(Some))
-                {
-                    return origin.value(index);
+    fn array(&mut self, array: &'a ArrayExpression<'a>) -> Result<ArgumentList<'a>> {
+        let mut result = ArgumentList::default();
+        self.budget.consume(array.elements.len() as u64)?;
+        for element in &array.elements {
+            if self.full(&mut result, element.span()) {
+                break;
+            }
+            match element {
+                ArrayExpressionElement::Elision(_) => {
+                    result.values.push(ForwardedValue::Unknown(None))
+                }
+                ArrayExpressionElement::SpreadElement(spread) => {
+                    self.spread(&mut result, &spread.argument, spread.span)?;
+                }
+                _ => {
+                    if let Some(expr) = element.as_expression() {
+                        result.values.push(self.expression(expr)?);
+                    }
                 }
             }
+            if result.unknown_tail.is_some() {
+                break;
+            }
         }
+        Ok(result)
     }
-    ForwardedValue::Expression(expr)
 }
 
 struct Parameters {
@@ -258,10 +337,10 @@ impl<'a> WrapperIndex<'a> {
         let mut script_root_functions = BTreeMap::new();
         let mut eval_scopes = BTreeSet::new();
         // An acyclic wrapper chain can consume at most the sum of all
-        // fixed formal counts before its final two API positions. Keep a
+        // fixed formal counts before its final two API positions plus dispatch receiver and target. Keep a
         // bounded prefix large enough for every such chain; any truncation
         // carries an unknown-tail witness rather than inventing missing args.
-        let mut positional_limit = 2usize;
+        let mut positional_limit = 4usize;
         for node in semantic.nodes().iter() {
             budget.consume(1)?;
             let params = match node.kind() {
@@ -440,36 +519,149 @@ impl<'a> WrapperIndex<'a> {
 /// one forwarding invocation are accepted, including parenthesized references.
 fn parameter_is_direct(
     symbol: SymbolId,
-    rest: bool,
     sink: Span,
     semantic: &Semantic<'_>,
+    constants: &ProvenConstantEnvironment,
     budget: &WorkBudget,
 ) -> Result<bool> {
     let scoping = semantic.scoping();
     for reference_id in scoping.get_resolved_reference_ids(symbol) {
         budget.consume(1)?;
         let reference = scoping.get_reference(*reference_id);
-        if reference.is_write() {
+        if reference.is_write() || reference.flags().is_member_write_target() {
             return Ok(false);
         }
-        let mut parents = semantic
-            .nodes()
-            .ancestor_ids(reference.node_id())
-            .map(|id| semantic.nodes().kind(id))
-            .filter(|kind| !matches!(kind, AstKind::ParenthesizedExpression(_)));
-        if rest && !matches!(parents.next(), Some(AstKind::SpreadElement(_))) {
-            return Ok(false);
+        let mut current = semantic.nodes().get_node(reference.node_id()).span();
+        let mut dispatch_member = false;
+        let mut accepted = false;
+        for id in semantic.nodes().ancestor_ids(reference.node_id()) {
+            budget.consume(1)?;
+            let kind = semantic.nodes().kind(id);
+            match kind {
+                AstKind::ParenthesizedExpression(_) => {}
+                AstKind::SpreadElement(_) | AstKind::ArrayExpression(_) if !dispatch_member => {}
+                AstKind::StaticMemberExpression(member)
+                    if !dispatch_member
+                        && !member.optional
+                        && member.object.span() == current
+                        && matches!(member.property.name.as_str(), "call" | "apply") =>
+                {
+                    dispatch_member = true;
+                }
+                AstKind::ComputedMemberExpression(member)
+                    if !dispatch_member
+                        && !member.optional
+                        && member.object.span() == current
+                        && static_string(&member.expression, scoping, constants)
+                            .as_deref()
+                            .is_some_and(|name| matches!(name, "call" | "apply")) =>
+                {
+                    dispatch_member = true;
+                }
+                AstKind::CallExpression(call) => {
+                    accepted =
+                        call.span == sink && (!dispatch_member || call.callee.span() == current);
+                    break;
+                }
+                AstKind::NewExpression(new) => {
+                    accepted = !dispatch_member && new.span == sink;
+                    break;
+                }
+                _ => break,
+            }
+            current = kind.span();
         }
-        let direct = match parents.next() {
-            Some(AstKind::CallExpression(call)) => call.span == sink,
-            Some(AstKind::NewExpression(new)) => new.span == sink,
-            _ => false,
-        };
-        if !direct {
+        if !accepted {
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+/// Resolve the same native dispatch head used by direct calls, but from the
+/// argument values in the specializing caller frame. A captured function
+/// value does not inherit its former member receiver.
+fn forwarded_dispatch<'a>(
+    callee: &'a Expression<'a>,
+    original_args: &'a [Argument<'a>],
+    args: &ArgumentList<'a>,
+    span: Span,
+    builder: &mut ValueBuilder<'_, 'a>,
+    collector: &Collector<'_, '_>,
+) -> Result<Option<Callable>> {
+    let scoping = collector.scoping;
+    let constants = collector.constants;
+    let Some((object, key)) = member_parts(callee, scoping, constants) else {
+        return Ok(None);
+    };
+    let Some(resolved_object) = builder.expression(object)?.expression() else {
+        return Ok(None);
+    };
+    let Some(head) = collector
+        .callables
+        .dispatch_head(resolved_object, &key, scoping, constants)
+    else {
+        return Ok(None);
+    };
+    let mode = head.mode;
+    let (target, captured) = if mode.reflect() {
+        let Some(target) = args.value(0).expression() else {
+            return Ok(None);
+        };
+        let original = original_args.first().and_then(Argument::as_expression);
+        (
+            target,
+            !original.is_some_and(|expr| std::ptr::eq(expr, target)),
+        )
+    } else {
+        (resolved_object, !std::ptr::eq(object, resolved_object))
+    };
+    let Some(mut callable) =
+        collector
+            .callables
+            .resolve(target, collector.source, scoping, constants)
+    else {
+        return Ok(None);
+    };
+    if captured {
+        callable.capture_as_argument();
+    }
+    let offset = mode.receiver_index();
+    let receiver_value = args.value(offset);
+    let receiver = match receiver_value {
+        ForwardedValue::Expression(expr) => Some(expr),
+        ForwardedValue::Missing => None,
+        _ => return Ok(None),
+    };
+    if mode.reflect() && matches!(receiver_value, ForwardedValue::Missing) {
+        return Ok(None);
+    }
+    let Some(mut dispatch) = collector
+        .callables
+        .prepare_dispatch(head, callable, receiver, span, scoping, constants)
+    else {
+        return Ok(None);
+    };
+    if mode == DispatchMode::Call {
+        dispatch.callable.prefix.append_forwarded(
+            args.values.iter().skip(offset + 1).cloned(),
+            args.unknown_tail,
+            collector.source,
+            scoping,
+            constants,
+        );
+    } else {
+        let Some(array) =
+            apply_array_source(args.value(offset + 1), mode, scoping, constants, span)
+        else {
+            return Ok(None);
+        };
+        dispatch
+            .callable
+            .prefix
+            .append_array_source(array, collector.source, scoping, constants);
+    }
+    Ok(Some(dispatch.callable))
 }
 
 /// Follow a chain with concrete source argument origins. Each step has a
@@ -487,15 +679,13 @@ pub(super) fn specialize<'a>(
         return Ok(());
     }
     let mut callee = &call.callee;
-    let mut args = ArgumentList::from_call(
-        &call.arguments,
-        None,
-        scoping,
-        wrappers.positional_limit,
-        budget,
-    )?;
+    let mut builder = ValueBuilder::new(None, scoping, wrappers.positional_limit, budget);
+    let mut args = builder.call(&call.arguments)?;
     let mut witnesses = Vec::new();
     let mut dependencies = BTreeSet::new();
+    if builder.used_iterator {
+        dependencies.insert("rest_iterator".into());
+    }
     let mut visited = BTreeSet::new();
     let mut constructor = false;
     let mut captured_target = false;
@@ -553,31 +743,41 @@ pub(super) fn specialize<'a>(
             end: sink_span.end,
         });
         sink = sink_span;
-        for symbol in wrapper.params.fixed.iter().copied() {
-            if parameter_is_direct(symbol, false, sink, semantic, budget)? {
+        for symbol in wrapper
+            .params
+            .fixed
+            .iter()
+            .copied()
+            .chain(wrapper.params.rest)
+        {
+            if parameter_is_direct(symbol, sink, semantic, collector.constants, budget)? {
                 wrapper.params.forwardable.insert(symbol);
-            }
-        }
-        if let Some(rest) = wrapper.params.rest {
-            if !parameter_is_direct(rest, true, sink, semantic, budget)? {
+            } else if wrapper.params.rest == Some(symbol) {
                 return Ok(());
             }
         }
         let environment = Some((&wrapper.params, &args));
-        let value = substitute(target, environment, scoping);
-        let ForwardedValue::Expression(target_expr) = value else {
+        let mut builder =
+            ValueBuilder::new(environment, scoping, wrappers.positional_limit, budget);
+        let next_args = builder.call(forwarded)?;
+        if !is_new {
+            if let Some(mut callable) =
+                forwarded_dispatch(target, forwarded, &next_args, sink, &mut builder, collector)?
+            {
+                if builder.used_iterator {
+                    dependencies.insert("rest_iterator".into());
+                }
+                callable.mark_forwarding(&witnesses, sink);
+                collector.emit_forwarded(&call.callee, callable, call.span, &dependencies);
+                return Ok(());
+            }
+        }
+        let Some(target_expr) = builder.expression(target)?.expression() else {
             return Ok(());
         };
-        if wrapper.params.rest.is_some() {
+        if builder.used_iterator {
             dependencies.insert("rest_iterator".into());
         }
-        let next_args = ArgumentList::from_call(
-            forwarded,
-            environment,
-            scoping,
-            wrappers.positional_limit,
-            budget,
-        )?;
         captured_target = !std::ptr::eq(target, target_expr);
         args = next_args;
         callee = target_expr;
