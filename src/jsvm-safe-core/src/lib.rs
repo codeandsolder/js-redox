@@ -205,7 +205,12 @@ fn eval_with_constants(
     scoping: &Scoping,
     constants: &HashMap<SymbolId, ConstBinding>,
 ) -> Option<Value> {
-    eval_with_resolver(expr, &|id| resolved_const_value(id, scoping, constants))
+    eval_with_resolver(expr, &|reference| {
+        let Expression::Identifier(id) = reference else {
+            return None;
+        };
+        resolved_const_value(id, scoping, constants)
+    })
 }
 
 struct ConstValueCollector<'s, 'c> {
@@ -660,6 +665,7 @@ struct FunctionContext {
 
 struct Collector<'s, 'c> {
     source: &'s str,
+    budget: &'c WorkBudget,
     completion: &'c completion::CompletionLiveness,
     initialized_bindings: &'c binding_initialization::BindingInitialization,
     scoping: &'c Scoping,
@@ -1548,9 +1554,11 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
                 return;
             }
         }
-        if let Some((span, text)) = self.structure_dispatch_switch(&it.body, it.span) {
-            self.push(span, text, "dispatch_switch_structured");
-            return;
+        if self.allow_effect_statements {
+            if let Some((span, text)) = self.structure_dispatch_switch(&it.body, it.span) {
+                self.push(span, text, "dispatch_switch_structured");
+                return;
+            }
         }
         walk::walk_for_statement(self, it);
     }
@@ -1568,9 +1576,11 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
             self.push(it.span, text, "single_iteration_while");
             return;
         }
-        if let Some((span, text)) = self.structure_dispatch_switch(&it.body, it.span) {
-            self.push(span, text, "dispatch_switch_structured");
-            return;
+        if self.allow_effect_statements {
+            if let Some((span, text)) = self.structure_dispatch_switch(&it.body, it.span) {
+                self.push(span, text, "dispatch_switch_structured");
+                return;
+            }
         }
         walk::walk_while_statement(self, it);
     }
@@ -1585,9 +1595,11 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
             self.push(it.span, text, "single_iteration_do_while");
             return;
         }
-        if let Some((span, text)) = self.structure_dispatch_switch(&it.body, it.span) {
-            self.push(span, text, "dispatch_switch_structured");
-            return;
+        if self.allow_effect_statements {
+            if let Some((span, text)) = self.structure_dispatch_switch(&it.body, it.span) {
+                self.push(span, text, "dispatch_switch_structured");
+                return;
+            }
         }
         walk::walk_do_while_statement(self, it);
     }
@@ -2072,6 +2084,7 @@ fn transform_once(
     let initialized_bindings = binding_initialization::BindingInitialization::analyze(&program);
     let mut collector = Collector {
         source,
+        budget,
         completion: &completion,
         initialized_bindings: &initialized_bindings,
         scoping,

@@ -3,11 +3,16 @@
 //! all selector/case evaluations and the enclosing iteration. The finite path
 //! requires a fresh, private dense array and a proved exit before exhaustion.
 use crate::{
-    array_element, completion, fragment,
+    completion, fragment,
+    numeric::exact_usize,
+    reference_is_statically_resolved_read,
     statement_hazards::DeclarationHazard,
     statically_resolved_symbol,
     trivial_loops::LoopBodyControl,
-    value_eval::{eval, known_bool, Value},
+    value_eval::{
+        canonical_array_index, eval, eval_with_resolver, inert_literal_value,
+        known_bool_with_resolver, same_value, Value,
+    },
     Collector,
 };
 use oxc_ast::ast::{
@@ -15,7 +20,9 @@ use oxc_ast::ast::{
     VariableDeclarationKind,
 };
 use oxc_ast_visit::Visit;
+use oxc_semantic::{ReferenceId, Scoping};
 use oxc_span::{GetSpan, Span};
+use oxc_syntax::symbol::SymbolId;
 use std::{
     collections::{HashMap, HashSet},
     fmt::Write as _,
@@ -66,7 +73,7 @@ fn dispatch_switch<'a>(
         return None;
     };
     if tail.label.is_some()
-        || switch.cases.len() < 2
+        || switch.cases.is_empty()
         || !collector
             .scoping
             .get_bindings(switch.scope_id.get()?)
@@ -140,6 +147,70 @@ impl<'a> StrictKey<'a> {
     }
 }
 
+/// Exact primitive facts for a single private dispatch loop activation.
+/// A dense literal has own data properties for its indices and length; no
+/// other member read is justified, even when standard prototypes seem likely.
+struct PrivateDispatchEnvironment<'a> {
+    scoping: &'a Scoping,
+    order: SymbolId,
+    counter: SymbolId,
+    values: &'a [Value],
+    index: f64,
+}
+
+impl PrivateDispatchEnvironment<'_> {
+    fn read_symbol(&self, expr: &Expression<'_>) -> Option<SymbolId> {
+        let Expression::Identifier(id) = expr else {
+            return None;
+        };
+        let reference = id.reference_id.get()?;
+        let symbol = statically_resolved_symbol(self.scoping, reference)?;
+        reference_is_statically_resolved_read(self.scoping, reference, symbol).then_some(symbol)
+    }
+
+    fn length(&self) -> Option<Value> {
+        Some(Value::Number(f64::from(
+            u32::try_from(self.values.len()).ok()?,
+        )))
+    }
+
+    fn resolve(&self, expr: &Expression<'_>) -> Option<Value> {
+        match expr {
+            Expression::Identifier(_) if self.read_symbol(expr) == Some(self.counter) => {
+                Some(Value::Number(self.index))
+            }
+            Expression::StaticMemberExpression(member)
+                if !member.optional
+                    && self.read_symbol(&member.object) == Some(self.order)
+                    && member.property.name == "length" =>
+            {
+                self.length()
+            }
+            Expression::ComputedMemberExpression(member)
+                if !member.optional && self.read_symbol(&member.object) == Some(self.order) =>
+            {
+                let key = self.value(&member.expression)?;
+                if matches!(&key, Value::String(text) if text == "length") {
+                    self.length()
+                } else {
+                    self.values
+                        .get(usize::try_from(canonical_array_index(&key)?).ok()?)
+                        .cloned()
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn value(&self, expr: &Expression<'_>) -> Option<Value> {
+        eval_with_resolver(expr, &|expr| self.resolve(expr))
+    }
+
+    fn test(&self, expr: &Expression<'_>) -> Option<bool> {
+        known_bool_with_resolver(expr, &|expr| self.resolve(expr))
+    }
+}
+
 impl Collector<'_, '_> {
     /// Structure independent switch arms while keeping the original loop,
     /// initializer, case-label evaluations, property lookup, and updates.
@@ -151,6 +222,17 @@ impl Collector<'_, '_> {
         loop_span: Span,
     ) -> Option<(Span, String)> {
         let switch = dispatch_switch(body, self, loop_span)?;
+        if let [case] = switch.cases.as_slice() {
+            if case.test.is_none() {
+                let selector = fragment(self.source, switch.discriminant.span());
+                let arm = statement_text(self.source, &case.consequent)?;
+                return Some((
+                    switch.span,
+                    format!("{{\nvoid ({selector}\n);\n{{\n{arm}\n}}\n}}"),
+                ));
+            }
+        }
+
         let mut serial = 0;
         let name = loop {
             let candidate = format!("__jsvm_selector_{}_{}", switch.span.start, serial);
@@ -204,23 +286,35 @@ impl Collector<'_, '_> {
         Some((switch.span, text))
     }
 
+    fn dispatch_references_are_private(
+        &self,
+        symbol: SymbolId,
+        selector: ReferenceId,
+        regions: &[Span],
+    ) -> bool {
+        self.scoping
+            .get_resolved_reference_ids(symbol)
+            .iter()
+            .all(|reference| {
+                *reference == selector
+                    || (reference_is_statically_resolved_read(self.scoping, *reference, symbol)
+                        && self.reference_spans.get(reference).is_some_and(|span| {
+                            regions
+                                .iter()
+                                .any(|region| region.start <= span.start && span.end <= region.end)
+                        }))
+            })
+    }
+
     /// Full straight-line recovery for a lexical loop-local dense literal
     /// table, when its own entries guarantee an exit. Out-of-bounds reads
     /// are deliberately not considered undefined: prototypes may supply one.
     pub(super) fn bounded_dispatch_replacement(&self, it: &ForStatement<'_>) -> Option<String> {
-        if it.update.is_some()
-            || it
-                .test
-                .as_ref()
-                .is_some_and(|test| known_bool(test) != Some(true))
-        {
-            return None;
-        }
         let switch = dispatch_switch(&it.body, self, it.span)?;
         let Some(ForStatementInit::VariableDeclaration(init)) = &it.init else {
             return None;
         };
-        if init.kind != VariableDeclarationKind::Let || init.declarations.len() != 2 {
+        if init.kind != VariableDeclarationKind::Let {
             return None;
         }
         let Expression::ComputedMemberExpression(selector) = &switch.discriminant else {
@@ -247,103 +341,175 @@ impl Collector<'_, '_> {
         let counter_ref = counter.reference_id.get()?;
         let order = statically_resolved_symbol(self.scoping, order_ref)?;
         let counter = statically_resolved_symbol(self.scoping, counter_ref)?;
+        let analyzed_regions = it
+            .test
+            .iter()
+            .map(GetSpan::span)
+            .chain(it.update.iter().map(GetSpan::span))
+            .chain(
+                switch
+                    .cases
+                    .iter()
+                    .filter_map(|case| case.test.as_ref().map(GetSpan::span)),
+            )
+            .collect::<Vec<_>>();
         if order == counter
-            || self.scoping.get_resolved_reference_ids(order) != [order_ref]
-            || self.scoping.get_resolved_reference_ids(counter) != [counter_ref]
+            || !self.dispatch_references_are_private(order, order_ref, &analyzed_regions)
+            || !self.dispatch_references_are_private(counter, counter_ref, &analyzed_regions)
         {
             return None;
         }
         let mut values = None;
-        let mut zero = false;
+        let mut initial = None;
         for decl in &init.declarations {
             let BindingPattern::BindingIdentifier(id) = &decl.id else {
                 return None;
             };
             let symbol = id.symbol_id.get()?;
-            let expr = decl.init.as_ref()?;
             if symbol == order {
-                let Expression::ArrayExpression(array) = expr else {
+                let Expression::ArrayExpression(array) = decl.init.as_ref()? else {
                     return None;
                 };
                 values = Some(
                     array
                         .elements
                         .iter()
-                        .map(array_element)
+                        .map(|element| eval(element.as_expression()?))
                         .collect::<Option<Vec<_>>>()?,
                 );
             } else if symbol == counter {
-                zero = matches!(eval(expr), Some(Value::Number(n)) if n == 0.0);
-            } else {
+                let Value::Number(value) = eval(decl.init.as_ref()?)? else {
+                    return None;
+                };
+                initial = Some(value);
+            } else if !self.scoping.get_resolved_reference_ids(symbol).is_empty()
+                || decl
+                    .init
+                    .as_ref()
+                    .is_some_and(|expr| !inert_literal_value(expr) && eval(expr).is_none())
+            {
+                // An unused, pure additional declarator has no observable
+                // initializer or per-iteration binding identity.
                 return None;
             }
         }
-        if !zero {
-            return None;
-        }
         let values = values?;
-        let mut labels = Vec::with_capacity(switch.cases.len());
-        for case in &switch.cases {
-            labels.push(match &case.test {
-                Some(test) => Some(eval(test)?),
-                None => None,
-            });
-        }
-        let default = labels.iter().position(Option::is_none);
-        let mut cases = HashMap::with_capacity(labels.len());
-        for (index, value) in labels.iter().enumerate() {
-            if let Some(key) = value.as_ref().and_then(StrictKey::from_value) {
-                cases.entry(key).or_insert(index);
+        let mut environment = PrivateDispatchEnvironment {
+            scoping: self.scoping,
+            order,
+            counter,
+            values: &values,
+            index: initial?,
+        };
+        // Constant labels get an O(1) typed lookup. Otherwise evaluate only
+        // the actually examined labels in source order with the postincrement
+        // counter value. An unknown or effectful examined label rejects the
+        // finite proof instead of assuming it unmatched.
+        let static_labels = switch
+            .cases
+            .iter()
+            .map(|case| {
+                case.test
+                    .as_ref()
+                    .map_or(Some(None), |expr| eval(expr).map(Some))
+            })
+            .collect::<Option<Vec<_>>>();
+        let default = switch.cases.iter().position(|case| case.test.is_none());
+        let constant_cases = static_labels.as_ref().map(|labels| {
+            let mut cases = HashMap::with_capacity(labels.len());
+            for (index, value) in labels.iter().enumerate() {
+                if let Some(key) = value.as_ref().and_then(StrictKey::from_value) {
+                    cases.entry(key).or_insert(index);
+                }
             }
-        }
+            cases
+        });
         let mut selected = HashSet::new();
         let mut chunks = Vec::new();
-        let mut terminated = false;
         let live = self.completion.needs_value(it.span);
-        for value in &values {
-            let Some(index) = StrictKey::from_value(value)
-                .and_then(|key| cases.get(&key).copied())
-                .or(default)
-            else {
-                // An unmatched *own* dense entry exits the switch and loop.
+        let mut needs_break_region = false;
+        loop {
+            self.budget.checkpoint().ok()?;
+            if !it
+                .test
+                .as_ref()
+                .map_or(Some(true), |test| environment.test(test))?
+            {
+                if live && chunks.is_empty() {
+                    chunks.push("void 0;".to_owned());
+                }
+                break;
+            }
+            // Only the proven own data slot may be read. Negative, fractional
+            // or exhausted indices would require a dynamic property lookup.
+            let value = values.get(exact_usize(environment.index)?)?;
+            environment.index += 1.0; // dense array indices are exactly representable
+            let matched = if let Some(cases) = &constant_cases {
+                StrictKey::from_value(value).and_then(|key| cases.get(&key).copied())
+            } else {
+                let mut matched = None;
+                for (index, case) in switch.cases.iter().enumerate() {
+                    self.budget.checkpoint().ok()?;
+                    if let Some(test) = &case.test {
+                        if same_value(value, &environment.value(test)?) {
+                            matched = Some(index);
+                            break;
+                        }
+                    }
+                }
+                matched
+            };
+            let Some(index) = matched.or(default) else {
                 if live {
                     chunks.push("void 0;".to_owned());
                 }
-                terminated = true;
                 break;
             };
             if !selected.insert(index) {
                 return None;
             } // do not clone effects
             let case = &switch.cases[index];
-            let (last, prefix) = case.consequent.split_last()?;
-            let (retained, exits) = match last {
-                Statement::ContinueStatement(node) if node.label.is_none() => (prefix, false),
-                Statement::BreakStatement(node) if node.label.is_none() => (prefix, true),
-                Statement::ReturnStatement(_) | Statement::ThrowStatement(_) => {
+            let (retained, exits) = match case.consequent.split_last() {
+                Some((Statement::ContinueStatement(node), prefix))
+                    if node.label.as_ref().is_none_or(|label| {
+                        self.active_labels
+                            .iter()
+                            .any(|(span, name)| *span == it.span && name == label.name.as_str())
+                    }) =>
+                {
+                    (prefix, false)
+                }
+                Some((Statement::BreakStatement(node), prefix)) if node.label.is_none() => {
+                    (prefix, true)
+                }
+                Some((last, _))
+                    if cannot_complete_normally(last) || index + 1 == switch.cases.len() =>
+                {
                     (case.consequent.as_slice(), true)
                 }
+                None if index + 1 == switch.cases.len() => (case.consequent.as_slice(), true),
                 _ => return None,
             };
             let control = LoopBodyControl::analyze(retained, it.span, &self.active_labels);
-            if control.exits_loop || control.continues_loop {
+            if control.continues_loop {
                 return None;
             }
+            needs_break_region |= control.exits_loop;
             let content = statement_text(self.source, retained)?;
-            // The switch creates a new accumulator initialized to undefined
-            // on each iteration. Empty selected arms must reset it as well.
+            // Each original switch created an accumulator initialized to undefined.
             chunks.push(if live {
                 completion::seed_undefined(content)
             } else {
                 format!("{{\n{content}\n}}")
             });
             if exits {
-                terminated = true;
                 break;
             }
-        }
-        if !terminated {
-            return None;
+            if it.update.as_ref().is_some_and(|update| {
+                !inert_literal_value(update) && environment.value(update).is_none()
+            }) {
+                return None;
+            }
         }
         // Removing a never-selected arm must not remove var/Annex B hoisting.
         for (index, case) in switch.cases.iter().enumerate() {
@@ -353,7 +519,12 @@ impl Collector<'_, '_> {
                 return None;
             }
         }
-        Some(format!("{{\n{}\n}}", chunks.join("\n")))
+        let content = chunks.join("\n");
+        Some(if needs_break_region {
+            format!("do {{\n{content}\n}} while (false);")
+        } else {
+            format!("{{\n{content}\n}}")
+        })
     }
 }
 
@@ -383,6 +554,39 @@ mod tests {
             assert_eq!(result.transforms.get("ordered_switch_unflatten"), None, "{}", result.source);
             assert_eq!(result.transforms.get("dispatch_switch_structured"), Some(&1), "{}", result.source);
             assert!(result.source.contains("a[i++]"), "{}", result.source);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn private_value_environment_proves_bounds_reads_and_pure_labels() -> Result<(), BudgetExceeded>
+    {
+        for source in [
+            "for(let a=[1,2],i=0;i<a.length;){switch(a[i++]){case 1:work();continue;case 2:other();continue;}break;}",
+            "for(let a=[1],i=0;i<a.length;){switch(a[i++]){case 1:work();continue;}break;}",
+            "for(let a=[1],i=0;i<a.length;){switch(a[i++]){default:work();continue;}break;}",
+            "for(let a=[0,1,2],i=1;i<a['length']&&a[i]!==2;){switch(a[i++]){case 1:work();continue;case 2:other();continue;}break;}",
+            "for(let a=[1,3],i=0;i<a.length;a.length){switch(a[i++]){case i:work();continue;case i+1:other();continue;}break;}",
+            "for(let a=[1,2],i=-0;1/i<0;){switch(a[i++]){case 1:work();continue;case 2:other();continue;}break;}",
+            "for(let a=[1,2],i=-1;i>=0;){switch(a[i++]){case 1:work();continue;case 2:other();continue;}break;}",
+            "for(let a=[1,2],i=0;i<1;){switch(a[i++]){case i:work();continue;case sideEffect():other();continue;}break;}",
+            "for(let a=[1,2],i=0,unused=void 0;i<a.length;){switch(a[i++]){case 1:if(check())break;work();continue;case 2:other();}break;}",
+            "again:for(let a=[1,2],i=0;i<a.length;){switch(a[i++]){case 1:work();continue again;case 2:other();continue again;}break;}",
+        ] {
+            let result = deobfuscate(source, 32, &WorkBudget::unlimited("private-dispatch-values"))?.unwrap_or_else(|| unreachable!());
+            assert_eq!(result.transforms.get("ordered_switch_unflatten"), Some(&1), "{source} -> {}",result.source);
+            assert!(!result.source.contains("switch"), "{}", result.source);
+            assert!(result.analysis_complete);
+        }
+        for source in [
+            "for(let a=[1,2],i=0;i<a.length;effect()){switch(a[i++]){case 1:work();continue;case 2:other();continue;}break;}",
+            "for(let a=[1,2],i=0;i<a.length;a[i]){switch(a[i++]){case 1:work();continue;case 2:other();continue;}break;}",
+            "for(let a=[1,2],i=0;i<a.length;){switch(a[i++]){case effect():other();continue;case 1:work();continue;}break;}",
+            "for(let a=[1,2],i=0;i<a.length;){switch(a[i++]){case 1:if(check())continue;work();continue;case 2:other();continue;}break;}",
+        ] {
+            let result = deobfuscate(source, 32, &WorkBudget::unlimited("dynamic-dispatch-values"))?.unwrap_or_else(|| unreachable!());
+            assert!(!result.transforms.contains_key("ordered_switch_unflatten"), "{source} -> {}",result.source);
+            assert!(result.transforms.contains_key("dispatch_switch_structured"), "{}", result.source);
         }
         Ok(())
     }

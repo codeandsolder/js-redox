@@ -440,6 +440,26 @@ fn depythonify_safe_deob_script_completion_runtime_equivalence() -> Result<()> {
         "var i=0;while(true){switch(i++){case 0:var x=events.push('var');continue;case 1:8;break;}break;}x;",
         "for(let a=[1,2],i=0;;){switch(a[i++]){case 1:inner:for(let j=0;j<2;j++){if(j===0)continue inner;events.push(j);}continue;case 2:9;break;}break;}",
         "outer:for(let a=[1,2],i=0;;){switch(a[i++]){case 1:if(events.push('break'))break outer;continue;case 2:9;break;}break;}",
+        "for(let a=[1,2],i=0;i<a.length;){switch(a[i++]){case 1:7;continue;case 2:8;continue;}break;}",
+        "9;for(let a=[1,2],i=0;i<a.length;){switch(a[i++]){case 1:7;continue;case 2:continue;}break;}",
+        "for(let a=[0,1,2],i=1;i<a['length']&&a[i]!==2;){switch(a[i++]){case 1:events.push('one');continue;case 2:events.push('bad');continue;}break;}",
+        "for(let a=[1,3],i=0;i<a.length;a.length){switch(a[i++]){case i:events.push('first');continue;case i+1:events.push('second');continue;}break;}",
+        "for(let a=[1,2],i=-0;1/i<0;){switch(a[i++]){case 1:events.push('zero');continue;case 2:events.push('bad');continue;}break;}",
+        "9;for(let a=[1,2],i=-1;i>=0;){switch(a[i++]){case 1:events.push('bad');continue;case 2:8;continue;}break;}",
+        "for(let a=[1,2],i=0;i<1;){switch(a[i++]){case i:events.push('hit');continue;case events.push('bad'):8;continue;}break;}",
+        "for(let a=[1,2],i=0,unused=void 0;i<a.length;){switch(a[i++]){case 1:if(events.push('break'))break;7;continue;case 2:events.push('bad');}break;}",
+        "for(let a=[1,2],i=0;i<a.length;){switch(a[i++]){case 1:if(events.length)break;events.push('one');continue;case 2:8;}break;}",
+        "again:for(let a=[1,2],i=0;i<a.length;){switch(a[i++]){case 1:events.push('one');continue again;case 2:events.push('two');continue again;}break;}",
+        "for(let a=[1,2],i=0;i<a.length;events.push('update')){switch(a[i++]){case 1:7;continue;case 2:8;continue;}break;}",
+        "Object.defineProperty(Array.prototype,'2',{get(){events.push('inherited');return 0}});for(let a=[1,2],i=0;i<a.length;a[i]){switch(a[i++]){case 1:7;continue;case 2:8;continue;}break;}",
+        "for(let a=[1,2],i=0;i<a.length;){switch(a[i++]){case (events.push('label'),1):7;continue;case 2:8;continue;}break;}",
+        "for(let a=[1+1,3],i=0;i<a.length;){switch(a[i++]){case a[0]:events.push('own0');continue;case a[1]:events.push('own1');continue;}break;}",
+        "for(let a=[1,2],i=0;i<a.length;){switch(a[i++]){case 1:if(!events.length){events.push('continue');continue;}8;continue;case 2:9;continue;}break;}",
+        "for(let a=[1],i=0;i<a.length;){switch(a[i++]){case 1:7;continue;}break;}",
+        "for(let a=[1],i=0;i<a.length;){switch(a[i++]){default:7;continue;}break;}",
+        "var i=0;for(;i<2;){switch((events.push('selector'),i++)){default:{events.push(i);continue;}}break;}",
+
+
 
     ];
     for (index, source) in sources.iter().enumerate() {

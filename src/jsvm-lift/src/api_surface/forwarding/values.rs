@@ -44,7 +44,10 @@ impl<'s, 'a> ValueBuilder<'s, 'a> {
     /// Resolve primitive facts against the original invocation environment.
     /// Captured expressions retain the source context of their own origin.
     pub(super) fn primitive(&self, expr: &Expression<'_>) -> Option<StaticPrimitiveValue> {
-        eval_static_primitive_with_resolver(expr, &|id| {
+        eval_static_primitive_with_resolver(expr, &|reference_expr| {
+            let Expression::Identifier(id) = reference_expr else {
+                return None;
+            };
             let reference = self.scoping.get_reference(id.reference_id.get()?);
             if !reference.is_read()
                 || reference.is_write()
