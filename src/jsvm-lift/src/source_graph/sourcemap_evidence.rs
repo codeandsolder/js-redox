@@ -314,6 +314,7 @@ fn add_sourcemap_composition(
     source_map: &Value,
     resource_id: u64,
     map_node: &str,
+    budget: &WorkBudget,
 ) -> Result<()> {
     let composition = source_map.get("composition").unwrap_or(&Value::Null);
     let composed_node = if let Some(composed_map_path) =
