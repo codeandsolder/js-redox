@@ -144,6 +144,19 @@ pub(super) struct PositionalArguments<'e, 'a> {
 }
 
 impl<'e, 'a> PositionalArguments<'e, 'a> {
+    fn from_syntax(args: &'e [Argument<'a>], limit: usize) -> Self {
+        let mut positions = Self::default();
+        for arg in args.iter().take(limit) {
+            if let Some(expr) = arg.as_expression() {
+                positions.values.push(ForwardedValue::Expression(expr));
+            } else {
+                positions.unknown_tail = Some(arg.span());
+                break;
+            }
+        }
+        positions
+    }
+
     pub(super) fn value(&self, index: usize) -> ForwardedValue<'e, 'a> {
         self.values.get(index).cloned().unwrap_or_else(|| {
             self.unknown_tail.map_or(ForwardedValue::Missing, |span| {
@@ -429,6 +442,7 @@ pub(super) struct Callable {
     dispatch: Option<&'static str>,
     pub(super) forwarded_sink_span: Option<[u32; 2]>,
     namespace_dependencies: BTreeSet<&'static str>,
+    factory_dependencies: BTreeSet<String>,
 }
 
 impl Callable {
@@ -446,6 +460,7 @@ impl Callable {
             dispatch: None,
             forwarded_sink_span: None,
             namespace_dependencies: BTreeSet::new(),
+            factory_dependencies: BTreeSet::new(),
         }
     }
 
@@ -464,9 +479,28 @@ impl Callable {
     pub(super) fn mark_forwarding(&mut self, witnesses: &[ApiBindingWitness], sink: Span) {
         self.dispatch = Some("wrapper");
         self.forwarded_sink_span = Some([sink.start, sink.end]);
+        self.append_forwarding_witnesses(witnesses);
+    }
+
+    fn append_forwarding_witnesses(&mut self, witnesses: &[ApiBindingWitness]) {
         for witness in witnesses {
             self.add_witness(&witness.kind, Span::new(witness.start, witness.end), None);
         }
+    }
+
+    pub(super) fn mark_returned(
+        &mut self,
+        witnesses: &[ApiBindingWitness],
+        dependencies: BTreeSet<String>,
+    ) {
+        self.capture_as_argument();
+        self.dispatch = Some("wrapper");
+        self.factory_dependencies.extend(dependencies);
+        self.append_forwarding_witnesses(witnesses);
+    }
+
+    pub(super) fn is_returned(&self) -> bool {
+        self.dispatch == Some("wrapper")
     }
 
     pub(super) fn capture_as_argument(&mut self) {
@@ -491,6 +525,7 @@ impl Callable {
             .iter()
             .map(|key| (*key).to_owned())
             .collect::<BTreeSet<_>>();
+        result.extend(self.factory_dependencies.iter().cloned());
         let mut cursor = self.witness.as_deref();
         while let Some(link) = cursor {
             if let Some(key) = &link.dependency {
@@ -646,6 +681,14 @@ impl DispatchMode {
     }
 }
 
+/// The native operation and its result allocation location may differ
+/// when a source-local factory creates the bound callable.
+#[derive(Clone, Copy)]
+pub(super) struct BindingSite {
+    pub(super) operation: Span,
+    pub(super) allocation: Span,
+}
+
 pub(super) struct DispatchOperands<'s, 'e, 'a> {
     pub(super) original_object: &'e Expression<'a>,
     pub(super) object: &'e Expression<'a>,
@@ -670,6 +713,7 @@ pub(super) struct CallableIndex {
     aliases: BTreeMap<SymbolId, Available<Callable>>,
     namespaces: BTreeMap<SymbolId, Available<Namespace>>,
     xhr: BTreeMap<SymbolId, Available<Callable>>,
+    returned_values: BTreeMap<(u32, u32), Callable>,
 }
 
 pub(super) fn member_parts<'a, 'e>(
@@ -715,6 +759,42 @@ impl CallableIndex {
         };
         collector.visit_program(program);
         collector.index
+    }
+
+    /// Register proven factory outputs before mutation/receiver analysis.
+    /// Bind allocation identity is tied to the factory invocation site.
+    pub(super) fn record_returned_value(&mut self, span: Span, callable: Callable) {
+        self.returned_values
+            .insert((span.start, span.end), callable);
+    }
+
+    pub(super) fn record_returned_alias(
+        &mut self,
+        declaration: &VariableDeclarator<'_>,
+        scoping: &Scoping,
+        mut callable: Callable,
+    ) {
+        let Some(symbol) = declaration
+            .id
+            .get_binding_identifier()
+            .and_then(|id| id.symbol_id.get())
+        else {
+            return;
+        };
+        if scoping.symbol_flags(symbol).is_const_variable()
+            && scoping.symbol_redeclarations(symbol).is_empty()
+            && xhr_binding_is_not_reassigned(scoping, symbol)
+        {
+            callable.capture_as_argument();
+            callable.add_witness("wrapper_return_alias", declaration.span, None);
+            self.aliases.insert(
+                symbol,
+                Available {
+                    after: declaration.span.end,
+                    value: callable,
+                },
+            );
+        }
     }
 
     fn namespace(
@@ -800,7 +880,11 @@ impl CallableIndex {
             }
         }
         if let Expression::CallExpression(call) = expr {
-            return self.resolve_bind(call, source, scoping, constants);
+            return self
+                .returned_values
+                .get(&(call.span.start, call.span.end))
+                .cloned()
+                .or_else(|| self.resolve_bind(call, source, scoping, constants));
         }
         None
     }
@@ -819,19 +903,44 @@ impl CallableIndex {
         if key != "bind" {
             return None;
         }
-        let mut callable = self.resolve(object, source, scoping, constants)?;
-        let receiver = match call.arguments.first() {
-            Some(arg) => Some(arg.as_expression()?),
-            None => None,
-        };
+        let callable = self.resolve(object, source, scoping, constants)?;
+        let args = PositionalArguments::from_syntax(&call.arguments, 3);
+        self.bind_values(
+            callable,
+            &args,
+            BindingSite {
+                operation: call.span,
+                allocation: call.span,
+            },
+            source,
+            scoping,
+            constants,
+        )
+    }
+
+    /// Bind an already resolved callable with captured positional arguments.
+    /// A factory's bind witness describes the native operation; its outer
+    /// invocation site identifies the newly allocated function object.
+    pub(super) fn bind_values(
+        &self,
+        mut callable: Callable,
+        args: &PositionalArguments<'_, '_>,
+        site: BindingSite,
+        source: &str,
+        scoping: &Scoping,
+        constants: &ProvenConstantEnvironment,
+    ) -> Option<Callable> {
+        let receiver_value = args.value(0);
+        let receiver = self.receiver_expression(&callable, &receiver_value)?;
         if !self.valid_receiver(&callable, receiver, scoping, constants) {
             return None;
         }
         self.add_receiver_dependencies(&mut callable, receiver, scoping, constants);
         let dependency = callable.dispatch_member_family("bind");
-        callable.add_witness("bind", call.span, Some(dependency));
-        callable.prefix.append(
-            call.arguments.get(1..).unwrap_or_default(),
+        callable.add_witness("bind", site.operation, Some(dependency));
+        callable.prefix.append_forwarded(
+            args.values.iter().skip(1).cloned(),
+            args.unknown_tail,
             source,
             scoping,
             constants,
@@ -839,9 +948,31 @@ impl CallableIndex {
         callable.bound = true;
         callable.captured = true;
         callable.detached = false;
-        callable.bound_object = Some(call.span);
+        callable.bound_object = Some(site.allocation);
         Some(callable)
     }
+
+    fn receiver_expression<'e, 'a>(
+        &self,
+        callable: &Callable,
+        value: &ForwardedValue<'e, 'a>,
+    ) -> Option<Option<&'e Expression<'a>>> {
+        match value {
+            ForwardedValue::Expression(expr) => Some(Some(expr)),
+            ForwardedValue::Missing => Some(None),
+            ForwardedValue::Primitive { value, .. }
+                if matches!(
+                    value.as_ref(),
+                    StaticPrimitiveValue::Null | StaticPrimitiveValue::Undefined
+                ) =>
+            {
+                Some(None)
+            }
+            _ if callable.bound || callable.kind.is_constructor() => Some(None),
+            _ => None,
+        }
+    }
+
     fn valid_receiver(
         &self,
         callable: &Callable,
@@ -946,7 +1077,9 @@ impl CallableIndex {
             callable.dispatch_member_family(operation)
         };
         callable.detached = false;
-        callable.dispatch = Some(operation);
+        if !callable.is_returned() {
+            callable.dispatch = Some(operation);
+        }
         callable.add_witness(operation, span, Some(dependency));
         Some(DispatchInvocation {
             callable,
@@ -987,28 +1120,8 @@ impl CallableIndex {
             callable.capture_as_argument();
         }
         let offset = mode.receiver_index();
-        let receiver = match operands.args.value(offset) {
-            ForwardedValue::Expression(expr) => Some(expr),
-            ForwardedValue::Missing => None,
-            ForwardedValue::Primitive { value, .. }
-                if matches!(
-                    value.as_ref(),
-                    StaticPrimitiveValue::Null | StaticPrimitiveValue::Undefined
-                ) =>
-            {
-                None
-            }
-            // A bound function ignores its new receiver altogether.
-            ForwardedValue::Primitive { .. } if callable.bound => None,
-            ForwardedValue::Array { .. }
-            | ForwardedValue::Object { .. }
-            | ForwardedValue::Unknown(_)
-                if callable.bound =>
-            {
-                None
-            }
-            _ => return None,
-        };
+        let receiver_value = operands.args.value(offset);
+        let receiver = self.receiver_expression(&callable, &receiver_value)?;
         let mut dispatch =
             self.prepare_dispatch(head, callable, receiver, operands.span, scoping, constants)?;
         if mode == DispatchMode::Call {
@@ -1046,17 +1159,8 @@ impl CallableIndex {
             return None;
         }
         let (object, key) = member_parts(&call.callee, scoping, constants)?;
-        let mut args = PositionalArguments::default();
-        // The Reflect target, receiver and two sink positions are sufficient.
-        // Unknown-length spreads stop the prefix, never becoming fixed slots.
-        for arg in call.arguments.iter().take(4) {
-            if let Some(expr) = arg.as_expression() {
-                args.values.push(ForwardedValue::Expression(expr));
-            } else {
-                args.unknown_tail = Some(arg.span());
-                break;
-            }
-        }
+        // Reflect target, receiver, and two sink positions suffice.
+        let args = PositionalArguments::from_syntax(&call.arguments, 4);
         self.resolve_dispatch_values(
             DispatchOperands {
                 original_object: object,

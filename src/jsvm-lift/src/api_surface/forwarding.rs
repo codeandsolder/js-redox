@@ -1,5 +1,6 @@
 //! Source-local callable indexing and bounded wrapper-chain specialization.
 //! Preserve original and specializing invocation provenance, not execution proof.
+mod factories;
 mod frame;
 mod values;
 
@@ -7,6 +8,8 @@ use super::{
     callables::{member_parts, DispatchOperands},
     *,
 };
+pub(super) use factories::collect_returned_values;
+use factories::resolve_returned_callable;
 use frame::{append_local_witnesses, instantiate, FrameProof, Wrapper};
 use oxc_ast::{
     ast::{Argument, Function},
@@ -16,6 +19,24 @@ use oxc_semantic::Semantic;
 use oxc_syntax::scope::ScopeId;
 use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 use values::{ArgumentList, ValueBuilder};
+
+pub(super) struct FrameContext<'s, 'c> {
+    source: &'s str,
+    scoping: &'c Scoping,
+    constants: &'c ProvenConstantEnvironment,
+    callables: &'c CallableIndex,
+}
+
+impl<'s, 'c> From<&Collector<'s, 'c>> for FrameContext<'s, 'c> {
+    fn from(collector: &Collector<'s, 'c>) -> Self {
+        Self {
+            source: collector.source,
+            scoping: collector.scoping,
+            constants: collector.constants,
+            callables: collector.callables,
+        }
+    }
+}
 
 enum LocalBinding<'a> {
     Function(&'a Function<'a>),
@@ -216,7 +237,7 @@ impl<'a> WrapperIndex<'a> {
         wrapper: &Wrapper<'_>,
         sink: Span,
         semantic: &Semantic<'_>,
-        collector: &Collector<'_, '_>,
+        collector: &FrameContext<'_, '_>,
         budget: &WorkBudget,
     ) -> Result<Option<Rc<FrameProof>>> {
         let key = (wrapper.span.start, wrapper.span.end, sink.start, sink.end);
@@ -353,119 +374,6 @@ impl<'a> WrapperIndex<'a> {
     }
 }
 
-struct ReturnedCallable {
-    callable: Callable,
-    witnesses: Vec<ApiBindingWitness>,
-    dependencies: BTreeSet<String>,
-}
-
-/// Recover functions returning an existing native callable through a
-/// confined straight-line value frame. Iterate over nested factory values
-/// and immutable aliases, rather than running arbitrary factory bodies.
-/// Async returns, closure creation and calls requiring a new environment
-/// are not interpreted as existing native callable values.
-fn resolve_returned_callable<'a>(
-    mut expr: &'a Expression<'a>,
-    semantic: &Semantic<'a>,
-    wrappers: &WrapperIndex<'a>,
-    collector: &Collector<'_, '_>,
-    budget: &WorkBudget,
-) -> Result<Option<ReturnedCallable>> {
-    let mut witnesses = Vec::new();
-    let mut dependencies = BTreeSet::new();
-    let mut visited = BTreeSet::new();
-    loop {
-        budget.consume(1)?;
-        if !visited.is_empty() {
-            if let Some(mut callable) = collector.callables.resolve(
-                expr,
-                collector.source,
-                collector.scoping,
-                collector.constants,
-            ) {
-                callable.capture_as_argument();
-                return Ok(Some(ReturnedCallable {
-                    callable,
-                    witnesses,
-                    dependencies,
-                }));
-            }
-        }
-        let Some(factory) =
-            wrappers.factory_call(expr, collector.scoping, budget, &mut witnesses)?
-        else {
-            return Ok(None);
-        };
-        if !visited.insert((factory.span.start, factory.span.end)) {
-            return Ok(None);
-        }
-        let Some(wrapper) = wrappers.resolve(
-            &factory.callee,
-            collector.scoping,
-            budget,
-            &mut dependencies,
-            &mut witnesses,
-            None,
-        )?
-        else {
-            return Ok(None);
-        };
-        if !wrapper.returns_value || wrapper.invocation().is_some() {
-            return Ok(None);
-        }
-        let mut arguments = ValueBuilder::new(
-            None,
-            collector.scoping,
-            collector.constants,
-            wrappers.positional_limit,
-            budget,
-        );
-        let args = arguments.call(&factory.arguments)?;
-        if arguments.used_iterator {
-            dependencies.insert("rest_iterator".into());
-        }
-        let Some(proof) =
-            wrappers.frame_proof(&wrapper, wrapper.body.span(), semantic, collector, budget)?
-        else {
-            return Ok(None);
-        };
-        let Some(mut builder) = instantiate(
-            &wrapper,
-            &args,
-            &proof,
-            collector,
-            wrappers.positional_limit,
-            budget,
-        )?
-        else {
-            return Ok(None);
-        };
-        let Some(origin) = wrapper.returned_origin(&mut builder, collector)? else {
-            return Ok(None);
-        };
-        if builder.used_iterator {
-            dependencies.insert("rest_iterator".into());
-        }
-        witnesses.push(ApiBindingWitness {
-            kind: "wrapper_definition".into(),
-            start: wrapper.span.start,
-            end: wrapper.span.end,
-        });
-        append_local_witnesses(&wrapper, &mut witnesses);
-        witnesses.push(ApiBindingWitness {
-            kind: "wrapper_return".into(),
-            start: wrapper.body.span().start,
-            end: wrapper.body.span().end,
-        });
-        witnesses.push(ApiBindingWitness {
-            kind: "returned_callable".into(),
-            start: factory.span.start,
-            end: factory.span.end,
-        });
-        expr = origin;
-    }
-}
-
 /// Resolve the same native dispatch head used by direct calls, but from the
 /// argument values in the specializing caller frame. A captured function
 /// value does not inherit its former member receiver.
@@ -475,7 +383,7 @@ fn forwarded_dispatch<'a>(
     args: &ArgumentList<'a>,
     span: Span,
     builder: &mut ValueBuilder<'_, 'a>,
-    collector: &Collector<'_, '_>,
+    collector: &FrameContext<'_, '_>,
 ) -> Result<Option<Callable>> {
     let scoping = collector.scoping;
     let constants = collector.constants;
@@ -521,9 +429,18 @@ pub(super) fn specialize<'a>(
     budget: &WorkBudget,
 ) -> Result<()> {
     let scoping = collector.scoping;
-    if !wrappers.may_resolve(site.callee, scoping) {
+    let indexed =
+        collector
+            .callables
+            .resolve(site.callee, collector.source, scoping, collector.constants);
+    if indexed
+        .as_ref()
+        .is_some_and(|callable| !callable.is_returned())
+        || (indexed.is_none() && !wrappers.may_resolve(site.callee, scoping))
+    {
         return Ok(());
     }
+    let context = FrameContext::from(&*collector);
     let mut callee = site.callee;
     let mut builder = ValueBuilder::new(
         None,
@@ -542,24 +459,32 @@ pub(super) fn specialize<'a>(
     let mut constructor = site.constructor;
     let mut captured_target = false;
     let mut sink = site.span;
+    let mut indexed = indexed;
     loop {
         budget.consume(1)?;
-        let callable = if let Some(returned) =
-            resolve_returned_callable(callee, semantic, wrappers, collector, budget)?
-        {
-            witnesses.extend(returned.witnesses);
-            dependencies.extend(returned.dependencies);
-            Some(returned.callable)
+        let callable = if let Some(callable) = indexed.take() {
+            Some(callable)
         } else if !visited.is_empty() {
-            collector
+            context
                 .callables
-                .resolve(callee, collector.source, scoping, collector.constants)
+                .resolve(callee, context.source, scoping, context.constants)
                 .map(|mut callable| {
                     if captured_target {
                         callable.capture_as_argument();
                     }
                     callable
                 })
+        } else {
+            None
+        };
+        let callable = if callable.is_some() {
+            callable
+        } else if let Some(returned) =
+            resolve_returned_callable(callee, semantic, wrappers, &context, budget)?
+        {
+            witnesses.extend(returned.witnesses);
+            dependencies.extend(returned.dependencies);
+            Some(returned.callable)
         } else {
             None
         };
@@ -611,14 +536,14 @@ pub(super) fn specialize<'a>(
             end: sink_span.end,
         });
         sink = sink_span;
-        let Some(proof) = wrappers.frame_proof(&wrapper, sink, semantic, collector, budget)? else {
+        let Some(proof) = wrappers.frame_proof(&wrapper, sink, semantic, &context, budget)? else {
             return Ok(());
         };
         let Some(mut builder) = instantiate(
             &wrapper,
             &args,
             &proof,
-            collector,
+            &context,
             wrappers.positional_limit,
             budget,
         )?
@@ -629,7 +554,7 @@ pub(super) fn specialize<'a>(
         let next_args = builder.call(forwarded)?;
         if !is_new {
             if let Some(mut callable) =
-                forwarded_dispatch(target, forwarded, &next_args, sink, &mut builder, collector)?
+                forwarded_dispatch(target, forwarded, &next_args, sink, &mut builder, &context)?
             {
                 if builder.used_iterator {
                     dependencies.insert("rest_iterator".into());
