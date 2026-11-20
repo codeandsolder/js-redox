@@ -52,8 +52,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
 sha2 = "0.11"
-string_wizard = { git = "https://github.com/codeandsolder/rolldown-crates-redox.git", rev = "7cb2792dfdbe0daaeea490aa1158daf7d3c67273", default-features = false }
-rolldown_redox = { git = "https://github.com/codeandsolder/rolldown-crates-redox.git", rev = "7cb2792dfdbe0daaeea490aa1158daf7d3c67273", default-features = false }
+string_wizard = { git = "https://github.com/codeandsolder/rolldown-crates-redox.git", rev = "c01f4b4042c5df24046c0822bb96585914a5add7", default-features = false }
+rolldown_redox = { git = "https://github.com/codeandsolder/rolldown-crates-redox.git", rev = "c01f4b4042c5df24046c0822bb96585914a5add7", default-features = false }
 url = "2"
 reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "cookies", "rustls", "gzip", "brotli", "deflate"] }
 wasmparser = "0.263.0"
