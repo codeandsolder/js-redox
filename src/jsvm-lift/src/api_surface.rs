@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use jsvm_safe_core::ProvenConstantEnvironment;
+use jsvm_safe_core::{ProvenConstantEnvironment, StaticPrimitiveValue};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     BindingPattern, CallExpression, ComputedMemberExpression, Expression, NewExpression,
@@ -816,20 +816,15 @@ enum FetchInitMethod {
 /// a primitive key: its coercion can execute user code.
 fn literal_property_name(
     property: &oxc_ast::ast::ObjectProperty<'_>,
-    scoping: &Scoping,
-    constants: &ProvenConstantEnvironment,
+    primitive: impl FnOnce(&Expression<'_>) -> Option<StaticPrimitiveValue>,
 ) -> Option<String> {
     if property.computed {
         let expression = property.key.as_expression()?;
-        if let Some(key) = static_string(expression, scoping, constants) {
-            return Some(key);
+        if let Some(key) = primitive(expression) {
+            return key.js_string();
         }
-        if !matches!(
-            expression,
-            Expression::NumericLiteral(_)
-                | Expression::BigIntLiteral(_)
-                | Expression::NullLiteral(_)
-        ) {
+        // The shared primitive domain deliberately excludes BigInt.
+        if !matches!(expression, Expression::BigIntLiteral(_)) {
             return None;
         }
     }
@@ -842,10 +837,9 @@ fn literal_property_name(
 
 fn literal_data_key(
     property: &oxc_ast::ast::ObjectProperty<'_>,
-    scoping: &Scoping,
-    constants: &ProvenConstantEnvironment,
+    primitive: impl FnOnce(&Expression<'_>) -> Option<StaticPrimitiveValue>,
 ) -> Option<String> {
-    let name = literal_property_name(property, scoping, constants)?;
+    let name = literal_property_name(property, primitive)?;
     if property.kind != PropertyKind::Init
         || property.method
         || (name == "__proto__" && !property.computed && !property.shorthand)
@@ -855,6 +849,13 @@ fn literal_data_key(
     Some(name)
 }
 
+fn literal_method_evidence(source: &str, literal: &str, span: Span) -> FetchInitMethod {
+    FetchInitMethod::Literal {
+        value: effective_http_method(literal),
+        expression: source_fragment(source, span),
+    }
+}
+
 fn method_value_evidence(
     source: &str,
     value: &Expression<'_>,
@@ -862,10 +863,7 @@ fn method_value_evidence(
     constants: &ProvenConstantEnvironment,
 ) -> FetchInitMethod {
     static_string(value, scoping, constants).map_or(FetchInitMethod::Unknown, |literal| {
-        FetchInitMethod::Literal {
-            value: effective_http_method(&literal),
-            expression: source_fragment(source, value.span()),
-        }
+        literal_method_evidence(source, &literal, value.span())
     })
 }
 
@@ -886,7 +884,9 @@ fn fetch_init_method(
             continue;
         };
 
-        let Some(name) = literal_property_name(property, scoping, constants) else {
+        let Some(name) =
+            literal_property_name(property, |expr| constants.exact_primitive(expr, scoping))
+        else {
             state = FetchInitMethod::Unknown;
             continue;
         };

@@ -183,23 +183,25 @@ struct ConstBinding {
     available_after: u32,
 }
 
+fn resolved_const_value(
+    id: &oxc_ast::ast::IdentifierReference<'_>,
+    scoping: &Scoping,
+    constants: &HashMap<SymbolId, ConstBinding>,
+) -> Option<Value> {
+    let reference = scoping.get_reference(id.reference_id.get()?);
+    if !reference.is_read() || reference.is_write() || reference.flags().is_member_write_target() {
+        return None;
+    }
+    let binding = constants.get(&reference.symbol_id()?)?;
+    (id.span.start >= binding.available_after).then(|| binding.value.clone())
+}
+
 fn eval_with_constants(
     expr: &Expression<'_>,
     scoping: &Scoping,
     constants: &HashMap<SymbolId, ConstBinding>,
 ) -> Option<Value> {
-    eval_with_resolver(expr, &|id| {
-        let reference_id = id.reference_id.get()?;
-        let reference = scoping.get_reference(reference_id);
-        if !reference.is_read()
-            || reference.is_write()
-            || reference.flags().is_member_write_target()
-        {
-            return None;
-        }
-        let binding = constants.get(&reference.symbol_id()?)?;
-        (id.span.start >= binding.available_after).then(|| binding.value.clone())
-    })
+    eval_with_resolver(expr, &|id| resolved_const_value(id, scoping, constants))
 }
 
 struct ConstValueCollector<'s, 'c> {
@@ -281,9 +283,29 @@ impl ProvenConstantEnvironment {
         }
     }
 
+    /// Resolve one lexical constant at its original source position. This
+    /// is the fallback for callers that overlay a proven invocation frame.
+    #[must_use]
+    pub fn resolve_identifier(
+        &self,
+        id: &oxc_ast::ast::IdentifierReference<'_>,
+        scoping: &Scoping,
+    ) -> Option<StaticPrimitiveValue> {
+        resolved_const_value(id, scoping, &self.bindings)
+    }
+
+    #[must_use]
+    pub fn exact_primitive(
+        &self,
+        expr: &Expression<'_>,
+        scoping: &Scoping,
+    ) -> Option<StaticPrimitiveValue> {
+        eval_with_constants(expr, scoping, &self.bindings)
+    }
+
     #[must_use]
     pub fn exact_string(&self, expr: &Expression<'_>, scoping: &Scoping) -> Option<String> {
-        match eval_with_constants(expr, scoping, &self.bindings)? {
+        match self.exact_primitive(expr, scoping)? {
             Value::String(value) => Some(value),
             _ => None,
         }

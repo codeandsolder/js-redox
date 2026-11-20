@@ -7,14 +7,14 @@ use super::{
     callables::{member_parts, DispatchOperands},
     *,
 };
-use frame::{append_local_witnesses, instantiate, uses_arguments_object, Wrapper};
+use frame::{append_local_witnesses, instantiate, FrameProof, Wrapper};
 use oxc_ast::{
     ast::{Argument, Function},
     AstKind,
 };
 use oxc_semantic::Semantic;
 use oxc_syntax::scope::ScopeId;
-use std::collections::BTreeMap;
+use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 use values::{ArgumentList, ValueBuilder};
 
 enum LocalBinding<'a> {
@@ -33,11 +33,15 @@ enum BindingOrigin<'a> {
 /// Reuse the already validated semantic AST, rather than reparsing the source
 /// or textually resolving names. Mutable lexical definitions and direct eval
 /// in a visible scope preclude an exact local target.
+type ProofKey = (u32, u32, u32, u32);
+type CachedProofs = BTreeMap<ProofKey, Option<Rc<FrameProof>>>;
+
 pub(super) struct WrapperIndex<'a> {
     bindings: BTreeMap<SymbolId, LocalBinding<'a>>,
     script_root_functions: BTreeMap<SymbolId, String>,
     eval_scopes: BTreeSet<ScopeId>,
     positional_limit: usize,
+    frame_proofs: RefCell<CachedProofs>,
 }
 
 impl<'a> WrapperIndex<'a> {
@@ -151,6 +155,7 @@ impl<'a> WrapperIndex<'a> {
             script_root_functions,
             eval_scopes,
             positional_limit,
+            frame_proofs: RefCell::new(BTreeMap::new()),
         })
     }
 
@@ -176,6 +181,35 @@ impl<'a> WrapperIndex<'a> {
             }
         }
         Ok(false)
+    }
+
+    fn frame_proof(
+        &self,
+        wrapper: &Wrapper<'_>,
+        sink: Span,
+        semantic: &Semantic<'_>,
+        collector: &Collector<'_, '_>,
+        budget: &WorkBudget,
+    ) -> Result<Option<Rc<FrameProof>>> {
+        let key = (wrapper.span.start, wrapper.span.end, sink.start, sink.end);
+        if let Some(proof) = self.frame_proofs.borrow().get(&key) {
+            return Ok(proof.clone());
+        }
+        let proof = if self.frame_has_dynamic_scope(wrapper, collector.scoping, budget)?
+            || wrapper.uses_arguments_object()
+        {
+            None
+        } else {
+            Some(Rc::new(FrameProof::collect(
+                wrapper,
+                sink,
+                semantic,
+                collector.constants,
+                budget,
+            )?))
+        };
+        self.frame_proofs.borrow_mut().insert(key, proof.clone());
+        Ok(proof)
     }
 
     fn may_resolve(&self, expr: &Expression<'_>, scoping: &Scoping) -> bool {
@@ -324,11 +358,7 @@ fn resolve_returned_callable<'a>(
         else {
             return Ok(None);
         };
-        if !wrapper.returns_value
-            || wrapper.invocation().is_some()
-            || wrappers.frame_has_dynamic_scope(&wrapper, collector.scoping, budget)?
-            || uses_arguments_object(wrapper.body)
-        {
+        if !wrapper.returns_value || wrapper.invocation().is_some() {
             return Ok(None);
         }
         let mut arguments = ValueBuilder::new(
@@ -342,11 +372,15 @@ fn resolve_returned_callable<'a>(
         if arguments.used_iterator {
             dependencies.insert("rest_iterator".into());
         }
+        let Some(proof) =
+            wrappers.frame_proof(&wrapper, wrapper.body.span(), semantic, collector, budget)?
+        else {
+            return Ok(None);
+        };
         let Some(mut builder) = instantiate(
             &wrapper,
             &args,
-            wrapper.body.span(),
-            semantic,
+            &proof,
             collector,
             wrappers.positional_limit,
             budget,
@@ -499,10 +533,7 @@ pub(super) fn specialize<'a>(
         else {
             return Ok(());
         };
-        if !visited.insert((wrapper.span.start, wrapper.span.end))
-            || wrappers.frame_has_dynamic_scope(&wrapper, scoping, budget)?
-            || uses_arguments_object(wrapper.body)
-        {
+        if !visited.insert((wrapper.span.start, wrapper.span.end)) {
             return Ok(());
         }
         let Some((target, forwarded, sink_span, is_new)) = wrapper.invocation() else {
@@ -519,11 +550,13 @@ pub(super) fn specialize<'a>(
             end: sink_span.end,
         });
         sink = sink_span;
+        let Some(proof) = wrappers.frame_proof(&wrapper, sink, semantic, collector, budget)? else {
+            return Ok(());
+        };
         let Some(mut builder) = instantiate(
             &wrapper,
             &args,
-            sink,
-            semantic,
+            &proof,
             collector,
             wrappers.positional_limit,
             budget,
