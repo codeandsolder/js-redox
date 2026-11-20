@@ -1574,8 +1574,6 @@ dependencies = [
 [[package]]
 name = "oxc_semantic"
 version = "0.158.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "36c8301783f312c94916a56eab2dcd1e3493f2d8d59bbd7fbc9169425502bb97"
 dependencies = [
  "itertools",
  "memchr",
