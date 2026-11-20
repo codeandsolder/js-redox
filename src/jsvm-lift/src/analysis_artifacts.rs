@@ -124,8 +124,8 @@ artifact!(
     SOURCE_GRAPH,
     "source graph",
     "analysis/source-graph.json",
-    "source-graph/v1",
-    arrays = ["nodes", "edges"],
+    "source-graph/v2",
+    arrays = ["nodes", "edges", "unresolved_edges"],
     objects = ["summary"]
 );
 artifact!(

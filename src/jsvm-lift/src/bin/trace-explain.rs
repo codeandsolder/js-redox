@@ -23,8 +23,8 @@ fn main() -> Result<()> {
     let invocations = materialize_invocation_views(&args.project, &budgets)?;
     let graph = build_source_graph(&args.project, &budgets)?;
     println!(
-        "Explained {invocations} invocation(s); source graph: {} nodes / {} edges",
-        graph.nodes, graph.edges
+        "Explained {invocations} invocation(s); source graph: {} nodes / {} edges / {} unresolved claims",
+        graph.nodes, graph.edges, graph.unresolved_edges
     );
     Ok(())
 }
