@@ -23,7 +23,7 @@ fn resolve_url(base: &str, reference: &str) -> String {
 #[derive(Debug, Default)]
 pub(super) struct InlineSourceIndex {
     by_identity: BTreeMap<(String, u64, u64), String>,
-    by_site: BTreeMap<(u64, u64), String>,
+    by_site: BTreeSet<(u64, u64)>,
     by_unique_raw: BTreeMap<String, Option<String>>,
 }
 
@@ -36,16 +36,9 @@ impl InlineSourceIndex {
         node: String,
     ) -> Result<()> {
         anyhow::ensure!(
-            !self.by_site.contains_key(&(parent, ordinal)),
+            self.by_site.insert((parent, ordinal)),
             "duplicate inline script site ({parent}, {ordinal})"
         );
-        anyhow::ensure!(
-            !self
-                .by_identity
-                .contains_key(&(raw.to_owned(), parent, ordinal)),
-            "duplicate inline script identity {raw} ({parent}, {ordinal})"
-        );
-        self.by_site.insert((parent, ordinal), node.clone());
         self.by_identity
             .insert((raw.to_owned(), parent, ordinal), node.clone());
         self.by_unique_raw
