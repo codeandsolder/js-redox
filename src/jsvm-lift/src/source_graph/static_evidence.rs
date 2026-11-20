@@ -128,6 +128,7 @@ pub(super) fn seed_browser_api_callsites(
                 "column":field(row,"column"),
                 "callee":field(row,"callee"),
                 "proof":field(row,"proof"),
+                "binding_status":field(row,"binding_status"),
                 "method":field(row,"method"),
                 "method_expression":field(row,"method_expression"),
                 "method_status":field(row,"method_status"),
@@ -149,8 +150,12 @@ pub(super) fn seed_browser_api_callsites(
             graph.add_edge(&parent, &node_id, "api_callsite", json!({}))?;
         }
         if bool_field(row, "absolute_network_url")
-            && string_field(row, "kind") != Some("xhr_open_candidate")
-            && string_field(row, "method_status") != Some("invalid")
+            && !string_field(row, "kind").is_some_and(|kind| kind.ends_with("_candidate"))
+            && string_field(row, "binding_status") != Some("candidate")
+            && !matches!(
+                string_field(row, "method_status"),
+                Some("invalid" | "conditional")
+            )
         {
             if let Some(url) = string_field(row, "url") {
                 for target in graph.targets_for(url)? {
@@ -239,6 +244,64 @@ mod tests {
                 .context("missing deob node")?["safe_static_only"],
             Value::Bool(true)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn candidate_api_sites_keep_source_provenance_without_verified_network_target() -> Result<()> {
+        let mut graph = GraphBuilder::default();
+        graph.register_resource_url("https://app.test/api", "resource:99");
+        let rows = json!({"callsites": [
+            {
+                "source_index_ordinal": 7, "callsite_ordinal": 0,
+                "resource_id": 5, "kind": "fetch_candidate",
+                "binding_status": "candidate",
+                "proof": "unresolved_global_member_mutation_may_replace_fetch",
+                "method": "POST", "method_status": "conditional",
+                "url": "https://app.test/api", "absolute_network_url": true
+            },
+            {
+                "source_index_ordinal": 7, "callsite_ordinal": 1,
+                "resource_id": 5, "kind": "fetch",
+                "binding_status": "candidate",
+                "proof": "candidate_marker_is_authoritative",
+                "method_status": "exact",
+                "url": "https://app.test/api", "absolute_network_url": true
+            },
+            {
+                "source_index_ordinal": 7, "callsite_ordinal": 2,
+                "resource_id": 5, "kind": "fetch",
+                "binding_status": "standard",
+                "method_status": "exact",
+                "url": "https://app.test/api", "absolute_network_url": true
+            }
+        ]});
+        let budget = AnalysisBudgets::standard("candidate-api-graph-test")
+            .operation(AnalysisOperation::SourceGraph, "candidate");
+        seed_browser_api_callsites(
+            &mut graph,
+            &rows,
+            &BTreeMap::new(),
+            &InlineSourceIndex::default(),
+            &budget,
+        )?;
+        let target_edges = graph
+            .edges
+            .iter()
+            .filter(|edge| edge["kind"] == "api_target")
+            .collect::<Vec<_>>();
+        assert_eq!(target_edges.len(), 1, "{target_edges:#?}");
+        assert_eq!(target_edges[0]["from"], "api-call:7:2");
+        for ordinal in 0..2 {
+            let id = format!("api-call:7:{ordinal}");
+            let node = graph.nodes.get(&id).context("candidate node missing")?;
+            assert_eq!(node["binding_status"], "candidate");
+            assert_eq!(node["url"], "https://app.test/api");
+            assert!(graph
+                .edges
+                .iter()
+                .any(|edge| { edge["to"] == id && edge["kind"] == "api_callsite" }));
+        }
         Ok(())
     }
 

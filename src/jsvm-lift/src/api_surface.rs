@@ -27,6 +27,9 @@ pub struct ApiCallsite {
     pub column: usize,
     pub callee: String,
     pub proof: String,
+    /// "standard" means no relevant local mutation was identified;
+    /// "candidate" retains syntax and arguments without proving the API binding.
+    pub binding_status: String,
     pub standard_browser_api_semantics_required: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub method: Option<String>,
@@ -123,34 +126,48 @@ impl<'a> Visit<'a> for SafeMemberReferenceCollector<'_> {
     }
 }
 
-/// Resolve a browser-global member path only when every computed key has
-/// a provably stable, side-effect-free string value. Both sink identification
-/// and mutation detection must use the same resolution semantics.
-fn global_path(
+/// Recognize global-rooted member accesses while preserving computed keys
+/// whose values cannot be proven. Unknown keys are never promoted to exact
+/// callsite identities, but they can identify possibly overwritten API families.
+fn global_path_pattern(
     scoping: &Scoping,
     constants: &ProvenConstantEnvironment,
     expression: &Expression<'_>,
-) -> Option<String> {
+) -> Option<Vec<Option<String>>> {
     match unparenthesized(expression) {
         Expression::Identifier(identifier) => {
             let reference = scoping.get_reference(identifier.reference_id.get()?);
             reference
                 .symbol_id()
                 .is_none()
-                .then(|| identifier.name.to_string())
+                .then(|| vec![Some(identifier.name.to_string())])
         }
-        Expression::StaticMemberExpression(member) if !member.optional => Some(format!(
-            "{}.{}",
-            global_path(scoping, constants, &member.object)?,
-            member.property.name
-        )),
-        Expression::ComputedMemberExpression(member) if !member.optional => Some(format!(
-            "{}.{}",
-            global_path(scoping, constants, &member.object)?,
-            static_string(&member.expression, scoping, constants)?
-        )),
+        Expression::StaticMemberExpression(member) if !member.optional => {
+            let mut path = global_path_pattern(scoping, constants, &member.object)?;
+            path.push(Some(member.property.name.to_string()));
+            Some(path)
+        }
+        Expression::ComputedMemberExpression(member) if !member.optional => {
+            let mut path = global_path_pattern(scoping, constants, &member.object)?;
+            path.push(static_string(&member.expression, scoping, constants));
+            Some(path)
+        }
         _ => None,
     }
+}
+
+/// A single computed key containing a dot is not a nested property access.
+fn global_path(
+    scoping: &Scoping,
+    constants: &ProvenConstantEnvironment,
+    expression: &Expression<'_>,
+) -> Option<String> {
+    let segments = global_path_pattern(scoping, constants, expression)?;
+    let path = segments
+        .into_iter()
+        .map(|segment| segment.filter(|value| !value.contains('.')))
+        .collect::<Option<Vec<_>>>()?;
+    Some(path.join("."))
 }
 
 fn static_string(
@@ -268,62 +285,91 @@ fn allowed_xhr_path(path: &str) -> bool {
     )
 }
 
-fn allowed_request_init_method_prototype_path(path: &str) -> bool {
-    matches!(
-        path,
-        "Object.prototype.method"
-            | "window.Object.prototype.method"
-            | "globalThis.Object.prototype.method"
-            | "self.Object.prototype.method"
-    )
-}
-
-fn sink_family(path: &str) -> Option<&'static str> {
-    if allowed_fetch_path(path) {
-        Some("fetch")
-    } else if allowed_send_beacon_path(path) {
-        Some("send_beacon")
-    } else if allowed_websocket_path(path) {
-        Some("websocket")
-    } else if allowed_xhr_path(path) {
-        Some("xhr")
-    } else if allowed_request_init_method_prototype_path(path) {
-        Some("request_init_method_prototype")
+/// Global aliases refer to the same object for property writes. Retain the
+/// path components so an unknown key cannot masquerade as a known segment.
+fn normalized_mutation_path(path: &[Option<String>]) -> &[Option<String>] {
+    if path.len() > 1 && matches!(path[0].as_deref(), Some("window" | "globalThis" | "self")) {
+        &path[1..]
     } else {
-        None
+        path
     }
 }
 
-fn simple_assignment_global_path(
+const MUTATION_TARGETS: &[(&str, &[&str])] = &[
+    ("fetch", &["fetch"]),
+    ("send_beacon", &["navigator", "sendBeacon"]),
+    ("websocket", &["WebSocket"]),
+    ("xhr", &["XMLHttpRequest"]),
+    ("xhr_open_method", &["XMLHttpRequest", "prototype", "open"]),
+    (
+        "request_init_method_prototype",
+        &["Object", "prototype", "method"],
+    ),
+];
+
+#[derive(Default)]
+struct SinkMutations {
+    definite: BTreeSet<&'static str>,
+    possible: BTreeSet<&'static str>,
+}
+
+impl SinkMutations {
+    fn record(&mut self, path: &[Option<String>]) {
+        let path = normalized_mutation_path(path);
+        for &(family, target) in MUTATION_TARGETS {
+            // Assigning to an ancestor namespace can replace a descendant
+            // binding, while writing below the binding cannot replace it.
+            if path.len() > target.len()
+                || !path
+                    .iter()
+                    .zip(target)
+                    .all(|(segment, name)| segment.as_deref().is_none_or(|value| value == *name))
+            {
+                continue;
+            }
+            if path.iter().all(Option::is_some) {
+                self.definite.insert(family);
+            } else {
+                self.possible.insert(family);
+            }
+        }
+    }
+
+    fn definitely(&self, family: &str) -> bool {
+        self.definite.contains(family)
+    }
+
+    fn possibly(&self, family: &str) -> bool {
+        self.possible.contains(family)
+    }
+}
+
+fn assignment_target_global_path_pattern(
     scoping: &Scoping,
     constants: &ProvenConstantEnvironment,
     target: &oxc_ast::ast::SimpleAssignmentTarget<'_>,
-) -> Option<String> {
+) -> Option<Vec<Option<String>>> {
     match target {
         oxc_ast::ast::SimpleAssignmentTarget::AssignmentTargetIdentifier(identifier) => {
             let reference = scoping.get_reference(identifier.reference_id.get()?);
             reference
                 .symbol_id()
                 .is_none()
-                .then(|| identifier.name.to_string())
+                .then(|| vec![Some(identifier.name.to_string())])
         }
         oxc_ast::ast::SimpleAssignmentTarget::StaticMemberExpression(member)
             if !member.optional =>
         {
-            Some(format!(
-                "{}.{}",
-                global_path(scoping, constants, &member.object)?,
-                member.property.name
-            ))
+            let mut path = global_path_pattern(scoping, constants, &member.object)?;
+            path.push(Some(member.property.name.to_string()));
+            Some(path)
         }
         oxc_ast::ast::SimpleAssignmentTarget::ComputedMemberExpression(member)
             if !member.optional =>
         {
-            Some(format!(
-                "{}.{}",
-                global_path(scoping, constants, &member.object)?,
-                static_string(&member.expression, scoping, constants)?
-            ))
+            let mut path = global_path_pattern(scoping, constants, &member.object)?;
+            path.push(static_string(&member.expression, scoping, constants));
+            Some(path)
         }
         _ => None,
     }
@@ -332,13 +378,13 @@ fn simple_assignment_global_path(
 struct SinkMutationCollector<'c> {
     scoping: &'c Scoping,
     constants: &'c ProvenConstantEnvironment,
-    mutated: BTreeSet<&'static str>,
+    mutations: SinkMutations,
 }
 
 impl SinkMutationCollector<'_> {
-    fn record(&mut self, path: Option<&str>) {
-        if let Some(family) = path.and_then(sink_family) {
-            self.mutated.insert(family);
+    fn record(&mut self, path: Option<Vec<Option<String>>>) {
+        if let Some(path) = path {
+            self.mutations.record(&path);
         }
     }
 }
@@ -350,24 +396,28 @@ impl<'a> Visit<'a> for SinkMutationCollector<'_> {
                 .left
                 .as_simple_assignment_target()
                 .and_then(|target| {
-                    simple_assignment_global_path(self.scoping, self.constants, target)
-                })
-                .as_deref(),
+                    assignment_target_global_path_pattern(self.scoping, self.constants, target)
+                }),
         );
         walk::walk_assignment_expression(self, assignment);
     }
 
     fn visit_update_expression(&mut self, update: &oxc_ast::ast::UpdateExpression<'a>) {
-        self.record(
-            simple_assignment_global_path(self.scoping, self.constants, &update.argument)
-                .as_deref(),
-        );
+        self.record(assignment_target_global_path_pattern(
+            self.scoping,
+            self.constants,
+            &update.argument,
+        ));
         walk::walk_update_expression(self, update);
     }
 
     fn visit_unary_expression(&mut self, unary: &oxc_ast::ast::UnaryExpression<'a>) {
         if unary.operator.as_str() == "delete" {
-            self.record(global_path(self.scoping, self.constants, &unary.argument).as_deref());
+            self.record(global_path_pattern(
+                self.scoping,
+                self.constants,
+                &unary.argument,
+            ));
         }
         walk::walk_unary_expression(self, unary);
     }
@@ -506,6 +556,7 @@ struct XhrBindingCollector<'c> {
     constants: &'c ProvenConstantEnvironment,
     safe_member_refs: &'c BTreeSet<ReferenceId>,
     standard_xhr_available: bool,
+    constructor_may_be_mutated: bool,
     symbols: BTreeSet<SymbolId>,
     candidate_symbols: BTreeSet<SymbolId>,
 }
@@ -528,7 +579,8 @@ impl<'a> Visit<'a> for XhrBindingCollector<'_> {
                                 self.scoping,
                                 symbol,
                                 self.safe_member_refs,
-                            ) {
+                            ) && !self.constructor_may_be_mutated
+                            {
                                 self.symbols.insert(symbol);
                             } else {
                                 self.candidate_symbols.insert(symbol);
@@ -546,7 +598,7 @@ struct Collector<'s, 'c> {
     source: &'s str,
     scoping: &'c Scoping,
     constants: &'c ProvenConstantEnvironment,
-    mutated_sinks: &'c BTreeSet<&'static str>,
+    mutations: &'c SinkMutations,
     xhr_symbols: &'c BTreeSet<SymbolId>,
     xhr_candidate_symbols: &'c BTreeSet<SymbolId>,
     lines: LineIndex,
@@ -574,6 +626,11 @@ impl Collector<'_, '_> {
             column,
             callee,
             proof: proof.to_string(),
+            binding_status: if kind.ends_with("_candidate") {
+                "candidate".to_owned()
+            } else {
+                "standard".to_owned()
+            },
             standard_browser_api_semantics_required: true,
             method,
             method_expression,
@@ -605,31 +662,44 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         if !call.optional {
             if let Some(path) = global_path(self.scoping, self.constants, &call.callee) {
-                if allowed_fetch_path(&path) && !self.mutated_sinks.contains("fetch") {
+                if allowed_fetch_path(&path) && !self.mutations.definitely("fetch") {
                     let (url, url_expression) = exact_argument(
                         self.source,
                         call.arguments.first(),
                         self.scoping,
                         self.constants,
                     );
-                    let method = fetch_method(
+                    let candidate = self.mutations.possibly("fetch");
+                    let mut method = fetch_method(
                         self.source,
                         &call.arguments,
                         url.is_some(),
-                        self.mutated_sinks.contains("request_init_method_prototype"),
+                        self.mutations.definitely("request_init_method_prototype")
+                            || self.mutations.possibly("request_init_method_prototype"),
                         self.scoping,
                         self.constants,
                     );
+                    if candidate && method.2.as_deref() == Some("exact") {
+                        method.2 = Some("conditional".to_owned());
+                    }
                     self.push(
-                        "fetch",
+                        if candidate {
+                            "fetch_candidate"
+                        } else {
+                            "fetch"
+                        },
                         call.span,
                         path,
-                        STANDARD_BROWSER_API_ASSUMPTION,
+                        if candidate {
+                            "unresolved_global_member_mutation_may_replace_fetch"
+                        } else {
+                            STANDARD_BROWSER_API_ASSUMPTION
+                        },
                         method,
                         (url, url_expression),
                     );
                 } else if allowed_send_beacon_path(&path)
-                    && !self.mutated_sinks.contains("send_beacon")
+                    && !self.mutations.definitely("send_beacon")
                 {
                     let (url, url_expression) = exact_argument(
                         self.source,
@@ -637,20 +707,38 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
                         self.scoping,
                         self.constants,
                     );
+                    let candidate = self.mutations.possibly("send_beacon");
                     self.push(
-                        "send_beacon",
+                        if candidate {
+                            "send_beacon_candidate"
+                        } else {
+                            "send_beacon"
+                        },
                         call.span,
                         path,
-                        STANDARD_BROWSER_API_ASSUMPTION,
-                        (Some("POST".to_string()), None, Some("exact".to_string())),
+                        if candidate {
+                            "unresolved_global_member_mutation_may_replace_sendBeacon"
+                        } else {
+                            STANDARD_BROWSER_API_ASSUMPTION
+                        },
+                        (
+                            Some("POST".to_owned()),
+                            None,
+                            Some(if candidate { "conditional" } else { "exact" }.to_owned()),
+                        ),
                         (url, url_expression),
                     );
                 }
             }
 
             if let Some(symbol) = self.xhr_receiver_symbol(&call.callee) {
-                let confirmed = self.xhr_symbols.contains(&symbol);
-                if confirmed || self.xhr_candidate_symbols.contains(&symbol) {
+                let stable_receiver = self.xhr_symbols.contains(&symbol);
+                let confirmed = stable_receiver
+                    && !self.mutations.possibly("xhr_open_method")
+                    && !self.mutations.definitely("xhr_open_method");
+                let candidate = !self.mutations.definitely("xhr_open_method")
+                    && (stable_receiver || self.xhr_candidate_symbols.contains(&symbol));
+                if confirmed || candidate {
                     let (method, method_expression) = exact_argument(
                         self.source,
                         call.arguments.first(),
@@ -675,16 +763,28 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
                         self.scoping,
                         self.constants,
                     );
+                    let dynamic_mutation = self.mutations.possibly("xhr")
+                        || self.mutations.possibly("xhr_open_method");
                     self.push(
                         if confirmed { "xhr_open" } else { "xhr_open_candidate" },
                         call.span,
                         source_fragment(self.source, call.callee.span()),
                         if confirmed {
                             "stable_symbol_initialized_from_standard_XMLHttpRequest"
+                        } else if dynamic_mutation {
+                            "unresolved_global_member_mutation_may_replace_XMLHttpRequest_or_open"
                         } else {
                             "unreassigned_binding_initialized_from_standard_XMLHttpRequest_but_receiver_escapes_or_is_mutable"
                         },
-                        (method, method_expression, method_status),
+                        (
+                            method,
+                            method_expression,
+                            if dynamic_mutation && method_status.as_deref() == Some("exact") {
+                                Some("conditional".to_owned())
+                            } else {
+                                method_status
+                            },
+                        ),
                         (url, url_expression),
                     );
                 }
@@ -695,18 +795,27 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
 
     fn visit_new_expression(&mut self, expression: &NewExpression<'a>) {
         if let Some(path) = global_path(self.scoping, self.constants, &expression.callee) {
-            if allowed_websocket_path(&path) && !self.mutated_sinks.contains("websocket") {
+            if allowed_websocket_path(&path) && !self.mutations.definitely("websocket") {
                 let (url, url_expression) = exact_argument(
                     self.source,
                     expression.arguments.first(),
                     self.scoping,
                     self.constants,
                 );
+                let candidate = self.mutations.possibly("websocket");
                 self.push(
-                    "websocket",
+                    if candidate {
+                        "websocket_candidate"
+                    } else {
+                        "websocket"
+                    },
                     expression.span,
                     path,
-                    STANDARD_BROWSER_API_ASSUMPTION,
+                    if candidate {
+                        "unresolved_global_member_mutation_may_replace_WebSocket"
+                    } else {
+                        STANDARD_BROWSER_API_ASSUMPTION
+                    },
                     (None, None, None),
                     (url, url_expression),
                 );
@@ -784,7 +893,7 @@ pub fn analyze_api_surface(source: &str, budget: &WorkBudget) -> Result<Vec<ApiC
         let mut mutations = SinkMutationCollector {
             scoping,
             constants: &constants,
-            mutated: BTreeSet::new(),
+            mutations: SinkMutations::default(),
         };
         mutations.visit_program(&program);
         budget.checkpoint()?;
@@ -793,7 +902,8 @@ pub fn analyze_api_surface(source: &str, budget: &WorkBudget) -> Result<Vec<ApiC
             scoping,
             constants: &constants,
             safe_member_refs: &safe_member_refs.refs,
-            standard_xhr_available: !mutations.mutated.contains("xhr"),
+            standard_xhr_available: !mutations.mutations.definitely("xhr"),
+            constructor_may_be_mutated: mutations.mutations.possibly("xhr"),
             symbols: BTreeSet::new(),
             candidate_symbols: BTreeSet::new(),
         };
@@ -804,7 +914,7 @@ pub fn analyze_api_surface(source: &str, budget: &WorkBudget) -> Result<Vec<ApiC
             source,
             scoping,
             constants: &constants,
-            mutated_sinks: &mutations.mutated,
+            mutations: &mutations.mutations,
             xhr_symbols: &xhr.symbols,
             xhr_candidate_symbols: &xhr.candidate_symbols,
             lines: LineIndex::new(source),
@@ -868,6 +978,166 @@ xhr.send(payload);
         assert_eq!(rows[5].kind, "xhr_open");
         assert_eq!(rows[5].method.as_deref(), Some("POST"));
         assert_eq!(rows[5].line, 8);
+        Ok(())
+    }
+
+    #[test]
+    fn dynamic_global_property_write_keeps_all_affected_api_calls_as_candidates() -> Result<()> {
+        let source = r#"
+let key = location.hash.slice(1);
+globalThis[key] = replacement;
+fetch("https://api.example.test/items", { method: "PATCH" });
+navigator.sendBeacon("https://api.example.test/telemetry", data);
+new WebSocket("wss://api.example.test/live");
+const xhr = new XMLHttpRequest();
+xhr.open("PUT", "https://api.example.test/form");
+"#;
+        let rows = analyze_api_surface(source)?;
+        assert_eq!(rows.len(), 4, "{rows:#?}");
+        assert_eq!(
+            rows.iter().map(|row| row.kind.as_str()).collect::<Vec<_>>(),
+            [
+                "fetch_candidate",
+                "send_beacon_candidate",
+                "websocket_candidate",
+                "xhr_open_candidate"
+            ],
+        );
+        assert!(rows.iter().all(|row| row.binding_status == "candidate"));
+        assert_eq!(
+            rows[0].url.as_deref(),
+            Some("https://api.example.test/items")
+        );
+        assert_eq!(
+            rows[0].url_expression.as_deref(),
+            Some(r#""https://api.example.test/items""#)
+        );
+        assert_eq!(rows[0].method.as_deref(), Some("PATCH"));
+        assert_eq!(rows[0].method_status.as_deref(), Some("conditional"));
+        assert_eq!(rows[1].method.as_deref(), Some("POST"));
+        assert_eq!(rows[1].method_status.as_deref(), Some("conditional"));
+        assert_eq!(rows[2].url.as_deref(), Some("wss://api.example.test/live"));
+        assert_eq!(rows[3].method.as_deref(), Some("PUT"));
+        assert_eq!(rows[3].method_status.as_deref(), Some("conditional"));
+        assert_eq!(
+            rows[3].url.as_deref(),
+            Some("https://api.example.test/form")
+        );
+        assert!(rows
+            .iter()
+            .all(|row| row.proof.contains("unresolved_global_member_mutation")));
+        Ok(())
+    }
+
+    #[test]
+    fn dynamic_nested_write_downgrades_only_matching_api_family() -> Result<()> {
+        let source = r#"
+let key = getKey();
+window.navigator[key] = replacement;
+fetch("https://api.example.test/known");
+navigator.sendBeacon("https://api.example.test/maybe", data);
+new WebSocket("wss://api.example.test/known");
+const xhr = new XMLHttpRequest();
+xhr.open("GET", "https://api.example.test/known");
+"#;
+        let rows = analyze_api_surface(source)?;
+        assert_eq!(rows.len(), 4, "{rows:#?}");
+        assert_eq!(rows[0].kind, "fetch");
+        assert_eq!(rows[1].kind, "send_beacon_candidate");
+        assert_eq!(rows[2].kind, "websocket");
+        assert_eq!(rows[3].kind, "xhr_open");
+        assert!(rows.iter().enumerate().all(|(index, row)| {
+            row.binding_status == if index == 1 { "candidate" } else { "standard" }
+        }));
+        assert_eq!(rows[0].method_status.as_deref(), Some("exact"));
+        assert_eq!(rows[1].method_status.as_deref(), Some("conditional"));
+        Ok(())
+    }
+
+    #[test]
+    fn definite_namespace_replacements_invalidate_global_aliases_and_descendants() -> Result<()> {
+        let source = r#"
+window.fetch = customFetch;
+self.navigator = customNavigator;
+globalThis.WebSocket = CustomSocket;
+globalThis.XMLHttpRequest = CustomXhr;
+fetch("https://fake.invalid/fetch");
+globalThis.fetch("https://fake.invalid/global-fetch");
+navigator.sendBeacon("https://fake.invalid/beacon", data);
+window.navigator.sendBeacon("https://fake.invalid/global-beacon", data);
+new WebSocket("wss://fake.invalid/socket");
+const xhr = new XMLHttpRequest();
+xhr.open("POST", "https://fake.invalid/xhr");
+"#;
+        let rows = analyze_api_surface(source)?;
+        assert!(rows.is_empty(), "{rows:#?}");
+        Ok(())
+    }
+
+    #[test]
+    fn inherited_method_and_xhr_prototype_dynamic_writes_preserve_uncertainty() -> Result<()> {
+        let source = r#"
+let key = getName();
+Object.prototype[key] = "DELETE";
+XMLHttpRequest.prototype[key] = customOpen;
+fetch("https://api.example.test/inherited", {});
+fetch("https://api.example.test/own", { method: "POST" });
+fetch("https://api.example.test/no-init");
+const xhr = new XMLHttpRequest();
+xhr.open("PATCH", "https://api.example.test/record");
+"#;
+        let rows = analyze_api_surface(source)?;
+        assert_eq!(rows.len(), 4, "{rows:#?}");
+        assert_eq!(rows[0].kind, "fetch");
+        assert_eq!(rows[0].method, None);
+        assert_eq!(rows[0].method_status.as_deref(), Some("unknown"));
+        assert_eq!(rows[1].kind, "fetch");
+        assert_eq!(rows[1].method.as_deref(), Some("POST"));
+        assert_eq!(rows[1].method_status.as_deref(), Some("exact"));
+        assert_eq!(rows[2].method.as_deref(), Some("GET"));
+        assert_eq!(rows[3].kind, "xhr_open_candidate");
+        assert_eq!(rows[3].binding_status, "candidate");
+        assert_eq!(rows[3].method.as_deref(), Some("PATCH"));
+        assert_eq!(rows[3].method_status.as_deref(), Some("conditional"));
+        Ok(())
+    }
+
+    #[test]
+    fn dynamically_computed_subproperties_cannot_replace_parent_api_binding() -> Result<()> {
+        let source = r#"
+let unknown = getName();
+globalThis[unknown].fetch = replacement;
+globalThis.fetch[unknown] = replacement;
+window["navigator.sendBeacon"] = fakeBeacon;
+fetch("https://api.example.test/verified");
+navigator.sendBeacon("https://api.example.test/verified", data);
+new WebSocket("wss://api.example.test/verified");
+"#;
+        let rows = analyze_api_surface(source)?;
+        assert_eq!(rows.len(), 3, "{rows:#?}");
+        assert!(rows.iter().all(|row| row.binding_status == "standard"));
+        assert_eq!(rows[0].kind, "fetch");
+        assert_eq!(rows[1].kind, "send_beacon");
+        assert_eq!(rows[2].kind, "websocket");
+        Ok(())
+    }
+
+    #[test]
+    fn shadowed_global_namespaces_and_unrelated_computed_writes_are_excluded() -> Result<()> {
+        let source = r#"
+function local(window, navigator) {
+    let key = getName();
+    window[key] = replacement;
+    navigator[key] = replacement;
+}
+const fixed = "unrelated";
+window[fixed] = replacement;
+fetch("https://api.example.test/verified");
+navigator.sendBeacon("https://api.example.test/verified", data);
+"#;
+        let rows = analyze_api_surface(source)?;
+        assert_eq!(rows.len(), 2, "{rows:#?}");
+        assert!(rows.iter().all(|row| row.binding_status == "standard"));
         Ok(())
     }
 
