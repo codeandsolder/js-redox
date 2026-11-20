@@ -21,6 +21,7 @@ mod pure_function;
 mod rewrite;
 mod selector;
 mod state_guard_folding;
+mod statement_hazards;
 mod string_exposure;
 mod switch_constant;
 mod trivial_loops;
@@ -1482,7 +1483,9 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
             } else {
                 (it.alternate.as_ref(), Some(&it.consequent))
             };
-            if !discarded.is_some_and(trivial_loops::has_hoisting_hazards) {
+            if !discarded
+                .is_some_and(|stmt| statement_hazards::DeclarationHazard::Discard.present(&[stmt]))
+            {
                 let replacement = completion::selected_if_branch(selected, self.source, live);
                 self.push(it.span, replacement, "dead_branch");
             }

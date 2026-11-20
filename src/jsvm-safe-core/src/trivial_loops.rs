@@ -2,48 +2,14 @@
 //! This is not an arbitrary bounded-loop evaluator: it recognizes loops
 //! whose precise number of iterations is established by their own AST.
 
-use crate::fragment;
+use crate::{fragment, statement_hazards::DeclarationHazard};
 use oxc_ast::ast::{
     BlockStatement, Expression, ForStatement, IfStatement, SequenceExpression, Statement,
-    VariableDeclaration, VariableDeclarationKind, WhileStatement,
+    VariableDeclarationKind, WhileStatement,
 };
-use oxc_ast_visit::{walk, Visit};
+use oxc_ast_visit::Visit;
 use oxc_semantic::Scoping;
 use oxc_span::GetSpan;
-
-#[derive(Default)]
-struct HoistingHazards {
-    present: bool,
-}
-
-impl<'a> Visit<'a> for HoistingHazards {
-    fn visit_variable_declaration(&mut self, declaration: &VariableDeclaration<'a>) {
-        if declaration.kind == VariableDeclarationKind::Var {
-            self.present = true;
-        }
-        walk::walk_variable_declaration(self, declaration);
-    }
-
-    fn visit_statement(&mut self, statement: &Statement<'a>) {
-        if matches!(statement, Statement::FunctionDeclaration(_)) {
-            // A dead function declaration can be observable under Annex B.
-            self.present = true;
-        } else {
-            walk::walk_statement(self, statement);
-        }
-    }
-
-    fn visit_function(&mut self, _: &oxc_ast::ast::Function<'a>, _: oxc_syntax::scope::ScopeFlags) {
-    }
-    fn visit_arrow_function_expression(&mut self, _: &oxc_ast::ast::ArrowFunctionExpression<'a>) {}
-    fn visit_class(&mut self, _: &oxc_ast::ast::Class<'a>) {}
-}
-
-pub(crate) fn has_hoisting_hazards(statement: &Statement<'_>) -> bool {
-    let mut hazards = HoistingHazards::default();
-    hazards.visit_statement(statement);
-    hazards.present
-}
 
 #[derive(Default)]
 struct ControlTransfers {
@@ -259,7 +225,7 @@ pub fn never_entered_while(it: &WhileStatement<'_>) -> Option<String> {
     if !literal_bool(&it.test, false) {
         return None;
     }
-    (!has_hoisting_hazards(&it.body)).then_some("{}".to_owned())
+    (!DeclarationHazard::Discard.present(&[&it.body])).then_some("{}".to_owned())
 }
 
 /// For (0; true; true) { ...; break; } executes its body exactly once unless
