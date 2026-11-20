@@ -1,3 +1,4 @@
+mod capture_evidence;
 mod generated_evidence;
 mod reference_evidence;
 mod static_evidence;
@@ -14,12 +15,12 @@ use crate::{
     sha256_hex,
 };
 use anyhow::{Context, Result};
+use capture_evidence::InlineSourceIndex;
 use serde_json::{json, Map, Value};
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     path::Path,
 };
-use url::Url;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SourceGraphSummary {
@@ -69,12 +70,6 @@ fn compact_key(parts: impl serde::Serialize) -> Result<String> {
 
 fn digest_id(prefix: &str, text: &str) -> String {
     format!("{prefix}{}", &sha256_hex(text.as_bytes())[..20])
-}
-
-fn resolve_url(base: &str, reference: &str) -> String {
-    Url::parse(base)
-        .and_then(|url| url.join(reference))
-        .map_or_else(|_| reference.to_string(), |url| url.to_string())
 }
 
 #[derive(Default)]
@@ -316,45 +311,6 @@ fn add_observed_callable_definition(
     Ok(())
 }
 
-#[derive(Default)]
-struct InlineSourceIndex {
-    by_identity: BTreeMap<(String, u64, u64), String>,
-    by_unique_raw: BTreeMap<String, Option<String>>,
-}
-
-impl InlineSourceIndex {
-    fn insert(&mut self, raw: &str, parent: u64, ordinal: u64, node: String) -> Result<()> {
-        anyhow::ensure!(
-            self.by_identity
-                .insert((raw.to_owned(), parent, ordinal), node.clone())
-                .is_none(),
-            "duplicate inline script identity {raw} ({parent}, {ordinal})"
-        );
-        self.by_unique_raw
-            .entry(raw.to_owned())
-            .and_modify(|existing| *existing = None)
-            .or_insert(Some(node));
-        Ok(())
-    }
-
-    fn exact(&self, raw: &str, parent: u64, ordinal: u64) -> Option<String> {
-        self.by_identity
-            .get(&(raw.to_owned(), parent, ordinal))
-            .cloned()
-    }
-
-    fn for_record(&self, record: &Value) -> Option<String> {
-        let raw = string_field(record, "raw_path")?;
-        match (
-            u64_field(record, "resource_id"),
-            u64_field(record, "ordinal"),
-        ) {
-            (Some(parent), Some(ordinal)) => self.exact(raw, parent, ordinal),
-            _ => self.by_unique_raw.get(raw).and_then(Clone::clone),
-        }
-    }
-}
-
 fn captured_sourcemap_candidates(
     graph: &mut GraphBuilder,
     row: &Value,
@@ -434,201 +390,6 @@ fn add_sourcemap_reference(
         )?;
     }
     Ok(reference)
-}
-
-fn seed_captured_resources(
-    graph: &mut GraphBuilder,
-    manifest: &CaptureManifest,
-    source_index: &Value,
-    budget: &work_budget::WorkBudget,
-) -> Result<BTreeMap<String, Vec<String>>> {
-    let mut source_by_resource = BTreeMap::<u64, Vec<&Value>>::new();
-    for unit in array_field(source_index, "units") {
-        budget.checkpoint()?;
-        if let Some(resource_id) = u64_field(unit, "resource_id") {
-            source_by_resource
-                .entry(resource_id)
-                .or_default()
-                .push(unit);
-        }
-    }
-
-    let mut resource_nodes_by_sha = BTreeMap::<String, Vec<String>>::new();
-    for (index, resource) in manifest.resources.iter().enumerate() {
-        budget.checkpoint()?;
-        let resource_id = required_u64(resource, "id", &format!("manifest.resources[{index}]"))?;
-        let node_id = format!("resource:{resource_id}");
-        let units = source_by_resource
-            .get(&resource_id)
-            .map_or_default(Vec::as_slice);
-        let source_paths = units
-            .iter()
-            .filter_map(|unit| nonempty_string_field(unit, "source_path"))
-            .map(|path| Value::String(path.to_string()))
-            .collect::<Vec<_>>();
-        let mut node = json!({
-            "type":"resource",
-            "resource_id":resource_id,
-            "url":field(resource,"url"),
-            "kind":field(resource,"kind"),
-            "status":field(resource,"status"),
-            "body_present":field(resource,"body_present"),
-            "raw_path":field(resource,"output_path"),
-            "source_paths":source_paths,
-            "sha256":field(resource,"sha256"),
-        });
-        if let Some(roles) = resource.get("saved_page_reference_roles") {
-            node["saved_page_reference_roles"] = roles.clone();
-        }
-        graph.add_node(node_id.clone(), node)?;
-        if let Some(url) = nonempty_string_field(resource, "url") {
-            graph.register_resource_url(url, &node_id);
-        }
-        if let Some(sha) = nonempty_string_field(resource, "sha256") {
-            resource_nodes_by_sha
-                .entry(sha.to_string())
-                .or_default()
-                .push(node_id);
-        }
-    }
-    Ok(resource_nodes_by_sha)
-}
-
-fn seed_navigation_roots(
-    graph: &mut GraphBuilder,
-    manifest: &CaptureManifest,
-    budget: &work_budget::WorkBudget,
-) -> Result<()> {
-    // A recorder may lack HAR log.pages, but its navigation URL still
-    // establishes an HTML/browser root for the captured resource graph.
-    // Only link a browser page to resource URLs exactly observed in the
-    // manifest; redirects and script references remain distinct edges.
-    for (index, page) in manifest.pages.iter().enumerate() {
-        budget.checkpoint()?;
-        if nonempty_string_field(page, "kind") != Some("recorder_navigation") {
-            continue;
-        }
-        let page_id = format!("page:{index}");
-        graph.add_node(
-            page_id.clone(),
-            json!({
-                "type": "browser_entrypoint",
-                "requested_url": field(page, "requested_url"),
-                "final_url": field(page, "final_url"),
-            }),
-        )?;
-        for (key, edge_kind) in [
-            ("requested_url", "requested_navigation"),
-            ("final_url", "observed_navigation"),
-        ] {
-            if let Some(url) = nonempty_string_field(page, key) {
-                for target in graph.targets_for(url)? {
-                    graph.add_edge(&page_id, &target, edge_kind, json!({"url":url}))?;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn seed_captured_reference_edges(
-    graph: &mut GraphBuilder,
-    manifest: &CaptureManifest,
-    budget: &work_budget::WorkBudget,
-) -> Result<()> {
-    // HAR-extracted HTML/script/source-map references and redirects.
-    for resource in &manifest.resources {
-        budget.checkpoint()?;
-        let resource_id = required_u64(resource, "id", "manifest resource")?;
-        let src = format!("resource:{resource_id}");
-        for reference in array_field(resource, "references") {
-            let Some(url) = nonempty_string_field(reference, "resolved_url") else {
-                continue;
-            };
-            let kind = nonempty_string_field(reference, "kind").unwrap_or("reference");
-            for dst in graph.targets_for(url)? {
-                graph.add_edge(
-                    &src,
-                    &dst,
-                    kind,
-                    json!({"raw":field(reference,"raw"), "resolved_url":url}),
-                )?;
-            }
-        }
-
-        let location = array_field(resource, "response_headers")
-            .iter()
-            .find(|header| {
-                string_field(header, "name")
-                    .is_some_and(|name| name.eq_ignore_ascii_case("location"))
-            })
-            .and_then(|header| nonempty_string_field(header, "value"));
-        if let (Some(location), Some(base)) = (location, nonempty_string_field(resource, "url")) {
-            let resolved = resolve_url(base, location);
-            for dst in graph.targets_for(&resolved)? {
-                graph.add_edge(
-                    &src,
-                    &dst,
-                    "redirect",
-                    json!({"raw":location, "resolved_url":resolved}),
-                )?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn seed_captured_inline_scripts(
-    graph: &mut GraphBuilder,
-    manifest: &CaptureManifest,
-    budget: &work_budget::WorkBudget,
-) -> Result<(InlineSourceIndex, BTreeMap<String, Vec<String>>)> {
-    // Inline scripts are generated source nodes owned by their HTML resource.
-    let mut inline_nodes = InlineSourceIndex::default();
-    let mut inline_nodes_by_sha = BTreeMap::<String, Vec<String>>::new();
-    for (index, item) in manifest.inline_scripts.iter().enumerate() {
-        budget.checkpoint()?;
-        let Some(output_path) = nonempty_string_field(item, "output_path") else {
-            continue;
-        };
-        let parent = required_u64(
-            item,
-            "parent_resource_id",
-            &format!("manifest.inline_scripts[{index}]"),
-        )?;
-        let ordinal = required_u64(
-            item,
-            "ordinal",
-            &format!("manifest.inline_scripts[{index}]"),
-        )?;
-        let node_id = format!("inline:{parent}:{ordinal}");
-        graph.add_node(
-            node_id.clone(),
-            json!({
-                "type":"inline_script",
-                "parent_resource_id":parent,
-                "ordinal":ordinal,
-                "script_type":field(item,"script_type"),
-                "source_path":output_path,
-                "bytes":field(item,"body_bytes"),
-                "sha256":field(item,"sha256"),
-            }),
-        )?;
-        graph.add_edge(
-            &format!("resource:{parent}"),
-            &node_id,
-            "inline_script",
-            json!({"ordinal":ordinal}),
-        )?;
-        inline_nodes.insert(output_path, parent, ordinal, node_id.clone())?;
-        if let Some(sha) = nonempty_string_field(item, "sha256") {
-            inline_nodes_by_sha
-                .entry(sha.to_string())
-                .or_default()
-                .push(node_id);
-        }
-    }
-    Ok((inline_nodes, inline_nodes_by_sha))
 }
 
 fn finish_source_graph(
@@ -1970,12 +1731,11 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
     )?;
 
     let mut graph = GraphBuilder::default();
-    let resource_nodes_by_sha =
-        seed_captured_resources(&mut graph, &manifest, &source_index, &budget)?;
-    seed_navigation_roots(&mut graph, &manifest, &budget)?;
-    seed_captured_reference_edges(&mut graph, &manifest, &budget)?;
-    let (inline_nodes, inline_nodes_by_sha) =
-        seed_captured_inline_scripts(&mut graph, &manifest, &budget)?;
+    let capture_evidence::CapturedSourceIndex {
+        resource_nodes_by_sha,
+        inline_nodes,
+        inline_nodes_by_sha,
+    } = capture_evidence::seed_capture_evidence(&mut graph, &manifest, &source_index, &budget)?;
 
     let runtime_index = seed_runtime_script_evidence(
         &mut graph,
@@ -2036,6 +1796,10 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
 
 #[cfg(test)]
 mod tests {
+    use super::capture_evidence::{
+        seed_captured_inline_scripts, seed_captured_reference_edges, seed_captured_resources,
+        seed_navigation_roots,
+    };
     use super::*;
     use crate::{
         analysis_artifacts::{load_artifact, write_artifact, JS_REFERENCES, SOURCE_GRAPH},
