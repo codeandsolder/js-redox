@@ -1,5 +1,7 @@
 mod generated_evidence;
+mod reference_evidence;
 mod static_evidence;
+mod wasm_evidence;
 
 use crate::{
     analysis_artifacts::{
@@ -314,123 +316,6 @@ fn add_observed_callable_definition(
     Ok(())
 }
 
-fn reference_resolutions(reference: &Value) -> Vec<&Value> {
-    // The contextual inventory is authoritative, even when empty or malformed.
-    // Summary fields are only used when no contextual inventory exists.
-    match reference.get("resolution_candidates") {
-        None => vec![reference],
-        Some(Value::Array(choices)) => choices.iter().collect(),
-        Some(_) => Vec::new(),
-    }
-}
-
-fn is_blocked_resolution(value: &Value) -> bool {
-    string_field(value, "resolution").is_some_and(|status| {
-        status == "import_map_blocked" || status.ends_with("_import_map_blocked")
-    })
-}
-
-fn add_reference_edges(
-    graph: &mut GraphBuilder,
-    specifier_nodes: &mut BTreeMap<String, String>,
-    source: &str,
-    reference: &Value,
-) -> Result<()> {
-    let kind = format!(
-        "js_{}",
-        string_field(reference, "kind").unwrap_or("reference")
-    );
-    let choices = reference_resolutions(reference);
-    if choices.is_empty() {
-        return add_unresolved_reference(graph, specifier_nodes, source, reference, &kind, None);
-    }
-    for choice in choices {
-        let blocked = is_blocked_resolution(choice);
-        if blocked || nonempty_string_field(choice, "resolved_url").is_none() {
-            add_unresolved_reference(
-                graph,
-                specifier_nodes,
-                source,
-                reference,
-                &kind,
-                Some(choice),
-            )?;
-            continue;
-        }
-        let url = nonempty_string_field(choice, "resolved_url")
-            .context("checked nonempty candidate URL disappeared")?;
-        for target in graph.targets_for(url)? {
-            graph.add_edge(
-                source,
-                &target,
-                &kind,
-                json!({
-                    "specifier":field(reference,"specifier"),
-                    "glob":field(reference,"glob"),
-                    "glob_match_url":field(choice,"glob_match_url"),
-                    "resolved_url":url,
-                    "resolution":field(choice,"resolution"),
-                    "import_map_key":field(choice,"import_map_key"),
-                    "scope":field(choice,"scope"),
-                    "document_resource_id":field(choice,"document_resource_id"),
-                    "start":field(reference,"start"),
-                    "end":field(reference,"end"),
-                }),
-            )?;
-        }
-    }
-    Ok(())
-}
-
-fn add_unresolved_reference(
-    graph: &mut GraphBuilder,
-    specifier_nodes: &mut BTreeMap<String, String>,
-    source: &str,
-    reference: &Value,
-    kind: &str,
-    context: Option<&Value>,
-) -> Result<()> {
-    let specifier = string_field(reference, "specifier").unwrap_or("");
-    let node_id = if let Some(existing) = specifier_nodes.get(specifier) {
-        existing.clone()
-    } else {
-        let node_id = digest_id("specifier:", specifier);
-        graph.add_node(
-            node_id.clone(),
-            json!({
-                "type":"module_specifier",
-                "specifier":specifier,
-                "bare":bool_field(reference,"bare_specifier"),
-                "captured":false,
-            }),
-        )?;
-        specifier_nodes.insert(specifier.to_owned(), node_id.clone());
-        node_id
-    };
-    let proof = context.unwrap_or(reference);
-    let blocked = is_blocked_resolution(proof);
-    graph.add_edge(
-        source,
-        &node_id,
-        kind,
-        json!({
-            "specifier":specifier,
-            "glob":field(reference,"glob"),
-            "resolved_url":Value::Null,
-            "resolution":if context.is_none()
-                && reference.get("resolution_candidates").is_some()
-                {json!("no_matching_contextual_resolution")}
-                else {field(proof,"resolution")},
-            "import_map_key":field(proof,"import_map_key"),
-            "scope":field(proof,"scope"),
-            "document_resource_id":field(proof,"document_resource_id"),
-            "blocked":blocked,
-            "start":field(reference,"start"),
-            "end":field(reference,"end"),
-        }),
-    )
-}
-
 #[derive(Default)]
 struct InlineSourceIndex {
     by_identity: BTreeMap<(String, u64, u64), String>,
@@ -549,35 +434,6 @@ fn add_sourcemap_reference(
         )?;
     }
     Ok(reference)
-}
-
-fn add_js_reference_edges(
-    graph: &mut GraphBuilder,
-    jsrefs: &Value,
-    inline_nodes: &InlineSourceIndex,
-    budget: &work_budget::WorkBudget,
-) -> Result<()> {
-    let mut specifier_nodes = BTreeMap::<String, String>::new();
-    for unit in array_field(jsrefs, "code_units") {
-        budget.checkpoint()?;
-        let Some(resource_id) = u64_field(unit, "resource_id") else {
-            continue;
-        };
-        let source = if string_field(unit, "origin") == Some("inline_script") {
-            let raw =
-                string_field(unit, "raw_path").context("inline reference missing raw path")?;
-            let ordinal = u64_field(unit, "ordinal").context("inline reference missing ordinal")?;
-            inline_nodes
-                .exact(raw, resource_id, ordinal)
-                .with_context(|| format!("inline reference has no exact captured source {raw} ({resource_id}, {ordinal})"))?
-        } else {
-            format!("resource:{resource_id}")
-        };
-        for reference in array_field(unit, "references") {
-            add_reference_edges(graph, &mut specifier_nodes, &source, reference)?;
-        }
-    }
-    Ok(())
 }
 
 fn seed_captured_resources(
@@ -2165,131 +2021,15 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
 
     generated_evidence::seed_generated_and_vm_evidence(&mut graph, &jsvm, &deob_nodes, &budget)?;
 
-    // Import-map definitions are captured provenance too, not just resolver state.
-    for record in array_field(&import_maps, "maps") {
-        budget.checkpoint()?;
-        let Some(raw_path) = string_field(record, "raw_path") else {
-            continue;
-        };
-        let Some(src) = (|| {
-            let parent = u64_field(record, "document_resource_id")?;
-            let ordinal = u64_field(record, "ordinal")?;
-            inline_nodes.exact(raw_path, parent, ordinal)
-        })() else {
-            continue;
-        };
+    reference_evidence::seed_import_map_definitions(
+        &mut graph,
+        &import_maps,
+        &inline_nodes,
+        &budget,
+    )?;
+    reference_evidence::seed_js_reference_edges(&mut graph, &jsrefs, &inline_nodes, &budget)?;
 
-        let document_resource_id = field(record, "document_resource_id");
-        if let Some(imports) = object_field(record, "imports") {
-            for (specifier, resolved) in imports {
-                let Some(resolved) = resolved.as_str() else {
-                    continue;
-                };
-                for dst in graph.targets_for(resolved)? {
-                    graph.add_edge(
-                        &src,
-                        &dst,
-                        "import_map_entry",
-                        json!({
-                            "specifier":specifier,
-                            "resolved_url":resolved,
-                            "document_resource_id":document_resource_id.clone(),
-                            "scope":Value::Null,
-                        }),
-                    )?;
-                }
-            }
-        }
-        if let Some(scopes) = object_field(record, "scopes") {
-            for (scope, entries) in scopes {
-                let Some(entries) = entries.as_object() else {
-                    continue;
-                };
-                for (specifier, resolved) in entries {
-                    let Some(resolved) = resolved.as_str() else {
-                        continue;
-                    };
-                    for dst in graph.targets_for(resolved)? {
-                        graph.add_edge(
-                            &src,
-                            &dst,
-                            "import_map_entry",
-                            json!({
-                                "specifier":specifier,
-                                "resolved_url":resolved,
-                                "document_resource_id":document_resource_id.clone(),
-                                "scope":scope,
-                            }),
-                        )?;
-                    }
-                }
-            }
-        }
-    }
-
-    // AST-backed JavaScript module / worker references.
-    add_js_reference_edges(&mut graph, &jsrefs, &inline_nodes, &budget)?;
-
-    // Captured or statically recovered WebAssembly modules are first-class derived sources.
-    for module in array_field(&wasm, "modules") {
-        budget.checkpoint()?;
-        let digest = string_field(module, "sha256").context("WASM module sha256 is required")?;
-        let node_id = format!("wasm:{}", &digest[..digest.len().min(20)]);
-        graph.add_node(
-            node_id.clone(),
-            json!({
-                "type":"wasm_module",
-                "sha256":digest,
-                "bytes":field(module,"byte_len"),
-                "binary_path":field(module,"binary_path"),
-                "extracted":bool_field(module,"extracted"),
-                "status":field(module,"status"),
-                "report_path":field(module,"report_path"),
-                "readable_wat_path":field(module,"wat_path"),
-                "deep_analysis_path":field(module,"deep_path"),
-            }),
-        )?;
-        for origin in array_field(module, "origins") {
-            let kind = string_field(origin, "type");
-            let parent = match kind {
-                Some("resource" | "resource_inline_base64" | "resource_static_bytes") => {
-                    u64_field(origin, "resource_id")
-                        .map(|resource_id| format!("resource:{resource_id}"))
-                }
-                Some("inline_script_base64" | "inline_script_static_bytes") => {
-                    match (
-                        u64_field(origin, "parent_resource_id"),
-                        u64_field(origin, "ordinal"),
-                    ) {
-                        (Some(parent_resource_id), Some(ordinal)) => {
-                            Some(format!("inline:{parent_resource_id}:{ordinal}"))
-                        }
-                        _ => None,
-                    }
-                }
-                _ => None,
-            };
-            let Some(parent) = parent else {
-                continue;
-            };
-            let edge_kind = match kind {
-                Some("resource") => "wasm_resource",
-                Some("resource_static_bytes" | "inline_script_static_bytes") => "wasm_static_bytes",
-                _ => "wasm_inline_base64",
-            };
-            graph.add_edge(
-                &parent,
-                &node_id,
-                edge_kind,
-                json!({
-                    "encoding":field(origin,"encoding"),
-                    "recovery_kind":field(origin,"recovery_kind"),
-                    "start":field(origin,"byte_start"),
-                    "end":field(origin,"byte_end"),
-                }),
-            )?;
-        }
-    }
+    wasm_evidence::seed_static_wasm_modules(&mut graph, &wasm, &budget)?;
 
     finish_source_graph(&project, &manifest, graph, &budget)
 }
