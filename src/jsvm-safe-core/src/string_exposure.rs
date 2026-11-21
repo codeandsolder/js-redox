@@ -1,4 +1,5 @@
 use crate::binding_facts::BindingFacts;
+use crate::fresh_data::FreshDataReads;
 use crate::rewrite::{apply, Counts, Replacement};
 use crate::value_eval::{canonical_array_index, eval, eval_binary, Value};
 use crate::{
@@ -130,6 +131,7 @@ struct StaticStringExposureCollector<'c> {
     scoping: &'c Scoping,
     arrays: &'c HashMap<SymbolId, Vec<Value>>,
     facts: &'c BindingFacts,
+    fresh_data: &'c FreshDataReads,
     replacements: Vec<Replacement>,
 }
 
@@ -154,10 +156,33 @@ impl<'a> Visit<'a> for StaticStringExposureCollector<'_> {
         walk::walk_binary_expression(self, binary);
     }
 
+    fn visit_static_member_expression(
+        &mut self,
+        member: &oxc_ast::ast::StaticMemberExpression<'a>,
+    ) {
+        if let Some(text) = self
+            .fresh_data
+            .get(member.span)
+            .and_then(Value::render_expression)
+        {
+            self.push(member.span, text, "fresh_own_member");
+            return;
+        }
+        walk::walk_static_member_expression(self, member);
+    }
+
     fn visit_computed_member_expression(&mut self, member: &ComputedMemberExpression<'a>) {
         if let Some(text) = static_array_lookup_text(member, self.scoping, self.arrays, self.facts)
         {
             self.push(member.span, text, "static_string_table_lookup");
+            return;
+        }
+        if let Some(text) = self
+            .fresh_data
+            .get(member.span)
+            .and_then(Value::render_expression)
+        {
+            self.push(member.span, text, "fresh_own_member");
             return;
         }
         walk::walk_computed_member_expression(self, member);
@@ -167,17 +192,20 @@ impl<'a> Visit<'a> for StaticStringExposureCollector<'_> {
 pub fn static_string_exposure_pass(
     program: &oxc_ast::ast::Program<'_>,
     scoping: &Scoping,
-) -> Vec<Replacement> {
+    budget: &WorkBudget,
+) -> Result<Vec<Replacement>, BudgetExceeded> {
     let facts = BindingFacts::analyze(program);
     let arrays = static_readonly_arrays(program, scoping, &facts);
+    let fresh_data = FreshDataReads::analyze(program, scoping, &facts, budget)?;
     let mut collector = StaticStringExposureCollector {
         scoping,
         arrays: &arrays,
         facts: &facts,
+        fresh_data: &fresh_data,
         replacements: Vec::new(),
     };
     collector.visit_program(program);
-    collector.replacements
+    Ok(collector.replacements)
 }
 
 #[derive(Debug, Clone)]
@@ -217,7 +245,7 @@ fn expose_static_strings_with_mode(
         }
         budget.checkpoint()?;
         let scoping = semantic_ret.semantic.scoping();
-        let replacements = static_string_exposure_pass(&program, scoping);
+        let replacements = static_string_exposure_pass(&program, scoping, budget)?;
         budget.checkpoint()?;
         if replacements.is_empty() {
             break;
@@ -294,7 +322,9 @@ mod tests {
             .build(&program);
         assert!(semantic_ret.diagnostics.is_empty());
         let scoping = semantic_ret.semantic.scoping();
-        let replacements = static_string_exposure_pass(&program, scoping);
+        let replacements =
+            static_string_exposure_pass(&program, scoping, &WorkBudget::unlimited("strings-test"))
+                .unwrap_or_else(|_| unreachable!());
         assert_eq!(replacements.len(), 1);
 
         let rewritten = apply(

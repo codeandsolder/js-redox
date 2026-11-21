@@ -554,6 +554,32 @@ fn depythonify_safe_deob_script_completion_runtime_equivalence() -> Result<()> {
 
 
 
+        "const a=[7];const v=a[0];(0,eval)('a[0]=9');[v,a[0]];",
+        "function f(fn){const a=[7];return fn(a[0],(a[0]=9),a[0]);}f((...args)=>args);",
+        "function f(){const a=[7];return a[(a[0]=9,0)];}f();",
+        "let a=[7];const prior=a[0];a[0]=9;[prior,a[0]];",
+        "const a=[7];const b=a;const x=b[0];(0,eval)('a[0]=9');[x,b[0]];",
+        "function f(flag){let a=[7];if(flag){a[0]=9;return 1;}return a[0];}[f(true),f(false)];",
+        "const a=[,9];[a.length,a[1]];",
+        "let a={x:7,...{x:9},x:11};a.x;",
+        "function f(){const a={x:7,y:events.push('init')};return a.x;}f();",
+        "({x:7,y:events.push('init')}).x;",
+        "let a=[7];let i=0;const v=a[i];a=[9];[v,a[i]];",
+        "function f(flag){let a={x:7};let b=a;if(flag)b={x:9};return [a.x,b.x];}[f(false),f(true)];",
+        "function f(flag){let a=[-0];if(flag)a=[0];return 1/a[0];}[f(true),f(false)];",
+        "let a=[7];let i=0;while(i++<2){a[0]++;}a[0];",
+        "let a=[7];try{a[0]=9;throw 1;}catch(e){}a[0];",
+        "let a={get x(){a.y=9;return 0;},y:7};const x=a.x;[x,a.y];",
+        "let a=[7];let b=0;b=(a[0]=9);a[0];",
+        "const a=[7,...[8,9]];[a[0],a[1],a.length];",
+        "const a=[7];const b={x:7,...{get y(){a[0]=9;return 1;}}};[a[0],b.x];",
+        "const a=[7];const x=a[0];Object.defineProperty(Array.prototype,'9',{get(){a[0]=9;return 0}});a[9];[x,a[0]];",
+        "function f(flag){const a=[7];flag&&eval('a[0]=9');return a[0];}[f(false),f(true)];",
+        "let a=[7];const b=()=>a[0];a=[9];b();",
+        "let a=[7];let b=a;const x=b[0];b=[9];[x,a[0],b[0]];",
+        "let a=[7];{let a=[9];a[0];}a[0];",
+        "const a=[7];let i=0;const o={[(i=1,'x')]:a[i-1]};[o.x,i];",
+        "function f(){const a=[7];with(new Proxy({},{has(t,k){if(k==='b')a[0]=9;return false;}})){var b=a[0];}return b;}f();",
     ];
     for (index, source) in sources.iter().enumerate() {
         let label = format!("script-completion-{index}");
