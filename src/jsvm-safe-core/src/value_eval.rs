@@ -353,7 +353,10 @@ pub fn eval_binary(op: &str, left: &Value, right: &Value) -> Option<Value> {
         "*" => Some(Value::Number(left.number()? * right.number()?)),
         "/" => Some(Value::Number(left.number()? / right.number()?)),
         "%" => Some(Value::Number(left.number()? % right.number()?)),
-        "**" => Some(Value::Number(left.number()?.powf(right.number()?))),
+        "**" => Some(Value::Number(crate::numeric::js_number_exponentiate(
+            left.number()?,
+            right.number()?,
+        ))),
         "<<" => {
             let shift = js_to_uint32(right.number()?) & 31;
             Some(Value::Number(f64::from(
@@ -389,11 +392,15 @@ pub fn eval_binary(op: &str, left: &Value, right: &Value) -> Option<Value> {
         }
         "<" | "<=" | ">" | ">=" => {
             let result = if let (Value::String(a), Value::String(b)) = (left, right) {
+                // ECMAScript compares UTF-16 code units, not Unicode
+                // scalar values or UTF-8 bytes. No temporary allocation is
+                // needed; supplementary characters expand to two units.
+                let order = a.encode_utf16().cmp(b.encode_utf16());
                 match op {
-                    "<" => a < b,
-                    "<=" => a <= b,
-                    ">" => a > b,
-                    ">=" => a >= b,
+                    "<" => order.is_lt(),
+                    "<=" => order.is_le(),
+                    ">" => order.is_gt(),
+                    ">=" => order.is_ge(),
                     _ => unreachable!(),
                 }
             } else {
@@ -449,5 +456,33 @@ where
     match eval_logical_left(v.operator.as_str(), left)? {
         LogicalStep::Value(value) => Some(value),
         LogicalStep::EvaluateRight => eval_with_resolver(&v.right, resolve),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{eval_binary, Value};
+
+    #[test]
+    fn relational_string_comparison_uses_utf16_code_units() {
+        for (left, right, lt, eq) in [
+            ("a", "ab", true, false),
+            ("a", "a", false, true),
+            ("😀", "\u{e000}", true, false),
+            ("\u{10000}", "\u{ffff}", true, false),
+            ("\u{10ffff}", "\u{10000}", false, false),
+            ("\u{e000}", "😀", false, false),
+        ] {
+            let left = Value::String(left.into());
+            let right = Value::String(right.into());
+            for (operator, expected) in
+                [("<", lt), ("<=", lt || eq), (">", !lt && !eq), (">=", !lt)]
+            {
+                assert!(
+                    matches!(eval_binary(operator, &left, &right), Some(Value::Bool(actual)) if actual == expected),
+                    "{left:?} {operator} {right:?}"
+                );
+            }
+        }
     }
 }

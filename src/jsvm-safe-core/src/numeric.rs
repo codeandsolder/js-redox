@@ -14,6 +14,18 @@ pub const fn js_number_equal(left: f64, right: f64) -> bool {
     left_bits == right_bits || ((left_bits & ABS_MASK) == 0 && (right_bits & ABS_MASK) == 0)
 }
 
+/// ECMAScript Number::exponentiate differs from IEEE 754 pow at NaN
+/// exponents and infinite exponents with a unit-magnitude base. Delegate
+/// the remaining (implementation-approximated) finite computation to powf.
+#[must_use]
+pub fn js_number_exponentiate(base: f64, exponent: f64) -> f64 {
+    if exponent.is_nan() || (exponent.is_infinite() && js_number_equal(base.abs(), 1.0)) {
+        f64::NAN
+    } else {
+        base.powf(exponent)
+    }
+}
+
 #[must_use]
 pub fn exact_u64(value: f64) -> Option<u64> {
     if !value.is_finite() || value < 0.0 {
@@ -70,7 +82,9 @@ pub fn exact_usize(value: f64) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{exact_i64, exact_u32, exact_u64, exact_usize, js_number_equal};
+    use super::{
+        exact_i64, exact_u32, exact_u64, exact_usize, js_number_equal, js_number_exponentiate,
+    };
 
     #[test]
     fn js_number_equality_preserves_signed_zero_and_nan_rules() {
@@ -84,6 +98,27 @@ mod tests {
         ));
         assert!(js_number_equal(42.0, 42.0));
         assert!(!js_number_equal(42.0, 42.000_000_000_000_01));
+    }
+
+    #[test]
+    fn exponentiation_preserves_ecmascript_exceptional_values() {
+        for exponent in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for base in [1.0, -1.0] {
+                assert!(js_number_exponentiate(base, exponent).is_nan());
+            }
+        }
+        assert!(js_number_exponentiate(0.0, f64::NAN).is_nan());
+        assert!(js_number_equal(js_number_exponentiate(f64::NAN, -0.0), 1.0));
+        assert_eq!(
+            js_number_exponentiate(-0.0, 3.0).to_bits(),
+            (-0.0_f64).to_bits()
+        );
+        assert_eq!(
+            js_number_exponentiate(-0.0, -3.0).to_bits(),
+            f64::NEG_INFINITY.to_bits()
+        );
+        assert!(js_number_equal(js_number_exponentiate(-2.0, 3.0), -8.0));
+        assert!(js_number_exponentiate(-2.0, 0.5).is_nan());
     }
 
     #[test]
