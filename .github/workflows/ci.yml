@@ -15,7 +15,7 @@ permissions:
 jobs:
   rust:
     name: Rust 1.100 quality gate
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@079cb96347f3dee5a628baaed46e63055c80efa5 # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@2376b14a6bc8263ab77013bd744248f49384b2fa # main
     with:
       rust-toolchain: "1.100.0"
       rust-components: "rustfmt clippy"
@@ -43,7 +43,7 @@ jobs:
   semantic:
     name: Semantic/runtime regressions
     needs: rust
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@079cb96347f3dee5a628baaed46e63055c80efa5 # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@2376b14a6bc8263ab77013bd744248f49384b2fa # main
     with:
       rust-toolchain: "1.100.0"
       timeout-minutes: 20
