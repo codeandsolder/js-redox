@@ -5,21 +5,20 @@
 //! authoritative contextual candidate inventory.
 
 use super::{
-    array_field, bool_field, digest_id, field, nonempty_string_field, object_field, string_field,
-    u64_field, GraphBuilder, InlineSourceIndex,
+    array_field, digest_id, field, nonempty_string_field, object_field, string_field, u64_field,
+    GraphBuilder, InlineSourceIndex,
 };
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
 use work_budget::WorkBudget;
 
-fn reference_resolutions(reference: &Value) -> Vec<&Value> {
+fn reference_resolutions(reference: &Value) -> &[Value] {
     // The contextual inventory is authoritative, even when empty or malformed.
     // Summary fields are only used when no contextual inventory exists.
     match reference.get("resolution_candidates") {
-        None => vec![reference],
-        Some(Value::Array(choices)) => choices.iter().collect(),
-        Some(_) => Vec::new(),
+        None => std::slice::from_ref(reference),
+        Some(Value::Array(choices)) => choices,
+        Some(_) => &[],
     }
 }
 
@@ -31,34 +30,28 @@ fn is_blocked_resolution(value: &Value) -> bool {
 
 fn add_reference_edges(
     graph: &mut GraphBuilder,
-    specifier_nodes: &mut BTreeMap<String, String>,
     source: &str,
     reference: &Value,
+    budget: &WorkBudget,
 ) -> Result<()> {
     let kind = format!(
         "js_{}",
         string_field(reference, "kind").unwrap_or("reference")
     );
     let choices = reference_resolutions(reference);
+    budget.consume(u64::try_from(choices.len().max(1))?)?;
     if choices.is_empty() {
-        return add_unresolved_reference(graph, specifier_nodes, source, reference, &kind, None);
+        return add_unresolved_reference(graph, source, reference, &kind, None);
     }
     for choice in choices {
         let blocked = is_blocked_resolution(choice);
         if blocked || nonempty_string_field(choice, "resolved_url").is_none() {
-            add_unresolved_reference(
-                graph,
-                specifier_nodes,
-                source,
-                reference,
-                &kind,
-                Some(choice),
-            )?;
+            add_unresolved_reference(graph, source, reference, &kind, Some(choice))?;
             continue;
         }
         let url = nonempty_string_field(choice, "resolved_url")
             .context("checked nonempty candidate URL disappeared")?;
-        for target in graph.targets_for(url)? {
+        for target in graph.targets_for(url, budget)? {
             graph.add_edge(
                 source,
                 &target,
@@ -69,6 +62,7 @@ fn add_reference_edges(
                     "glob_match_url":field(choice,"glob_match_url"),
                     "resolved_url":url,
                     "resolution":field(choice,"resolution"),
+                    "bare_specifier":choice.get("bare_specifier").and_then(Value::as_bool),
                     "import_map_key":field(choice,"import_map_key"),
                     "scope":field(choice,"scope"),
                     "document_resource_id":field(choice,"document_resource_id"),
@@ -83,30 +77,24 @@ fn add_reference_edges(
 
 fn add_unresolved_reference(
     graph: &mut GraphBuilder,
-    specifier_nodes: &mut BTreeMap<String, String>,
     source: &str,
     reference: &Value,
     kind: &str,
     context: Option<&Value>,
 ) -> Result<()> {
     let specifier = string_field(reference, "specifier").unwrap_or("");
-    let node_id = if let Some(existing) = specifier_nodes.get(specifier) {
-        existing.clone()
-    } else {
-        let node_id = digest_id("specifier:", specifier);
-        graph.add_node(
-            node_id.clone(),
-            json!({
-                "type":"module_specifier",
-                "specifier":specifier,
-                "bare":bool_field(reference,"bare_specifier"),
-                "captured":false,
-            }),
-        )?;
-        specifier_nodes.insert(specifier.to_owned(), node_id.clone());
-        node_id
-    };
-    let proof = context.unwrap_or(reference);
+    let node_id = digest_id("specifier:", specifier);
+    graph.intern_node(
+        node_id.clone(),
+        json!({
+            "type":"module_specifier",
+            "specifier":specifier,
+            "captured":false,
+        }),
+    )?;
+    // A missing authoritative contextual choice is not summary evidence.
+    // Non-contextual references are passed as their own choice by the caller.
+    let proof = context.unwrap_or(&Value::Null);
     let blocked = is_blocked_resolution(proof);
     graph.add_edge(
         source,
@@ -117,13 +105,13 @@ fn add_unresolved_reference(
             "glob":field(reference,"glob"),
             "resolved_url":Value::Null,
             "resolution":if context.is_none()
-                && reference.get("resolution_candidates").is_some()
                 {json!("no_matching_contextual_resolution")}
                 else {field(proof,"resolution")},
             "import_map_key":field(proof,"import_map_key"),
             "scope":field(proof,"scope"),
             "document_resource_id":field(proof,"document_resource_id"),
             "blocked":blocked,
+            "bare_specifier":proof.get("bare_specifier").and_then(Value::as_bool),
             "start":field(reference,"start"),
             "end":field(reference,"end"),
         }),
@@ -136,7 +124,6 @@ pub(super) fn seed_js_reference_edges(
     inline_nodes: &InlineSourceIndex,
     budget: &WorkBudget,
 ) -> Result<()> {
-    let mut specifier_nodes = BTreeMap::<String, String>::new();
     for unit in array_field(jsrefs, "code_units") {
         budget.checkpoint()?;
         let Some(resource_id) = u64_field(unit, "resource_id") else {
@@ -153,7 +140,7 @@ pub(super) fn seed_js_reference_edges(
             format!("resource:{resource_id}")
         };
         for reference in array_field(unit, "references") {
-            add_reference_edges(graph, &mut specifier_nodes, &source, reference)?;
+            add_reference_edges(graph, &source, reference, budget)?;
         }
     }
     Ok(())
@@ -196,7 +183,7 @@ pub(super) fn seed_import_map_definitions(
                     }
                     continue;
                 };
-                for dst in graph.targets_for(resolved)? {
+                for dst in graph.targets_for(resolved, budget)? {
                     graph.add_edge(
                         &src,
                         &dst,
@@ -229,7 +216,7 @@ pub(super) fn seed_import_map_definitions(
                         }
                         continue;
                     };
-                    for dst in graph.targets_for(resolved)? {
+                    for dst in graph.targets_for(resolved, budget)? {
                         graph.add_edge(
                             &src,
                             &dst,
@@ -258,7 +245,7 @@ fn add_blocked_import_map_entry(
     scope: Value,
 ) -> Result<()> {
     let target = digest_id("specifier:", specifier);
-    graph.add_node(
+    graph.intern_node(
         target.clone(),
         json!({
             "type":"module_specifier",
@@ -329,8 +316,8 @@ mod tests {
         ]});
         seed_import_map_definitions(&mut graph, &maps, &inline, &budget())?;
         let blocked = graph
-            .edges
-            .iter()
+            .edges()
+            .values()
             .filter(|edge| edge["kind"] == "import_map_entry_blocked")
             .collect::<Vec<_>>();
         assert_eq!(blocked.len(), 3);
@@ -352,20 +339,18 @@ mod tests {
         }));
         let target = digest_id("specifier:", "blocked");
         assert!(blocked.iter().all(|edge| edge["to"] == target));
-        assert_eq!(graph.nodes[&target]["type"], "module_specifier");
+        assert_eq!(graph.node_value(&target)["type"], "module_specifier");
         let mapped = graph
-            .edges
-            .iter()
+            .edges()
+            .values()
             .filter(|edge| edge["kind"] == "import_map_entry")
             .collect::<Vec<_>>();
         assert_eq!(mapped.len(), 4);
         assert!(mapped.iter().all(|edge| edge["from"] == "inline:3:1"));
         assert!(mapped.iter().any(|edge| edge["to"] == "resource:8"));
         assert!(mapped.iter().any(|edge| edge["to"] == "resource:9"));
-        assert!(!graph.nodes.contains_key(&digest_id("specifier:", "ghost")));
-        assert!(!graph
-            .nodes
-            .contains_key(&digest_id("specifier:", "malformed")));
+        assert!(!graph.has_node(&digest_id("specifier:", "ghost")));
+        assert!(!graph.has_node(&digest_id("specifier:", "malformed")));
         Ok(())
     }
 
@@ -404,16 +389,16 @@ mod tests {
             }
         ]});
         seed_js_reference_edges(&mut graph, &refs, &inline, &budget())?;
-        assert_eq!(graph.edges.len(), 2);
-        assert!(graph.edges.iter().any(|edge| {
+        assert_eq!(graph.edges().len(), 2);
+        assert!(graph.edges().values().any(|edge| {
             edge["from"] == "inline:3:1"
                 && edge["to"] == "resource:12"
                 && edge["document_resource_id"] == 3
                 && edge["resolution"] == "import_map"
         }));
         let unresolved = graph
-            .edges
-            .iter()
+            .edges()
+            .values()
             .find(|edge| edge["from"] == "inline:4:1" && edge["document_resource_id"] == 4)
             .context("missing blocked inline reference")?;
         assert!(unresolved["to"]
@@ -422,8 +407,8 @@ mod tests {
         assert_eq!(unresolved["blocked"], true);
         assert_eq!(unresolved["resolution"], "import_map_blocked");
         assert!(!graph
-            .edges
-            .iter()
+            .edges()
+            .values()
             .any(|edge| edge["resolved_url"] == "https://example.test/WRONG.js"));
         Ok(())
     }
@@ -456,10 +441,48 @@ mod tests {
             &budget(),
         )?;
         let target = digest_id("specifier:", "pkg");
-        assert_eq!(graph.nodes[&target]["type"], "module_specifier");
-        assert_eq!(graph.nodes[&target]["bare"], true);
-        assert_eq!(graph.edges.len(), 2);
-        assert!(graph.edges.iter().all(|edge| edge["to"] == target));
+        assert_eq!(graph.node_value(&target)["type"], "module_specifier");
+        assert!(graph.node_value(&target).get("bare").is_none());
+        assert!(graph
+            .edges()
+            .values()
+            .any(|edge| edge["kind"] == "js_import_static" && edge["bare_specifier"] == true));
+        assert_eq!(graph.edges().len(), 2);
+        assert!(graph.edges().values().all(|edge| edge["to"] == target));
+        Ok(())
+    }
+    #[test]
+    fn specifier_bare_classification_is_contextual_edge_evidence() -> Result<()> {
+        let mut graph = GraphBuilder::default();
+        let refs = json!({"code_units":[{"resource_id":5,"references":[{
+            "kind":"import_static","specifier":"./pkg.js","bare_specifier":true,
+            "resolution_candidates":[
+                {"document_resource_id":1,"bare_specifier":true,"resolved_url":null},
+                {"document_resource_id":2,"bare_specifier":false,"resolution":"import_map_blocked","resolved_url":null}
+            ]
+        }, {"kind":"import_static","specifier":"./pkg.js","bare_specifier":true,"resolution":"import_map_blocked","document_resource_id":99,"import_map_key":"stale","scope":"stale","resolution_candidates":[]}]}]});
+        seed_js_reference_edges(&mut graph, &refs, &InlineSourceIndex::default(), &budget())?;
+        let target = digest_id("specifier:", "./pkg.js");
+        assert_eq!(graph.node_count(), 1);
+        assert!(graph.node_value(&target).get("bare").is_none());
+        assert_eq!(graph.edges().len(), 3);
+        for (document, bare) in [
+            (json!(1), json!(true)),
+            (json!(2), json!(false)),
+            (Value::Null, Value::Null),
+        ] {
+            assert!(graph.edges().values().any(|edge| edge["to"] == target
+                && edge["document_resource_id"] == document
+                && edge["bare_specifier"] == bare));
+        }
+        let unmatched = graph
+            .edges()
+            .values()
+            .find(|edge| edge["resolution"] == "no_matching_contextual_resolution")
+            .context("missing unmatched contextual edge")?;
+        assert_eq!(unmatched["blocked"], false);
+        assert!(unmatched["import_map_key"].is_null());
+        assert!(unmatched["scope"].is_null());
         Ok(())
     }
 }

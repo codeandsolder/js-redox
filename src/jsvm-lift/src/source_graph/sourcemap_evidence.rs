@@ -89,9 +89,7 @@ impl ResourceIdentity {
         let Some(url) = nonempty_string_field(row, "map_url") else {
             return Ok((Vec::new(), "url_only"));
         };
-        let count = graph.url_to_resources.get(url).map_or(1, Vec::len);
-        budget.consume(u64::try_from(count)?)?;
-        Ok((graph.targets_for(url)?, "url_only"))
+        Ok((graph.targets_for(url, budget)?, "url_only"))
     }
 }
 
@@ -139,7 +137,7 @@ fn add_sourcemap_reference(
     // Recovery from common bytes does not prove a particular HTTP response
     // instance. Own the recovered sources on the resolution evidence node.
     let reference = format!("sourcemap-reference:{resource_id}");
-    graph.add_node(
+    graph.insert_node(
         reference.clone(),
         json!({
             "type":"source_map_reference",
@@ -218,10 +216,10 @@ fn add_recovered_sourcemap_sources(
         let ordinal = required_u64(recovered, "ordinal", source_field)?;
         let node_id = format!("{node_prefix}:{resource_id}:{ordinal}");
         anyhow::ensure!(
-            !graph.nodes.contains_key(&node_id),
+            !graph.has_node(&node_id),
             "duplicate recovered source identity {node_id}"
         );
-        graph.add_node(
+        graph.insert_node(
             node_id.clone(),
             json!({
                 "type":node_type,
@@ -251,7 +249,7 @@ fn add_sourcemap_chain_links(
         let map_identity = ResourceIdentity::map(link, budget)?;
         let code_identity = ResourceIdentity::code(link, budget)?;
         let chain_node = format!("sourcemap-chain:{resource_id}:{link_index}");
-        graph.add_node(
+        graph.insert_node(
             chain_node.clone(),
             json!({
                 "type":"sourcemap_chain_link",
@@ -321,7 +319,7 @@ fn add_sourcemap_composition(
         nonempty_string_field(composition, "composed_map_path")
     {
         let node_id = format!("sourcemap-composed:{resource_id}");
-        graph.add_node(
+        graph.insert_node(
                 node_id.clone(),
                 json!({
                     "type":"composed_source_map",
@@ -425,14 +423,14 @@ mod tests {
         let mut graph = GraphBuilder::default();
         for id in [90, 91] {
             let node = format!("resource:{id}");
-            graph.add_node(&node, json!({"type":"resource"}))?;
+            graph.insert_node(&node, json!({"type":"resource"}))?;
             graph.register_resource_url("https://maps.test/child.map", &node);
         }
         seed_sourcemap_evidence(&mut graph, &ambiguous_sourcemap_graph_fixture(), &budget)?;
         let edges_from = |kind: &str, from: &str| {
             graph
-                .edges
-                .iter()
+                .edges()
+                .values()
                 .filter(|edge| edge["kind"] == kind && edge["from"] == from)
                 .collect::<Vec<_>>()
         };
@@ -448,9 +446,9 @@ mod tests {
             edges_from("source_map_source", "sourcemap-reference:7").len(),
             1
         );
-        assert!(!graph.nodes.contains_key("sourcemap-source:7:1"));
+        assert!(!graph.has_node("sourcemap-source:7:1"));
         assert_eq!(
-            graph.nodes["sourcemap-composed:7"]["source_path"],
+            graph.node_value("sourcemap-composed:7")["source_path"],
             "maps/composed.map"
         );
         assert_eq!(
@@ -461,7 +459,7 @@ mod tests {
             edges_from("source_map_composed_source", "sourcemap-composed:7").len(),
             1
         );
-        assert!(!graph.nodes.contains_key("sourcemap-final:7:1"));
+        assert!(!graph.has_node("sourcemap-final:7:1"));
 
         let map_candidates =
             edges_from("source_map_chain_resource_candidate", "sourcemap-chain:7:0");
@@ -515,8 +513,8 @@ mod tests {
         seed_sourcemap_evidence(&mut graph, &artifact, &budget)?;
         let has_edge = |kind: &str, from: &str, to: &str| {
             graph
-                .edges
-                .iter()
+                .edges()
+                .values()
                 .any(|edge| edge["kind"] == kind && edge["from"] == from && edge["to"] == to)
         };
         assert!(has_edge("source_map", "resource:42", "resource:43"));
@@ -530,8 +528,8 @@ mod tests {
             "resource:43",
             "sourcemap-final:42:2"
         ));
-        assert!(!graph.nodes.contains_key("sourcemap-reference:42"));
-        assert!(!graph.nodes.contains_key("sourcemap-composed:42"));
+        assert!(!graph.has_node("sourcemap-reference:42"));
+        assert!(!graph.has_node("sourcemap-composed:42"));
         assert!(has_edge(
             "source_map_reference",
             "resource:44",
@@ -547,12 +545,12 @@ mod tests {
             "sourcemap-reference:44",
             "sourcemap-final:44:2"
         ));
-        assert!(!graph.nodes.contains_key("sourcemap-composed:44"));
-        assert_eq!(graph.external_nodes.len(), 1);
+        assert!(!graph.has_node("sourcemap-composed:44"));
+        assert_eq!(graph.external_url_count(), 1);
         assert_eq!(
             graph
-                .edges
-                .iter()
+                .edges()
+                .values()
                 .filter(|edge| edge["kind"] == "source_map_resource_candidate"
                     && edge["from"] == "sourcemap-reference:44")
                 .count(),
@@ -573,22 +571,22 @@ mod tests {
         seed_sourcemap_evidence(&mut graph, &artifact, &budget)?;
         let targets = |from: &str, kind: &str| -> BTreeSet<&str> {
             graph
-                .edges
-                .iter()
+                .edges()
+                .values()
                 .filter(|edge| edge["from"] == from && edge["kind"] == kind)
                 .filter_map(|edge| edge["to"].as_str())
                 .collect()
         };
         assert_eq!(
-            graph.nodes["sourcemap-chain:7:0"]["map_resource_id"],
+            graph.node_value("sourcemap-chain:7:0")["map_resource_id"],
             Value::Null
         );
         assert_eq!(
-            graph.nodes["sourcemap-chain:7:0"]["claimed_map_resource_id"],
+            graph.node_value("sourcemap-chain:7:0")["claimed_map_resource_id"],
             10
         );
         assert_eq!(
-            graph.nodes["sourcemap-chain:7:0"]["code_resource_id"],
+            graph.node_value("sourcemap-chain:7:0")["code_resource_id"],
             Value::Null
         );
         assert_eq!(targets("resource:7", "source_map").len(), 0);
@@ -621,8 +619,8 @@ mod tests {
             BTreeSet::from(["resource:14"])
         );
         assert!(graph
-            .edges
-            .iter()
+            .edges()
+            .values()
             .filter(|edge| edge["kind"] == "source_map_chain_resource_candidate"
                 || edge["kind"] == "source_map_resource_candidate")
             .all(|edge| edge["identity_basis"] == "conflicting_resource_ids"));

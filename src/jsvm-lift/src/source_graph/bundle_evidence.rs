@@ -29,7 +29,7 @@ fn seed_bundle_payload_nodes(
             bundle_nodes.insert(bundle_id, node_id.clone()).is_none(),
             "duplicate bundle payload ID {bundle_id}"
         );
-        graph.add_node(
+        graph.insert_node(
             node_id.clone(),
             json!({
                 "type":"bundle_payload",
@@ -99,7 +99,7 @@ fn seed_bundle_module_nodes<'a>(
             module_rows.insert(node_id.clone(), module).is_none(),
             "duplicate bundle factory identity {node_id}"
         );
-        graph.add_node(
+        graph.insert_node(
             node_id.clone(),
             json!({
                 "type":"bundle_module",
@@ -265,7 +265,7 @@ fn add_unresolved_dependency(
         "bundle-module-ref:",
         &compact_key((source_node, dependency))?,
     );
-    graph.add_node(
+    graph.intern_node(
         ref_id.clone(),
         json!({
             "type":"bundle_module_reference",
@@ -394,7 +394,7 @@ mod tests {
         seed_bundle_evidence(&mut graph, &fixture, &deob_nodes, &budget)?;
 
         let direct = |source: &str, destination: &str| {
-            graph.edges.iter().find(|edge| {
+            graph.edges().values().find(|edge| {
                 edge["kind"] == "bundle_module_dependency"
                     && edge["from"] == source
                     && edge["to"] == destination
@@ -424,8 +424,8 @@ mod tests {
         assert!(direct(entry, "bundle-module:1:3").is_none());
         let ref_for = |id: &str| -> Result<String> {
             graph
-                .edges
-                .iter()
+                .edges()
+                .values()
                 .find(|edge| {
                     edge["kind"] == "bundle_module_dependency_unresolved"
                         && edge["from"] == entry
@@ -440,36 +440,37 @@ mod tests {
         let missing = ref_for("missing")?;
         let duplicate = ref_for("dup")?;
         assert_eq!(
-            graph.nodes[&private]["excluded_nested_module_table_nodes"],
+            graph.node_value(&private)["excluded_nested_module_table_nodes"],
             json!(["bundle-module:2:1"])
         );
-        assert_eq!(graph.nodes[&private]["candidate_nodes"], json!([]));
-        assert_eq!(graph.nodes[&private]["ambiguous"], false);
+        assert_eq!(graph.node_value(&private)["candidate_nodes"], json!([]));
+        assert_eq!(graph.node_value(&private)["ambiguous"], false);
         assert_eq!(
-            graph.nodes[&ambiguous]["candidate_nodes"],
+            graph.node_value(&ambiguous)["candidate_nodes"],
             json!(["bundle-module:3:1", "bundle-module:4:2"])
         );
-        assert_eq!(graph.nodes[&ambiguous]["ambiguous"], true);
-        assert_eq!(graph.nodes[&missing]["ambiguous"], false);
+        assert_eq!(graph.node_value(&ambiguous)["ambiguous"], true);
+        assert_eq!(graph.node_value(&missing)["ambiguous"], false);
         assert_eq!(
-            graph.nodes[&duplicate]["candidate_nodes"],
+            graph.node_value(&duplicate)["candidate_nodes"],
             json!(["bundle-module:1:2", "bundle-module:1:3"])
         );
         assert_eq!(
-            graph.nodes[&duplicate]["ambiguous"], true,
+            graph.node_value(&duplicate)["ambiguous"],
+            true,
             "multiple factories sharing a logical ID must not select the last factory"
         );
         for node in [&private, &ambiguous, &missing, &duplicate] {
             assert!(graph
-                .edges
-                .iter()
+                .edges()
+                .values()
                 .any(|edge| edge["kind"] == "bundle_module_dependency_unresolved"
                     && edge["from"] == entry
                     && edge["to"] == *node));
         }
         assert!(graph
-            .edges
-            .iter()
+            .edges()
+            .values()
             .any(|edge| edge["kind"] == "bundle_payload"
                 && edge["from"] == "deob:42"
                 && edge["to"] == "bundle:1"));
@@ -501,15 +502,14 @@ mod tests {
         seed_bundle_evidence(&mut graph, &bundles, &BTreeMap::new(), &budget)?;
         let reference = |source: &str| -> Result<&Value> {
             let edge = graph
-                .edges
-                .iter()
+                .edges()
+                .values()
                 .find(|edge| {
                     edge["kind"] == "bundle_module_dependency_unresolved" && edge["from"] == source
                 })
                 .context("missing unresolved edge")?;
             let node = graph
-                .nodes
-                .get(edge["to"].as_str().context("missing target ID")?)
+                .node(edge["to"].as_str().context("missing target ID")?)
                 .context("missing reference node")?;
             assert_eq!(node["source_module_node"], source);
             assert_eq!(edge["candidate_count"], 2);
@@ -562,8 +562,8 @@ mod tests {
         let budget = WorkBudget::unlimited("unknown-path-bundle");
         seed_bundle_evidence(&mut graph, &fixture, &BTreeMap::new(), &budget)?;
         assert!(graph
-            .edges
-            .iter()
+            .edges()
+            .values()
             .any(|edge| edge["from"] == "bundle-module:1:0"
                 && edge["to"] == "bundle-module:2:1"
                 && edge["kind"] == "bundle_module_dependency"));
@@ -573,8 +573,8 @@ mod tests {
         let mut graph = GraphBuilder::default();
         seed_bundle_evidence(&mut graph, &fixture, &BTreeMap::new(), &budget)?;
         assert!(graph
-            .edges
-            .iter()
+            .edges()
+            .values()
             .any(|edge| edge["from"] == "bundle-module:1:0"
                 && edge["to"] == "bundle-module:2:1"
                 && edge["kind"] == "bundle_module_dependency"));
