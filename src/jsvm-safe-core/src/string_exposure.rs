@@ -1,8 +1,9 @@
+use crate::binding_facts::BindingFacts;
 use crate::rewrite::{apply, Counts, Replacement};
 use crate::value_eval::{canonical_array_index, eval, eval_binary, Value};
 use crate::{
     array_element, parse_as, reference_is_statically_resolved_read, semantically_valid_source_type,
-    symbol_of, SafeSourceMode,
+    SafeSourceMode,
 };
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{BindingPattern, ComputedMemberExpression, Expression, VariableDeclarationKind};
@@ -10,7 +11,7 @@ use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::{ReferenceId, Scoping, SemanticBuilder};
 use oxc_span::Span;
 use oxc_syntax::symbol::SymbolId;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 use work_budget::{BudgetExceeded, WorkBudget};
 
@@ -55,15 +56,17 @@ fn static_array_index(expr: &Expression<'_>) -> Option<usize> {
 
 #[derive(Default)]
 struct StaticArrayReadCollector {
-    references: HashSet<ReferenceId>,
+    references: HashMap<ReferenceId, usize>,
 }
 
 impl<'a> Visit<'a> for StaticArrayReadCollector {
     fn visit_computed_member_expression(&mut self, member: &ComputedMemberExpression<'a>) {
-        if !member.optional && static_array_index(&member.expression).is_some() {
-            if let Expression::Identifier(identifier) = &member.object {
+        if !member.optional {
+            if let (Expression::Identifier(identifier), Some(index)) =
+                (&member.object, static_array_index(&member.expression))
+            {
                 if let Some(reference_id) = identifier.reference_id.get() {
-                    self.references.insert(reference_id);
+                    self.references.insert(reference_id, index);
                 }
             }
         }
@@ -74,20 +77,25 @@ impl<'a> Visit<'a> for StaticArrayReadCollector {
 pub fn static_readonly_arrays(
     program: &oxc_ast::ast::Program<'_>,
     scoping: &Scoping,
+    facts: &BindingFacts,
 ) -> HashMap<SymbolId, Vec<Value>> {
     let mut candidate_collector = StaticArrayCandidateCollector::default();
     candidate_collector.visit_program(program);
     let mut read_collector = StaticArrayReadCollector::default();
     read_collector.visit_program(program);
     let mut out = candidate_collector.arrays;
-    out.retain(|symbol, _| {
-        scoping
-            .get_resolved_reference_ids(*symbol)
-            .iter()
-            .all(|reference_id| {
-                read_collector.references.contains(reference_id)
-                    && reference_is_statically_resolved_read(scoping, *reference_id, *symbol)
-            })
+    out.retain(|symbol, values| {
+        facts.is_private(scoping, *symbol)
+            && scoping
+                .get_resolved_reference_ids(*symbol)
+                .iter()
+                .all(|reference_id| {
+                    read_collector
+                        .references
+                        .get(reference_id)
+                        .is_some_and(|index| *index < values.len())
+                        && reference_is_statically_resolved_read(scoping, *reference_id, *symbol)
+                })
     });
     out
 }
@@ -96,11 +104,12 @@ pub fn static_array_lookup_text(
     member: &ComputedMemberExpression<'_>,
     scoping: &Scoping,
     arrays: &HashMap<SymbolId, Vec<Value>>,
+    facts: &BindingFacts,
 ) -> Option<String> {
     if member.optional {
         return None;
     }
-    let symbol = symbol_of(scoping, &member.object)?;
+    let symbol = facts.initialized_read(scoping, &member.object)?;
     let values = arrays.get(&symbol)?;
     let index = static_array_index(&member.expression)?;
     values.get(index)?.render()
@@ -120,6 +129,7 @@ fn literal_string_concat_text(binary: &oxc_ast::ast::BinaryExpression<'_>) -> Op
 struct StaticStringExposureCollector<'c> {
     scoping: &'c Scoping,
     arrays: &'c HashMap<SymbolId, Vec<Value>>,
+    facts: &'c BindingFacts,
     replacements: Vec<Replacement>,
 }
 
@@ -145,7 +155,8 @@ impl<'a> Visit<'a> for StaticStringExposureCollector<'_> {
     }
 
     fn visit_computed_member_expression(&mut self, member: &ComputedMemberExpression<'a>) {
-        if let Some(text) = static_array_lookup_text(member, self.scoping, self.arrays) {
+        if let Some(text) = static_array_lookup_text(member, self.scoping, self.arrays, self.facts)
+        {
             self.push(member.span, text, "static_string_table_lookup");
             return;
         }
@@ -157,10 +168,12 @@ pub fn static_string_exposure_pass(
     program: &oxc_ast::ast::Program<'_>,
     scoping: &Scoping,
 ) -> Vec<Replacement> {
-    let arrays = static_readonly_arrays(program, scoping);
+    let facts = BindingFacts::analyze(program);
+    let arrays = static_readonly_arrays(program, scoping, &facts);
     let mut collector = StaticStringExposureCollector {
         scoping,
         arrays: &arrays,
+        facts: &facts,
         replacements: Vec::new(),
     };
     collector.visit_program(program);
@@ -261,12 +274,14 @@ mod tests {
     #[test]
     fn dynamic_with_scope_blocks_only_affected_array_reads() {
         let source = r#"
+            {
             const blocked = ["outer"];
             const safe = ["safe"];
             with ({ blocked: ["inner"] }) {
                 sink(blocked[0]);
             }
             sink(safe[0]);
+            }
         "#;
         let allocator = Allocator::default();
         let program = parse_as(&allocator, source, SourceType::cjs());

@@ -1,10 +1,11 @@
-//! Source regions dominated by binding initialization, for both reads and
-//! writes. Lexical containment alone does not establish execution order:
+//! Binding initialization and lexical exposure facts shared by rewrites.
+//! Lexical containment alone does not establish execution order:
 //! hoisted function declarations may be invoked before their textual site.
 use oxc_ast::ast::{
-    ArrowFunctionExpression, BindingPattern, CatchClause, Declaration, ForInStatement,
-    ForOfStatement, ForStatement, ForStatementInit, ForStatementLeft, FormalParameters, Function,
-    FunctionType, Statement, VariableDeclaration, VariableDeclarationKind,
+    ArrowFunctionExpression, BindingPattern, CallExpression, CatchClause, Declaration, Expression,
+    ForInStatement, ForOfStatement, ForStatement, ForStatementInit, ForStatementLeft,
+    FormalParameters, Function, FunctionType, Statement, VariableDeclaration,
+    VariableDeclarationKind,
 };
 use oxc_ast::AstKind;
 use oxc_ast_visit::{walk, Visit};
@@ -18,16 +19,20 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Default)]
-pub(crate) struct BindingInitialization {
+pub(crate) struct BindingFacts {
     hoisted_vars: HashSet<SymbolId>,
     parameters: HashSet<SymbolId>,
     regions: HashMap<SymbolId, Vec<Span>>,
     node_spans: Vec<Span>,
     scope_entries: HashMap<ScopeId, u32>,
     hoisted_functions: HashSet<ScopeId>,
+    scopes: Vec<Option<ScopeId>>,
+    dynamic_scopes: HashSet<ScopeId>,
+    exported_bindings: HashSet<SymbolId>,
+    ambient_root: bool,
 }
 
-impl BindingInitialization {
+impl BindingFacts {
     fn record_pattern(&mut self, pattern: &BindingPattern<'_>, region: Span) {
         for ident in pattern.get_binding_identifiers() {
             if let Some(symbol) = ident.symbol_id.get() {
@@ -36,15 +41,19 @@ impl BindingInitialization {
         }
     }
 
-    fn record_lexical_declarations(&mut self, declaration: &VariableDeclaration<'_>, end: u32) {
+    fn record_declaration_regions(&mut self, declaration: &VariableDeclaration<'_>, end: u32) {
         if !matches!(
             declaration.kind,
-            VariableDeclarationKind::Let | VariableDeclarationKind::Const
+            VariableDeclarationKind::Let
+                | VariableDeclarationKind::Const
+                | VariableDeclarationKind::Var
         ) {
             return;
         }
         for declarator in &declaration.declarations {
-            self.record_pattern(&declarator.id, Span::new(declarator.span.end, end));
+            if declaration.kind != VariableDeclarationKind::Var || declarator.init.is_some() {
+                self.record_pattern(&declarator.id, Span::new(declarator.span.end, end));
+            }
         }
     }
 
@@ -81,7 +90,10 @@ impl BindingInitialization {
     }
 
     pub(crate) fn analyze(program: &oxc_ast::ast::Program<'_>) -> Self {
-        let mut facts = Self::default();
+        let mut facts = Self {
+            ambient_root: !program.source_type.is_module(),
+            ..Self::default()
+        };
         facts.visit_program(program);
         facts
     }
@@ -90,7 +102,7 @@ impl BindingInitialization {
     /// initialized, their value cannot be changed. A hoisted declaration is
     /// different; the enclosing lexical scope's entry (not the declaration's
     /// text) is its earliest creation site.
-    pub(crate) fn proves_immutable_initialized(
+    pub(crate) fn proves_value_initialized(
         &self,
         scoping: &Scoping,
         symbol: SymbolId,
@@ -124,6 +136,41 @@ impl BindingInitialization {
         })
     }
 
+    /// Can this binding's value or properties be exposed to unmodeled code
+    /// without an ordinary reference? A classic script's global environment
+    /// and directly exported module allocations are not private. A potential
+    /// direct eval can access only bindings visible at its lexical call site.
+    pub(crate) fn is_private(&self, scoping: &Scoping, symbol: SymbolId) -> bool {
+        if (self.ambient_root && scoping.symbol_scope_id(symbol) == scoping.root_scope_id())
+            || self.exported_bindings.contains(&symbol)
+        {
+            return false;
+        }
+        let name = scoping.symbol_name(symbol);
+        !self
+            .dynamic_scopes
+            .iter()
+            .any(|&scope| scoping.find_binding(scope, name.into()) == Some(symbol))
+    }
+
+    pub(crate) fn initialized_read(
+        &self,
+        scoping: &Scoping,
+        expression: &Expression<'_>,
+    ) -> Option<SymbolId> {
+        let Expression::Identifier(identifier) = expression else {
+            return None;
+        };
+        let reference = identifier.reference_id.get()?;
+        let symbol = crate::statically_resolved_symbol(scoping, reference)?;
+        if !crate::reference_is_statically_resolved_read(scoping, reference, symbol) {
+            return None;
+        }
+        let scope = scoping.get_reference(reference).scope_id();
+        self.proves_value_initialized(scoping, symbol, scope, identifier.span)
+            .then_some(symbol)
+    }
+
     pub(crate) fn proves_initialized(
         &self,
         scoping: &Scoping,
@@ -151,7 +198,7 @@ impl BindingInitialization {
     }
 }
 
-impl<'a> Visit<'a> for BindingInitialization {
+impl<'a> Visit<'a> for BindingFacts {
     fn enter_node(&mut self, kind: AstKind<'a>) {
         self.node_spans.push(kind.span());
     }
@@ -161,9 +208,23 @@ impl<'a> Visit<'a> for BindingInitialization {
     }
 
     fn enter_scope(&mut self, _: ScopeFlags, scope: &Cell<Option<ScopeId>>) {
+        self.scopes.push(scope.get());
         if let (Some(scope), Some(span)) = (scope.get(), self.node_spans.last()) {
             self.scope_entries.insert(scope, span.start);
         }
+    }
+
+    fn leave_scope(&mut self) {
+        self.scopes.pop();
+    }
+
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        if crate::is_potential_direct_eval(call) {
+            if let Some(Some(scope)) = self.scopes.last() {
+                self.dynamic_scopes.insert(*scope);
+            }
+        }
+        walk::walk_call_expression(self, call);
     }
 
     fn visit_statements(&mut self, statements: &oxc_allocator::Vec<'a, Statement<'a>>) {
@@ -177,13 +238,24 @@ impl<'a> Visit<'a> for BindingInitialization {
             let declaration = match statement {
                 Statement::VariableDeclaration(declaration) => Some(declaration.as_ref()),
                 Statement::ExportDeclaration(export) => match &export.declaration {
-                    Declaration::VariableDeclaration(declaration) => Some(declaration.as_ref()),
+                    Declaration::VariableDeclaration(declaration) => {
+                        for declarator in &declaration.declarations {
+                            self.exported_bindings.extend(
+                                declarator
+                                    .id
+                                    .get_binding_identifiers()
+                                    .into_iter()
+                                    .filter_map(|id| id.symbol_id.get()),
+                            );
+                        }
+                        Some(declaration.as_ref())
+                    }
                     _ => None,
                 },
                 _ => None,
             };
             if let Some(declaration) = declaration {
-                self.record_lexical_declarations(declaration, end);
+                self.record_declaration_regions(declaration, end);
             }
             self.visit_statement(statement);
         }
@@ -221,7 +293,7 @@ impl<'a> Visit<'a> for BindingInitialization {
 
     fn visit_for_statement(&mut self, node: &ForStatement<'a>) {
         if let Some(ForStatementInit::VariableDeclaration(declaration)) = &node.init {
-            self.record_lexical_declarations(declaration, node.span.end);
+            self.record_declaration_regions(declaration, node.span.end);
         }
         walk::walk_for_statement(self, node);
     }
