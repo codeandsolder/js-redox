@@ -81,7 +81,9 @@ fn analyze_proxy_return(
         .items
         .iter()
         .map(|param| match &param.pattern {
-            BindingPattern::BindingIdentifier(id) => Some(id.name.as_str()),
+            BindingPattern::BindingIdentifier(id) if param.initializer.is_none() => {
+                Some(id.name.as_str())
+            }
             _ => None,
         })
         .collect::<Option<Vec<_>>>()?;

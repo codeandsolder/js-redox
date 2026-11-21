@@ -1071,6 +1071,20 @@ impl Collector<'_, '_> {
         });
     }
 
+    /// A primitive fold must be safe at *any* expression precedence.
+    /// Do not rewrap an already canonical unary literal on every pass.
+    fn push_primitive(&mut self, span: Span, value: &Value, kind: &'static str) {
+        if value
+            .render()
+            .is_some_and(|text| text == fragment(self.source, span))
+        {
+            return;
+        }
+        if let Some(text) = value.render_expression() {
+            self.push(span, text, kind);
+        }
+    }
+
     fn push_arithmetic(&mut self, span: Span, text: String, mut proof: ArithmeticStateProof) {
         let start = span.start as usize;
         let end = span.end as usize;
@@ -1166,12 +1180,15 @@ impl Collector<'_, '_> {
             }
             ProxyProperty::StaticMember { property } if call.arguments.len() == 1 => {
                 let object = fragment(self.source, call.arguments[0].span());
-                Some((format!("(({object}).{property})"), "proxy_static_member"))
+                Some((format!("(0, ({object}).{property})"), "proxy_static_member"))
             }
             ProxyProperty::ComputedMember if call.arguments.len() == 2 => {
                 let object = fragment(self.source, call.arguments[0].span());
                 let property = fragment(self.source, call.arguments[1].span());
-                Some((format!("(({object})[{property}])"), "proxy_computed_member"))
+                Some((
+                    format!("(0, ({object})[{property}])"),
+                    "proxy_computed_member",
+                ))
             }
             ProxyProperty::Unary { operator } if call.arguments.len() == 1 => {
                 let argument = fragment(self.source, call.arguments[0].span());
@@ -1270,7 +1287,7 @@ impl Collector<'_, '_> {
             .collect::<Option<Vec<_>>>()?;
         let text = function
             .evaluate(&values)
-            .and_then(|value| value.render())?;
+            .and_then(|value| value.render_expression())?;
         self.push(call.span, text, "pure_function_eval");
         Some(CallRewriteTraversal::WalkChildren)
     }
@@ -1312,7 +1329,7 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
             if let Some(text) = self
                 .constants
                 .resolve_identifier(id, self.scoping)
-                .and_then(|value| value.render())
+                .and_then(|value| value.render_expression())
             {
                 self.push(id.span, text, "const_propagate");
                 return;
@@ -1354,28 +1371,29 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
         }
         if let (Some(left), Some(right)) = (eval(&it.left), eval(&it.right)) {
             if let Some(value) = eval_binary(it.operator.as_str(), &left, &right) {
-                if let Some(text) = value.render() {
-                    self.push(it.span, text, "constant_fold");
-                }
+                self.push_primitive(it.span, &value, "constant_fold");
             }
         }
         walk::walk_binary_expression(self, it);
     }
 
     fn visit_unary_expression(&mut self, it: &UnaryExpression<'a>) {
+        if it.operator.as_str() == "delete"
+            && matches!(it.argument.without_parentheses(), Expression::Identifier(_))
+        {
+            // Delete uses a Reference rather than GetValue. In sloppy code,
+            // even a lexical const identifier cannot be substituted here.
+            return;
+        }
         if let Some(value) = eval_unary(it) {
-            if let Some(text) = value.render() {
-                self.push(it.span, text, "constant_fold");
-            }
+            self.push_primitive(it.span, &value, "constant_fold");
         }
         walk::walk_unary_expression(self, it);
     }
 
     fn visit_logical_expression(&mut self, it: &LogicalExpression<'a>) {
         if let Some(value) = eval_logical(it) {
-            if let Some(text) = value.render() {
-                self.push(it.span, text, "constant_fold");
-            }
+            self.push_primitive(it.span, &value, "constant_fold");
         }
         walk::walk_logical_expression(self, it);
     }
@@ -1391,11 +1409,18 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
     fn visit_conditional_expression(&mut self, it: &oxc_ast::ast::ConditionalExpression<'a>) {
         if let Some(test) = known_bool(&it.test) {
             let selected = if test { &it.consequent } else { &it.alternate };
-            self.push(
-                it.span,
-                fragment(self.source, selected.span()).to_string(),
-                "constant_branch",
-            );
+            let selected_text = fragment(self.source, selected.span());
+            // A conditional performs GetValue even when its selected arm
+            // is a reference or anonymous definition. Grouping alone would
+            // change direct eval, call receivers, delete and name inference.
+            let text = if trivial_loops::inherently_value(selected)
+                && !effect_statements::conditional_has_name_hazard(selected, 0)
+            {
+                format!("({selected_text})")
+            } else {
+                format!("(0, {selected_text})")
+            };
+            self.push(it.span, text, "constant_branch");
         }
         walk::walk_conditional_expression(self, it);
     }
@@ -1634,7 +1659,7 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
                     .get(&symbol)
                     .and_then(|object| object.get(it.property.name.as_str()))
                 {
-                    if let Some(text) = value.render() {
+                    if let Some(text) = value.render_expression() {
                         self.push(it.span, text, proxy_literal_kind(value));
                         return;
                     }
@@ -1657,7 +1682,7 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
                         .get(&symbol)
                         .and_then(|object| object.get(&property))
                     {
-                        if let Some(text) = value.render() {
+                        if let Some(text) = value.render_expression() {
                             self.push(it.span, text, proxy_literal_kind(value));
                             return;
                         }

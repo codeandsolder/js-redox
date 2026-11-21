@@ -106,7 +106,7 @@ pub fn inert_literal_statement(expr: &Expression<'_>) -> bool {
 /// entirely can change direct eval and member-method receiver identity.
 /// Only collapse to the final expression if its AST produces a value, not a
 /// Reference. Otherwise keep an effectful prefix to retain comma semantics.
-fn inherently_value(expr: &Expression<'_>) -> bool {
+pub(super) fn inherently_value(expr: &Expression<'_>) -> bool {
     match expr {
         Expression::ParenthesizedExpression(paren) => inherently_value(&paren.expression),
         Expression::BooleanLiteral(_)

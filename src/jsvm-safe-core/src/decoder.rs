@@ -1484,7 +1484,7 @@ pub fn decoder_call_rewrite(
     if let Some(raw) = decoder_argument_integer(argument) {
         let text = decoder
             .value_for_call(raw, key.as_deref())
-            .and_then(|value| value.render())?;
+            .and_then(|value| value.render_expression())?;
         return Some(DecoderCallRewrite { text, stop: false });
     }
 
@@ -1822,7 +1822,10 @@ impl<'a> Visit<'a> for SparseDecoderCallCollector<'_> {
             walk::walk_call_expression(self, call);
             return;
         };
-        let Some(text) = decoder.value_for_raw(raw).and_then(|value| value.render()) else {
+        let Some(text) = decoder
+            .value_for_raw(raw)
+            .and_then(|value| value.render_expression())
+        else {
             walk::walk_call_expression(self, call);
             return;
         };
