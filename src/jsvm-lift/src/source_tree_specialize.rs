@@ -156,7 +156,10 @@ impl<'a> Visit<'a> for StablePrimitiveBindings<'_> {
                 {
                     continue;
                 }
-                let value = eval_static_primitive_with_resolver(init, &|id| {
+                let value = eval_static_primitive_with_resolver(init, &|reference_expr| {
+                    let Expression::Identifier(id) = reference_expr else {
+                        return None;
+                    };
                     id.reference_id
                         .get()
                         .and_then(|reference| self.scoping.get_reference(reference).symbol_id())
@@ -320,7 +323,10 @@ impl OriginalCallLiterals<'_> {
         if let Some(literal) = literal_argument(arg, self.source) {
             return Some(literal);
         }
-        eval_static_primitive_with_resolver(arg.as_expression()?, &|id| {
+        eval_static_primitive_with_resolver(arg.as_expression()?, &|reference_expr| {
+            let Expression::Identifier(id) = reference_expr else {
+                return None;
+            };
             id.reference_id
                 .get()
                 .and_then(|reference| self.scoping.get_reference(reference).symbol_id())

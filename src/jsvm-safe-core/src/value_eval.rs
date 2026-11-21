@@ -4,11 +4,12 @@
 //! subset remains deliberately narrower than Oxc's full constant evaluator.
 //! Knowing an expression's result is not sufficient proof that replacing the
 //! expression preserves its effects (for example `void sideEffect()`).  Callers
-//! may resolve identifiers only after independently proving their bindings safe.
+//! may resolve identifier and member reads only with independent proofs of
+//! binding identity, initialization and side-effect-free property access.
 
 use oxc_ast::ast::{
-    ArrayExpressionElement, Expression, IdentifierReference, LogicalExpression, StringLiteral,
-    TemplateElement, UnaryExpression,
+    ArrayExpressionElement, Expression, LogicalExpression, StringLiteral, TemplateElement,
+    UnaryExpression,
 };
 use oxc_ecmascript::{StringToNumber, ToInt32, ToUint32};
 use oxc_syntax::number::ToJsString;
@@ -146,10 +147,12 @@ pub fn known_bool(expr: &Expression<'_>) -> Option<bool> {
 
 pub fn eval_with_resolver<'a, F>(expr: &Expression<'a>, resolve: &F) -> Option<Value>
 where
-    F: Fn(&IdentifierReference<'a>) -> Option<Value>,
+    F: Fn(&Expression<'a>) -> Option<Value>,
 {
     match expr {
-        Expression::Identifier(id) => resolve(id),
+        Expression::Identifier(_)
+        | Expression::StaticMemberExpression(_)
+        | Expression::ComputedMemberExpression(_) => resolve(expr),
         Expression::StringLiteral(v) => string_literal_value(v).map(Value::String),
         Expression::NumericLiteral(v) => Some(Value::Number(v.value)),
         Expression::BooleanLiteral(v) => Some(Value::Bool(v.value)),
@@ -234,7 +237,7 @@ fn inert_array_element(element: &ArrayExpressionElement<'_>) -> bool {
 
 pub fn known_bool_with_resolver<'a, F>(expr: &Expression<'a>, resolve: &F) -> Option<bool>
 where
-    F: Fn(&IdentifierReference<'a>) -> Option<Value>,
+    F: Fn(&Expression<'a>) -> Option<Value>,
 {
     if let Some(v) = eval_with_resolver(expr, resolve) {
         return Some(v.truthy());
@@ -276,7 +279,7 @@ pub fn eval_unary_value(op: &str, value: &Value) -> Option<Value> {
 
 fn eval_unary_with_resolver<'a, F>(v: &UnaryExpression<'a>, resolve: &F) -> Option<Value>
 where
-    F: Fn(&IdentifierReference<'a>) -> Option<Value>,
+    F: Fn(&Expression<'a>) -> Option<Value>,
 {
     let op = v.operator.as_str();
     if op == "!" {
@@ -424,7 +427,7 @@ pub fn eval_logical_left(op: &str, left: Value) -> Option<LogicalStep> {
 
 fn eval_logical_with_resolver<'a, F>(v: &LogicalExpression<'a>, resolve: &F) -> Option<Value>
 where
-    F: Fn(&IdentifierReference<'a>) -> Option<Value>,
+    F: Fn(&Expression<'a>) -> Option<Value>,
 {
     let left = eval_with_resolver(&v.left, resolve)?;
     match eval_logical_left(v.operator.as_str(), left)? {
