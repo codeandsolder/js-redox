@@ -100,6 +100,22 @@ impl Value {
             Self::Number(_) => None,
         }
     }
+
+    /// Render a primitive for substitution into an arbitrary expression.
+    /// A negative number and undefined are unary expressions, not atoms:
+    /// substituting them without grouping can change a surrounding member,
+    /// call, optional chain or exponentiation.
+    #[must_use]
+    pub fn render_expression(&self) -> Option<String> {
+        let text = self.render()?;
+        if matches!(self, Self::Undefined)
+            || matches!(self, Self::Number(value) if value.is_sign_negative())
+        {
+            Some(format!("({text})"))
+        } else {
+            Some(text)
+        }
+    }
 }
 
 fn render_number(n: f64) -> String {

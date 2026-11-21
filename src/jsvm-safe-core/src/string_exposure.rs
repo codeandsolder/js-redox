@@ -112,7 +112,7 @@ pub fn static_array_lookup_text(
     let symbol = facts.initialized_read(scoping, &member.object)?;
     let values = arrays.get(&symbol)?;
     let index = static_array_index(&member.expression)?;
-    values.get(index)?.render()
+    values.get(index)?.render_expression()
 }
 
 fn literal_string_concat_text(binary: &oxc_ast::ast::BinaryExpression<'_>) -> Option<String> {
