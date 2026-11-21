@@ -123,10 +123,14 @@ fn assert_invariants(label: &str, outcome: &SafeDeobOutcome) {
 
 fn deob_fixture(scratch: &Path, file: &str) -> Result<SafeDeobOutcome> {
     let source = fixture(file)?;
+    deob_fixture_source(scratch, file, &source)
+}
+
+fn deob_fixture_source(scratch: &Path, file: &str, source: &str) -> Result<SafeDeobOutcome> {
     let work_budget = budget(file);
-    let outcome = deobfuscate_source(&source, file, SourceMode::Auto, 16, false, &work_budget)
+    let outcome = deobfuscate_source(source, file, SourceMode::Auto, 16, false, &work_budget)
         .with_context(|| format!("deobfuscating {file}"))?;
-    runtime_equivalent(scratch, file, &source, &outcome.source)?;
+    runtime_equivalent(scratch, file, source, &outcome.source)?;
     assert_invariants(file, &outcome);
     Ok(outcome)
 }
@@ -336,6 +340,30 @@ fn assert_main_contract(file: &str, outcome: &SafeDeobOutcome) {
 fn depythonify_safe_deob_script_completion_runtime_equivalence() -> Result<()> {
     let scratch = TempDir::new()?;
     let sources = [
+        "function f(){return a[0];const a=[7];}f();",
+        "function f(){return g();const a=[7];function g(){return a[0];}}f();",
+        "function f(){const a=[7];(eval)('a[0]=9');return a[0];}f();",
+        "function f(){const a=[7];const g=()=>eval('a[0]=9');g();return a[0];}f();",
+        "function f(){const a=[7];function g(a){eval('a[0]=9')}g([0]);return a[0];}f();",
+        "function f(){const a=[7];(0,eval)('1');return a[0];}f();",
+        "Object.defineProperty(Array.prototype,'9',{get(){this[0]=9;return 1}});function f(){const a=[7];events.push(a[9]);return a[0];}f();",
+        "const a=[7];(0,eval)('a[0]=9');a[0];",
+        "const a=[7];Object.defineProperty(globalThis,'read',{get(){a[0]=9;return x=>x}});read(a[0]);",
+        "function f(){const p={x:1,get x(){return 2;}};return p.x;}f();",
+        "function f(){const p={x:1,...{x:2}};return p.x;}f();",
+        "function f(){const p={x:1,['x']:events.push('key')};return p.x;}f();",
+        "function f(){const p={x:1,mutate(){this.x=2;}};p.mutate();return p.x;}f();",
+        "function f(){const p={x:1};eval('p.x=9');return p.x;}f();",
+        "function f(){return g();var p={x:1};function g(){return p.x;}}f();",
+        "function f(){var p={x:1};var p={x:2};return p.x;}f();",
+        "function f(){const p={__proto__:1};return p.__proto__===Object.prototype;}f();",
+        "function f(){const p={['__proto__']:1};return p.__proto__;}f();",
+        "function f(){const p={invoke:function(eval,s){var hidden=7;return eval(s);}};return p.invoke(eval,'hidden');}f();",
+        "function f(){const p={op:function(a,a){return a+a;}};return p.op(1,2);}f();",
+        "function f(){const p={x:1,...{x:2},x:3};return p.x;}f();",
+        "function f(){const p={x:1,[(events.push('key'),'x')]:2,x:3};return p.x;}f();",
+        "function f(){let p={op(a,b){return a+b;}};return p.op(1,2);}f();",
+        "function f(){var p={x:1};const g=()=>p.x;return g();}f();",
         "f();const x=7;function f(){return x;}",
         "function g(){return f();const x=7;function f(){return x;}}g();",
         "switch(1){case 0:const x=7;break;case 1:x;}",
@@ -869,7 +897,26 @@ fn depythonify_safe_deob_generated_runtime_equivalence() -> Result<()> {
     let scratch = TempDir::new()?;
     let mut totals = BTreeMap::<String, usize>::new();
     for file in MAIN_FIXTURES {
-        let outcome = deob_fixture(scratch.path(), file)?;
+        let ambient = deob_fixture(scratch.path(), file)?;
+        // These fixtures exercise own-member transformations. The original
+        // classic-script input is still checked for runtime equivalence.
+        // A separately scoped variant establishes allocation privacy.
+        let outcome = if matches!(
+            file,
+            "proxy-literals-unary.js"
+                | "proxy-members.js"
+                | "proxy-calls.js"
+                | "safe-mix.js"
+                | "obscura-control-flow-storage.js"
+        ) {
+            let original = fixture(file)?;
+            let local = format!("(function(){{\n{original}\n}})();");
+            let label = format!("private-{file}");
+            runtime_equivalent(scratch.path(), &label, &original, &local)?;
+            deob_fixture_source(scratch.path(), &label, &local)?
+        } else {
+            ambient
+        };
         let expected_changed = !matches!(
             file,
             "static-alias-installer-calls.js" | "static-alias-live-forwarding.js"

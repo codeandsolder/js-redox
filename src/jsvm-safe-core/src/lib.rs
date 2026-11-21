@@ -1,7 +1,7 @@
 mod base91;
 mod base91_recovery;
 mod binary_rhs_reflow;
-mod binding_initialization;
+mod binding_facts;
 mod bitwise_algebra;
 mod bitwise_ast;
 mod bitwise_effects;
@@ -186,7 +186,7 @@ fn direct_identifier_name<'a>(expr: &'a Expression<'a>) -> Option<&'a str> {
 #[derive(Debug)]
 pub struct ProvenConstantEnvironment {
     bindings: HashMap<SymbolId, Value>,
-    initialization: binding_initialization::BindingInitialization,
+    initialization: binding_facts::BindingFacts,
 }
 
 struct ConstValueCollector<'s, 'c> {
@@ -221,7 +221,7 @@ impl ProvenConstantEnvironment {
     pub fn collect(program: &oxc_ast::ast::Program<'_>, scoping: &Scoping) -> Self {
         let mut constants = Self {
             bindings: HashMap::new(),
-            initialization: binding_initialization::BindingInitialization::analyze(program),
+            initialization: binding_facts::BindingFacts::analyze(program),
         };
         // An initializer can only consume facts proved available at that
         // source position. These dependencies are already in source order;
@@ -250,7 +250,7 @@ impl ProvenConstantEnvironment {
         let value = self.bindings.get(&symbol)?;
         let scope = scoping.get_reference(reference_id).scope_id();
         self.initialization
-            .proves_immutable_initialized(scoping, symbol, scope, id.span)
+            .proves_value_initialized(scoping, symbol, scope, id.span)
             .then(|| value.clone())
     }
 
@@ -1151,7 +1151,8 @@ impl Collector<'_, '_> {
         if !Self::is_plain_call(call) {
             return None;
         }
-        let (symbol, key) = static_proxy_member(&call.callee, self.scoping)?;
+        let (symbol, key) =
+            static_proxy_member(&call.callee, self.scoping, &self.constants.initialization)?;
         let property = self.proxies.get(&symbol)?.get(&key)?;
         let rewrite = match property {
             ProxyProperty::Call { arity } if call.arguments.len() == arity + 1 => {
@@ -1623,7 +1624,11 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
 
     fn visit_static_member_expression(&mut self, it: &StaticMemberExpression<'a>) {
         if !it.optional {
-            if let Some(symbol) = symbol_of(self.scoping, &it.object) {
+            if let Some(symbol) = self
+                .constants
+                .initialization
+                .initialized_read(self.scoping, &it.object)
+            {
                 if let Some(ProxyProperty::Literal(value)) = self
                     .proxies
                     .get(&symbol)
@@ -1642,7 +1647,11 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
     fn visit_computed_member_expression(&mut self, it: &ComputedMemberExpression<'a>) {
         if !it.optional {
             if let Some(Value::String(property)) = eval(&it.expression) {
-                if let Some(symbol) = symbol_of(self.scoping, &it.object) {
+                if let Some(symbol) = self
+                    .constants
+                    .initialization
+                    .initialized_read(self.scoping, &it.object)
+                {
                     if let Some(ProxyProperty::Literal(value)) = self
                         .proxies
                         .get(&symbol)
@@ -1669,7 +1678,12 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
                     return;
                 }
             }
-            if let Some(text) = static_array_lookup_text(it, self.scoping, self.arrays) {
+            if let Some(text) = static_array_lookup_text(
+                it,
+                self.scoping,
+                self.arrays,
+                &self.constants.initialization,
+            ) {
                 self.push(it.span, text, "static_array_lookup");
                 walk::walk_computed_member_expression(self, it);
                 return;
@@ -1997,7 +2011,8 @@ fn transform_once(
     let semantic = semantic_ret.semantic;
     let scoping = semantic.scoping();
 
-    let arrays = static_readonly_arrays(&program, scoping);
+    let constants = ProvenConstantEnvironment::collect(&program, scoping);
+    let arrays = static_readonly_arrays(&program, scoping, &constants.initialization);
     budget.checkpoint()?;
     let reference_spans = collect_reference_spans(&program);
     budget.checkpoint()?;
@@ -2006,10 +2021,9 @@ fn transform_once(
     let decoders = decoder_analysis.decoders;
     let mut protected_spans = decoder_analysis.protected_spans;
     let mut initial_replacements = decoder_analysis.replacements;
-    let constants = ProvenConstantEnvironment::collect(&program, scoping);
     budget.checkpoint()?;
     let shorthand_spans = collect_shorthand_spans(&program);
-    let proxies = collect_proxy_objects(&program, scoping);
+    let proxies = collect_proxy_objects(&program, scoping, &constants.initialization);
     budget.checkpoint()?;
     let pure_functions = collect_pure_functions(&program, scoping);
     let from_char_code_aliases = collect_from_char_code_aliases(&program, scoping);
@@ -7726,8 +7740,86 @@ mod tests {
     }
 
     #[test]
+    fn own_member_facts_require_private_initialized_allocations() {
+        for source in [
+            "function f(){sink(a[0]);const a=[7];}",
+            "function f(){return g();const a=[7];function g(){return a[0];}}",
+            "function f(){const a=[7];(eval)('a[0]=9');return a[0];}",
+            "function f(){const a=[7];const g=()=>eval('a[0]=9');g();return a[0];}",
+            "function f(){const a=[7];sink(a[9]);return a[0];}",
+            "const a=[7];sink(a[0]);",
+            "export const a=[7];sink(a[0]);",
+            "const a=[7];export {a};sink(a[0]);",
+            "function f(){const p={x:1,get x(){return 2;}};return p.x;}",
+            "function f(){const p={x:1,...{x:2}};return p.x;}",
+            "function f(){const p={x:1,['x']:other()};return p.x;}",
+            "function f(){const p={x:1,mutate(){this.x=2;}};p.mutate();return p.x;}",
+            "function f(){const p={x:1};eval('p.x=9');return p.x;}",
+            "function f(){return g();var p={x:1};function g(){return p.x;}}",
+            "function f(){var p={x:1};var p={x:2};return p.x;}",
+            "function f(){const p={__proto__:1};return p.__proto__;}",
+            "function f(){const p={invoke:function(eval,s){return eval(s);}};return p.invoke(eval,'1');}",
+            "function f(){const p={op:function(a,a){return a+a;}};return p.op(1,2);}",
+        ] {
+            let result=deobfuscate(source,32).unwrap_or_else(|| unreachable!("{source}"));
+            assert!(!result.transforms.keys().any(|key| key == "static_array_lookup" || key.starts_with("proxy_")), "{source} -> {}",result.source);
+        }
+        for (source, kind) in [
+            (
+                "function f(){const a=[7];return a[0];}",
+                "static_array_lookup",
+            ),
+            (
+                "function f(){const a=[7];return ()=>a[0];}",
+                "static_array_lookup",
+            ),
+            (
+                "function f(){const a=[7];function other(a){eval('a[0]=8');}return a[0];}",
+                "static_array_lookup",
+            ),
+            (
+                "function f(){const a=[7];(0,eval)('1');return a[0];}",
+                "static_array_lookup",
+            ),
+            ("const a=[7];export {};sink(a[0]);", "static_array_lookup"),
+            (
+                "function f(){const p={x:1,x:2};return p.x;}",
+                "proxy_literal",
+            ),
+            (
+                "function f(){var p={x:1,...other(),x:2};return p.x;}",
+                "proxy_literal",
+            ),
+            (
+                "function f(){const p={x:1,[other()]:2,x:3};return p.x;}",
+                "proxy_literal",
+            ),
+            (
+                "function f(){const p={['__proto__']:1};return p.__proto__;}",
+                "proxy_literal",
+            ),
+            (
+                "function f(){let p={op(a,b){return a+b;}};return p.op(1,2);}",
+                "proxy_binary",
+            ),
+            (
+                "function f(){var p={x:1};const g=()=>p.x;return g();}",
+                "proxy_literal",
+            ),
+        ] {
+            let result = deobfuscate(source, 32).unwrap_or_else(|| unreachable!("{source}"));
+            assert!(
+                result.transforms.contains_key(kind),
+                "{source} -> {} {:?}",
+                result.source,
+                result.transforms
+            );
+        }
+    }
+
+    #[test]
     fn static_array_lookup_requires_non_escaping_read_only_array() {
-        let immutable = r#"const table = ["alpha"]; sink(table[0]);"#;
+        let immutable = r#"{ const table = ["alpha"]; sink(table[0]); }"#;
         let result = deobfuscate(immutable, 4);
         assert!(result.is_some());
         let result = result.unwrap_or_else(|| unreachable!());
@@ -7735,10 +7827,10 @@ mod tests {
         assert_eq!(result.transforms.get("static_array_lookup"), Some(&1));
 
         for source in [
-            r#"const table = ["before"]; table[0] = "after"; sink(table[0]);"#,
-            r#"const table = ["before"]; const alias = table; alias[0] = "after"; sink(table[0]);"#,
-            r#"const table = ["before"]; mutate(table); sink(table[0]);"#,
-            r#"const table = ["before"]; table["push"]("after"); sink(table[0]);"#,
+            r#"{ const table = ["before"]; table[0] = "after"; sink(table[0]); }"#,
+            r#"{ const table = ["before"]; const alias = table; alias[0] = "after"; sink(table[0]); }"#,
+            r#"{ const table = ["before"]; mutate(table); sink(table[0]); }"#,
+            r#"{ const table = ["before"]; table["push"]("after"); sink(table[0]); }"#,
         ] {
             let result = deobfuscate(source, 4);
             assert!(result.is_some());
@@ -7757,7 +7849,7 @@ mod tests {
             ("1", "ONE"),
             ("1.0", "ONE"),
         ] {
-            let source = format!("const table = [\"ZERO\", \"ONE\"]; sink(table[{index}]);");
+            let source = format!("{{ const table = [\"ZERO\", \"ONE\"]; sink(table[{index}]); }}");
             let result = deobfuscate(&source, 4);
             assert!(result.is_some(), "index={index}");
             let Some(result) = result else { unreachable!() };
@@ -7781,7 +7873,7 @@ mod tests {
             "\"-0\"",
             "\"4294967295\"",
         ] {
-            let source = format!("const table = [\"ZERO\", \"ONE\"]; sink(table[{index}]);");
+            let source = format!("{{ const table = [\"ZERO\", \"ONE\"]; sink(table[{index}]); }}");
             let result = deobfuscate(&source, 4);
             assert!(result.is_some(), "index={index}");
             let Some(result) = result else { unreachable!() };
