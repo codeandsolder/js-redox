@@ -637,7 +637,7 @@ impl<'a> Visit<'a> for NumericStateAliasRisks {
     }
 
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
-        if matches!(&call.callee, Expression::Identifier(id) if id.name == "eval") {
+        if is_potential_direct_eval(call) {
             self.mark_eval_or_with();
         }
         walk::walk_call_expression(self, call);
@@ -1810,6 +1810,22 @@ fn decoder_argument_integer(arg: &Argument<'_>) -> Option<i64> {
         .or_else(|| (!negative).then_some(value))
 }
 
+/// Whether a call's syntax permits intrinsic eval to access its caller's
+/// lexical environment. Parentheses preserve the reference; optional calls,
+/// sequences and member calls do not. A shadowed binding may still hold the
+/// intrinsic, so this deliberately does not assert the callee's identity.
+#[must_use]
+pub fn is_potential_direct_eval(call: &CallExpression<'_>) -> bool {
+    if call.optional {
+        return false;
+    }
+    let mut expression = &call.callee;
+    while let Expression::ParenthesizedExpression(parenthesized) = expression {
+        expression = &parenthesized.expression;
+    }
+    matches!(expression, Expression::Identifier(identifier) if identifier.name == "eval")
+}
+
 #[derive(Default)]
 struct DirectEvalProbe {
     found: bool,
@@ -1817,10 +1833,7 @@ struct DirectEvalProbe {
 
 impl<'a> Visit<'a> for DirectEvalProbe {
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
-        if matches!(
-            &call.callee,
-            Expression::Identifier(identifier) if identifier.name.as_str() == "eval"
-        ) {
+        if is_potential_direct_eval(call) {
             self.found = true;
             return;
         }
@@ -7209,6 +7222,8 @@ mod tests {
             // A direct eval in another function cannot observe this helper's
             // unreferenced local variable.
             "function unrelated(x){return eval(x);}function healthy(){let dead=0;dead=5;return 1;}",
+            "function healthy(){let dead=0;dead=5;return (0,eval)('typeof dead');}",
+            "function healthy(){let dead=0;dead=5;return eval?.('typeof dead');}",
             // An occurrence in string content is not an arguments reference.
             "function unrelated(){return 'arguments';}function healthy(){let dead=0;dead=5;return 1;}",
             // A nested ordinary function owns its own arguments object.
@@ -7237,6 +7252,8 @@ mod tests {
     fn numeric_state_proofs_keep_writes_visible_to_eval_and_mapped_arguments() {
         let fixtures = [
             "function f(x){x=5;eval('x');return 1;}",
+            "function f(x){x=5;(eval)('x');return 1;}",
+            "function f(x){const change=()=>((eval))('x');x=5;return change();}",
             "function f(x){x=5;arguments[0];return 1;}",
             "function f(x){const change=()=>eval('x');x=5;return change();}",
             "function f(x){const nested=()=>arguments[0];x=5;return nested();}",

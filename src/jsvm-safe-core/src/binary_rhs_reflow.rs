@@ -15,7 +15,7 @@ struct ScopeHazards {
 
 impl<'a> Visit<'a> for ScopeHazards {
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
-        if matches!(&call.callee, Expression::Identifier(id) if id.name == "eval") {
+        if crate::is_potential_direct_eval(call) {
             self.direct_eval = true;
         }
         walk::walk_call_expression(self, call);

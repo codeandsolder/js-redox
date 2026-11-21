@@ -3,7 +3,8 @@
 //! A resolved binding with one visible write may still be changed by direct
 //! eval in its lexical environment. This audit never infers runtime execution.
 
-use oxc_ast::{ast::Expression, AstKind};
+use jsvm_safe_core::is_potential_direct_eval;
+use oxc_ast::AstKind;
 use oxc_semantic::Semantic;
 use oxc_span::{GetSpan, Span};
 use oxc_syntax::symbol::SymbolId;
@@ -26,18 +27,6 @@ pub struct LexicalBindingMutationAudit {
     pub root_scope_binding: bool,
     /// No syntax-level hazards; never implies initialization or call ordering.
     pub source_mutation_isolated: bool,
-}
-
-/// Direct eval is sensitive to JavaScript grammar. Parentheses are fine, but
-/// a comma sequence makes evaluation indirect and cannot write lexical locals.
-fn syntactic_direct_eval(expression: &Expression<'_>) -> bool {
-    match expression {
-        Expression::Identifier(identifier) => identifier.name == "eval",
-        Expression::ParenthesizedExpression(parenthesized) => {
-            syntactic_direct_eval(&parenthesized.expression)
-        }
-        _ => false,
-    }
 }
 
 fn enclosing_function(semantic: &Semantic<'_>, node: &oxc_semantic::AstNode<'_>) -> Option<Span> {
@@ -93,9 +82,7 @@ pub fn audit_lexical_binding_mutation(
             enclosing_function: enclosing_function(semantic, node),
         };
         match node.kind() {
-            AstKind::CallExpression(call)
-                if !call.optional && syntactic_direct_eval(&call.callee) =>
-            {
+            AstKind::CallExpression(call) if is_potential_direct_eval(call) => {
                 lexical_direct_eval_calls.push(site);
             }
             AstKind::WithStatement(_) => lexical_with_statements.push(site),
@@ -124,7 +111,7 @@ pub fn audit_lexical_binding_mutation(
 
 #[cfg(test)]
 mod tests {
-    use super::{audit_lexical_binding_mutation, syntactic_direct_eval};
+    use super::{audit_lexical_binding_mutation, is_potential_direct_eval};
     use crate::test_support::{source_offset, TestResult, TestValue};
     use oxc_allocator::Allocator;
     use oxc_ast::ast::{Expression, Statement};
@@ -156,7 +143,7 @@ mod tests {
                 _ => None,
             }
             .test_value("eval call expression")?;
-            assert_eq!(syntactic_direct_eval(&call.callee), expected, "{source}");
+            assert_eq!(is_potential_direct_eval(call), expected, "{source}");
         }
         Ok(())
     }

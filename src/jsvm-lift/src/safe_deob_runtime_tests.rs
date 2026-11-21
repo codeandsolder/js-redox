@@ -336,6 +336,12 @@ fn assert_main_contract(file: &str, outcome: &SafeDeobOutcome) {
 fn depythonify_safe_deob_script_completion_runtime_equivalence() -> Result<()> {
     let scratch = TempDir::new()?;
     let sources = [
+        "function f(){let x;x=7;return (eval)('x');} f();",
+        "function f(){let x;x=7;return ((eval))('x');} f();",
+        "function f(){let x;x=7;return (()=>(eval)('x'))();} f();",
+        "function f(){function hidden(){return 'ok';}return (eval)('hidden()');} f();",
+        "function f(){let x;x=7;return (0,eval)('typeof x');} f();",
+        "function f(){let x;x=7;return eval?.('typeof x');} f();",
         "1;",
         "1;2;",
         "1;var x;",

@@ -206,13 +206,6 @@ fn source_call(e: &Expression<'_>, sites: &HashSet<(u32, u32)>) -> Option<Span> 
 fn locally_owned_symbol(s: &Semantic<'_>, symbol: SymbolId, context: NodeId) -> bool {
     owner(s, s.scoping().symbol_declaration(symbol)) == Some(context)
 }
-fn is_direct_eval_callee(expression: &Expression<'_>) -> bool {
-    match expression {
-        Expression::Identifier(id) => id.name == "eval",
-        Expression::ParenthesizedExpression(p) => is_direct_eval_callee(&p.expression),
-        _ => false,
-    }
-}
 fn has_dynamic_scope(
     s: &Semantic<'_>,
     context: NodeId,
@@ -232,7 +225,9 @@ fn has_dynamic_scope(
         }
         match n.kind() {
             AstKind::WithStatement(_) => return Ok(true),
-            AstKind::CallExpression(c) if is_direct_eval_callee(&c.callee) => return Ok(true),
+            AstKind::CallExpression(c) if jsvm_safe_core::is_potential_direct_eval(c) => {
+                return Ok(true)
+            }
             _ => {}
         }
     }
