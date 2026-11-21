@@ -1,11 +1,12 @@
-//! Source regions dominated by binding initialization, used before deleting
-//! writes to otherwise unused locals. A lexical binding can be resolved and
-//! write-only yet still throw on PutValue in its temporal dead zone.
+//! Source regions dominated by binding initialization, for both reads and
+//! writes. Lexical containment alone does not establish execution order:
+//! hoisted function declarations may be invoked before their textual site.
 use oxc_ast::ast::{
-    ArrowFunctionExpression, BindingPattern, CatchClause, ForInStatement, ForOfStatement,
-    ForStatement, ForStatementInit, ForStatementLeft, FormalParameters, Function, Statement,
-    VariableDeclaration, VariableDeclarationKind,
+    ArrowFunctionExpression, BindingPattern, CatchClause, Declaration, ForInStatement,
+    ForOfStatement, ForStatement, ForStatementInit, ForStatementLeft, FormalParameters, Function,
+    FunctionType, Statement, VariableDeclaration, VariableDeclarationKind,
 };
+use oxc_ast::AstKind;
 use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::Scoping;
 use oxc_span::{GetSpan, Span};
@@ -13,13 +14,17 @@ use oxc_syntax::{
     scope::{ScopeFlags, ScopeId},
     symbol::SymbolId,
 };
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(crate) struct BindingInitialization {
     hoisted_vars: HashSet<SymbolId>,
     parameters: HashSet<SymbolId>,
     regions: HashMap<SymbolId, Vec<Span>>,
+    node_spans: Vec<Span>,
+    scope_entries: HashMap<ScopeId, u32>,
+    hoisted_functions: HashSet<ScopeId>,
 }
 
 impl BindingInitialization {
@@ -32,7 +37,10 @@ impl BindingInitialization {
     }
 
     fn record_lexical_declarations(&mut self, declaration: &VariableDeclaration<'_>, end: u32) {
-        if declaration.kind != VariableDeclarationKind::Let {
+        if !matches!(
+            declaration.kind,
+            VariableDeclarationKind::Let | VariableDeclarationKind::Const
+        ) {
             return;
         }
         for declarator in &declaration.declarations {
@@ -42,7 +50,10 @@ impl BindingInitialization {
 
     fn record_iteration_binding(&mut self, left: &ForStatementLeft<'_>, body: Span) {
         if let ForStatementLeft::VariableDeclaration(declaration) = left {
-            if declaration.kind == VariableDeclarationKind::Let {
+            if matches!(
+                declaration.kind,
+                VariableDeclarationKind::Let | VariableDeclarationKind::Const
+            ) {
                 for declarator in &declaration.declarations {
                     self.record_pattern(&declarator.id, body);
                 }
@@ -75,6 +86,44 @@ impl BindingInitialization {
         facts
     }
 
+    /// Immutable bindings can be read by a later-created closure: once
+    /// initialized, their value cannot be changed. A hoisted declaration is
+    /// different; the enclosing lexical scope's entry (not the declaration's
+    /// text) is its earliest creation site.
+    pub(crate) fn proves_immutable_initialized(
+        &self,
+        scoping: &Scoping,
+        symbol: SymbolId,
+        scope: ScopeId,
+        at: Span,
+    ) -> bool {
+        let owner = scoping.symbol_scope_id(symbol);
+        self.regions.get(&symbol).is_some_and(|regions| {
+            regions.iter().any(|region| {
+                if region.start > at.start || at.end > region.end {
+                    return false;
+                }
+                for ancestor in scoping.scope_ancestors(scope) {
+                    if ancestor == owner {
+                        return true;
+                    }
+                    if self.hoisted_functions.contains(&ancestor) {
+                        let Some(entry) = scoping
+                            .scope_parent_id(ancestor)
+                            .and_then(|parent| self.scope_entries.get(&parent))
+                        else {
+                            return false;
+                        };
+                        if *entry < region.start || *entry > region.end {
+                            return false;
+                        }
+                    }
+                }
+                false
+            })
+        })
+    }
+
     pub(crate) fn proves_initialized(
         &self,
         scoping: &Scoping,
@@ -103,6 +152,20 @@ impl BindingInitialization {
 }
 
 impl<'a> Visit<'a> for BindingInitialization {
+    fn enter_node(&mut self, kind: AstKind<'a>) {
+        self.node_spans.push(kind.span());
+    }
+
+    fn leave_node(&mut self, _: AstKind<'a>) {
+        self.node_spans.pop();
+    }
+
+    fn enter_scope(&mut self, _: ScopeFlags, scope: &Cell<Option<ScopeId>>) {
+        if let (Some(scope), Some(span)) = (scope.get(), self.node_spans.last()) {
+            self.scope_entries.insert(scope, span.start);
+        }
+    }
+
     fn visit_statements(&mut self, statements: &oxc_allocator::Vec<'a, Statement<'a>>) {
         let Some(last) = statements.last() else {
             return;
@@ -111,7 +174,15 @@ impl<'a> Visit<'a> for BindingInitialization {
         for statement in statements {
             // This is one actual statement list. A switch case's lexical
             // declaration does not dominate a separately selectable case.
-            if let Statement::VariableDeclaration(declaration) = statement {
+            let declaration = match statement {
+                Statement::VariableDeclaration(declaration) => Some(declaration.as_ref()),
+                Statement::ExportDeclaration(export) => match &export.declaration {
+                    Declaration::VariableDeclaration(declaration) => Some(declaration.as_ref()),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(declaration) = declaration {
                 self.record_lexical_declarations(declaration, end);
             }
             self.visit_statement(statement);
@@ -134,6 +205,11 @@ impl<'a> Visit<'a> for BindingInitialization {
     }
 
     fn visit_function(&mut self, node: &Function<'a>, flags: ScopeFlags) {
+        if node.r#type == FunctionType::FunctionDeclaration {
+            if let Some(scope) = node.scope_id.get() {
+                self.hoisted_functions.insert(scope);
+            }
+        }
         self.record_parameters(&node.params, node.span.end);
         walk::walk_function(self, node, flags);
     }
