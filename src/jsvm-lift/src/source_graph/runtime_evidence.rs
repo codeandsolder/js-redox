@@ -84,9 +84,18 @@ impl RuntimeInstances {
         (self.digest(session, script_id)? == digest).then(|| runtime_node_id(digest))
     }
 
-    pub(super) fn observed_node(&self, session: &str, script_id: &Value) -> Option<String> {
+    pub(super) fn observed_node(
+        &self,
+        session: &str,
+        script_id: &Value,
+        expected_digest: Option<&str>,
+    ) -> Option<String> {
         let id = script_id_text(script_id)?;
-        self.digest(session, &id).map(runtime_node_id)
+        let digest = self.digest(session, &id)?;
+        if expected_digest.is_some_and(|expected| expected != digest) {
+            return None;
+        }
+        Some(runtime_node_id(digest))
     }
 }
 
@@ -548,12 +557,12 @@ mod tests {
         assert!(index.exact_node("worker", "7", &first).is_none());
         index.register("main", "7", &second);
         index.register("main", "7", &first);
-        assert!(index.observed_node("main", &json!(7)).is_none());
+        assert!(index.observed_node("main", &json!(7), None).is_none());
         assert_eq!(
-            index.observed_node("worker", &json!(7)),
+            index.observed_node("worker", &json!(7), None),
             Some(runtime_node_id(&second))
         );
-        assert!(index.observed_node("worker", &Value::Null).is_none());
+        assert!(index.observed_node("worker", &Value::Null, None).is_none());
     }
 
     #[test]
