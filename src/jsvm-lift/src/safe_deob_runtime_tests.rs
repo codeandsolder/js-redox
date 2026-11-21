@@ -336,6 +336,22 @@ fn assert_main_contract(file: &str, outcome: &SafeDeobOutcome) {
 fn depythonify_safe_deob_script_completion_runtime_equivalence() -> Result<()> {
     let scratch = TempDir::new()?;
     let sources = [
+        "f();const x=7;function f(){return x;}",
+        "function g(){return f();const x=7;function f(){return x;}}g();",
+        "switch(1){case 0:const x=7;break;case 1:x;}",
+        "f();const x=7;function f(){const y=x+1;return y;}",
+        "f();const x=7;function f(){class C{static y=x;}return C.y;}",
+        "{f();const x=7;function f(){return x;}}",
+        "const f=()=>x;f();const x=7;",
+        "const x=7;const f=()=>x;f();",
+        "const x=7;const f=function(){return x;};f();",
+        "const x=7;{function f(){return x;}f();}",
+        "const x=7;const f=()=>{function g(){return x;}return g();};f();",
+        "const x=7;class C{static get value(){return x;}}C.value;",
+        "for(const x=7;;){x;break;}",
+        "const x=7,y=x+1,z=y+1;z;",
+        "switch(0){case 0:const x=7;x;break;case 1:break;}",
+        "switch(1){case 0:const x=7;function f(){return x;}break;case 1:f();}",
         "function f(){let x;x=7;return (eval)('x');} f();",
         "function f(){let x;x=7;return ((eval))('x');} f();",
         "function f(){let x;x=7;return (()=>(eval)('x'))();} f();",

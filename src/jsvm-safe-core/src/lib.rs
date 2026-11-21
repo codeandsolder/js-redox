@@ -181,126 +181,77 @@ fn direct_identifier_name<'a>(expr: &'a Expression<'a>) -> Option<&'a str> {
     }
 }
 
-#[derive(Debug, Clone)]
-struct ConstBinding {
-    value: Value,
-    available_after: u32,
-}
-
-fn resolved_const_value(
-    id: &oxc_ast::ast::IdentifierReference<'_>,
-    scoping: &Scoping,
-    constants: &HashMap<SymbolId, ConstBinding>,
-) -> Option<Value> {
-    let reference = scoping.get_reference(id.reference_id.get()?);
-    if !reference.is_read() || reference.is_write() || reference.flags().is_member_write_target() {
-        return None;
-    }
-    let binding = constants.get(&reference.symbol_id()?)?;
-    (id.span.start >= binding.available_after).then(|| binding.value.clone())
-}
-
-fn eval_with_constants(
-    expr: &Expression<'_>,
-    scoping: &Scoping,
-    constants: &HashMap<SymbolId, ConstBinding>,
-) -> Option<Value> {
-    eval_with_resolver(expr, &|reference| {
-        let Expression::Identifier(id) = reference else {
-            return None;
-        };
-        resolved_const_value(id, scoping, constants)
-    })
+/// Immutable primitive bindings indexed by semantic identity and proven
+/// initialization regions, shared by reconstruction and source analysis.
+#[derive(Debug)]
+pub struct ProvenConstantEnvironment {
+    bindings: HashMap<SymbolId, Value>,
+    initialization: binding_initialization::BindingInitialization,
 }
 
 struct ConstValueCollector<'s, 'c> {
     scoping: &'c Scoping,
-    constants: &'s mut HashMap<SymbolId, ConstBinding>,
-    changed: bool,
+    constants: &'s mut ProvenConstantEnvironment,
 }
 
 impl<'a> Visit<'a> for ConstValueCollector<'_, '_> {
     fn visit_variable_declaration(&mut self, it: &oxc_ast::ast::VariableDeclaration<'a>) {
         if it.kind == VariableDeclarationKind::Const {
-            for d in &it.declarations {
-                let BindingPattern::BindingIdentifier(id) = &d.id else {
+            for declaration in &it.declarations {
+                let BindingPattern::BindingIdentifier(id) = &declaration.id else {
                     continue;
                 };
                 let Some(symbol) = id.symbol_id.get() else {
                     continue;
                 };
-                if self.constants.contains_key(&symbol) {
+                let Some(init) = &declaration.init else {
                     continue;
+                };
+                if let Some(value) = self.constants.exact_primitive(init, self.scoping) {
+                    self.constants.bindings.insert(symbol, value);
                 }
-                let Some(init) = &d.init else {
-                    continue;
-                };
-                let Some(value) = eval_with_constants(init, self.scoping, self.constants) else {
-                    continue;
-                };
-                self.constants.insert(
-                    symbol,
-                    ConstBinding {
-                        value,
-                        available_after: d.span.end,
-                    },
-                );
-                self.changed = true;
             }
         }
         walk::walk_variable_declaration(self, it);
     }
 }
 
-fn collect_const_values(
-    program: &oxc_ast::ast::Program<'_>,
-    scoping: &Scoping,
-) -> HashMap<SymbolId, ConstBinding> {
-    let mut constants = HashMap::new();
-    loop {
-        let changed = {
-            let mut collector = ConstValueCollector {
-                scoping,
-                constants: &mut constants,
-                changed: false,
-            };
-            collector.visit_program(program);
-            collector.changed
-        };
-        if !changed {
-            break;
-        }
-    }
-    constants
-}
-
-/// Immutable primitive bindings proven from `const` declarations.
-///
-/// Bindings are keyed by Oxc semantic identity, become available only after
-/// their declaration, and use the same deliberately narrow pure-expression
-/// evaluator as safe deobfuscation.
-#[derive(Debug)]
-pub struct ProvenConstantEnvironment {
-    bindings: HashMap<SymbolId, ConstBinding>,
-}
-
 impl ProvenConstantEnvironment {
     #[must_use]
     pub fn collect(program: &oxc_ast::ast::Program<'_>, scoping: &Scoping) -> Self {
-        Self {
-            bindings: collect_const_values(program, scoping),
+        let mut constants = Self {
+            bindings: HashMap::new(),
+            initialization: binding_initialization::BindingInitialization::analyze(program),
+        };
+        // An initializer can only consume facts proved available at that
+        // source position. These dependencies are already in source order;
+        // repeatedly walking the entire AST cannot establish new dominance.
+        ConstValueCollector {
+            scoping,
+            constants: &mut constants,
         }
+        .visit_program(program);
+        constants
     }
 
-    /// Resolve one lexical constant at its original source position. This
-    /// is the fallback for callers that overlay a proven invocation frame.
+    /// Resolve a lexical primitive only when its initialization is proved
+    /// for this exact reference, including across later-created closures.
     #[must_use]
     pub fn resolve_identifier(
         &self,
         id: &oxc_ast::ast::IdentifierReference<'_>,
         scoping: &Scoping,
     ) -> Option<StaticPrimitiveValue> {
-        resolved_const_value(id, scoping, &self.bindings)
+        let reference_id = id.reference_id.get()?;
+        let symbol = statically_resolved_symbol(scoping, reference_id)?;
+        if !reference_is_statically_resolved_read(scoping, reference_id, symbol) {
+            return None;
+        }
+        let value = self.bindings.get(&symbol)?;
+        let scope = scoping.get_reference(reference_id).scope_id();
+        self.initialization
+            .proves_immutable_initialized(scoping, symbol, scope, id.span)
+            .then(|| value.clone())
     }
 
     #[must_use]
@@ -309,7 +260,12 @@ impl ProvenConstantEnvironment {
         expr: &Expression<'_>,
         scoping: &Scoping,
     ) -> Option<StaticPrimitiveValue> {
-        eval_with_constants(expr, scoping, &self.bindings)
+        eval_with_resolver(expr, &|reference| {
+            let Expression::Identifier(id) = reference else {
+                return None;
+            };
+            self.resolve_identifier(id, scoping)
+        })
     }
 
     #[must_use]
@@ -667,11 +623,10 @@ struct Collector<'s, 'c> {
     source: &'s str,
     budget: &'c WorkBudget,
     completion: &'c completion::CompletionLiveness,
-    initialized_bindings: &'c binding_initialization::BindingInitialization,
     scoping: &'c Scoping,
     arrays: &'c HashMap<SymbolId, Vec<Value>>,
     decoders: &'c HashMap<SymbolId, Decoder>,
-    constants: &'c HashMap<SymbolId, ConstBinding>,
+    constants: &'c ProvenConstantEnvironment,
     shorthand_spans: &'c HashSet<(u32, u32)>,
     proxies: &'c HashMap<SymbolId, ProxyObject>,
     pure_functions: &'c HashMap<SymbolId, PureFunction>,
@@ -1074,7 +1029,7 @@ impl Collector<'_, '_> {
         let Some(symbol) = reference.symbol_id() else {
             return false;
         };
-        self.initialized_bindings.proves_initialized(
+        self.constants.initialization.proves_initialized(
             self.scoping,
             symbol,
             reference.scope_id(),
@@ -1353,23 +1308,13 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
                 walk::walk_expression(self, it);
                 return;
             }
-            if let Some(reference_id) = id.reference_id.get() {
-                let reference = self.scoping.get_reference(reference_id);
-                if reference.is_read()
-                    && !reference.is_write()
-                    && !reference.flags().is_member_write_target()
-                {
-                    if let Some(symbol) = reference.symbol_id() {
-                        if let Some(binding) = self.constants.get(&symbol) {
-                            if id.span.start >= binding.available_after {
-                                if let Some(text) = binding.value.render() {
-                                    self.push(id.span, text, "const_propagate");
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                }
+            if let Some(text) = self
+                .constants
+                .resolve_identifier(id, self.scoping)
+                .and_then(|value| value.render())
+            {
+                self.push(id.span, text, "const_propagate");
+                return;
             }
         }
         walk::walk_expression(self, it);
@@ -2061,7 +2006,7 @@ fn transform_once(
     let decoders = decoder_analysis.decoders;
     let mut protected_spans = decoder_analysis.protected_spans;
     let mut initial_replacements = decoder_analysis.replacements;
-    let constants = collect_const_values(&program, scoping);
+    let constants = ProvenConstantEnvironment::collect(&program, scoping);
     budget.checkpoint()?;
     let shorthand_spans = collect_shorthand_spans(&program);
     let proxies = collect_proxy_objects(&program, scoping);
@@ -2094,12 +2039,10 @@ fn transform_once(
     budget.checkpoint()?;
 
     let completion = completion::CompletionLiveness::analyze(&program);
-    let initialized_bindings = binding_initialization::BindingInitialization::analyze(&program);
     let mut collector = Collector {
         source,
         budget,
         completion: &completion,
-        initialized_bindings: &initialized_bindings,
         scoping,
         arrays: &arrays,
         decoders: &decoders,
@@ -7632,6 +7575,44 @@ mod tests {
                 if error.kind() == work_budget::BudgetExceededKind::Work
                     && error.scope() == "safe-deob-fuel"
         ));
+    }
+
+    #[test]
+    fn constant_reads_require_initialization_on_every_reaching_execution() {
+        for source in [
+            "f();const x=7;function f(){return x;}",
+            "function g(){return f();const x=7;function f(){return x;}}g();",
+            "switch(1){case 0:const x=7;break;case 1:sink(x);}",
+            "f();const x=7;function f(){const y=x+1;return y;}",
+            "f();const x=7;function f(){class C{static y=x;}return C.y;}",
+            "{f();const x=7;function f(){return x;}}",
+            "const f=()=>x;f();const x=7;",
+            "switch(0){case 0:f();const x=7;function f(){return x;}break;case 1:f();}",
+        ] {
+            let result = deobfuscate(source, 32).unwrap_or_else(|| unreachable!("{source}"));
+            assert!(
+                !result.transforms.contains_key("const_propagate"),
+                "{source} -> {}",
+                result.source
+            );
+        }
+        for source in [
+            "const x=7;const f=()=>x;f();",
+            "const x=7;const f=function(){return x;};f();",
+            "const x=7;{function f(){return x;}sink(f());}",
+            "const x=7;const f=()=>{function g(){return x;}return g();};f();",
+            "const x=7;class C{static get value(){return x;}}sink(C.value);",
+            "for(const x=7;;){sink(x);break;}",
+            "const x=7,y=x+1,z=y+1;sink(z);",
+            "switch(0){case 0:const x=7;sink(x);break;case 1:break;}",
+        ] {
+            let result = deobfuscate(source, 32).unwrap_or_else(|| unreachable!("{source}"));
+            assert!(
+                result.transforms.contains_key("const_propagate"),
+                "{source} -> {}",
+                result.source
+            );
+        }
     }
 
     #[test]
