@@ -12,4 +12,4 @@ concurrency:
 
 jobs:
   quarantine:
-    uses: codeandsolder/ci-workflows/.github/workflows/cargo-release-quarantine.yml@73448b1d381ada61a26dc3483d10342a7a41246c # main
+    uses: codeandsolder/ci-workflows/.github/workflows/cargo-release-quarantine.yml@9190509a6314e35770f27b70dc771d14227e95aa # main
