@@ -346,86 +346,178 @@ fn match_directives(
     }
 }
 
+fn parent_frame(event: &Map<String, Value>) -> Option<&Map<String, Value>> {
+    event
+        .get("stackTrace")?
+        .get("callFrames")?
+        .as_array()?
+        .first()?
+        .as_object()
+}
+
+fn script_id(value: Option<&Value>) -> Option<String> {
+    crate::runtime_identity::script_id_text(value?).map(std::borrow::Cow::into_owned)
+}
+
+/// All claims for a session-local script ID. Agreement on source bytes does
+/// not imply agreement on the ancestor frame or execution context.
+struct ParentEventEvidence<'a> {
+    representative: &'a Map<String, Value>,
+    digests: BTreeSet<Option<&'a str>>,
+    same_ancestry: bool,
+    same_url: bool,
+    count: usize,
+}
+
+impl<'a> ParentEventEvidence<'a> {
+    fn new(event: &'a Map<String, Value>) -> Self {
+        Self {
+            representative: event,
+            digests: BTreeSet::from([captured_javascript_digest(event)]),
+            same_ancestry: true,
+            same_url: true,
+            count: 1,
+        }
+    }
+
+    fn add(&mut self, event: &'a Map<String, Value>) {
+        self.digests.insert(captured_javascript_digest(event));
+        self.same_ancestry &= parent_frame(self.representative) == parent_frame(event)
+            && self.representative.get("executionContextId") == event.get("executionContextId");
+        self.same_url &= text(self.representative.get("url")) == text(event.get("url"));
+        self.count += 1;
+    }
+
+    fn digest(&self) -> Option<&'a str> {
+        if self.digests.len() == 1 {
+            self.digests.first().copied().flatten()
+        } else {
+            None
+        }
+    }
+
+    fn status(&self) -> &'static str {
+        if self.digests.len() != 1 {
+            "conflicting_source_claims"
+        } else if !self.same_ancestry {
+            "ambiguous_ancestry"
+        } else if self.count > 1 {
+            "consistent_duplicate"
+        } else {
+            "unique"
+        }
+    }
+}
+
+#[derive(Default)]
+struct ParentEventIndex<'a> {
+    sessions: HashMap<String, HashMap<String, ParentEventEvidence<'a>>>,
+}
+
+impl<'a> ParentEventIndex<'a> {
+    fn register(&mut self, event: &'a Map<String, Value>) {
+        let Some(id) = script_id(event.get("scriptId")) else {
+            return;
+        };
+        self.sessions
+            .entry(event_session(event))
+            .or_default()
+            .entry(id)
+            .and_modify(|evidence| evidence.add(event))
+            .or_insert_with(|| ParentEventEvidence::new(event));
+    }
+
+    fn get(&self, session: &str, id: &str) -> Option<&ParentEventEvidence<'a>> {
+        self.sessions.get(session)?.get(id)
+    }
+}
+
 fn generation_origins(
     event_rows: &[usize],
     events: &[Value],
-    events_by_script_id: &HashMap<(String, String), usize>,
-) -> Vec<Value> {
+    events_by_script_id: &ParentEventIndex<'_>,
+    budget: &WorkBudget,
+) -> Result<Vec<Value>> {
     let mut output = Vec::new();
     let mut seen = BTreeSet::new();
     for event_index in event_rows {
+        budget.consume(1)?;
         let Some(event) = events.get(*event_index).and_then(Value::as_object) else {
             continue;
         };
         let session = event_session(event);
-        let child_script_id = stringish(event.get("scriptId"));
-        let mut current_index = *event_index;
+        let child_script_id = script_id(event.get("scriptId"));
+        let mut current = event;
         let mut visited = BTreeSet::new();
-        if !child_script_id.is_empty() {
-            visited.insert(child_script_id.clone());
+        if let Some(id) = &child_script_id {
+            visited.insert(id.clone());
         }
         let mut chain = Vec::new();
+        let mut termination = "depth_limit";
         for _ in 0..32 {
-            let Some(current) = events.get(current_index).and_then(Value::as_object) else {
+            budget.consume(1)?;
+            let Some(frame) = parent_frame(current) else {
+                termination = "no_recorded_parent";
                 break;
             };
-            let Some(frame) = current
-                .get("stackTrace")
-                .and_then(Value::as_object)
-                .and_then(|stack| stack.get("callFrames"))
-                .and_then(Value::as_array)
-                .and_then(|frames| frames.first())
-                .and_then(Value::as_object)
-            else {
+            let Some(parent_script_id) = script_id(frame.get("scriptId")) else {
+                termination = "invalid_parent_script_id";
                 break;
             };
-            let parent_script_id = stringish(frame.get("scriptId"));
-            if parent_script_id.is_empty() || !visited.insert(parent_script_id.clone()) {
+            if !visited.insert(parent_script_id.clone()) {
+                termination = "cycle";
                 break;
             }
-            let parent_index = events_by_script_id
-                .get(&(session.clone(), parent_script_id.clone()))
-                .copied();
-            let parent = parent_index
-                .and_then(|index| events.get(index))
-                .and_then(Value::as_object);
-            let captured = parent
-                .and_then(|parent| parent.get("captured"))
-                .and_then(Value::as_object);
-            let parent_url = parent
-                .and_then(|parent| text(parent.get("url")))
+            let parent = events_by_script_id.get(&session, &parent_script_id);
+            let status = parent.map_or("unavailable", ParentEventEvidence::status);
+            let parent_url = text(frame.get("url"))
                 .filter(|url| !url.is_empty())
-                .or_else(|| text(frame.get("url")))
+                .or_else(|| {
+                    parent
+                        .filter(|evidence| evidence.same_url)
+                        .and_then(|evidence| text(evidence.representative.get("url")))
+                })
                 .unwrap_or_default();
+            if let Some(parent) = parent {
+                budget.consume(u64::try_from(parent.digests.len())?)?;
+            }
             chain.push(json!({
-                "cdp_session": session,
-                "script_id": parent_script_id,
-                "sha256": captured.and_then(|value| value.get("sha256")).cloned().unwrap_or(Value::Null),
-                "url": parent_url,
-                "function_name": text(frame.get("functionName")).unwrap_or_default(),
-                "line_number": frame.get("lineNumber").cloned().unwrap_or(Value::Null),
-                "column_number": frame.get("columnNumber").cloned().unwrap_or(Value::Null),
+                "cdp_session":session,
+                "script_id":parent_script_id,
+                "sha256":parent.and_then(ParentEventEvidence::digest),
+                "url":parent_url,
+                "function_name":text(frame.get("functionName")).unwrap_or_default(),
+                "line_number":frame.get("lineNumber").cloned().unwrap_or(Value::Null),
+                "column_number":frame.get("columnNumber").cloned().unwrap_or(Value::Null),
+                "parent_event_status":status,
+                "parent_event_count":parent.map_or(0, |evidence| evidence.count),
+                "parent_event_digest_claims":parent.map(|evidence| &evidence.digests),
             }));
-            let Some(parent_index) = parent_index else {
+            let Some(parent) = parent else {
+                termination = "unavailable_parent_event";
                 break;
             };
-            current_index = parent_index;
+            match status {
+                "conflicting_source_claims" => {
+                    termination = "conflicting_parent_event";
+                    break;
+                }
+                "ambiguous_ancestry" => {
+                    termination = "ambiguous_parent_ancestry";
+                    break;
+                }
+                _ => current = parent.representative,
+            }
         }
         if chain.is_empty() {
             continue;
         }
-        let origin = json!({
-            "cdp_session": session,
-            "child_script_id": child_script_id,
-            "chain": chain,
-        });
-        if let Ok(key) = serde_json::to_string(&origin) {
-            if seen.insert(key) {
-                output.push(origin);
-            }
+        let origin = json!({"cdp_session":session,"child_script_id":child_script_id,"chain":chain,"chain_termination":termination});
+        if seen.insert(serde_json::to_string(&origin)?) {
+            output.push(origin);
         }
     }
-    output
+    Ok(output)
 }
 
 fn document_inline_origins(event_rows: &[usize], events: &[Value]) -> Vec<Value> {
@@ -568,18 +660,13 @@ pub(super) fn analyze_recorder_runtime_scripts(
     let (body_hashes, network_urls) = captured_resource_identity(manifest);
 
     let mut events_by_hash = HashMap::<String, Vec<usize>>::new();
-    let mut events_by_script_id = HashMap::<(String, String), usize>::new();
+    let mut events_by_script_id = ParentEventIndex::default();
     for (index, event) in events.iter().enumerate() {
         budget.checkpoint()?;
         let Some(event) = event.as_object() else {
             continue;
         };
-        if !event.get("scriptId").is_none_or(Value::is_null) {
-            events_by_script_id.insert(
-                (event_session(event), stringish(event.get("scriptId"))),
-                index,
-            );
-        }
+        events_by_script_id.register(event);
         if let Some(digest) = captured_javascript_digest(event) {
             events_by_hash
                 .entry(digest.to_owned())
@@ -648,7 +735,7 @@ pub(super) fn analyze_recorder_runtime_scripts(
             }));
         }
 
-        let origins = generation_origins(&event_rows, events, &events_by_script_id);
+        let origins = generation_origins(&event_rows, events, &events_by_script_id, budget)?;
         let document_origins = document_inline_origins(&event_rows, events);
         let relative_path = source_path
             .strip_prefix(capture)
@@ -698,7 +785,10 @@ pub(super) fn analyze_recorder_runtime_scripts(
                     .and_then(Value::as_array)
                     .map_or_default(Vec::as_slice);
                 max_depth = max_depth.max(chain.len());
-                if let Some(root) = chain.last() {
+                if origin["chain_termination"] == "no_recorded_parent" {
+                    let Some(root) = chain.last() else {
+                        continue;
+                    };
                     if let Some(digest) = text(root.get("sha256")) {
                         root_hashes.insert(digest.to_owned());
                     }
@@ -864,20 +954,74 @@ mod tests {
             ),
             event("oopif-1", "2", "frame-child", "", Some("1")),
         ];
-        let mut by_id = HashMap::new();
-        for (index, event) in events.iter().enumerate() {
-            let object = event.as_object().context("fixture event must be object")?;
-            by_id.insert(
-                (event_session(object), stringish(object.get("scriptId"))),
-                index,
-            );
+        let mut by_id = ParentEventIndex::default();
+        for event in &events {
+            by_id.register(event.as_object().context("fixture event must be object")?);
         }
-        let main = generation_origins(&[1], &events, &by_id);
-        let frame = generation_origins(&[3], &events, &by_id);
+        let budget = WorkBudget::unlimited("generation-session");
+        let main = generation_origins(&[1], &events, &by_id, &budget)?;
+        let frame = generation_origins(&[3], &events, &by_id, &budget)?;
         assert_eq!(main[0]["chain"][0]["sha256"], "main-parent");
         assert_eq!(frame[0]["chain"][0]["sha256"], "frame-parent");
         assert_eq!(main[0]["cdp_session"], "main");
         assert_eq!(frame[0]["cdp_session"], "oopif-1");
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_generation_parent_claims_do_not_select_arbitrary_ancestors() -> Result<()> {
+        let events = vec![
+            event(
+                "main",
+                "1",
+                "parent-a",
+                "https://fixture.test/a.js",
+                Some("7"),
+            ),
+            event(
+                "main",
+                "1",
+                "parent-b",
+                "https://fixture.test/b.js",
+                Some("8"),
+            ),
+            event("main", "2", "child", "", Some("1")),
+            event("main", "3", "same", "", Some("7")),
+            event("main", "3", "same", "", Some("8")),
+            event("main", "4", "child-two", "", Some("3")),
+            event("main", "7", "root", "", None),
+            event("main", "8", "other-root", "", None),
+            event("main", "7", "root", "", None),
+            event("main", "9", "child-three", "", Some("7")),
+        ];
+        let budget = WorkBudget::unlimited("ambiguous-generation");
+        let mut forward = ParentEventIndex::default();
+        let mut reverse = ParentEventIndex::default();
+        for event in &events {
+            forward.register(event.as_object().context("fixture event")?);
+        }
+        for event in events.iter().rev() {
+            reverse.register(event.as_object().context("fixture event")?);
+        }
+        let origins = generation_origins(&[2, 5, 9], &events, &forward, &budget)?;
+        assert_eq!(
+            origins,
+            generation_origins(&[2, 5, 9], &events, &reverse, &budget)?
+        );
+        assert_eq!(origins[0]["chain_termination"], "conflicting_parent_event");
+        assert_eq!(origins[0]["chain"][0]["sha256"], Value::Null);
+        assert_eq!(
+            origins[0]["chain"][0]["parent_event_digest_claims"],
+            json!(["parent-a", "parent-b"])
+        );
+        assert_eq!(origins[1]["chain_termination"], "ambiguous_parent_ancestry");
+        assert_eq!(origins[1]["chain"][0]["sha256"], "same");
+        assert_eq!(origins[2]["chain_termination"], "no_recorded_parent");
+        assert_eq!(
+            origins[2]["chain"][0]["parent_event_status"],
+            "consistent_duplicate"
+        );
+        assert_eq!(origins[2]["chain"][0]["sha256"], "root");
         Ok(())
     }
 
