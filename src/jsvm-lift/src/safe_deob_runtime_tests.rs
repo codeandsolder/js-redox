@@ -931,8 +931,8 @@ fn depythonify_safe_deob_decoder_number_runtime_equivalence() -> Result<()> {
 #[test]
 #[ignore = "requires Node; semantic CI invokes explicitly"]
 fn depythonify_safe_deob_heap_liveness_runtime_equivalence() -> Result<()> {
-    let churn = "{let waste={x:1};}".repeat(128);
-    let temporaries = "({x:1}),".repeat(128);
+    let churn = "{let waste={ x:1 };}".repeat(128);
+    let temporaries = "({ x:1 }),".repeat(128);
     let sources = [
         format!("let holder;{{let p={{x:7}};let a={{__proto__:p}};holder={{a}};}}{churn}holder.a.x;"),
         format!("let holder={{x:{{y:7}},self:null}};holder.self=holder;{churn}holder.self.x.y;"),

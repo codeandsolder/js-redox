@@ -51,9 +51,9 @@ impl Reference {
         match self {
             Self::Binding(symbol) => {
                 if let Some(value) = value {
-                    environment.insert(*symbol, value, budget)?;
+                    environment.insert(*symbol, value.clone(), budget)?;
                 } else {
-                    environment.remove(symbol, budget)?;
+                    environment.remove(*symbol, budget)?;
                 }
                 Ok(true)
             }
@@ -272,7 +272,7 @@ impl Analyzer<'_> {
         &mut self,
         span: Span,
         object: Evaluation,
-        key: Evaluation,
+        key: &Evaluation,
         environment: &mut Environment,
     ) -> Evaluation {
         let Some(name) = key.primitive_value().map(Value::js_string) else {
@@ -580,8 +580,7 @@ impl Analyzer<'_> {
             }
         }
         if matches!(operator, "===" | "!==") {
-            let equal = if let (Some(left), Some(right)) =
-                (left.fact.as_ref(), right.fact.as_ref())
+            let equal = if let (Some(left), Some(right)) = (left.fact.as_ref(), right.fact.as_ref())
             {
                 self.heap_result(left.strict_equal(right, self.budget))
                     .flatten()
@@ -589,9 +588,7 @@ impl Analyzer<'_> {
                 None
             };
             Evaluation {
-                fact: equal.map(|equal| {
-                    Fact::Primitive(Value::Bool(equal == (operator == "===")))
-                }),
+                fact: equal.map(|equal| Fact::Primitive(Value::Bool(equal == (operator == "===")))),
                 inert: left.inert && right.inert,
             }
         } else {
@@ -654,12 +651,11 @@ impl Analyzer<'_> {
         if !self.join_heap(environment, &other, first_new) {
             return Self::barrier(environment);
         }
-        let fact =
-            if let (Some(left), Some(right)) = (left.fact.as_ref(), right.fact.as_ref()) {
-                self.heap_result(left.join(right, self.budget)).flatten()
-            } else {
-                None
-            };
+        let fact = if let (Some(left), Some(right)) = (left.fact.as_ref(), right.fact.as_ref()) {
+            self.heap_result(left.join(right, self.budget)).flatten()
+        } else {
+            None
+        };
         Evaluation {
             fact,
             inert: test.inert && left.inert && right.inert,
@@ -759,11 +755,7 @@ impl Analyzer<'_> {
                     let is_data = property.kind == PropertyKind::Init;
                     let Some(key) = key else {
                         if self
-                            .heap_result(data.define_unknown_key(
-                                is_data,
-                                value.fact,
-                                self.budget,
-                            ))
+                            .heap_result(data.define_unknown_key(is_data, value.fact, self.budget))
                             .is_none()
                         {
                             return Self::barrier(environment);
@@ -803,7 +795,7 @@ impl Analyzer<'_> {
                 else {
                     return Self::barrier(environment);
                 };
-                self.member(expression.span(), object, key, environment)
+                self.member(expression.span(), object, &key, environment)
             }
             Expression::SequenceExpression(sequence) => {
                 let mut result = Evaluation::unknown_inert();
@@ -902,13 +894,11 @@ impl Analyzer<'_> {
                 {
                     break;
                 }
-            } else {
-                if self
-                    .heap_result(environment.remove(&symbol, self.budget))
-                    .is_none()
-                {
-                    break;
-                }
+            } else if self
+                .heap_result(environment.remove(symbol, self.budget))
+                .is_none()
+            {
+                break;
             }
         }
     }
@@ -1079,7 +1069,7 @@ mod tests {
     #[test]
     fn exhausted_heap_budget_does_not_publish_partial_reaching_facts() -> Result<(), BudgetExceeded>
     {
-        let mut source = "let p0={x:7};".to_owned();
+        let mut source = "let p0={ x:7 };".to_owned();
         for index in 1..128 {
             use std::fmt::Write;
             let _ = write!(source, "let p{index}={{__proto__:p{}}};", index - 1);
@@ -1106,7 +1096,7 @@ mod tests {
     #[test]
     fn heap_collection_keeps_outer_aliases_prototypes_and_expression_temporaries(
     ) -> Result<(), BudgetExceeded> {
-        let churn = "{let waste={x:1};}".repeat(256);
+        let churn = "{let waste={ x:1 };}".repeat(256);
         let source = format!(
             "let holder;{{let p={{x:7}};let a={{__proto__:p}};holder={{a}};}}{churn}holder.a.x;"
         );
@@ -1126,7 +1116,7 @@ mod tests {
             "function f(flag){{let holder={{x:7}};if(flag){{holder={{x:7}};{churn}}}holder.x;}}"
         );
         assert_eq!(reads(&source)?, vec![("holder.x".into(), "7".into())]);
-        let temporaries = "({x:1}),".repeat(256);
+        let temporaries = "({ x:1 }),".repeat(256);
         let source = format!("let a={{x:7}};let b=a; b.x=({temporaries}a={{x:9}},8);b.x;a.x;");
         assert_eq!(
             reads(&source)?,
