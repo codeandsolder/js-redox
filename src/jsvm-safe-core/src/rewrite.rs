@@ -15,6 +15,7 @@ use oxc_ast_visit::{walk, Visit};
 use oxc_span::GetSpan;
 use std::collections::{BTreeMap, HashSet};
 use string_wizard::{MagicString, TextEdit};
+use work_budget::{BudgetExceeded, WorkBudget};
 
 #[derive(Debug, Clone)]
 pub struct Replacement {
@@ -393,28 +394,44 @@ pub fn apply(
     counts: &mut Counts,
     arithmetic_state_proofs: &mut Vec<ArithmeticStateProof>,
     iteration: usize,
-) -> Option<String> {
+    budget: &WorkBudget,
+) -> Result<Option<String>, BudgetExceeded> {
+    budget.checkpoint()?;
     let mut collector = BoundaryCollector {
         source: program.source_text,
         boundaries: StatementBoundaries::default(),
         directives: DirectiveInventory::default(),
     };
     collector.visit_program(program);
+    budget.checkpoint()?;
     collector
         .boundaries
         .protect(program.source_text, &mut replacements);
+    budget.checkpoint()?;
     if replacements.is_empty() {
-        return Some(program.source_text.to_owned());
+        return Ok(Some(program.source_text.to_owned()));
     }
-    let transaction = RewriteTransaction::prepare(program.source_text, replacements)?;
-    if transaction.source != program.source_text
-        && !collector
+    let transaction = RewriteTransaction::prepare(program.source_text, replacements);
+    budget.checkpoint()?;
+    let Some(transaction) = transaction else {
+        return Ok(None);
+    };
+    let valid = transaction.source == program.source_text
+        || collector
             .directives
-            .preserves(program, &transaction.source, &transaction.edits)
-    {
-        return None;
+            .preserves(program, &transaction.source, &transaction.edits);
+    // Directive validation reparses the candidate source. Never publish
+    // counts or proof records after that work has exhausted the budget,
+    // even when the candidate would otherwise be rejected.
+    budget.checkpoint()?;
+    if !valid {
+        return Ok(None);
     }
-    Some(transaction.commit(counts, arithmetic_state_proofs, iteration))
+    Ok(Some(transaction.commit(
+        counts,
+        arithmetic_state_proofs,
+        iteration,
+    )))
 }
 
 struct RewriteTransaction {
@@ -520,8 +537,16 @@ mod tests {
         let allocator = oxc_allocator::Allocator::default();
         let program = crate::parse_as(&allocator, source, oxc_span::SourceType::cjs())
             .unwrap_or_else(|| unreachable!());
-        apply(&program, edits, &mut Counts::default(), &mut Vec::new(), 1)
-            .unwrap_or_else(|| unreachable!())
+        apply(
+            &program,
+            edits,
+            &mut Counts::default(),
+            &mut Vec::new(),
+            1,
+            &WorkBudget::unlimited("rewrite-test"),
+        )
+        .unwrap_or_else(|_| unreachable!())
+        .unwrap_or_else(|| unreachable!())
     }
 
     #[test]
@@ -788,8 +813,33 @@ mod tests {
             &mut counts,
             &mut proofs,
             1,
+            &WorkBudget::unlimited("directive-contract-test"),
         )
-        .is_none());
+        .is_ok_and(|result| result.is_none()));
+        assert!(counts.into_inner().is_empty());
+        assert!(proofs.is_empty());
+    }
+
+    #[test]
+    fn cancelled_transaction_does_not_publish_edits_or_proofs() {
+        let source = "work(1);";
+        let allocator = oxc_allocator::Allocator::default();
+        let program = crate::parse_as(&allocator, source, oxc_span::SourceType::cjs())
+            .unwrap_or_else(|| unreachable!());
+        let mut counts = Counts::default();
+        let mut proofs = Vec::new();
+        let parent = WorkBudget::unlimited("cancelled-parent");
+        let child = parent.child("rewrite", work_budget::BudgetLimits::unlimited());
+        parent.cancel();
+        let result = apply(
+            &program,
+            vec![replacement_with_proof(5, 6, "2")],
+            &mut counts,
+            &mut proofs,
+            1,
+            &child,
+        );
+        assert!(result.is_err_and(|error| error.is_inherited()));
         assert!(counts.into_inner().is_empty());
         assert!(proofs.is_empty());
     }

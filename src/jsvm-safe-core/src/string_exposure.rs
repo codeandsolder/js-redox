@@ -256,7 +256,9 @@ fn expose_static_strings_with_mode(
             &mut counts,
             &mut Vec::new(),
             iteration,
-        ) else {
+            budget,
+        )?
+        else {
             return Ok(None);
         };
         if next == current {
@@ -333,9 +335,10 @@ mod tests {
             &mut Counts::default(),
             &mut Vec::new(),
             1,
+            &WorkBudget::unlimited("strings-rewrite-test"),
         );
-        assert!(rewritten.is_some());
-        let rewritten = rewritten.unwrap_or_default();
+        assert!(rewritten.as_ref().is_ok_and(Option::is_some));
+        let rewritten = rewritten.ok().flatten().unwrap_or_default();
         assert!(rewritten.contains("sink(blocked[0])"));
         assert!(rewritten.contains("sink(\"safe\")"));
     }

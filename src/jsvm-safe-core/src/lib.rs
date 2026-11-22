@@ -704,7 +704,9 @@ impl Collector<'_, '_> {
                 counts,
                 arithmetic_state_proofs,
                 iteration,
-            ) else {
+                self.budget,
+            )?
+            else {
                 return Ok(None);
             };
             if next != self.source {
@@ -2268,7 +2270,9 @@ fn recover_static_decoders_with_mode(
             &mut counts,
             &mut Vec::new(),
             iteration,
-        ) else {
+            budget,
+        )?
+        else {
             return Ok(None);
         };
         if next == current {

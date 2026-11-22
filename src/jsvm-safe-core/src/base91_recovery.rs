@@ -918,7 +918,9 @@ fn expose_static_strings_allow_with(
             &mut counts,
             &mut Vec::new(),
             iteration,
-        ) else {
+            budget,
+        )?
+        else {
             return Ok(None);
         };
         for (kind, count) in counts.into_inner() {
@@ -1119,7 +1121,9 @@ pub fn recover_base91_strings_with_source_mode(
                 &mut counts,
                 &mut Vec::new(),
                 iteration,
-            ) else {
+                budget,
+            )?
+            else {
                 return Ok(None);
             };
             next
