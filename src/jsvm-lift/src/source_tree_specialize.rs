@@ -1165,6 +1165,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::literal_string_with_formatting_args,
+        reason = "JavaScript fixture braces are source syntax, not Rust format placeholders"
+    )]
     fn dynamic_scope_and_mutated_bindings_are_not_inferred_as_constants() -> Result<()> {
         for src in [
             "const leaf=x=>x;const api={};api.run=()=>{let x=3;x=4;return leaf(x);};",

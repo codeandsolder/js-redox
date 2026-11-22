@@ -1258,6 +1258,10 @@ console.log(JSON.stringify({call,objectTrace,arrayTrace,memberTrace,
 
     #[test]
     #[ignore = "requires installed Node; differential runtime oracle"]
+    #[expect(
+        clippy::literal_string_with_formatting_args,
+        reason = "JavaScript fixture braces are source syntax, not Rust format placeholders"
+    )]
     fn node_confirms_computed_key_getvalue_vs_putvalue_coercion_order() -> anyhow::Result<()> {
         use std::process::Command;
         let script = r"

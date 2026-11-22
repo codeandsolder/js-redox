@@ -7304,6 +7304,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::literal_string_with_formatting_args,
+        reason = "JavaScript fixture braces are source syntax, not Rust format placeholders"
+    )]
     fn unused_numeric_write_requires_binding_initialization_on_its_execution_path() {
         for source in [
             "{x=7;let x;}",
@@ -7881,6 +7885,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::literal_string_with_formatting_args,
+        reason = "JavaScript fixture braces are source syntax, not Rust format placeholders"
+    )]
     fn own_member_facts_require_private_initialized_allocations() {
         for source in [
             "function f(){sink(a[0]);const a=[7];}",

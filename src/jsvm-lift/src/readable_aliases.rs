@@ -456,6 +456,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::literal_string_with_formatting_args,
+        reason = "JavaScript fixture braces are source syntax, not Rust format placeholders"
+    )]
     fn group_and_detached_calls() {
         let s = "function f(){var R=Object.create, z=Object.defineProperty, x=other(); return [R(null),z({},'a',{value:1}),x];}";
         let out = rewrite(s);
@@ -464,6 +468,10 @@ mod tests {
         assert!(out.contains("(0, Object.defineProperty)({},'a'"), "{out}");
     }
     #[test]
+    #[expect(
+        clippy::literal_string_with_formatting_args,
+        reason = "JavaScript fixture braces are source syntax, not Rust format placeholders"
+    )]
     fn inlines_uses_inside_retained_group_declarators() {
         let source = "function make(p){var R=Object.create, Z=Object.defineProperty, build=(q)=>Z(R(q),'x',{value:1}), keep=7; return build(p)+keep;}";
         let output = rewrite(source);

@@ -1100,6 +1100,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::literal_string_with_formatting_args,
+        reason = "JavaScript fixture braces are source syntax, not Rust format placeholders"
+    )]
     fn reaching_facts_follow_real_expression_order_and_joins() -> Result<(), BudgetExceeded> {
         for (source, expected) in [
             ("const a=[7]; a[0]; mutate(a); a[0];", vec![("a[0]", "7")]),
@@ -1181,6 +1185,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::literal_string_with_formatting_args,
+        reason = "JavaScript fixture braces are source syntax, not Rust format placeholders"
+    )]
     fn heap_facts_follow_alias_writes_and_nested_references() -> Result<(), BudgetExceeded> {
         for (source, expected) in [
             ("const a=[7];a[0]=9;a[0];", vec![("a[0]","9")]),
@@ -1225,6 +1233,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::literal_string_with_formatting_args,
+        reason = "JavaScript fixture braces are source syntax, not Rust format placeholders"
+    )]
     fn prototype_and_descriptor_facts_support_inheritance_and_new_properties(
     ) -> Result<(), BudgetExceeded> {
         for (source, expected) in [
@@ -1277,6 +1289,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::literal_string_with_formatting_args,
+        reason = "JavaScript fixture braces are source syntax, not Rust format placeholders"
+    )]
     fn copy_data_properties_preserves_exact_enumerability_aliases_and_effects(
     ) -> Result<(), BudgetExceeded> {
         for (source, expected) in [

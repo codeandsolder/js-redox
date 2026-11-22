@@ -894,6 +894,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::literal_string_with_formatting_args,
+        reason = "JavaScript fixture braces are source syntax, not Rust format placeholders"
+    )]
     fn module_export_forms_mark_exact_externally_observable_bindings() {
         for (source, exposed) in [
             ("export const x=1;const y=2;", true),

@@ -341,6 +341,10 @@ fn assert_main_contract(file: &str, outcome: &SafeDeobOutcome) {
 
 #[test]
 #[ignore = "requires Node; semantic CI invokes explicitly"]
+#[expect(
+    clippy::literal_string_with_formatting_args,
+    reason = "JavaScript fixture braces are source syntax, not Rust format placeholders"
+)]
 fn depythonify_safe_deob_script_completion_runtime_equivalence() -> Result<()> {
     let sources = [
         "let x=0;function f(){x=(eval('var x=1'),2);return x;}[f(),x];",
@@ -1525,6 +1529,10 @@ fn zero_transform_fixture(scratch: &Path, file: &str, kinds: &[&str]) -> Result<
 
 #[test]
 #[ignore = "requires Node; semantic CI invokes explicitly"]
+#[expect(
+    clippy::literal_string_with_formatting_args,
+    reason = "JavaScript fixture braces are source syntax, not Rust format placeholders"
+)]
 fn depythonify_safe_deob_safety_runtime_equivalence() -> Result<()> {
     let scratch = TempDir::new()?;
     assert!(
