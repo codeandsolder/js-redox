@@ -5,23 +5,16 @@ use super::html::{
 use super::parse::{Har, HarEntry, NameValue};
 use super::resource::{
     decode_body, format_json_if_possible, output_path_for, refine_resource_kind, resource_kind,
-    write_resource,
 };
-use super::{HarProjectOptions, HarProjectSummary};
+use super::{resource_store::ResourceStore, HarProjectOptions, HarProjectSummary};
 use crate::{
     browser_decode::decode_html,
     capture_project::{write_manifest, CaptureManifest, CaptureSource, MANIFEST_NAME, SCHEMA},
-    sha256_hex,
 };
 use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::{Map, Value};
-use std::{
-    collections::{BTreeMap, HashMap},
-    fmt::Write as _,
-    fs,
-    path::Path,
-};
+use std::{collections::BTreeMap, fmt::Write as _, fs, path::Path};
 use url::Url;
 
 use work_budget::WorkBudget;
@@ -150,9 +143,8 @@ fn materialize_inline_scripts(
     parent_resource_id: usize,
     base_url: &str,
     html: &str,
-    written: &str,
-    output_root: &Path,
-    seen: &mut HashMap<String, String>,
+    inline_base: &str,
+    store: &mut ResourceStore<'_>,
     counts: &mut BTreeMap<String, usize>,
     references: &mut Vec<Reference>,
     inline_scripts: &mut Vec<InlineScriptMeta>,
@@ -199,8 +191,8 @@ fn materialize_inline_scripts(
             continue;
         }
         let ext = inline_script_extension(&ty);
-        let desired = format!("{written}.inline/script-{ordinal:03}.{ext}");
-        let (script_path, _) = write_resource(output_root, desired, &body, seen)?;
+        let desired = format!("{inline_base}.inline/script-{ordinal:03}.{ext}");
+        let stored = store.write(&desired, &body)?;
         *counts.entry("inline_scripts".into()).or_insert(0) += 1;
         inline_scripts.push(InlineScriptMeta {
             parent_resource_id,
@@ -208,9 +200,9 @@ fn materialize_inline_scripts(
             script_type: ty,
             src: None,
             resolved_src: None,
-            output_path: Some(script_path),
+            output_path: Some(stored.path),
             body_bytes: body.len(),
-            sha256: Some(sha256_hex(&body)),
+            sha256: Some(stored.sha256),
             charset: script.attrs.get("charset").cloned(),
             parent_document_encoding: Some(document_encoding.to_string()),
             parent_decode_source: Some(document_decode_source.to_string()),
@@ -235,8 +227,7 @@ fn materialize_entry(
     id: usize,
     entry: &HarEntry,
     har_root: &Path,
-    output_root: &Path,
-    seen: &mut HashMap<String, String>,
+    store: &mut ResourceStore<'_>,
     counts: &mut BTreeMap<String, usize>,
     inline_scripts: &mut Vec<InlineScriptMeta>,
 ) -> Result<ResourceMeta> {
@@ -265,7 +256,6 @@ fn materialize_entry(
 
     if let Some(body) = body {
         body_bytes = body.len();
-        sha256 = Some(sha256_hex(&body));
         kind = refine_resource_kind(
             &transport_kind,
             entry.resource_type.as_deref(),
@@ -283,9 +273,11 @@ fn materialize_entry(
             }
         }
         let desired = output_path_for(&entry.request.url, &kind, &entry.response.content.mime_type);
-        let (written, reused) = write_resource(output_root, desired, &body, seen)?;
+        let stored = store.write(desired, &body)?;
+        let written = stored.path;
         output_path = Some(written.clone());
-        reused_body = reused;
+        reused_body = stored.reused;
+        sha256 = Some(stored.sha256);
         if kind == "html" && body_complete {
             let transport_content_type = header_value(&entry.response.headers, "content-type")
                 .or_else(|| {
@@ -308,13 +300,18 @@ fn materialize_entry(
                     raw: href,
                 });
             }
+            // The store maps logical directories to physical directories. Keep
+            // the original logical parent and the allocated leaf name so an
+            // inline body remains adjacent to its document even after a collision.
+            let (logical_parent, _) = desired.rsplit_once('/').context("resource parent")?;
+            let (_, physical_leaf) = written.rsplit_once('/').context("resource filename")?;
+            let inline_base = format!("{logical_parent}/{physical_leaf}");
             materialize_inline_scripts(
                 id,
                 document_base_url.as_deref().unwrap_or(&entry.request.url),
                 &decoded.source,
-                &written,
-                output_root,
-                seen,
+                &inline_base,
+                store,
                 counts,
                 &mut references,
                 inline_scripts,
@@ -379,7 +376,7 @@ fn build_manifest(
         .into_iter()
         .map(serde_json::to_value)
         .collect::<serde_json::Result<Vec<_>>>()?;
-    let mut seen = HashMap::new();
+    let mut store = ResourceStore::new(&args.output, budget);
     let mut counts = BTreeMap::new();
     let mut inline_scripts = Vec::new();
     let mut resources = Vec::with_capacity(har.log.entries.len());
@@ -390,8 +387,7 @@ fn build_manifest(
             id,
             &entry,
             har_root,
-            &args.output,
-            &mut seen,
+            &mut store,
             &mut counts,
             &mut inline_scripts,
         )?)?);
