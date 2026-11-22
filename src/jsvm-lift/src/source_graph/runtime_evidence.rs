@@ -5,10 +5,12 @@
 //! identify the source of a later debugger witness.
 
 use super::{
-    array_field, bool_field, compact_key, digest_id, field, nonempty_string_field, string_field,
-    GraphBuilder,
+    array_field, compact_key, digest_id, field, nonempty_string_field, string_field, GraphBuilder,
 };
-use crate::runtime_identity::{script_id_text, IdentityState, ScriptIdentityIndex};
+use crate::{
+    runtime_coverage::{PositiveCoverageWitness, RuntimeCoverageIndex},
+    runtime_identity::{script_id_text, IdentityState, ScriptIdentityIndex},
+};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -84,6 +86,8 @@ pub(super) fn add_runtime_network_source_edges(
     runtime: &Value,
     runtime_node: &str,
     resource_nodes_by_sha: &BTreeMap<String, Vec<String>>,
+    witnesses: &[PositiveCoverageWitness],
+    budget: &work_budget::WorkBudget,
 ) -> Result<()> {
     let Some(digest) = nonempty_string_field(runtime, "sha256") else {
         return Ok(());
@@ -95,6 +99,7 @@ pub(super) fn add_runtime_network_source_edges(
     let hash_matches = resource_nodes_by_sha
         .get(digest)
         .map_or_default(Vec::as_slice);
+    budget.consume(u64::try_from(hash_matches.len())?)?;
     let exact = hash_matches
         .iter()
         .filter(|node| {
@@ -123,33 +128,34 @@ pub(super) fn add_runtime_network_source_edges(
     } else {
         // A runtime URL cannot identify which captured HTTP response supplied
         // script bytes. Preserve all URL candidates without asserting execution.
-        (
-            urls.iter()
-                .flat_map(|url| graph.captured_targets(url).into_iter().flatten())
-                .filter(|node| {
-                    graph.node(node).is_some_and(|resource| {
-                        nonempty_string_field(resource, "kind") == Some("javascript")
-                    })
-                })
-                .cloned()
-                .collect::<BTreeSet<_>>(),
-            "url_only",
-        )
+        let mut parents = BTreeSet::new();
+        for url in &urls {
+            let Some(candidates) = graph.captured_targets(url) else {
+                continue;
+            };
+            budget.consume(u64::try_from(candidates.len())?)?;
+            for node in candidates {
+                if graph.node(node).is_some_and(|resource| {
+                    nonempty_string_field(resource, "kind") == Some("javascript")
+                }) {
+                    parents.insert(node.clone());
+                }
+            }
+        }
+        (parents, "url_only")
     };
     let uniquely_verified = basis == "sha256_and_url" && parents.len() == 1;
+    budget.consume(u64::try_from(witnesses.len())?)?;
+    let observed_urls = witnesses
+        .iter()
+        .filter_map(|witness| witness.script_url.as_deref())
+        .collect::<BTreeSet<_>>();
     for parent in &parents {
+        budget.consume(1)?;
         let parent_url = graph
             .node(parent)
             .and_then(|resource| nonempty_string_field(resource, "url"));
-        let execution_observed = parent_url.is_some_and(|url| {
-            array_field(runtime, "script_instances")
-                .iter()
-                .any(|instance| {
-                    nonempty_string_field(instance, "script_url") == Some(url)
-                        && nonempty_string_field(&instance["execution"], "status")
-                            == Some("positive")
-                })
-        });
+        let execution_observed = parent_url.is_some_and(|url| observed_urls.contains(url));
         let kind = if uniquely_verified && execution_observed {
             "runtime_execution"
         } else if uniquely_verified {
@@ -180,6 +186,8 @@ struct RuntimeClassificationContext<'a> {
     inline_nodes_by_sha: &'a BTreeMap<String, Vec<String>>,
     family_counts: &'a BTreeMap<String, Value>,
     gtm_family_counts: &'a BTreeMap<String, Value>,
+    coverage: &'a RuntimeCoverageIndex,
+    budget: &'a work_budget::WorkBudget,
 }
 
 fn runtime_family_counts(runtime: &Value, field_name: &str) -> BTreeMap<String, Value> {
@@ -462,6 +470,8 @@ fn add_runtime_classification_edges(
                 source,
                 runtime_node,
                 context.resource_nodes_by_sha,
+                context.coverage.witnesses(digest),
+                context.budget,
             )?;
         }
         Some("inline_script") => {
@@ -477,7 +487,7 @@ fn add_runtime_classification_edges(
                             "identity_basis":"sha256_only_inline_script",
                             "candidate_count":parents.len(),
                             "exact_response_identity":false,
-                            "runtime_execution_observed":bool_field(source,"observed_executed"),
+                            "runtime_execution_observed":!context.coverage.witnesses(digest).is_empty(),
                             "coverage_mode":field(source,"coverage_mode"),
                         }),
                     )?;
@@ -550,11 +560,14 @@ pub(super) fn seed_runtime_script_evidence(
         })
         .collect::<BTreeMap<_, _>>();
 
+    let coverage = RuntimeCoverageIndex::build(runtime, budget)?;
     let context = RuntimeClassificationContext {
         resource_nodes_by_sha,
         inline_nodes_by_sha,
         family_counts: &family_counts,
         gtm_family_counts: &gtm_family_counts,
+        coverage: &coverage,
+        budget,
     };
 
     for source in array_field(runtime, "sources") {
@@ -586,7 +599,8 @@ pub(super) fn seed_runtime_script_evidence(
                 "cdp_sessions":source.get("cdp_sessions").cloned().unwrap_or_else(|| json!([])),
                 "execution_context_ids":source.get("execution_context_ids").cloned().unwrap_or_else(|| json!([])),
                 "script_instances":source.get("script_instances").cloned().unwrap_or_else(|| json!([])),
-                "observed_executed":field(source,"observed_executed"),
+                "observed_executed":!coverage.witnesses(digest).is_empty(),
+                "positive_coverage_witnesses":coverage.witnesses(digest),
                 "coverage_mode":field(source,"coverage_mode"),
                 "observed_source_path":field(source,"observed_source_path"),
                 "general_source_path":runtime_general_paths.get(digest),

@@ -1,18 +1,18 @@
 //! Join V8 best-effort or precise coverage by (CDP target session, script ID).
 //! A positive range is a witness that code ran in the recorded interval.
 //! Zero/absent coverage is deliberately not evidence of non-execution.
-use crate::analysis_artifacts::{write_artifact, EXECUTION_COVERAGE};
+use crate::{
+    analysis_artifacts::{write_artifact, EXECUTION_COVERAGE},
+    runtime_identity::{script_id_text, IdentityState, ScriptIdentityIndex},
+};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
-use std::{
-    collections::{HashMap, HashSet},
-    fs,
-    path::Path,
-};
+use std::{collections::HashSet, fs, path::Path};
 use work_budget::WorkBudget;
 
 pub(super) struct CoverageIndex {
-    by_script: HashMap<(String, String), Value>,
+    by_script: ScriptIdentityIndex<Value>,
+    urls: ScriptIdentityIndex<Option<String>>,
     available_sessions: HashSet<String>,
     mode: String,
 }
@@ -52,10 +52,10 @@ impl CoverageIndex {
             .get("sessions")
             .and_then(Value::as_array)
             .context("execution coverage requires sessions[]")?;
-        let mut by_script = HashMap::new();
+        let mut by_script = ScriptIdentityIndex::default();
+        let mut urls = ScriptIdentityIndex::default();
         let mut available_sessions = HashSet::new();
         let mut seen_sessions = HashSet::new();
-        let mut duplicate_keys = HashSet::new();
         let mut script_rows = Vec::new();
         for session in sessions {
             budget.consume(1)?;
@@ -86,7 +86,7 @@ impl CoverageIndex {
                 .context("captured execution coverage missing scripts[]")?;
             for script in scripts {
                 budget.consume(1)?;
-                let Some(script_id) = nonempty_text(script.get("scriptId")) else {
+                let Some(script_id) = script.get("scriptId").and_then(script_id_text) else {
                     continue;
                 };
                 let mut positive_functions = 0usize;
@@ -117,7 +117,7 @@ impl CoverageIndex {
                         positive_functions += 1;
                     }
                 }
-                let row = json!({
+                let mut row = json!({
                     "cdp_session": name,
                     "script_id": script_id,
                     "coverage_mode": mode,
@@ -126,17 +126,16 @@ impl CoverageIndex {
                     "positive_ranges": positive_ranges,
                     "function_profiles": functions.len(),
                     "offset_units": "utf16",
-                    "source_url": script.get("url").cloned().unwrap_or(Value::Null),
                 });
-                let key = (name.to_owned(), script_id.to_owned());
-                if by_script.insert(key.clone(), row.clone()).is_some() {
-                    duplicate_keys.insert(key);
-                }
+                by_script.register(name, &script_id, row.clone());
+                urls.register(
+                    name,
+                    &script_id,
+                    nonempty_text(script.get("url")).map(ToOwned::to_owned),
+                );
+                row["source_url"] = script.get("url").cloned().unwrap_or(Value::Null);
                 script_rows.push(row);
             }
-        }
-        for key in duplicate_keys {
-            by_script.remove(&key);
         }
         let document = json!({
             "schema": EXECUTION_COVERAGE.schema,
@@ -155,6 +154,7 @@ impl CoverageIndex {
         write_artifact(project, EXECUTION_COVERAGE, &document)?;
         Ok(Some(Self {
             by_script,
+            urls,
             available_sessions,
             mode: mode.to_owned(),
         }))
@@ -165,21 +165,20 @@ impl CoverageIndex {
     }
 
     pub(super) fn for_script(&self, session: &str, script_id: &str) -> Value {
-        self.by_script
-            .get(&(session.to_owned(), script_id.to_owned()))
-            .cloned()
-            .unwrap_or_else(|| {
-                json!({
-                    "status": if self.mode == "none" {
-                        "disabled"
-                    } else if self.available_sessions.contains(session) {
-                        "not_reported"
-                    } else {
-                        "unavailable"
-                    },
-                    "coverage_mode": self.mode
-                })
-            })
+        match self.by_script.lookup(session, script_id) {
+            Some(IdentityState::Unique(row)) => {
+                let mut row = row.clone();
+                row["source_url"] =
+                    json!(self.urls.get(session, script_id).and_then(Option::as_deref));
+                row
+            }
+            Some(IdentityState::Conflict) => {
+                json!({"status":"ambiguous_coverage_profiles","coverage_mode":self.mode})
+            }
+            None => {
+                json!({"status": if self.mode == "none" { "disabled" } else if self.available_sessions.contains(session) { "not_reported" } else { "unavailable" }, "coverage_mode":self.mode})
+            }
+        }
     }
 }
 
@@ -227,6 +226,47 @@ mod tests {
             serde_json::from_slice(&fs::read(project.join("analysis/execution-coverage.json"))?)?;
         assert_eq!(output["summary"]["mode"], "best-effort");
         assert_eq!(output["scripts"][0]["coverage_mode"], "best-effort");
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_profiles_are_unique_only_when_they_agree() -> Result<()> {
+        let temp = TempDir::new()?;
+        let capture = temp.path().join("capture");
+        let project = temp.path().join("project");
+        fs::create_dir_all(&capture)?;
+        fs::create_dir_all(&project)?;
+        let profile = |id: Value, count: u64| json!({"scriptId":id,"functions":[{"ranges":[{"startOffset":0,"endOffset":3,"count":count}]}]});
+        let mut first = profile(json!("1"), 1);
+        first["url"] = json!("first.js");
+        let mut second = profile(json!(1), 1);
+        second["url"] = json!("second.js");
+        let fixture = json!({"schema":"js-redox/execution-coverage/v2","mode":"best-effort","offsetUnits":"utf16","sessions":[{"cdpSession":"main","status":"captured","scripts":[first,second,profile(json!(2),1),profile(json!(2),0),profile(json!(2),1)]}]});
+        fs::write(
+            capture.join("execution-coverage.json"),
+            serde_json::to_vec(&fixture)?,
+        )?;
+        let index = CoverageIndex::load(
+            &capture,
+            &project,
+            &WorkBudget::unlimited("coverage-duplicates"),
+        )?
+        .context("coverage missing")?;
+        assert_eq!(index.for_script("main", "1")["status"], "positive");
+        assert!(index.for_script("main", "1")["source_url"].is_null());
+        assert_eq!(
+            index.for_script("main", "2")["status"],
+            "ambiguous_coverage_profiles"
+        );
+        let raw: Value =
+            serde_json::from_slice(&fs::read(project.join("analysis/execution-coverage.json"))?)?;
+        assert_eq!(
+            raw["scripts"]
+                .as_array()
+                .context("coverage profiles missing")?
+                .len(),
+            5
+        );
         Ok(())
     }
 

@@ -2,22 +2,21 @@
 //!
 //! Do not infer handler calls or claim a particular HTML tag scheduled a
 //! script when multiple tags have identical source bytes.
-use crate::document_entrypoints::DocumentEntrypoints;
+use crate::{
+    document_entrypoints::DocumentEntrypoints,
+    runtime_coverage::{PositiveCoverageWitness, RuntimeCoverageIndex},
+};
+use anyhow::Result;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
-use work_budget::{BudgetExceeded, WorkBudget};
+use work_budget::WorkBudget;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PositiveScriptInstance {
-    pub cdp_session: String,
-    pub script_id: String,
-    pub execution_context_id: Option<u64>,
-    pub script_url: Option<String>,
+    #[serde(flatten)]
+    pub witness: PositiveCoverageWitness,
     pub url_correlates_with_html_root: bool,
-    pub positive_functions: u64,
-    pub positive_ranges: u64,
-    pub counter_offset_units: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -52,50 +51,6 @@ fn field<'a>(row: &'a Value, name: &str) -> Option<&'a str> {
     row.get(name).and_then(Value::as_str)
 }
 
-fn positive_instance(
-    instance: &Value,
-    expected_url: Option<&str>,
-) -> Option<PositiveScriptInstance> {
-    let execution = instance.get("execution")?;
-    if field(execution, "status") != Some("positive") {
-        return None;
-    }
-    let functions = execution
-        .get("positive_functions")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let ranges = execution
-        .get("positive_ranges")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    if functions == 0 && ranges == 0 {
-        return None;
-    }
-    let url = field(instance, "script_url")
-        .or_else(|| field(execution, "source_url"))
-        .map(str::to_owned);
-    let id = instance.get("script_id")?;
-    let script_id = match id {
-        Value::String(value) => value.clone(),
-        Value::Number(value) => value.to_string(),
-        _ => return None,
-    };
-    let cdp_session = field(instance, "cdp_session").unwrap_or("main").to_string();
-    Some(PositiveScriptInstance {
-        cdp_session,
-        script_id,
-        execution_context_id: instance.get("execution_context_id").and_then(Value::as_u64),
-        url_correlates_with_html_root: expected_url
-            .is_some_and(|expected| url.as_deref() == Some(expected)),
-        script_url: url,
-        positive_functions: functions,
-        positive_ranges: ranges,
-        counter_offset_units: field(execution, "offset_units")
-            .unwrap_or("unknown")
-            .to_owned(),
-    })
-}
-
 /// Correlate initial HTML source *bytes* with counter-positive JS script
 /// instances.
 ///
@@ -104,12 +59,13 @@ fn positive_instance(
 ///
 /// # Errors
 ///
-/// Returns `BudgetExceeded` if the supplied analysis budget is exhausted.
+/// Returns an error if the identity inventory is invalid or the analysis budget is exhausted.
 pub fn join_initial_source_coverage(
     documents: &[DocumentEntrypoints],
     runtime_scripts: &Value,
     budget: &WorkBudget,
-) -> Result<InitialSourceCoverageJoin, BudgetExceeded> {
+) -> Result<InitialSourceCoverageJoin> {
+    let coverage = RuntimeCoverageIndex::build(runtime_scripts, budget)?;
     let mut by_digest = BTreeMap::<String, Vec<&Value>>::new();
     if let Some(sources) = runtime_scripts.get("sources").and_then(Value::as_array) {
         for source in sources {
@@ -144,30 +100,25 @@ pub fn join_initial_source_coverage(
                         if let Some(classification) = field(row, "classification") {
                             classifications.push(classification.to_owned());
                         }
-                        for instance in row
-                            .get("script_instances")
-                            .and_then(Value::as_array)
-                            .into_iter()
-                            .flatten()
-                        {
+                    }
+                    if body.matches_manifest_sha256 {
+                        for witness in coverage.witnesses(&body.sha256) {
                             budget.consume(1)?;
-                            if let Some(witness) = positive_instance(instance, Some(expected_url)) {
-                                if witness.url_correlates_with_html_root {
-                                    url_correlated += 1;
-                                }
-                                positive_instances.push(witness);
+                            if witness.capture_instrumentation {
+                                continue;
                             }
+                            let url_correlates_with_html_root =
+                                witness.script_url.as_deref() == Some(expected_url);
+                            if url_correlates_with_html_root {
+                                url_correlated += 1;
+                            }
+                            positive_instances.push(PositiveScriptInstance {
+                                witness: witness.clone(),
+                                url_correlates_with_html_root,
+                            });
                         }
                     }
                 }
-                positive_instances.sort_by(|left, right| {
-                    (&left.cdp_session, &left.script_id, &left.script_url).cmp(&(
-                        &right.cdp_session,
-                        &right.script_id,
-                        &right.script_url,
-                    ))
-                });
-                positive_instances.dedup();
                 classifications.sort();
                 classifications.dedup();
                 let source_bytes_positively_executed =
@@ -175,7 +126,15 @@ pub fn join_initial_source_coverage(
                 if source_bytes_positively_executed {
                     positive += 1;
                 }
-                if matches.is_some() && body.matches_manifest_sha256 {
+                let source_bytes_parsed = body.matches_manifest_sha256
+                    && matches.is_some_and(|rows| {
+                        rows.iter().any(|row| {
+                            row.get("script_instances")
+                                .and_then(Value::as_array)
+                                .is_some_and(|instances| !instances.is_empty())
+                        })
+                    });
+                if source_bytes_parsed {
                     parsed += 1;
                 }
                 roots.push(RootSourceExecutionWitness {
@@ -183,7 +142,7 @@ pub fn join_initial_source_coverage(
                     script_ordinal: script.ordinal,
                     source_raw_path: body.output_path.clone(),
                     source_raw_sha256: body.sha256.clone(),
-                    source_bytes_parsed: matches.is_some() && body.matches_manifest_sha256,
+                    source_bytes_parsed,
                     source_bytes_positively_executed,
                     positive_instances,
                     runtime_script_body_classifications: classifications,
@@ -240,7 +199,7 @@ mod tests {
                 }],
             }],
         };
-        let runtime = json!({"sources":[
+        let mut runtime = json!({"sources":[
             {
                 "sha256":"abc", "classification":"inline_script",
                 "observed_executed":true,
@@ -253,12 +212,12 @@ mod tests {
                 ]
             },
             {"sha256":"other","classification":"inline_script",
-             "observed_executed":true,"script_instances":[{"script_id":"9","execution":{"status":"positive","positive_functions":3}}]},
+             "observed_executed":true,"script_instances":[{"cdp_session":"main","script_id":"9","execution":{"status":"positive","positive_functions":3}}]},
             {"sha256":"abc","classification":"capture_instrumentation",
-             "script_instances":[{"script_id":"10","execution":{"status":"positive","positive_functions":5}}]}
+             "script_instances":[{"cdp_session":"main","script_id":"10","execution":{"status":"positive","positive_functions":5}}]}
         ]});
         let got = join_initial_source_coverage(
-            &[doc],
+            std::slice::from_ref(&doc),
             &runtime,
             &WorkBudget::unlimited("coverage-test"),
         )?;
@@ -271,8 +230,22 @@ mod tests {
         assert!(only.source_bytes_positively_executed);
         assert!(!only.exact_html_tag_execution_proven);
         assert_eq!(only.positive_instances.len(), 1);
-        assert_eq!(only.positive_instances[0].script_id, "7");
-        assert_eq!(only.positive_instances[0].counter_offset_units, "utf16");
+        assert_eq!(only.positive_instances[0].witness.script_id, "7");
+        assert_eq!(
+            only.positive_instances[0].witness.counter_offset_units,
+            "utf16"
+        );
+        runtime["script_identity_conflicts"] =
+            json!([{"cdp_session":"main","script_id":"7","sha256_claims":["abc","missing"]}]);
+        let conflicted = join_initial_source_coverage(
+            &[doc],
+            &runtime,
+            &WorkBudget::unlimited("coverage-conflict"),
+        )?;
+        assert_eq!(conflicted.source_parsed_matches, 1);
+        assert_eq!(conflicted.positively_executed_source_matches, 0);
+        assert_eq!(conflicted.url_correlated_positive_instances, 0);
+        assert!(conflicted.roots[0].positive_instances.is_empty());
         Ok(())
     }
 }

@@ -56,6 +56,7 @@ pub mod project_scan;
 pub mod project_sourcemaps;
 pub mod readable_aliases;
 pub mod readable_names;
+mod runtime_coverage;
 mod runtime_identity;
 pub mod safe_deob;
 pub mod source_graph;
