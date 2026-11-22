@@ -447,3 +447,21 @@ fn depythonify_safe_deob_literal_object_construction_runtime_equivalence() -> Re
         ].into_iter().map(str::to_owned).collect(),
     )
 }
+
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_literal_equality_facts_runtime_equivalence() -> Result<()> {
+    compare_sources(
+        "literal-equality-facts",
+        [
+            "events.push((2 ** 1.5)==='x',1n!==1,[]===[],({})==({}),(()=>{})!=(function(){}));",
+            "events.push((class {})===(class {}),/x/===/x/,null==({}),(void 0)!=(class {}));",
+            "events.push(((2 ** 1.5)?null:void 0)==null,((2 ** 1.5)?null:void 0)===null,((2 ** 1.5)?[]:class{})==({}));",
+            "function effect(){events.push('called');return 1} events.push(((2 ** 1.5)==='x')?effect():true,(![])===false);",
+            "function effect(){events.push('called');return 1} events.push(({valueOf(){return effect()}})==1,[effect()]===0,(class {static {effect()}})===0);",
+            "try{(1n/0n)===0}catch(e){events.push(e.name)} try{missing===[]}catch(e){events.push(e.name)}",
+            "let obj={get value(){events.push('read');return null}}; events.push(obj.value==null,(2 ** 1.5)==='x');",
+            "const x={};events.push(x===x,x==x,1n==1,(2 ** 1.5)=='x');",
+        ].into_iter().map(str::to_owned).collect(),
+    )
+}

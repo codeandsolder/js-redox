@@ -150,7 +150,7 @@ fn literal_claims() -> Result<Vec<Claim>> {
     for left in ATOMS {
         add_expression_family(left, &mut claims)?;
         for right in ATOMS {
-            for operator in ["&&", "||", "??", ","] {
+            for operator in ["&&", "||", "??", ",", "===", "!==", "==", "!="] {
                 add_expression_family(&format!("({left}) {operator} ({right})"), &mut claims)?;
             }
         }
