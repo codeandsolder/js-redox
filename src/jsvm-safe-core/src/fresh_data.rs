@@ -7,7 +7,8 @@
 //! bodies and unsupported control regions are analyzed from an empty state.
 use crate::binding_facts::BindingFacts;
 use crate::value_eval::{
-    eval, eval_binary, eval_logical_left, eval_unary_value, same_value, LogicalStep, Value,
+    eval, eval_binary, eval_logical_left, eval_unary_value, literal_property_key, same_value,
+    LogicalStep, Value,
 };
 use oxc_ast::ast::{
     Argument, ArrayExpressionElement, AssignmentTarget, BindingPattern, Declaration, Expression,
@@ -427,11 +428,7 @@ impl Analyzer<'_> {
                                 }
                                 key
                             } else {
-                                property
-                                    .key
-                                    .static_name()
-                                    .and_then(oxc_ast::StaticPropertyName::into_cow_str)
-                                    .map(std::borrow::Cow::into_owned)
+                                literal_property_key(&property.key)
                             };
                             let value = self.expression(&property.value, environment);
                             inert &= value.inert;
@@ -717,6 +714,11 @@ mod tests {
             ),
             ("let a={x:7,...side(),x:9};a.x;", vec![("a.x", "9")]),
             ("let a={x:7,...side()};a.x;", vec![]),
+            ("let a={'1e+21':7,1e21:9};a[1e21];", vec![("a[1e21]", "9")]),
+            (
+                "let a={'0.0000001':7,1e-7:9};a['0.0000001'];a[1e-7];",
+                vec![("a['0.0000001']", "7"), ("a[1e-7]", "9")],
+            ),
             ("const a=[7,...iter];a[0];", vec![("a[0]", "7")]),
             ("const a=[...iter,7];a.length;", vec![]),
             (

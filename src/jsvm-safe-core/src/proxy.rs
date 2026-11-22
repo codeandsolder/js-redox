@@ -1,5 +1,5 @@
 use crate::binding_facts::BindingFacts;
-use crate::value_eval::{eval, Value};
+use crate::value_eval::{eval, literal_property_key, Value};
 use crate::{direct_identifier_name, reference_is_statically_resolved_read};
 use oxc_ast::ast::{
     BindingPattern, ComputedMemberExpression, Expression, PropertyKind, Statement,
@@ -215,10 +215,7 @@ fn analyze_proxy_object(
                 .and_then(eval)
                 .and_then(|value| value.js_string())
         } else {
-            prop.key
-                .static_name()
-                .and_then(oxc_ast::StaticPropertyName::into_cow_str)
-                .map(std::borrow::Cow::into_owned)
+            literal_property_key(&prop.key)
         };
         let Some(key) = key else {
             properties.clear();
