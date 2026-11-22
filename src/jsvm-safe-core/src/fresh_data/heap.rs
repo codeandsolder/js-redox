@@ -8,6 +8,11 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use work_budget::{BudgetExceeded, WorkBudget};
 
+/// Charge variable-sized operations before allocating or iterating.
+fn charge(budget: &WorkBudget, units: usize) -> Result<(), BudgetExceeded> {
+    budget.consume(u64::try_from(units).unwrap_or(u64::MAX))
+}
+
 pub(super) type AllocationId = usize;
 pub(super) type Locations = Rc<[AllocationId]>;
 
@@ -18,7 +23,42 @@ pub(super) enum Fact {
 }
 
 impl Fact {
-    pub(super) fn join(&self, other: &Self) -> Option<Self> {
+    pub(super) fn join(
+        &self,
+        other: &Self,
+        budget: &WorkBudget,
+    ) -> Result<Option<Self>, BudgetExceeded> {
+        self.charge_merge(other, budget)?;
+        Ok(self.join_proven(other))
+    }
+
+    fn clone_weight(&self) -> usize {
+        match self {
+            Self::Primitive(Value::String(value)) => value.len().saturating_add(1),
+            _ => 1,
+        }
+    }
+
+    fn merge_weight(&self) -> usize {
+        match self {
+            Self::Objects(locations) => locations.len().saturating_add(1),
+            _ => self.clone_weight(),
+        }
+    }
+
+    fn charge_merge(&self, other: &Self, budget: &WorkBudget) -> Result<(), BudgetExceeded> {
+        if let (Self::Objects(a), Self::Objects(b)) = (self, other) {
+            if Rc::ptr_eq(a, b) {
+                return Ok(());
+            }
+        }
+        charge(
+            budget,
+            self.merge_weight().saturating_add(other.merge_weight()),
+        )
+    }
+
+    fn join_proven(&self, other: &Self) -> Option<Self> {
         match (self, other) {
             (Self::Primitive(a), Self::Primitive(b)) => {
                 let equal = match (a, b) {
@@ -60,21 +100,38 @@ impl Fact {
         }
     }
 
-    pub(super) fn strict_equal(&self, other: &Self) -> Option<bool> {
-        match (self, other) {
+    pub(super) fn strict_equal(
+        &self,
+        other: &Self,
+        budget: &WorkBudget,
+    ) -> Result<Option<bool>, BudgetExceeded> {
+        self.charge_merge(other, budget)?;
+        Ok(match (self, other) {
             (Self::Primitive(a), Self::Primitive(b)) => Some(same_value(a, b)),
             (Self::Objects(a), Self::Objects(b)) => {
                 if a.len() == 1 && b.len() == 1 {
-                    return Some(a == b);
+                    return Ok(Some(a == b));
                 }
-                // Disjoint possible allocations cannot be the same object.
-                if a.iter().all(|id| b.binary_search(id).is_err()) {
-                    return Some(false);
+                if Rc::ptr_eq(a, b) {
+                    return Ok(None);
                 }
-                None
+                let mut left = a.iter().peekable();
+                let mut right = b.iter().peekable();
+                while let (Some(x), Some(y)) = (left.peek(), right.peek()) {
+                    match x.cmp(y) {
+                        std::cmp::Ordering::Less => {
+                            left.next();
+                        }
+                        std::cmp::Ordering::Greater => {
+                            right.next();
+                        }
+                        std::cmp::Ordering::Equal => return Ok(None),
+                    }
+                }
+                Some(false)
             }
             _ => Some(false),
-        }
+        })
     }
 
     pub(super) fn primitive(&self) -> Option<&Value> {
@@ -89,7 +146,7 @@ impl Fact {
 /// values do not imply arbitrary getters or setters. MaybeData means either
 /// an absent own property or a writable own data property on every path.
 fn join_value(left: &Option<Fact>, right: &Option<Fact>) -> Option<Fact> {
-    left.as_ref()?.join(right.as_ref()?)
+    left.as_ref()?.join_proven(right.as_ref()?)
 }
 
 #[derive(Clone)]
@@ -101,6 +158,27 @@ enum Property {
 }
 
 impl Property {
+    fn fact(&self) -> Option<&Fact> {
+        match self {
+            Self::Data(value) | Self::MaybeData(value) => value.as_ref(),
+            Self::Absent | Self::Opaque => None,
+        }
+    }
+
+    fn clone_weight(&self) -> usize {
+        self.fact().map_or(1, Fact::clone_weight)
+    }
+
+    fn charge_pair(&self, other: &Self, budget: &WorkBudget) -> Result<(), BudgetExceeded> {
+        match (self.fact(), other.fact()) {
+            (Some(left), Some(right)) => left.charge_merge(right, budget),
+            _ => charge(
+                budget,
+                self.clone_weight().saturating_add(other.clone_weight()),
+            ),
+        }
+    }
+
     fn join(&self, other: &Self) -> Self {
         match (self, other) {
             (Self::Absent, Self::Absent) => Self::Absent,
@@ -156,8 +234,12 @@ impl Properties {
         self.listed.insert(key, property);
     }
 
-    fn charge(&self, budget: &WorkBudget) -> Result<(), BudgetExceeded> {
-        budget.consume(u64::try_from(self.listed.len()).unwrap_or(u64::MAX))
+    fn charge_clone(&self, budget: &WorkBudget) -> Result<(), BudgetExceeded> {
+        charge(budget, self.listed.capacity())?;
+        for (key, property) in &self.listed {
+            charge(budget, key.len().saturating_add(property.clone_weight()))?;
+        }
+        charge(budget, self.unlisted.clone_weight())
     }
 
     fn data_only(&self) -> bool {
@@ -168,31 +250,60 @@ impl Properties {
                 .all(|property| !matches!(property, Property::Opaque))
     }
 
-    fn define_unknown(&mut self, definition: &Property) {
+    fn define_unknown(
+        &mut self,
+        definition: &Property,
+        budget: &WorkBudget,
+    ) -> Result<(), BudgetExceeded> {
+        charge(budget, self.listed.capacity())?;
         for property in self.listed.values_mut() {
+            property.charge_pair(definition, budget)?;
             *property = property.join(definition);
         }
+        self.unlisted.charge_pair(definition, budget)?;
         self.unlisted = self.unlisted.join(definition);
+        Ok(())
     }
 
-    fn combine(&mut self, other: &Self, operation: impl Fn(&Property, &Property) -> Property) {
+    fn combine(
+        &mut self,
+        other: &Self,
+        budget: &WorkBudget,
+        operation: impl Fn(&Property, &Property) -> Property,
+    ) -> Result<(), BudgetExceeded> {
+        charge(
+            budget,
+            self.listed
+                .capacity()
+                .saturating_add(other.listed.capacity()),
+        )?;
         for (key, property) in &mut self.listed {
-            *property = operation(property, other.get(key));
+            charge(budget, key.len())?;
+            let right = other.get(key);
+            property.charge_pair(right, budget)?;
+            *property = operation(property, right);
         }
         for (key, property) in &other.listed {
-            self.listed
-                .entry(key.clone())
-                .or_insert_with(|| operation(&self.unlisted, property));
+            charge(budget, key.len())?;
+            if !self.listed.contains_key(key) {
+                self.unlisted.charge_pair(property, budget)?;
+                self.listed
+                    .insert(key.clone(), operation(&self.unlisted, property));
+            }
         }
+        self.unlisted.charge_pair(&other.unlisted, budget)?;
         self.unlisted = operation(&self.unlisted, &other.unlisted);
+        Ok(())
     }
 
-    fn join(&mut self, other: &Self) {
-        self.combine(other, Property::join);
+    fn join(&mut self, other: &Self, budget: &WorkBudget) -> Result<(), BudgetExceeded> {
+        self.combine(other, budget, Property::join)
     }
 
-    fn copy_from(&mut self, other: &Self) {
-        self.combine(other, |previous, source| source.copied_over(previous));
+    fn copy_from(&mut self, other: &Self, budget: &WorkBudget) -> Result<(), BudgetExceeded> {
+        self.combine(other, budget, |previous, source| {
+            source.copied_over(previous)
+        })
     }
 }
 
@@ -253,13 +364,18 @@ impl OwnData {
     /// An unknown computed definition can overwrite any one own key,
     /// and an unknown spread can overwrite any subset. Both join with the
     /// previous descriptor instead of conflating unknown values with accessors.
-    pub(super) fn define_unknown_key(&mut self, is_data: bool, value: Option<Fact>) {
+    pub(super) fn define_unknown_key(
+        &mut self,
+        is_data: bool,
+        value: Option<Fact>,
+        budget: &WorkBudget,
+    ) -> Result<(), BudgetExceeded> {
         let definition = if is_data {
             Property::Data(value)
         } else {
             Property::Opaque
         };
-        self.properties.define_unknown(&definition);
+        self.properties.define_unknown(&definition, budget)
     }
 
     /// Array spread cannot overwrite any of the already created prefix
@@ -272,14 +388,14 @@ impl OwnData {
         self.properties.get(key)
     }
 
-    fn join(&mut self, other: &Self) {
+    fn join(&mut self, other: &Self, budget: &WorkBudget) -> Result<(), BudgetExceeded> {
         // A single allocation's prototype cannot change on any modeled
         // path. Unknown prototype mutation invalidates the allocation.
-        self.properties.join(&other.properties);
+        self.properties.join(&other.properties, budget)
     }
 
     fn enumerable_data(&self, budget: &WorkBudget) -> Result<Option<Properties>, BudgetExceeded> {
-        self.properties.charge(budget)?;
+        self.properties.charge_clone(budget)?;
         let mut properties = self.properties.clone();
         if self.kind == AllocationKind::Array {
             // All tracked ordinary literal properties are enumerable,
@@ -301,9 +417,7 @@ impl OwnData {
         let Some(properties) = environment.enumerable_data(source, budget)? else {
             return Ok(false);
         };
-        self.properties.charge(budget)?;
-        properties.charge(budget)?;
-        self.properties.copy_from(&properties);
+        self.properties.copy_from(&properties, budget)?;
         Ok(true)
     }
 
@@ -358,11 +472,19 @@ impl OwnData {
 
 /// Outer None means no proved normal lookup yet; inner None is an
 /// effect-free data lookup whose value is unknown.
-fn join_lookup(result: &mut Option<Option<Fact>>, value: Option<Fact>) {
+fn join_lookup(
+    result: &mut Option<Option<Fact>>,
+    value: Option<Fact>,
+    budget: &WorkBudget,
+) -> Result<(), BudgetExceeded> {
+    if let (Some(Some(previous)), Some(next)) = (result.as_ref(), value.as_ref()) {
+        previous.charge_merge(next, budget)?;
+    }
     *result = Some(match result.take() {
         Some(previous) => join_value(&previous, &value),
         None => value,
     });
+    Ok(())
 }
 
 /// Bound dead allocation retention without tracing the entire live heap
@@ -483,28 +605,68 @@ impl Environment {
         self.bindings.get(symbol)
     }
 
-    pub(super) fn insert(&mut self, symbol: SymbolId, fact: Fact) {
+    fn charge_binding_copy(&self, budget: &WorkBudget) -> Result<(), BudgetExceeded> {
+        if Rc::strong_count(&self.bindings) > 1 {
+            charge(budget, self.bindings.capacity())?;
+            for fact in self.bindings.values() {
+                charge(budget, fact.clone_weight())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn charge_allocation_copy(&self, budget: &WorkBudget) -> Result<(), BudgetExceeded> {
+        if Rc::strong_count(&self.allocations) > 1 {
+            charge(budget, self.allocations.capacity())?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn insert(
+        &mut self,
+        symbol: SymbolId,
+        fact: Fact,
+        budget: &WorkBudget,
+    ) -> Result<(), BudgetExceeded> {
+        self.charge_binding_copy(budget)?;
         Rc::make_mut(&mut self.bindings).insert(symbol, fact);
+        Ok(())
     }
 
-    pub(super) fn remove(&mut self, symbol: &SymbolId) {
-        self.remove_binding(symbol);
+    pub(super) fn remove(
+        &mut self,
+        symbol: &SymbolId,
+        budget: &WorkBudget,
+    ) -> Result<(), BudgetExceeded> {
+        self.remove_binding(symbol, budget)?;
+        Ok(())
     }
 
-    fn remove_binding(&mut self, symbol: &SymbolId) -> Option<Fact> {
+    fn remove_binding(
+        &mut self,
+        symbol: &SymbolId,
+        budget: &WorkBudget,
+    ) -> Result<Option<Fact>, BudgetExceeded> {
         if let Some(bindings) = Rc::get_mut(&mut self.bindings) {
-            return bindings.remove(symbol);
+            return Ok(bindings.remove(symbol));
         }
         if self.bindings.contains_key(symbol) {
-            Rc::make_mut(&mut self.bindings).remove(symbol)
+            self.charge_binding_copy(budget)?;
+            Ok(Rc::make_mut(&mut self.bindings).remove(symbol))
         } else {
-            None
+            Ok(None)
         }
     }
 
-    pub(super) fn allocate(&mut self, id: AllocationId, data: OwnData) -> Fact {
+    pub(super) fn allocate(
+        &mut self,
+        id: AllocationId,
+        data: OwnData,
+        budget: &WorkBudget,
+    ) -> Result<Fact, BudgetExceeded> {
+        self.charge_allocation_copy(budget)?;
         Rc::make_mut(&mut self.allocations).insert(id, Rc::new(data));
-        Fact::Objects(Rc::from([id]))
+        Ok(Fact::Objects(Rc::from([id])))
     }
 
     pub(super) fn retire_bindings<'a>(
@@ -514,7 +676,7 @@ impl Environment {
     ) -> Result<(), BudgetExceeded> {
         let mut retired = 0usize;
         for symbol in symbols {
-            if let Some(Fact::Objects(locations)) = self.remove_binding(symbol) {
+            if let Some(Fact::Objects(locations)) = self.remove_binding(symbol, budget)? {
                 retired = retired.saturating_add(locations.len());
             }
         }
@@ -571,6 +733,7 @@ impl Environment {
         }
         budget.consume(u64::try_from(self.allocations.capacity()).unwrap_or(u64::MAX))?;
         if live_allocations != self.allocations.len() {
+            self.charge_allocation_copy(budget)?;
             Rc::make_mut(&mut self.allocations).retain(|id, _| trace.marked.contains(id));
         }
         // HashMap iteration follows capacity, not just length. Release
@@ -582,6 +745,7 @@ impl Environment {
                 .saturating_mul(4)
                 .max(MIN_COLLECTION_SIZE)
         {
+            self.charge_allocation_copy(budget)?;
             Rc::make_mut(&mut self.allocations).shrink_to_fit();
         }
         if self.bindings.capacity()
@@ -591,6 +755,7 @@ impl Environment {
                 .saturating_mul(4)
                 .max(MIN_COLLECTION_SIZE)
         {
+            self.charge_binding_copy(budget)?;
             Rc::make_mut(&mut self.bindings).shrink_to_fit();
         }
         // Make the next trace proportional to the surviving graph, not
@@ -608,37 +773,74 @@ impl Environment {
     /// only in the branch that created them. Older allocations must still
     /// be valid in both branches: a missing entry means effects invalidated
     /// that proof, not that the allocation never existed.
-    pub(super) fn join(&mut self, other: &Self, first_new: AllocationId) {
+    pub(super) fn join(
+        &mut self,
+        other: &Self,
+        first_new: AllocationId,
+        budget: &WorkBudget,
+    ) -> Result<(), BudgetExceeded> {
+        // A failed join is not a usable abstract state: its caller aborts
+        // the analysis. Stop merging immediately at the first budget error.
         if !Rc::ptr_eq(&self.bindings, &other.bindings) {
+            self.charge_binding_copy(budget)?;
+            charge(budget, self.bindings.capacity())?;
+            let mut failure = Ok(());
             Rc::make_mut(&mut self.bindings).retain(|symbol, fact| {
-                let Some(joined) = other
-                    .bindings
-                    .get(symbol)
-                    .and_then(|right| fact.join(right))
-                else {
+                if failure.is_err() {
+                    return true;
+                }
+                let Some(right) = other.bindings.get(symbol) else {
                     return false;
                 };
-                *fact = joined;
-                true
+                match fact.join(right, budget) {
+                    Ok(Some(joined)) => {
+                        *fact = joined;
+                        true
+                    }
+                    Ok(None) => false,
+                    Err(error) => {
+                        failure = Err(error);
+                        true
+                    }
+                }
             });
+            failure?;
         }
         if !Rc::ptr_eq(&self.allocations, &other.allocations) {
+            self.charge_allocation_copy(budget)?;
+            charge(
+                budget,
+                self.allocations
+                    .capacity()
+                    .saturating_add(other.allocations.capacity()),
+            )?;
             let allocations = Rc::make_mut(&mut self.allocations);
+            let mut failure = Ok(());
             allocations.retain(|id, data| {
+                if failure.is_err() {
+                    return true;
+                }
                 let Some(right) = other.allocations.get(id) else {
                     return *id >= first_new;
                 };
                 if !Rc::ptr_eq(data, right) {
-                    Rc::make_mut(data).join(right);
+                    failure = (|| {
+                        if Rc::strong_count(data) > 1 {
+                            data.properties.charge_clone(budget)?;
+                        }
+                        Rc::make_mut(data).join(right, budget)
+                    })();
                 }
                 true
             });
+            failure?;
             for (&id, data) in other.allocations.iter() {
                 if id >= first_new {
                     allocations.entry(id).or_insert_with(|| Rc::clone(data));
                 }
             }
         }
+        Ok(())
     }
 
     fn enumerable_data(
@@ -648,6 +850,7 @@ impl Environment {
     ) -> Result<Option<Properties>, BudgetExceeded> {
         match source {
             Fact::Objects(locations) => {
+                charge(budget, locations.len())?;
                 let mut merged: Option<Properties> = None;
                 for id in locations.iter() {
                     let Some(data) = self.allocations.get(id) else {
@@ -657,9 +860,7 @@ impl Environment {
                         return Ok(None);
                     };
                     if let Some(merged) = &mut merged {
-                        merged.charge(budget)?;
-                        properties.charge(budget)?;
-                        merged.join(&properties);
+                        merged.join(&properties, budget)?;
                     } else {
                         merged = Some(properties);
                     }
@@ -693,106 +894,164 @@ impl Environment {
     /// Every successful path must reach either known ordinary writable data
     /// or a null prototype, without an opaque descriptor or unknown object.
     /// This is also sufficient to establish ordinary [[Set]] eligibility.
-    pub(super) fn read(&self, locations: &Locations, key: &str) -> Option<Option<Fact>> {
+    pub(super) fn read(
+        &self,
+        locations: &Locations,
+        key: &str,
+        budget: &WorkBudget,
+    ) -> Result<Option<Option<Fact>>, BudgetExceeded> {
         if let [id] = locations.as_ref() {
-            if let Property::Data(value) = self.allocations.get(id)?.property(key) {
-                return Some(value.clone());
+            charge(budget, key.len())?;
+            let Some(data) = self.allocations.get(id) else {
+                return Ok(None);
+            };
+            if let Property::Data(value) = data.property(key) {
+                if let Some(value) = value {
+                    charge(budget, value.clone_weight())?;
+                }
+                return Ok(Some(value.clone()));
             }
         }
+        charge(budget, locations.len())?;
         let mut pending = locations.to_vec();
         let mut visited = HashSet::new();
         let mut result = None;
         while let Some(id) = pending.pop() {
+            charge(budget, 1)?;
             if !visited.insert(id) {
                 continue;
             }
-            let data = self.allocations.get(&id)?;
-            match data.property(key) {
+            let Some(data) = self.allocations.get(&id) else {
+                return Ok(None);
+            };
+            let property = data.property(key);
+            charge(budget, key.len().saturating_add(property.clone_weight()))?;
+            match property {
                 Property::Data(value) => {
-                    join_lookup(&mut result, value.clone());
+                    join_lookup(&mut result, value.clone(), budget)?;
                     continue;
                 }
-                Property::MaybeData(value) => join_lookup(&mut result, value.clone()),
+                Property::MaybeData(value) => join_lookup(&mut result, value.clone(), budget)?,
                 Property::Absent => {}
-                Property::Opaque => return None,
+                Property::Opaque => return Ok(None),
             }
             match &data.prototype {
-                Prototype::Unknown => return None,
+                Prototype::Unknown => return Ok(None),
                 Prototype::Null => {
-                    join_lookup(&mut result, Some(Fact::Primitive(Value::Undefined)));
+                    join_lookup(&mut result, Some(Fact::Primitive(Value::Undefined)), budget)?;
                 }
                 Prototype::Objects(prototypes) => {
-                    // Literal prototypes already existed at allocation.
-                    // Check the invariant before following any edges.
+                    charge(budget, prototypes.len())?;
                     if prototypes.is_empty() || prototypes.iter().any(|&prototype| prototype >= id)
                     {
-                        return None;
+                        return Ok(None);
                     }
                     pending.extend(prototypes.iter().copied());
                 }
             }
         }
-        result
+        Ok(result)
     }
 
     fn update(
         &mut self,
         locations: &Locations,
-        can_update: impl Fn(&OwnData) -> bool,
-        mut apply: impl FnMut(&mut OwnData),
-    ) -> bool {
-        if locations.is_empty()
-            || !locations.iter().all(|id| {
-                self.allocations
-                    .get(id)
-                    .is_some_and(|data| can_update(data))
-            })
-        {
-            return false;
-        }
-
+        key: &str,
+        value: Option<&Fact>,
+        budget: &WorkBudget,
+        apply: impl Fn(&mut OwnData),
+    ) -> Result<bool, BudgetExceeded> {
+        charge(budget, locations.len())?;
         let weak = locations.len() != 1;
+        // Charge receiver enumeration and descriptor copies before writes.
+        // The caller has already checked ordinary mutation eligibility.
+        if locations.is_empty() {
+            return Ok(false);
+        }
+        self.charge_allocation_copy(budget)?;
+        for id in locations.iter() {
+            let Some(data) = self.allocations.get(id) else {
+                return Ok(false);
+            };
+            charge(
+                budget,
+                key.len()
+                    .saturating_add(value.map_or(1, Fact::clone_weight)),
+            )?;
+            if weak || Rc::strong_count(data) > 1 || Rc::strong_count(&self.allocations) > 1 {
+                data.properties.charge_clone(budget)?;
+            }
+            if data.is_length(key) {
+                charge(budget, data.properties.listed.capacity())?;
+            }
+        }
         let allocations = Rc::make_mut(&mut self.allocations);
         for id in locations.iter() {
             let Some(data) = allocations.get_mut(id) else {
-                return false;
+                return Ok(false);
             };
             if weak {
-                // The receiver may refer to any one of these allocations.
-                // Join modified and unmodified states for every possibility.
                 let mut updated = data.as_ref().clone();
                 apply(&mut updated);
-                Rc::make_mut(data).join(&updated);
+                if Rc::strong_count(data) > 1 {
+                    data.properties.charge_clone(budget)?;
+                }
+                Rc::make_mut(data).join(&updated, budget)?;
             } else {
                 apply(Rc::make_mut(data));
             }
         }
-        true
+        Ok(true)
     }
 
-    pub(super) fn write(&mut self, locations: &Locations, key: &str, value: Option<Fact>) -> bool {
-        // Own data, inherited writable data, and missing properties on a
-        // fully known prototype chain all define/update own data without
-        // an arbitrary setter. The receiver still needs its exotic Array
-        // length rules checked separately.
-        if self.read(locations, key).is_none() {
-            return false;
+    pub(super) fn write(
+        &mut self,
+        locations: &Locations,
+        key: &str,
+        value: Option<Fact>,
+        budget: &WorkBudget,
+    ) -> Result<bool, BudgetExceeded> {
+        if self.read(locations, key, budget)?.is_none() {
+            return Ok(false);
         }
-        self.update(
-            locations,
-            |data| data.can_write(key, &value),
-            |data| data.write(key, value.clone()),
-        )
+        charge(budget, locations.len())?;
+        if key == "length" {
+            charge(
+                budget,
+                locations
+                    .len()
+                    .saturating_mul(value.as_ref().map_or(1, Fact::clone_weight)),
+            )?;
+        }
+        if !locations.iter().all(|id| {
+            self.allocations
+                .get(id)
+                .is_some_and(|data| data.can_write(key, &value))
+        }) {
+            return Ok(false);
+        }
+        self.update(locations, key, value.as_ref(), budget, |data| {
+            data.write(key, value.clone())
+        })
     }
 
-    /// Deletion on an ordinary allocation cannot invoke an inherited setter
-    /// or getter. Fresh literal properties are configurable, except length.
-    pub(super) fn delete(&mut self, locations: &Locations, key: &str) -> bool {
-        self.update(
-            locations,
-            |data| !data.is_length(key),
-            |data| data.delete_own(key),
-        )
+    /// Deletion of an ordinary allocation never invokes an inherited
+    /// accessor. Array length is non-configurable.
+    pub(super) fn delete(
+        &mut self,
+        locations: &Locations,
+        key: &str,
+        budget: &WorkBudget,
+    ) -> Result<bool, BudgetExceeded> {
+        charge(budget, locations.len())?;
+        if !locations.iter().all(|id| {
+            self.allocations
+                .get(id)
+                .is_some_and(|data| !data.is_length(key))
+        }) {
+            return Ok(false);
+        }
+        self.update(locations, key, None, budget, |data| data.delete_own(key))
     }
 }
 
@@ -801,54 +1060,152 @@ mod tests {
     use super::*;
 
     #[test]
-    fn location_join_is_ordered_unique_and_preserves_exact_identity() {
+    fn budget_accounts_for_prototype_edges_and_weak_descriptor_updates(
+    ) -> Result<(), BudgetExceeded> {
+        let unlimited = WorkBudget::unlimited("heap-setup");
+        let mut heap = Environment::new();
+        let mut base = OwnData::new(AllocationKind::Ordinary);
+        base.define_data("x".into(), Some(Fact::Primitive(Value::Number(7.0))));
+        let mut prior = heap.allocate(0, base, &unlimited)?;
+        for id in 1..128 {
+            let mut next = OwnData::new(AllocationKind::Ordinary);
+            next.set_literal_prototype(Some(prior));
+            prior = heap.allocate(id, next, &unlimited)?;
+        }
+        let Fact::Objects(locations) = prior else {
+            unreachable!()
+        };
+        let bounded = WorkBudget::new("prototype", work_budget::BudgetLimits::work(32));
+        assert!(heap.read(&locations, "x", &bounded).is_err());
+        assert!(matches!(
+            heap.read(&locations, "x", &unlimited)?,
+            Some(Some(Fact::Primitive(Value::Number(7.0))))
+        ));
+
+        let mut data = OwnData::new(AllocationKind::Ordinary);
+        for index in 0..128 {
+            data.define_data(
+                format!("key{index}"),
+                Some(Fact::Primitive(Value::Number(7.0))),
+            );
+        }
+        heap.allocate(128, data.clone(), &unlimited)?;
+        heap.allocate(129, data, &unlimited)?;
+        let locations = Rc::from([128, 129]);
+        let bounded = WorkBudget::new("weak-write", work_budget::BudgetLimits::work(32));
+        assert!(heap
+            .write(
+                &locations,
+                "key0",
+                Some(Fact::Primitive(Value::Number(9.0))),
+                &bounded
+            )
+            .is_err());
+        assert!(matches!(
+            heap.read(&locations, "key0", &unlimited)?,
+            Some(Some(Fact::Primitive(Value::Number(7.0))))
+        ));
+        assert!(heap.write(
+            &locations,
+            "key0",
+            Some(Fact::Primitive(Value::Number(9.0))),
+            &unlimited
+        )?);
+        assert!(matches!(
+            heap.read(&locations, "key0", &unlimited)?,
+            Some(None)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn budget_charges_changed_maps_without_charging_identical_forks() -> Result<(), BudgetExceeded>
+    {
+        let unlimited = WorkBudget::unlimited("heap-setup");
+        let mut heap = Environment::new();
+        let mut data = OwnData::new(AllocationKind::Ordinary);
+        data.define_data("x".into(), Some(Fact::Primitive(Value::Number(7.0))));
+        for id in 0..128 {
+            let fact = heap.allocate(id, data.clone(), &unlimited)?;
+            heap.insert(SymbolId::new(id), fact, &unlimited)?;
+        }
+        let mut fork = heap.clone();
+        let bounded = WorkBudget::new("unchanged-join", work_budget::BudgetLimits::work(0));
+        heap.join(&fork, 128, &bounded)?;
+        let bounded = WorkBudget::new("map-detach", work_budget::BudgetLimits::work(16));
+        assert!(fork
+            .insert(SymbolId::new(0), Fact::Primitive(Value::Null), &bounded)
+            .is_err());
+        fork.insert(SymbolId::new(0), Fact::Primitive(Value::Null), &unlimited)?;
+        let bounded = WorkBudget::new("changed-join", work_budget::BudgetLimits::work(16));
+        assert!(heap.join(&fork, 128, &bounded).is_err());
+        assert!(matches!(
+            heap.get(&SymbolId::new(0)),
+            Some(Fact::Objects(_))
+        ));
+        heap.join(&fork, 128, &unlimited)?;
+        assert!(heap.get(&SymbolId::new(0)).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn location_join_is_ordered_unique_and_preserves_exact_identity() -> Result<(), BudgetExceeded>
+    {
+        let budget = WorkBudget::unlimited("heap-join");
         let left = Fact::Objects(Rc::from([0, 2, 4, 6]));
         let right = Fact::Objects(Rc::from([1, 2, 3, 6, 7]));
-        let Some(Fact::Objects(joined)) = left.join(&right) else {
+        let Some(Fact::Objects(joined)) = left.join(&right, &budget)? else {
             unreachable!()
         };
         assert_eq!(joined.as_ref(), &[0, 1, 2, 3, 4, 6, 7]);
-        assert_eq!(left.strict_equal(&right), None);
+        assert_eq!(left.strict_equal(&right, &budget)?, None);
         assert_eq!(
-            left.strict_equal(&Fact::Objects(Rc::from([1, 3]))),
+            left.strict_equal(&Fact::Objects(Rc::from([1, 3])), &budget)?,
             Some(false)
         );
-        let same = left.join(&left);
+        let same = left.join(&left, &budget)?;
         let (Fact::Objects(original), Some(Fact::Objects(same))) = (left, same) else {
             unreachable!()
         };
         assert!(Rc::ptr_eq(&original, &same));
+        Ok(())
     }
 
     #[test]
-    fn fork_shares_unchanged_maps_and_isolates_the_first_mutation() {
+    fn fork_shares_unchanged_maps_and_isolates_the_first_mutation() -> Result<(), BudgetExceeded> {
+        let budget = WorkBudget::unlimited("heap-fork");
         let symbol = SymbolId::new(0);
         let mut heap = Environment::new();
         let mut data = OwnData::new(AllocationKind::Ordinary);
         data.define_data("x".into(), Some(Fact::Primitive(Value::Number(7.0))));
-        let object = heap.allocate(0, data);
+        let object = heap.allocate(0, data, &budget)?;
         let Fact::Objects(locations) = &object else {
             unreachable!()
         };
-        heap.insert(symbol, object.clone());
+        heap.insert(symbol, object.clone(), &budget)?;
 
         let unchanged = heap.clone();
         assert!(Rc::ptr_eq(&heap.bindings, &unchanged.bindings));
         assert!(Rc::ptr_eq(&heap.allocations, &unchanged.allocations));
-        heap.join(&unchanged, 1);
+        heap.join(&unchanged, 1, &budget)?;
         assert!(Rc::ptr_eq(&heap.bindings, &unchanged.bindings));
         assert!(Rc::ptr_eq(&heap.allocations, &unchanged.allocations));
 
         let mut changed = heap.clone();
-        assert!(changed.write(locations, "x", Some(Fact::Primitive(Value::Number(9.0)))));
+        assert!(changed.write(
+            locations,
+            "x",
+            Some(Fact::Primitive(Value::Number(9.0))),
+            &budget
+        )?);
         assert!(Rc::ptr_eq(&heap.bindings, &changed.bindings));
         assert!(!Rc::ptr_eq(&heap.allocations, &changed.allocations));
         assert!(matches!(
-            heap.read(locations, "x"),
+            heap.read(locations, "x", &budget)?,
             Some(Some(Fact::Primitive(Value::Number(7.0))))
         ));
-        heap.join(&changed, 1);
-        assert!(matches!(heap.read(locations, "x"), Some(None)));
+        heap.join(&changed, 1, &budget)?;
+        assert!(matches!(heap.read(locations, "x", &budget)?, Some(None)));
 
         let mut invalidated = heap.clone();
         invalidated.clear();
@@ -856,9 +1213,10 @@ mod tests {
         assert!(invalidated.allocations.is_empty());
         assert!(heap.get(&symbol).is_some());
         assert!(heap.allocations.contains_key(&0));
-        heap.join(&invalidated, 1);
+        heap.join(&invalidated, 1, &budget)?;
         assert!(heap.get(&symbol).is_none());
         assert!(heap.allocations.is_empty());
+        Ok(())
     }
 
     #[test]
@@ -867,22 +1225,22 @@ mod tests {
         let mut heap = Environment::new();
         let mut parent = OwnData::new(AllocationKind::Ordinary);
         parent.define_data("next".into(), None);
-        let root = heap.allocate(0, parent);
-        let child = heap.allocate(1, OwnData::new(AllocationKind::Ordinary));
+        let root = heap.allocate(0, parent, &budget)?;
+        let child = heap.allocate(1, OwnData::new(AllocationKind::Ordinary), &budget)?;
         let Fact::Objects(root_locations) = &root else {
             unreachable!()
         };
-        assert!(heap.write(root_locations, "next", Some(child)));
+        assert!(heap.write(root_locations, "next", Some(child), &budget)?);
         let mut child_data = OwnData::new(AllocationKind::Ordinary);
         child_data.set_literal_prototype(Some(root.clone()));
         Rc::make_mut(&mut heap.allocations).insert(1, Rc::new(child_data));
-        heap.insert(SymbolId::new(0), root);
+        heap.insert(SymbolId::new(0), root, &budget)?;
         let mut uncollected = heap.clone();
         let mut peak = 0usize;
         let (mut collected_entries, mut original_entries) = (0usize, 0usize);
         for id in 2..4096 {
-            heap.allocate(id, OwnData::new(AllocationKind::Ordinary));
-            uncollected.allocate(id, OwnData::new(AllocationKind::Ordinary));
+            heap.allocate(id, OwnData::new(AllocationKind::Ordinary), &budget)?;
+            uncollected.allocate(id, OwnData::new(AllocationKind::Ordinary), &budget)?;
             heap.collect_if_needed(&budget)?;
             peak = peak.max(heap.allocations.len());
             // Both maps would be copied at an unknown conditional branch.
@@ -894,7 +1252,7 @@ mod tests {
         eprintln!("peak retained allocations: {peak} vs {}; cumulative fork entries: {collected_entries} vs {original_entries}", uncollected.allocations.len());
         heap.collect(&budget)?;
         assert_eq!(heap.allocations.len(), 2);
-        heap.remove(&SymbolId::new(0));
+        heap.remove(&SymbolId::new(0), &budget)?;
         heap.collect(&budget)?;
         assert!(heap.allocations.is_empty());
         Ok(())
@@ -906,8 +1264,8 @@ mod tests {
         let mut heap = Environment::new();
         let symbols = (0..256).map(SymbolId::new).collect::<Vec<_>>();
         for (id, &symbol) in symbols.iter().enumerate() {
-            let object = heap.allocate(id, OwnData::new(AllocationKind::Ordinary));
-            heap.insert(symbol, object);
+            let object = heap.allocate(id, OwnData::new(AllocationKind::Ordinary), &budget)?;
+            heap.insert(symbol, object, &budget)?;
             heap.collect_if_needed(&budget)?;
         }
         assert_eq!(heap.allocations.len(), symbols.len());
@@ -925,30 +1283,30 @@ mod tests {
         let mut heap = Environment::new();
         let mut data = OwnData::new(AllocationKind::Ordinary);
         data.define_data("x".into(), Some(Fact::Primitive(Value::Number(7.0))));
-        let root = heap.allocate(0, data.clone());
-        heap.insert(symbol, root.clone());
+        let root = heap.allocate(0, data.clone(), &budget)?;
+        heap.insert(symbol, root.clone(), &budget)?;
         let mut other = heap.clone();
         let first_new = 1;
         heap.protect_before(first_new);
         other.protect_before(first_new);
-        let replacement = heap.allocate(first_new, data);
-        heap.insert(symbol, replacement);
+        let replacement = heap.allocate(first_new, data, &budget)?;
+        heap.insert(symbol, replacement, &budget)?;
         heap.collect(&budget)?;
         assert!(heap.allocations.contains_key(&0));
         heap.protect_before(0);
         other.protect_before(0);
-        heap.join(&other, first_new);
+        heap.join(&other, first_new, &budget)?;
         let Some(Fact::Objects(locations)) = heap.get(&symbol) else {
             unreachable!()
         };
         assert!(matches!(
-            heap.read(locations, "x"),
+            heap.read(locations, "x", &budget)?,
             Some(Some(Fact::Primitive(Value::Number(7.0))))
         ));
         let mut invalidated = other.clone();
         invalidated.clear();
-        invalidated.insert(symbol, root);
-        other.join(&invalidated, first_new);
+        invalidated.insert(symbol, root, &budget)?;
+        other.join(&invalidated, first_new, &budget)?;
         assert!(!other.allocations.contains_key(&0));
         Ok(())
     }
