@@ -456,6 +456,60 @@ fn capture_origin(source: &str) -> Option<(String, [u32; 2])> {
     Some((hash.to_owned(), [start.parse().ok()?, end.parse().ok()?]))
 }
 
+impl Reader<'_> {
+    fn captured_aliases(&self, span: [u32; 2]) -> BTreeMap<String, CapturedAlias> {
+        let mut by_name: BTreeMap<String, (SymbolId, CapturedAlias)> = BTreeMap::new();
+        let mut ambiguous = BTreeSet::new();
+        for (symbol, reads) in &self.property_reads {
+            let count = reads
+                .iter()
+                .filter(|&&end| span[0] <= end && end <= span[1])
+                .count();
+            if count == 0 {
+                continue;
+            }
+            let declaration = self.scoping.symbol_span(*symbol);
+            if span[0] <= declaration.start && declaration.end <= span[1] {
+                continue;
+            }
+            let Some(writes) = self.writes.get(symbol) else {
+                continue;
+            };
+            if !writes.iter().any(|write| write.literal.is_some()) {
+                continue;
+            }
+            let name = self.scoping.symbol_name(*symbol).to_owned();
+            let tracked = writes.len();
+            let total_writes = self
+                .scoping
+                .get_resolved_reference_ids(*symbol)
+                .iter()
+                .filter(|reference| self.scoping.get_reference(**reference).is_write())
+                .count();
+            let alias = CapturedAlias {
+                binding: name.clone(),
+                declaration: [declaration.start, declaration.end],
+                original_reads: count,
+                writes: writes.clone(),
+                other_writes_possible: self.unmodeled_writes.contains(symbol)
+                    || total_writes > tracked,
+            };
+            if let Some((previous, _)) = by_name.insert(name.clone(), (*symbol, alias)) {
+                if previous != *symbol {
+                    ambiguous.insert(name);
+                }
+            }
+        }
+        for name in &ambiguous {
+            by_name.remove(name);
+        }
+        by_name
+            .into_iter()
+            .map(|(name, (_, alias))| (name, alias))
+            .collect::<BTreeMap<_, _>>()
+    }
+}
+
 struct CapturedReads<'s> {
     scoping: &'s Scoping,
     candidates: &'s BTreeMap<String, CapturedAlias>,
@@ -541,57 +595,10 @@ pub fn explain_captured_handler_origins(
             functions.0.contains(&<(u32, u32)>::from(span)),
             "handler {path} original byte span is not an AST function"
         );
-        let mut by_name: BTreeMap<String, (SymbolId, CapturedAlias)> = BTreeMap::new();
-        let mut ambiguous = BTreeSet::new();
-        for (symbol, reads) in &reader.property_reads {
-            let count = reads
-                .iter()
-                .filter(|&&end| span[0] <= end && end <= span[1])
-                .count();
-            if count == 0 {
-                continue;
-            }
-            let declaration = scoping.symbol_span(*symbol);
-            if span[0] <= declaration.start && declaration.end <= span[1] {
-                continue;
-            }
-            let Some(writes) = reader.writes.get(symbol) else {
-                continue;
-            };
-            if !writes.iter().any(|write| write.literal.is_some()) {
-                continue;
-            }
-            let name = scoping.symbol_name(*symbol).to_owned();
-            let tracked = writes.len();
-            let total_writes = scoping
-                .get_resolved_reference_ids(*symbol)
-                .iter()
-                .filter(|reference| scoping.get_reference(**reference).is_write())
-                .count();
-            let alias = CapturedAlias {
-                binding: name.clone(),
-                declaration: [declaration.start, declaration.end],
-                original_reads: count,
-                writes: writes.clone(),
-                other_writes_possible: reader.unmodeled_writes.contains(symbol)
-                    || total_writes > tracked,
-            };
-            if let Some((previous, _)) = by_name.insert(name.clone(), (*symbol, alias)) {
-                if previous != *symbol {
-                    ambiguous.insert(name);
-                }
-            }
-        }
-        for name in &ambiguous {
-            by_name.remove(name);
-        }
-        if by_name.is_empty() {
+        let candidates = reader.captured_aliases(span);
+        if candidates.is_empty() {
             continue;
         }
-        let candidates = by_name
-            .into_iter()
-            .map(|(name, (_, alias))| (name, alias))
-            .collect::<BTreeMap<_, _>>();
         let allocator = Allocator::default();
         let transformed = parse_program(&allocator, source, SourceType::unambiguous());
         ensure!(

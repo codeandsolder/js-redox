@@ -384,6 +384,22 @@ impl<'s> Plan<'s> {
             );
         }
     }
+    fn update(&mut self, update: &oxc_ast::ast::UpdateExpression<'_>) {
+        if self.simple_target(&update.argument) {
+            if let SimpleAssignmentTarget::ComputedMemberExpression(member) = &update.argument {
+                self.key_coercion(Some((member.object.span(), member.expression.span())));
+            }
+            self.mark(update.argument.span(), "GetValue target", "getter may run");
+            self.mark(update.span, "numeric update", update.operator.as_str());
+            if let SimpleAssignmentTarget::ComputedMemberExpression(member) = &update.argument {
+                self.key_coercion(Some((member.object.span(), member.expression.span())));
+            }
+            self.mark(update.argument.span(), "PutValue target", "setter may run");
+        } else {
+            self.opaque(update.span, "extended update expression");
+        }
+    }
+
     fn expression(&mut self, expr: &Expression<'_>) {
         match expr {
             Expression::ParenthesizedExpression(paren) => self.expression(&paren.expression),
@@ -479,25 +495,7 @@ impl<'s> Plan<'s> {
                     "void produces undefined only if its operand completes",
                 );
             }
-            Expression::UpdateExpression(update) => {
-                if self.simple_target(&update.argument) {
-                    if let SimpleAssignmentTarget::ComputedMemberExpression(member) =
-                        &update.argument
-                    {
-                        self.key_coercion(Some((member.object.span(), member.expression.span())));
-                    }
-                    self.mark(update.argument.span(), "GetValue target", "getter may run");
-                    self.mark(update.span, "numeric update", update.operator.as_str());
-                    if let SimpleAssignmentTarget::ComputedMemberExpression(member) =
-                        &update.argument
-                    {
-                        self.key_coercion(Some((member.object.span(), member.expression.span())));
-                    }
-                    self.mark(update.argument.span(), "PutValue target", "setter may run");
-                } else {
-                    self.opaque(update.span, "extended update expression");
-                }
-            }
+            Expression::UpdateExpression(update) => self.update(update),
             // Delete/typeof and coercing unary operators, optional chains,
             // templates and class initializers remain opaque rather than
             // pretending we know their effect/exception order.

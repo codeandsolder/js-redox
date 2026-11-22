@@ -805,15 +805,7 @@ impl CallerView {
     }
 }
 
-fn format_view(view: &CallerView, original: &str) -> String {
-    let mut output = format!(
-        "# Caller-oriented lexical forwarding: {}\n\n",
-        code_span(&view.entry)
-    );
-    output.push_str("This is a **source-derived reading view**, not a rewritten executable. ");
-    output.push_str("Edges resolve original lexical symbols, direct calls, constructors and eligible Function.call invocations. ");
-    output.push_str("Parameter arrows trace unchanged, directly forwarded bindings only. ");
-    output.push_str("Potential indirect `eval`, mapped `arguments`, or dynamic mutations require runtime analysis before claiming values are invariant.\n\n");
+fn append_path_provenance(output: &mut String, view: &CallerView) {
     for path in &view.paths {
         let _ = write!(output, "## {}\n\n", code_span(&path.functions.join(" → ")));
         for edge in &path.links {
@@ -878,6 +870,9 @@ fn format_view(view: &CallerView, original: &str) -> String {
         }
         output.push('\n');
     }
+}
+
+fn append_reachable_graph(output: &mut String, view: &CallerView) {
     output.push_str("## Complete reachable lexical call graph\n\n");
     output.push_str("Each original callsite occurs once, independent of path depth. ");
     output.push_str(
@@ -932,6 +927,9 @@ fn format_view(view: &CallerView, original: &str) -> String {
             );
         }
     }
+}
+
+fn append_source_excerpts(output: &mut String, view: &CallerView, original: &str) {
     output.push_str("\n## Original source excerpts\n\n");
     output.push_str(
         "These are **verbatim original function expressions**, not runnable copies; \
@@ -961,7 +959,151 @@ fn format_view(view: &CallerView, original: &str) -> String {
             }
         }
     }
+}
+
+fn format_view(view: &CallerView, original: &str) -> String {
+    let mut output = format!(
+        "# Caller-oriented lexical forwarding: {}\n\n",
+        code_span(&view.entry)
+    );
+    output.push_str("This is a **source-derived reading view**, not a rewritten executable. ");
+    output.push_str("Edges resolve original lexical symbols, direct calls, constructors and eligible Function.call invocations. ");
+    output.push_str("Parameter arrows trace unchanged, directly forwarded bindings only. ");
+    output.push_str("Potential indirect `eval`, mapped `arguments`, or dynamic mutations require runtime analysis before claiming values are invariant.\n\n");
+    append_path_provenance(&mut output, view);
+    append_reachable_graph(&mut output, view);
+    append_source_excerpts(&mut output, view, original);
     output
+}
+
+fn stable_function_symbols(
+    defs: &BTreeMap<FunctionKey, Definition>,
+    scoping: &Scoping,
+) -> BTreeMap<SymbolId, FunctionKey> {
+    let mut symbols = BTreeMap::new();
+    let mut ambiguous = BTreeSet::new();
+    for (key, def) in defs {
+        if let Some(symbol) = def.symbol {
+            if symbols.insert(symbol, *key).is_some() {
+                ambiguous.insert(symbol);
+            }
+        }
+    }
+    for symbol in ambiguous {
+        symbols.remove(&symbol);
+    }
+    // Filter symbol targets in place rather than allocating temporary keys.
+    symbols.retain(|symbol, key| {
+        let writes = scoping
+            .get_resolved_reference_ids(*symbol)
+            .iter()
+            .filter(|reference| scoping.get_reference(**reference).is_write())
+            .count();
+        let declaration_assignment = defs
+            .get(key)
+            .is_some_and(|definition| definition.initialized_by_assignment);
+        // A single assignment can establish a previously declared function;
+        // any additional write means the call target can vary at runtime.
+        writes <= usize::from(declaration_assignment)
+    });
+    symbols
+}
+
+fn expand_aliases(
+    symbols: BTreeMap<SymbolId, FunctionKey>,
+    aliases: &BTreeMap<SymbolId, SymbolId>,
+) -> BTreeMap<SymbolId, FunctionKey> {
+    let mut expanded = symbols;
+    // Alias-to-alias chains may be declared in any source order.
+    for _ in 0..aliases.len() {
+        let mut grew = false;
+        for (alias, target) in aliases {
+            if let Some(&key) = expanded.get(target) {
+                if expanded.insert(*alias, key).is_none() {
+                    grew = true;
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+
+    expanded
+}
+
+fn finite_reachable_edges(
+    root: FunctionKey,
+    edges: &BTreeMap<FunctionKey, Vec<(FunctionKey, CallLink)>>,
+) -> Vec<ResolvedCallEdge> {
+    // Explore the *finite graph* separately from the path-focused index.
+    // Each reachable function is expanded once; cycles and arbitrary
+    // call depths are represented without enumerating every simple path.
+    let mut queue = VecDeque::from([root]);
+    let mut visited = BTreeSet::new();
+    let mut reachable_edges = Vec::new();
+    while let Some(from) = queue.pop_front() {
+        if !visited.insert(from) {
+            continue;
+        }
+        if let Some(edges) = edges.get(&from) {
+            for (to, call) in edges {
+                reachable_edges.push(ResolvedCallEdge {
+                    from_span: from.into(),
+                    to_span: (*to).into(),
+                    call: call.clone(),
+                });
+                queue.push_back(*to);
+            }
+        }
+    }
+    reachable_edges.sort_by_key(|edge| (edge.from_span, edge.to_span, edge.call.span));
+    reachable_edges
+}
+
+fn build_caller_view(
+    root: FunctionKey,
+    def: &Definition,
+    defs: &BTreeMap<FunctionKey, Definition>,
+    edges: &BTreeMap<FunctionKey, Vec<(FunctionKey, CallLink)>>,
+    source: &str,
+) -> Option<CallerView> {
+    let origins = PathOrigins {
+        entry: (0..def.params.len()).map(Some).collect(),
+        constructed: vec![None; def.params.len()],
+    };
+    let mut walker = PathWalker {
+        defs,
+        edges,
+        root,
+        output: Vec::new(),
+    };
+    walker.walk(
+        root,
+        &origins,
+        &mut vec![def.label.clone()],
+        &mut vec![(root).into()],
+        &mut Vec::new(),
+        &mut BTreeSet::from([root]),
+    );
+    let reachable_edges = finite_reachable_edges(root, edges);
+    let reachable_functions = propagate_reachable_parameter_origins(root, defs, edges);
+    let mut paths = walker.output;
+    if reachable_edges.is_empty() {
+        return None;
+    }
+    // Stable display ordering and bounded, meaningful entries.
+    paths.sort_by(|a, b| a.functions.cmp(&b.functions));
+    let mut view = CallerView {
+        entry: def.label.clone(),
+        entry_span: (root).into(),
+        paths,
+        reachable_edges,
+        reachable_functions,
+        source: String::new(),
+    };
+    view.source = format_view(&view, source);
+    Some(view)
 }
 
 /// Discover exported member-assigned entry functions and their exact direct
@@ -991,33 +1133,7 @@ pub fn reconstruct_caller_views(
         scoping,
     };
     finder.visit_program(&parsed.program);
-    let mut symbols = BTreeMap::new();
-    let mut ambiguous = BTreeSet::new();
-    for (key, def) in &finder.functions {
-        if let Some(symbol) = def.symbol {
-            if symbols.insert(symbol, *key).is_some() {
-                ambiguous.insert(symbol);
-            }
-        }
-    }
-    for symbol in ambiguous {
-        symbols.remove(&symbol);
-    }
-    // Filter symbol targets in place rather than allocating temporary keys.
-    symbols.retain(|symbol, key| {
-        let writes = scoping
-            .get_resolved_reference_ids(*symbol)
-            .iter()
-            .filter(|reference| scoping.get_reference(**reference).is_write())
-            .count();
-        let declaration_assignment = finder
-            .functions
-            .get(key)
-            .is_some_and(|definition| definition.initialized_by_assignment);
-        // A single assignment can establish a previously declared function;
-        // any additional write means the call target can vary at runtime.
-        writes <= usize::from(declaration_assignment)
-    });
+    let symbols = stable_function_symbols(&finder.functions, scoping);
     // First validate the original function definitions, then extend the map
     // through const aliases. A renamed direct call is still a call to the
     // original function, not a new function definition.
@@ -1029,22 +1145,7 @@ pub fn reconstruct_caller_views(
         aliases: BTreeMap::new(),
     };
     aliases.visit_program(&parsed.program);
-    let mut expanded = symbols.clone();
-    // Alias-to-alias chains may be declared in any source order.
-    for _ in 0..aliases.aliases.len() {
-        let mut grew = false;
-        for (alias, target) in &aliases.aliases {
-            if let Some(&key) = expanded.get(target) {
-                if expanded.insert(*alias, key).is_none() {
-                    grew = true;
-                }
-            }
-        }
-        if !grew {
-            break;
-        }
-    }
-
+    let expanded = expand_aliases(symbols, &aliases.aliases);
     let mut call_writes = CallPropertyWrites {
         scoping,
         assigned: BTreeSet::new(),
@@ -1073,64 +1174,11 @@ pub fn reconstruct_caller_views(
         {
             continue;
         }
-        let origins = PathOrigins {
-            entry: (0..def.params.len()).map(Some).collect(),
-            constructed: vec![None; def.params.len()],
-        };
-        let mut walker = PathWalker {
-            defs: &finder.functions,
-            edges: &collector.edges,
-            root: *root,
-            output: Vec::new(),
-        };
-        walker.walk(
-            *root,
-            &origins,
-            &mut vec![def.label.clone()],
-            &mut vec![(*root).into()],
-            &mut Vec::new(),
-            &mut BTreeSet::from([*root]),
-        );
-        // Explore the *finite graph* separately from the path-focused index.
-        // Each reachable function is expanded once; cycles and arbitrary
-        // call depths are represented without enumerating every simple path.
-        let mut queue = VecDeque::from([*root]);
-        let mut visited = BTreeSet::new();
-        let mut reachable_edges = Vec::new();
-        while let Some(from) = queue.pop_front() {
-            if !visited.insert(from) {
-                continue;
-            }
-            if let Some(edges) = collector.edges.get(&from) {
-                for (to, call) in edges {
-                    reachable_edges.push(ResolvedCallEdge {
-                        from_span: from.into(),
-                        to_span: (*to).into(),
-                        call: call.clone(),
-                    });
-                    queue.push_back(*to);
-                }
-            }
+        if let Some(view) =
+            build_caller_view(*root, def, &finder.functions, &collector.edges, source)
+        {
+            views.push(view);
         }
-        reachable_edges.sort_by_key(|edge| (edge.from_span, edge.to_span, edge.call.span));
-        let reachable_functions =
-            propagate_reachable_parameter_origins(*root, &finder.functions, &collector.edges);
-        let mut paths = walker.output;
-        if reachable_edges.is_empty() {
-            continue;
-        }
-        // Stable display ordering and bounded, meaningful entries.
-        paths.sort_by(|a, b| a.functions.cmp(&b.functions));
-        let mut view = CallerView {
-            entry: def.label.clone(),
-            entry_span: (*root).into(),
-            paths,
-            reachable_edges,
-            reachable_functions,
-            source: String::new(),
-        };
-        view.source = format_view(&view, source);
-        views.push(view);
     }
     Ok(views)
 }

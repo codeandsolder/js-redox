@@ -271,35 +271,14 @@ struct ProvenFastPath {
     body: String,
 }
 
-/// Install only proof-checked guarded specializations in source code.
-///
-/// # Errors
-///
-/// Rejects invalid original JavaScript or lexical semantics and generated output that fails
-/// parsing or verification; unsupported specializations return no result instead of a
-/// fabricated proof.
-pub fn install_guarded_specializations(
+fn prove_fast_paths(
     original: &str,
     variants: &[GuardedVariant],
-) -> Result<Option<GuardedProgram>> {
-    let allocator = Allocator::default();
-    let parsed = parse_program(&allocator, original, SourceType::unambiguous());
-    ensure!(parsed.is_clean(), "invalid original program");
-    let semantic = SemanticBuilder::new()
-        .with_check_syntax_error(true)
-        .build(&parsed.program);
-    ensure!(
-        semantic.diagnostics.is_empty(),
-        "invalid original lexical program"
-    );
-    let mut collector = Functions {
-        scoping: semantic.semantic.scoping(),
-        slots: BTreeMap::new(),
-    };
-    collector.visit_program(&parsed.program);
+    slots: &BTreeMap<[u32; 2], FunctionSlot>,
+) -> Result<BTreeMap<[u32; 2], Vec<ProvenFastPath>>> {
     let mut grouped = BTreeMap::<[u32; 2], Vec<ProvenFastPath>>::new();
     for variant in variants {
-        let Some(slot) = collector.slots.get(&variant.function_span) else {
+        let Some(slot) = slots.get(&variant.function_span) else {
             continue;
         };
         let wrapper_allocator = Allocator::default();
@@ -332,6 +311,36 @@ pub fn install_guarded_specializations(
             body,
         });
     }
+    Ok(grouped)
+}
+
+/// Install only proof-checked guarded specializations in source code.
+///
+/// # Errors
+///
+/// Rejects invalid original JavaScript or lexical semantics and generated output that fails
+/// parsing or verification; unsupported specializations return no result instead of a
+/// fabricated proof.
+pub fn install_guarded_specializations(
+    original: &str,
+    variants: &[GuardedVariant],
+) -> Result<Option<GuardedProgram>> {
+    let allocator = Allocator::default();
+    let parsed = parse_program(&allocator, original, SourceType::unambiguous());
+    ensure!(parsed.is_clean(), "invalid original program");
+    let semantic = SemanticBuilder::new()
+        .with_check_syntax_error(true)
+        .build(&parsed.program);
+    ensure!(
+        semantic.diagnostics.is_empty(),
+        "invalid original lexical program"
+    );
+    let mut collector = Functions {
+        scoping: semantic.semantic.scoping(),
+        slots: BTreeMap::new(),
+    };
+    collector.visit_program(&parsed.program);
+    let grouped = prove_fast_paths(original, variants, &collector.slots)?;
     if grouped.is_empty() {
         return Ok(None);
     }
