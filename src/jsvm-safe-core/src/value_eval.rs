@@ -189,7 +189,9 @@ fn render_number(n: f64) -> String {
     }
 }
 
-pub fn same_value(a: &Value, b: &Value) -> bool {
+/// JavaScript Strict Equality (the `===` operator), not proof-fact identity.
+#[must_use = "Use the JavaScript strict equality result"]
+pub fn strict_primitive_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::String(a), Value::String(b)) => a == b,
         // JavaScript Strict Equality: NaN is never equal to itself, while
@@ -201,8 +203,23 @@ pub fn same_value(a: &Value, b: &Value) -> bool {
     }
 }
 
-pub fn same_values(a: &[Value], b: &[Value]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).all(|(left, right)| same_value(left, right))
+/// Compare two proof facts without conflating opposite signed zeros or
+/// distinct floating-point encodings. This is intentionally stricter than
+/// ECMAScript SameValue, which treats all NaNs as equal.
+#[must_use = "Only merge primitive facts when their represented values are identical"]
+pub fn identical_primitive_value(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Number(left), Value::Number(right)) => left.to_bits() == right.to_bits(),
+        _ => strict_primitive_equal(left, right),
+    }
+}
+
+#[must_use = "Only merge primitive sequences when their represented values are identical"]
+pub fn identical_primitive_values(a: &[Value], b: &[Value]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(left, right)| identical_primitive_value(left, right))
 }
 
 pub fn render_value_array(values: &[Value]) -> Option<String> {
@@ -391,7 +408,7 @@ fn abstract_primitive_equal(left: &Value, right: &Value) -> bool {
             crate::numeric::js_number_equal(text.as_str().string_to_number(), *number)
         }
         (Value::Null | Value::Undefined, _) | (_, Value::Null | Value::Undefined) => false,
-        _ => same_value(left, right),
+        _ => strict_primitive_equal(left, right),
     }
 }
 
@@ -442,8 +459,8 @@ pub fn eval_binary(op: &str, left: &Value, right: &Value) -> Option<Value> {
         "&" => Some(Value::Number(f64::from(
             js_to_int32(left.number()) & js_to_int32(right.number()),
         ))),
-        "===" => Some(Value::Bool(same_value(left, right))),
-        "!==" => Some(Value::Bool(!same_value(left, right))),
+        "===" => Some(Value::Bool(strict_primitive_equal(left, right))),
+        "!==" => Some(Value::Bool(!strict_primitive_equal(left, right))),
         "==" | "!=" => {
             let equal = abstract_primitive_equal(left, right);
             Some(Value::Bool(if op == "==" { equal } else { !equal }))
@@ -600,5 +617,37 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod primitive_equality_tests {
+    use super::{
+        identical_primitive_value, identical_primitive_values, strict_primitive_equal, Value,
+    };
+
+    #[test]
+    fn strict_equality_and_fact_identity_differ_for_signed_zero_and_nan() {
+        let positive_zero = Value::Number(0.0);
+        let negative_zero = Value::Number(-0.0);
+        let nan = Value::Number(f64::from_bits(0x7ff8_0000_0000_0001));
+        let other_nan = Value::Number(f64::from_bits(0x7ff8_0000_0000_0002));
+
+        assert!(strict_primitive_equal(&positive_zero, &negative_zero));
+        assert!(!identical_primitive_value(&positive_zero, &negative_zero));
+        assert!(!strict_primitive_equal(&nan, &nan));
+        assert!(identical_primitive_value(&nan, &nan));
+        assert!(!identical_primitive_value(&nan, &other_nan));
+        assert!(!identical_primitive_values(
+            &[positive_zero],
+            &[negative_zero]
+        ));
+        assert!(identical_primitive_values(&[nan.clone()], &[nan]));
+        assert!(!identical_primitive_values(&[other_nan], &[]));
+        assert!(identical_primitive_value(
+            &Value::String("a".into()),
+            &Value::String("a".into())
+        ));
+        assert!(!identical_primitive_value(&Value::Null, &Value::Undefined));
     }
 }

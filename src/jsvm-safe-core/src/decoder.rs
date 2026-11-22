@@ -10,8 +10,8 @@ use crate::binding_facts::{BindingFacts, ReferenceIdentity};
 use crate::numeric::exact_usize;
 use crate::rewrite::Replacement;
 use crate::value_eval::{
-    canonical_array_index_key, eval, exact_computed_property_key, js_to_uint32,
-    literal_property_key, render_value_array, same_values, Value,
+    canonical_array_index_key, eval, exact_computed_property_key, identical_primitive_values,
+    js_to_uint32, literal_property_key, render_value_array, Value,
 };
 use crate::{
     argument_integer, array_element, expression_integer, fragment, statically_resolved_symbol,
@@ -2851,7 +2851,7 @@ fn prove_rotation_iife(
         if decoder.values.is_empty()
             || table.is_some_and(|previous| {
                 previous.provider_array_span != decoder.provider_array_span
-                    || !same_values(&previous.values, &decoder.values)
+                    || !identical_primitive_values(&previous.values, &decoder.values)
             })
         {
             return Ok(false);
@@ -2934,8 +2934,8 @@ fn materializable_rotated_providers(
                 );
             }
             Some((span, values))
-                if *span == decoder.provider_array_span && same_values(values, &decoder.values) => {
-            }
+                if *span == decoder.provider_array_span
+                    && identical_primitive_values(values, &decoder.values) => {}
             Some(_) => {
                 inconsistent.insert(decoder.provider);
             }

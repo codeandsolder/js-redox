@@ -9,7 +9,7 @@
 use crate::numeric::exact_u32;
 use crate::value_eval::{
     canonical_array_index, eval, eval_binary, eval_logical_left, eval_unary_value, js_to_uint32,
-    same_value, string_literal_value, template_element_value, LogicalStep, Value,
+    strict_primitive_equal, string_literal_value, template_element_value, LogicalStep, Value,
 };
 use crate::{
     direct_identifier_name, fragment, js_parse_int, symbol_has_only_read_references, symbol_of,
@@ -1080,7 +1080,7 @@ fn select_switch_case(
             default = Some(index);
             continue;
         };
-        if same_value(&discriminant, &eval_with_env(test, env)?) {
+        if strict_primitive_equal(&discriminant, &eval_with_env(test, env)?) {
             return Some(index);
         }
     }
