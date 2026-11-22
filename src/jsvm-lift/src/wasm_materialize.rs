@@ -214,6 +214,24 @@ impl WasmInventory<'_> {
         Ok(())
     }
 
+    fn record_recovered(
+        &mut self,
+        occurrence: (String, &'static str, u32, u32),
+        digest: String,
+        bytes: &[u8],
+    ) -> Result<Option<&mut ModuleOrigins>> {
+        if !self.seen_occurrences.insert(occurrence) {
+            return Ok(None);
+        }
+        let binary = write_recovered_binary(&self.inline_root, &digest, bytes)?;
+        let module = self
+            .modules
+            .entry(digest)
+            .or_insert_with(|| ModuleOrigins::new(binary));
+        module.inline = true;
+        Ok(Some(module))
+    }
+
     fn record_inline(
         &mut self,
         source: &SourceCandidate,
@@ -221,21 +239,19 @@ impl WasmInventory<'_> {
         budget: &WorkBudget,
     ) -> Result<()> {
         budget.checkpoint()?;
-        let key = (
-            source.source_path.clone(),
-            "inline_base64_literal",
-            artifact.source_start,
-            artifact.source_end,
-        );
-        if !self.seen_occurrences.insert(key) {
+        let Some(module) = self.record_recovered(
+            (
+                source.source_path.clone(),
+                "inline_base64_literal",
+                artifact.source_start,
+                artifact.source_end,
+            ),
+            artifact.sha256,
+            &artifact.bytes,
+        )?
+        else {
             return Ok(());
-        }
-        let binary = write_recovered_binary(&self.inline_root, &artifact.sha256, &artifact.bytes)?;
-        let module = self
-            .modules
-            .entry(artifact.sha256)
-            .or_insert_with(|| ModuleOrigins::new(binary));
-        module.inline = true;
+        };
         module.origins.push(origin_with(
             &source.provenance,
             [
@@ -262,21 +278,19 @@ impl WasmInventory<'_> {
         budget: &WorkBudget,
     ) -> Result<()> {
         budget.checkpoint()?;
-        let key = (
-            source.source_path.clone(),
-            "static_byte_assembly",
-            artifact.allocation_start,
-            artifact.sink_end,
-        );
-        if !self.seen_occurrences.insert(key) {
+        let Some(module) = self.record_recovered(
+            (
+                source.source_path.clone(),
+                "static_byte_assembly",
+                artifact.allocation_start,
+                artifact.sink_end,
+            ),
+            artifact.sha256,
+            &artifact.bytes,
+        )?
+        else {
             return Ok(());
-        }
-        let binary = write_recovered_binary(&self.inline_root, &artifact.sha256, &artifact.bytes)?;
-        let module = self
-            .modules
-            .entry(artifact.sha256)
-            .or_insert_with(|| ModuleOrigins::new(binary));
-        module.inline = true;
+        };
         let assembled_type = match source.provenance.get("type").and_then(Value::as_str) {
             Some("resource_inline_base64") => "resource_static_bytes",
             _ => "inline_script_static_bytes",

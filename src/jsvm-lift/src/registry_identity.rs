@@ -51,6 +51,28 @@ pub struct ProvenOriginRegistryValueInstall {
     pub exact_key: i64,
 }
 
+impl From<&ProvenOriginRegistryHandlerInstall> for ProvenOriginRegistryValueInstall {
+    fn from(proof: &ProvenOriginRegistryHandlerInstall) -> Self {
+        let handler = &proof.install;
+        Self {
+            install: ProvenRegistryForwardingValueCall {
+                call_start: handler.call_start,
+                call_end: handler.call_end,
+                receiver_start: handler.receiver_start,
+                receiver_end: handler.receiver_end,
+                key_start: handler.key_start,
+                key_end: handler.key_end,
+                value_start: handler.handler_start,
+                value_end: handler.handler_end,
+                registry_path: handler.registry_path.clone(),
+                registry_key_confined: handler.registry_key_confined,
+            },
+            origin: proof.origin.clone(),
+            exact_key: proof.exact_key,
+        }
+    }
+}
+
 fn unique_argument_containing(
     argument_spans: &[(u32, u32)],
     start: u32,

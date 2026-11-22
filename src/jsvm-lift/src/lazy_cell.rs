@@ -2776,7 +2776,7 @@ pub fn proven_slow_lazy_cell_captured_handler_from_value(
 /// install whose original handler feeds the wrapper.
 ///
 /// This is the function-valued specialization of the generic captured-value
-/// theorem above; it intentionally preserves the old handler-only API.
+/// theorem above, using the same exact value-flow proof.
 #[must_use = "Only a returned proof establishes the captured handler identity"]
 pub fn proven_slow_lazy_cell_captured_handler_install(
     source: &str,
@@ -2785,27 +2785,15 @@ pub fn proven_slow_lazy_cell_captured_handler_install(
     exact_assignment: &ProvenSlowLazyCellExactRegistryAssignment,
     install: &crate::registry_identity::ProvenOriginRegistryHandlerInstall,
 ) -> Option<ProvenSlowLazyCellCapturedHandlerInstall> {
-    let (caller_handler_parameter_index, caller_handler_symbol) =
-        proven_slow_lazy_cell_captured_value_path(
-            source,
-            program,
-            semantic,
-            exact_assignment,
-            RegistryInstallFacts {
-                call: Span::new(install.install.call_start, install.install.call_end),
-                key: Span::new(install.install.key_start, install.install.key_end),
-                value: Span::new(install.install.handler_start, install.install.handler_end),
-                registry_path: &install.install.registry_path,
-                origin: &install.origin,
-                exact_key: install.exact_key,
-            },
-        )?;
-    Some(ProvenSlowLazyCellCapturedHandlerInstall {
-        exact_assignment: exact_assignment.clone(),
-        install: install.clone(),
-        caller_handler_parameter_index,
-        caller_handler_symbol,
-    })
+    let value = install.into();
+    let captured = proven_slow_lazy_cell_captured_value_install(
+        source,
+        program,
+        semantic,
+        exact_assignment,
+        &value,
+    )?;
+    proven_slow_lazy_cell_captured_handler_from_value(&captured, install)
 }
 
 /// Join the independently proven resolver index and captured logical handler.
@@ -4789,6 +4777,41 @@ mod tests {
         Ok((factory, registry))
     }
 
+    fn with_factory_fixture(
+        source: &str,
+        check: impl FnOnce(
+            &oxc_ast::ast::Program<'_>,
+            &oxc_semantic::Semantic<'_>,
+            &crate::receiver_identity::ProvenOriginFlow,
+            super::ProvenSlowLazyCellFactoryCall,
+            super::ProvenSlowLazyCellRegistryAssignment,
+        ) -> TestResult,
+    ) -> TestResult {
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new()
+            .with_build_nodes(true)
+            .with_cfg(true)
+            .build(&parsed.program);
+        assert!(semantic.diagnostics.is_empty());
+        let flow = structurally_proven_origin_flow(
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &test_budget(),
+        )
+        .test_value("origin flow")?;
+        let (factory, registry) =
+            exact_factory_registry(source, &parsed.program, &semantic.semantic, &flow)?;
+        check(
+            &parsed.program,
+            &semantic.semantic,
+            &flow,
+            factory,
+            registry,
+        )
+    }
+
     const FORWARDED_VALUE_SOURCE: &str = r#"
             let outer_phase;
             const C = function() {
@@ -4821,79 +4844,56 @@ mod tests {
     #[test]
     fn proves_state_fields_along_concrete_forwarding_chain() -> TestResult {
         let source = FORWARDED_VALUE_SOURCE;
-        let allocator = Allocator::default();
-        let parsed = parse_program(&allocator, source, SourceType::cjs());
-        assert!(parsed.is_clean());
-        let semantic = SemanticBuilder::new()
-            .with_build_nodes(true)
-            .with_cfg(true)
-            .build(&parsed.program);
-        assert!(semantic.diagnostics.is_empty());
-        let flow = structurally_proven_origin_flow(
-            &parsed.program,
-            semantic.semantic.scoping(),
-            &test_budget(),
-        )
-        .test_value("origin flow")?;
-        let (_factory, registry) =
-            exact_factory_registry(source, &parsed.program, &semantic.semantic, &flow)?;
+        with_factory_fixture(source, |program, semantic, flow, _factory, registry| {
+            let exact = proven_slow_lazy_cell_exact_registry_assignments(
+                source, program, semantic, flow, &registry,
+            )
+            .into_iter()
+            .find(|proof| proof.exact_key_value == 7)
+            .test_value("exact assignment")?;
+            assert_eq!(exact.provenance_calls.len(), 2);
+            let fields = proven_slow_lazy_cell_state_fields_for_exact_assignment(
+                source,
+                program,
+                semantic,
+                &exact,
+                &test_budget(),
+            )
+            .test_value("path state fields budget")?
+            .test_value("path state fields")?;
+            assert_eq!(fields.fields.method_key.string.assignment.value, "create");
+            assert_eq!(
+                fields.fields.prototype_field.initialization.property,
+                "base"
+            );
+            let values = proven_origin_registry_value_installs(
+                program,
+                semantic.scoping(),
+                flow,
+                &test_budget(),
+            )
+            .test_value("proven_origin_registry_value_installs")?;
+            let value = values
+                .iter()
+                .find(|proof| {
+                    proof.exact_key == 7
+                        && source_slice(
+                            source,
+                            proof.install.value_start,
+                            proof.install.value_end,
+                            "logical value span",
+                        )
+                        .is_ok_and(|value| value == "\"payload\"")
+                })
+                .test_value("logical value install")?;
+            let captured = proven_slow_lazy_cell_captured_value_install(
+                source, program, semantic, &exact, value,
+            )
+            .test_value("captured non-function value")?;
+            assert_eq!(captured.exact_assignment.exact_key_value, 7);
 
-        let exact = proven_slow_lazy_cell_exact_registry_assignments(
-            source,
-            &parsed.program,
-            &semantic.semantic,
-            &flow,
-            &registry,
-        )
-        .into_iter()
-        .find(|proof| proof.exact_key_value == 7)
-        .test_value("exact assignment")?;
-        assert_eq!(exact.provenance_calls.len(), 2);
-        let fields = proven_slow_lazy_cell_state_fields_for_exact_assignment(
-            source,
-            &parsed.program,
-            &semantic.semantic,
-            &exact,
-            &test_budget(),
-        )
-        .test_value("path state fields budget")?
-        .test_value("path state fields")?;
-        assert_eq!(fields.fields.method_key.string.assignment.value, "create");
-        assert_eq!(
-            fields.fields.prototype_field.initialization.property,
-            "base"
-        );
-        let values = proven_origin_registry_value_installs(
-            &parsed.program,
-            semantic.semantic.scoping(),
-            &flow,
-            &test_budget(),
-        )
-        .test_value("proven_origin_registry_value_installs")?;
-        let value = values
-            .iter()
-            .find(|proof| {
-                proof.exact_key == 7
-                    && source_slice(
-                        source,
-                        proof.install.value_start,
-                        proof.install.value_end,
-                        "logical value span",
-                    )
-                    .is_ok_and(|value| value == "\"payload\"")
-            })
-            .test_value("logical value install")?;
-        let captured = proven_slow_lazy_cell_captured_value_install(
-            source,
-            &parsed.program,
-            &semantic.semantic,
-            &exact,
-            value,
-        )
-        .test_value("captured non-function value")?;
-        assert_eq!(captured.exact_assignment.exact_key_value, 7);
-
-        Ok(())
+            Ok(())
+        })
     }
 
     #[test]
@@ -5193,94 +5193,74 @@ mod tests {
     #[test]
     fn proves_object_create_carrier_getter_delegation() -> TestResult {
         let source = CARRIER_DELEGATION_SOURCE;
-        let allocator = Allocator::default();
-        let parsed = parse_program(&allocator, source, SourceType::cjs());
-        assert!(parsed.is_clean());
-        let semantic = SemanticBuilder::new()
-            .with_build_nodes(true)
-            .with_cfg(true)
-            .build(&parsed.program);
-        assert!(semantic.diagnostics.is_empty());
-        let scoping = semantic.semantic.scoping();
-        let flow = structurally_proven_origin_flow(&parsed.program, scoping, &test_budget())
-            .test_value("origin flow")?;
-        let (factory, registry) =
-            exact_factory_registry(source, &parsed.program, &semantic.semantic, &flow)?;
+        with_factory_fixture(source, |program, semantic, flow, factory, registry| {
+            let scoping = semantic.scoping();
 
-        let exact = proven_slow_lazy_cell_exact_registry_assignments(
-            source,
-            &parsed.program,
-            &semantic.semantic,
-            &flow,
-            &registry,
-        )
-        .into_iter()
-        .find(|proof| proof.exact_key_value == 7)
-        .test_value("exact assignment")?;
-        let fields = proven_slow_lazy_cell_state_fields_for_exact_assignment(
-            source,
-            &parsed.program,
-            &semantic.semantic,
-            &exact,
-            &test_budget(),
-        )
-        .test_value("path state fields budget")?
-        .test_value("path state fields")?;
-        let reads =
-            structurally_proven_lazy_registry_read_calls(&parsed.program, scoping, &test_budget())
-                .test_value("lazy registry proof")?;
-        let accessor = reads.first().test_value("lazy accessor")?;
-        let carrier = proven_slow_lazy_cell_prototype_carrier(
-            source,
-            &parsed.program,
-            &semantic.semantic,
-            &fields,
-            accessor,
-            &test_budget(),
-        )
-        .test_value("prototype carrier budget")?
-        .test_value("prototype carrier")?;
-        assert_eq!(carrier.method_name, "create");
-        assert_eq!(carrier.projection_property, "prototype");
-        assert_eq!(carrier.resolver_property, "resolve");
-        assert!(carrier.standard_object_prototype_semantics_required);
+            let exact = proven_slow_lazy_cell_exact_registry_assignments(
+                source, program, semantic, flow, &registry,
+            )
+            .into_iter()
+            .find(|proof| proof.exact_key_value == 7)
+            .test_value("exact assignment")?;
+            let fields = proven_slow_lazy_cell_state_fields_for_exact_assignment(
+                source,
+                program,
+                semantic,
+                &exact,
+                &test_budget(),
+            )
+            .test_value("path state fields budget")?
+            .test_value("path state fields")?;
+            let reads =
+                structurally_proven_lazy_registry_read_calls(program, scoping, &test_budget())
+                    .test_value("lazy registry proof")?;
+            let accessor = reads.first().test_value("lazy accessor")?;
+            let carrier = proven_slow_lazy_cell_prototype_carrier(
+                source,
+                program,
+                semantic,
+                &fields,
+                accessor,
+                &test_budget(),
+            )
+            .test_value("prototype carrier budget")?
+            .test_value("prototype carrier")?;
+            assert_eq!(carrier.method_name, "create");
+            assert_eq!(carrier.projection_property, "prototype");
+            assert_eq!(carrier.resolver_property, "resolve");
+            assert!(carrier.standard_object_prototype_semantics_required);
 
-        let update =
-            proven_slow_lazy_cell_update_state(&parsed.program, &semantic.semantic, &factory)
+            let update = proven_slow_lazy_cell_update_state(program, semantic, &factory)
                 .test_value("update state")?;
-        let (install, captured) =
-            capture_exact_handler(source, &parsed.program, &semantic.semantic, &flow, &exact)?;
-        assert_generic_handler_capture(
-            source,
-            &parsed.program,
-            &semantic.semantic,
-            &flow,
-            &exact,
-            &install,
-            &captured,
-        )?;
-        let resolver_index_proof = proven_slow_lazy_cell_resolver_index(
-            source,
-            &parsed.program,
-            &semantic.semantic,
-            &update,
-            SlowLazyCellResolverIndexFacts {
-                selector: Span::new(accessor.selector_start, accessor.selector_end),
-                selector_key_symbol: accessor.selector_key_symbol,
-                exact_assignment: &exact,
-                phase_value: 23,
-            },
-        )
-        .test_value("resolver slot")?;
-        let resolved_handler_proof =
-            proven_slow_lazy_cell_resolved_handler(&resolver_index_proof, &captured)
-                .test_value("resolved handler")?;
-        let read = structurally_compatible_slow_lazy_cell_read(&resolved_handler_proof, &carrier)
-            .test_value("end-to-end lazy read")?;
-        assert_eq!(read.resolved_handler.resolver.exact_key_value, 7);
-        assert_eq!(read.resolved_handler.resolver.handler_slot, 6);
+            let (install, captured) =
+                capture_exact_handler(source, program, semantic, flow, &exact)?;
+            assert_generic_handler_capture(
+                source, program, semantic, flow, &exact, &install, &captured,
+            )?;
+            let resolver_index_proof = proven_slow_lazy_cell_resolver_index(
+                source,
+                program,
+                semantic,
+                &update,
+                SlowLazyCellResolverIndexFacts {
+                    selector: Span::new(accessor.selector_start, accessor.selector_end),
+                    selector_key_symbol: accessor.selector_key_symbol,
+                    exact_assignment: &exact,
+                    phase_value: 23,
+                },
+            )
+            .test_value("resolver slot")?;
+            let resolved_handler_proof =
+                proven_slow_lazy_cell_resolved_handler(&resolver_index_proof, &captured)
+                    .test_value("resolved handler")?;
+            let read =
+                structurally_compatible_slow_lazy_cell_read(&resolved_handler_proof, &carrier)
+                    .test_value("end-to-end lazy read")?;
+            assert_eq!(read.resolved_handler.resolver.exact_key_value, 7);
+            assert_eq!(read.resolved_handler.resolver.handler_slot, 6);
 
-        Ok(())
+            Ok(())
+        })
     }
 
     #[test]
@@ -5444,101 +5424,80 @@ mod tests {
     #[test]
     fn proves_real_style_resolver_index_cancellation() -> TestResult {
         let source = RESOLVER_CANCELLATION_SOURCE;
-        let allocator = Allocator::default();
-        let parsed = parse_program(&allocator, source, SourceType::cjs());
-        assert!(parsed.is_clean());
-        let semantic = SemanticBuilder::new()
-            .with_build_nodes(true)
-            .with_cfg(true)
-            .build(&parsed.program);
-        assert!(semantic.diagnostics.is_empty());
-        let scoping = semantic.semantic.scoping();
-        let flow = structurally_proven_origin_flow(&parsed.program, scoping, &test_budget())
-            .test_value("origin flow")?;
-        let (factory, registry) =
-            exact_factory_registry(source, &parsed.program, &semantic.semantic, &flow)?;
-        let update =
-            proven_slow_lazy_cell_update_state(&parsed.program, &semantic.semantic, &factory)
+        with_factory_fixture(source, |program, semantic, flow, factory, registry| {
+            let update = proven_slow_lazy_cell_update_state(program, semantic, &factory)
                 .test_value("update proof")?;
 
-        assert_eq!(registry.registry_path, vec!["T"]);
-        assert_eq!(registry.factory_key_parameter_index, 4);
-        let exact_assignments = proven_slow_lazy_cell_exact_registry_assignments(
-            source,
-            &parsed.program,
-            &semantic.semantic,
-            &flow,
-            &registry,
-        );
-        assert_eq!(
-            exact_assignments
+            assert_eq!(registry.registry_path, vec!["T"]);
+            assert_eq!(registry.factory_key_parameter_index, 4);
+            let exact_assignments = proven_slow_lazy_cell_exact_registry_assignments(
+                source, program, semantic, flow, &registry,
+            );
+            assert_eq!(
+                exact_assignments
+                    .iter()
+                    .map(|proof| proof.exact_key_value)
+                    .collect::<Vec<_>>(),
+                vec![7, 1_000_000]
+            );
+            let exact_seven = exact_assignments
                 .iter()
-                .map(|proof| proof.exact_key_value)
-                .collect::<Vec<_>>(),
-            vec![7, 1_000_000]
-        );
-        let exact_seven = exact_assignments
-            .iter()
-            .find(|proof| proof.exact_key_value == 7)
-            .test_value("small exact key")?;
-        let exact_large = exact_assignments
-            .iter()
-            .find(|proof| proof.exact_key_value == 1_000_000)
-            .test_value("large exact key")?;
-        let (_, captured_handler) = capture_exact_handler(
-            source,
-            &parsed.program,
-            &semantic.semantic,
-            &flow,
-            exact_seven,
-        )?;
+                .find(|proof| proof.exact_key_value == 7)
+                .test_value("small exact key")?;
+            let exact_large = exact_assignments
+                .iter()
+                .find(|proof| proof.exact_key_value == 1_000_000)
+                .test_value("large exact key")?;
+            let (_, captured_handler) =
+                capture_exact_handler(source, program, semantic, flow, exact_seven)?;
 
-        let (selector_span, selector_key_symbol) = fixture_selector(&parsed.program)?;
-        let proof = proven_slow_lazy_cell_resolver_index(
-            source,
-            &parsed.program,
-            &semantic.semantic,
-            &update,
-            SlowLazyCellResolverIndexFacts {
-                selector: selector_span,
-                selector_key_symbol,
-                exact_assignment: exact_seven,
-                phase_value: 23,
-            },
-        )
-        .test_value("resolver cancellation")?;
-        assert_eq!(proof.handler_slot, 6);
-        let resolved = proven_slow_lazy_cell_resolved_handler(&proof, &captured_handler)
-            .test_value("resolved original handler")?;
-        assert_eq!(resolved.captured_handler.install.exact_key, 7);
-        assert!(proven_slow_lazy_cell_resolver_index(
-            source,
-            &parsed.program,
-            &semantic.semantic,
-            &update,
-            SlowLazyCellResolverIndexFacts {
-                selector: selector_span,
-                selector_key_symbol,
-                exact_assignment: exact_seven,
-                phase_value: 50,
-            },
-        )
-        .is_none());
-        assert!(proven_slow_lazy_cell_resolver_index(
-            source,
-            &parsed.program,
-            &semantic.semantic,
-            &update,
-            SlowLazyCellResolverIndexFacts {
-                selector: selector_span,
-                selector_key_symbol,
-                exact_assignment: exact_large,
-                phase_value: 23,
-            },
-        )
-        .is_none());
+            let (selector_span, selector_key_symbol) = fixture_selector(program)?;
+            let proof = proven_slow_lazy_cell_resolver_index(
+                source,
+                program,
+                semantic,
+                &update,
+                SlowLazyCellResolverIndexFacts {
+                    selector: selector_span,
+                    selector_key_symbol,
+                    exact_assignment: exact_seven,
+                    phase_value: 23,
+                },
+            )
+            .test_value("resolver cancellation")?;
+            assert_eq!(proof.handler_slot, 6);
+            let resolved = proven_slow_lazy_cell_resolved_handler(&proof, &captured_handler)
+                .test_value("resolved original handler")?;
+            assert_eq!(resolved.captured_handler.install.exact_key, 7);
+            assert!(proven_slow_lazy_cell_resolver_index(
+                source,
+                program,
+                semantic,
+                &update,
+                SlowLazyCellResolverIndexFacts {
+                    selector: selector_span,
+                    selector_key_symbol,
+                    exact_assignment: exact_seven,
+                    phase_value: 50,
+                },
+            )
+            .is_none());
+            assert!(proven_slow_lazy_cell_resolver_index(
+                source,
+                program,
+                semantic,
+                &update,
+                SlowLazyCellResolverIndexFacts {
+                    selector: selector_span,
+                    selector_key_symbol,
+                    exact_assignment: exact_large,
+                    phase_value: 23,
+                },
+            )
+            .is_none());
 
-        Ok(())
+            Ok(())
+        })
     }
 
     #[test]
