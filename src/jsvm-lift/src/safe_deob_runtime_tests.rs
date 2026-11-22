@@ -340,6 +340,16 @@ fn assert_main_contract(file: &str, outcome: &SafeDeobOutcome) {
 fn depythonify_safe_deob_script_completion_runtime_equivalence() -> Result<()> {
     let scratch = TempDir::new()?;
     let sources = [
+        "let x=0;function f(){x=(eval('var x=1'),2);return x;}[f(),x];",
+        "let x=0;function f(){x=eval('var x=1;true')?2:3;return x;}[f(),x];",
+        "let x=0;function f(){'use strict';x=(eval('var x=1'),2);return x;}[f(),x];",
+        "let x=0;function f(){eval('var x=1');return function(){x=(events.push('pre'),2);return x;};}[f()(),x];",
+        "function f(x){x=(eval('var x=1'),2);return x;}f(0);",
+        "function f(){try{x=(events.push('rhs'),2);}catch(e){events.push(e.name)}let x=1;return x;}f();",
+        "function f(){const x=1;try{x=(events.push('rhs'),2);}catch(e){events.push(e.name)}return x;}f();",
+        "function f(){let x=1;x=(events.push('test'),false)?(events.push('yes'),2):(events.push('no'),3);return x;}f();",
+        "var x=1;function f(){x=(events.push('rhs'),2);return x;}[f(),x];",
+        "let x=0;function f(){x=((0,eval)('1'),2);return x;}[f(),x];",
         "function f(x){return x+1}eval('f=function(x){return x+9}');f(2)",
         "function f(x){return x+1}const g=()=>{eval('var f=function(x){return x+9}');return f(2)};g()",
         "function f(x){return x+1}function g(){'use strict';eval('f=function(x){return x+9}')}g();f(2)",
