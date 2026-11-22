@@ -368,6 +368,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn computed_member_preview_clips_without_panicking_at_utf8_boundaries() -> anyhow::Result<()> {
+        let prefix = format!("arr[\"{}", "a".repeat(153));
+        let source = format!("{prefix}💡\"]; ");
+        let allocator = oxc_allocator::Allocator::default();
+        let parsed = rolldown_redox::ecmascript::parse_program(
+            &allocator,
+            &source,
+            oxc_span::SourceType::cjs(),
+        );
+        assert!(parsed.is_clean());
+        let Some(oxc_ast::ast::Statement::ExpressionStatement(statement)) =
+            parsed.program.body.first()
+        else {
+            anyhow::bail!("expected fixture expression")
+        };
+        let evidence = expression_evidence(&source, &statement.expression);
+        assert_eq!(evidence.computed_members, 1);
+        assert_eq!(evidence.computed_previews, BTreeSet::from([prefix]));
+        Ok(())
+    }
+
+    #[test]
     fn follows_expression_evidence_through_variables() {
         let mut vars = HashMap::new();
         vars.insert(
