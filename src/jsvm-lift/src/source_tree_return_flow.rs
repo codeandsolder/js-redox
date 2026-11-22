@@ -1,15 +1,16 @@
 //! Symbol-resolved terminal return dataflow in original lexical helper views.
 //!
 //! A function-owned return temporary can be eliminated at a terminal store
-//! when no escaped closure, dynamic scope, or argument alias can observe it.
+//! when assignment completion, implicit naming and deferred observers are preserved.
 //! Earlier local reads and writes remain intact; branch joins are handled
 //! without assuming the temporary was otherwise unused.
 //! This is an analyst-only source view, never a rewrite of captured executable
 //! reconstruction. Never infer values from spelling alone.
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    ArrowFunctionExpression, AssignmentTarget, Expression, Function, FunctionBody,
-    IdentifierReference, Statement, WithStatement,
+    AccessorProperty, ArrowFunctionBody, ArrowFunctionExpression, AssignmentExpression,
+    AssignmentTarget, Expression, FormalParameters, Function, FunctionBody, IdentifierReference,
+    PropertyDefinition, Statement, WithStatement,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::{Scoping, SemanticBuilder};
@@ -17,7 +18,7 @@ use oxc_span::{GetSpan, SourceType, Span};
 use oxc_syntax::{
     operator::AssignmentOperator,
     scope::{ScopeFlags, ScopeId},
-    symbol::SymbolId,
+    symbol::{SymbolFlags, SymbolId},
 };
 use rolldown_redox::ecmascript::parse_program;
 
@@ -51,25 +52,49 @@ impl<'a> Visit<'a> for DynamicScope {
 struct CapturedBinding<'s> {
     scoping: &'s Scoping,
     symbol: SymbolId,
-    nested_functions: usize,
+    deferred_depth: usize,
     captured: bool,
+}
+
+impl CapturedBinding<'_> {
+    fn field_initializer(&mut self, is_static: bool, value: Option<&Expression<'_>>) {
+        if let Some(value) = value {
+            self.deferred_depth += usize::from(!is_static);
+            self.visit_expression(value);
+            self.deferred_depth -= usize::from(!is_static);
+        }
+    }
 }
 
 impl<'a> Visit<'a> for CapturedBinding<'_> {
     fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
-        self.nested_functions += 1;
+        self.deferred_depth += 1;
         walk::walk_function(self, function, flags);
-        self.nested_functions -= 1;
+        self.deferred_depth -= 1;
     }
 
     fn visit_arrow_function_expression(&mut self, arrow: &ArrowFunctionExpression<'a>) {
-        self.nested_functions += 1;
+        self.deferred_depth += 1;
         walk::walk_arrow_function_expression(self, arrow);
-        self.nested_functions -= 1;
+        self.deferred_depth -= 1;
+    }
+
+    fn visit_property_definition(&mut self, field: &PropertyDefinition<'a>) {
+        self.visit_decorators(&field.decorators);
+        self.visit_property_key(&field.key);
+        // Only instance initialization is deferred; computed keys and static
+        // field initialization occur during class definition.
+        self.field_initializer(field.r#static, field.value.as_ref());
+    }
+
+    fn visit_accessor_property(&mut self, field: &AccessorProperty<'a>) {
+        self.visit_decorators(&field.decorators);
+        self.visit_property_key(&field.key);
+        self.field_initializer(field.r#static, field.value.as_ref());
     }
 
     fn visit_identifier_reference(&mut self, id: &IdentifierReference<'a>) {
-        if self.nested_functions > 0 && binding(self.scoping, id) == Some(self.symbol) {
+        if self.deferred_depth > 0 && binding(self.scoping, id) == Some(self.symbol) {
             self.captured = true;
         }
     }
@@ -83,11 +108,12 @@ fn binding(scoping: &Scoping, id: &IdentifierReference<'_>) -> Option<SymbolId> 
 
 fn assignment<'a>(
     statement: &'a Statement<'a>,
-) -> Option<(&'a IdentifierReference<'a>, &'a Expression<'a>)> {
+) -> Option<(&'a IdentifierReference<'a>, &'a AssignmentExpression<'a>)> {
     let Statement::ExpressionStatement(statement) = statement else {
         return None;
     };
-    let Expression::AssignmentExpression(assignment) = &statement.expression else {
+    let Expression::AssignmentExpression(assignment) = statement.expression.without_parentheses()
+    else {
         return None;
     };
     if assignment.operator != AssignmentOperator::Assign {
@@ -96,14 +122,14 @@ fn assignment<'a>(
     let AssignmentTarget::AssignmentTargetIdentifier(target) = &assignment.left else {
         return None;
     };
-    Some((target, &assignment.right))
+    Some((target, assignment))
 }
 
 fn ident_return<'a>(statement: &'a Statement<'a>) -> Option<&'a IdentifierReference<'a>> {
     let Statement::ReturnStatement(statement) = statement else {
         return None;
     };
-    let Expression::Identifier(id) = statement.argument.as_ref()? else {
+    let Expression::Identifier(id) = statement.argument.as_ref()?.without_parentheses() else {
         return None;
     };
     Some(id)
@@ -128,11 +154,59 @@ struct Candidate {
 struct ReturnFlow<'s> {
     scoping: &'s Scoping,
     source: &'s str,
-    function_scope: Option<ScopeId>,
     edits: Vec<Candidate>,
 }
 
 impl ReturnFlow<'_> {
+    /// Keep NamedEvaluation in its original assignment context. Naming an
+    /// anonymous class explicitly would introduce a new lexical name binding
+    /// and may change what its static initializers observe.
+    fn terminal_value(&self, assignment: &AssignmentExpression<'_>) -> Option<&str> {
+        let span = if assignment.right.is_anonymous_function_definition() {
+            assignment.span
+        } else {
+            assignment.right.span()
+        };
+        snippet(self.source, span)
+    }
+
+    /// The assigned value equals the subsequently read binding only for a
+    /// mutable local. Include parameter initializers in the observer proof:
+    /// they can create closures or use eval before the body is entered.
+    fn terminal_symbol(
+        &self,
+        body: &FunctionBody<'_>,
+        params: &FormalParameters<'_>,
+        scope: Option<ScopeId>,
+    ) -> Option<SymbolId> {
+        let returned = body.statements.last().and_then(ident_return)?;
+        let symbol = binding(self.scoping, returned)?;
+        if scope != Some(self.scoping.symbol_scope_id(symbol)) {
+            return None;
+        }
+        let flags = self.scoping.symbol_flags(symbol);
+        if !flags.intersects(SymbolFlags::Variable | SymbolFlags::Function | SymbolFlags::Class)
+            || flags.intersects(SymbolFlags::ConstVariable | SymbolFlags::FunctionExpression)
+        {
+            return None;
+        }
+        let mut dynamic = DynamicScope::default();
+        dynamic.visit_formal_parameters(params);
+        dynamic.visit_function_body(body);
+        if dynamic.present {
+            return None;
+        }
+        let mut capture = CapturedBinding {
+            scoping: self.scoping,
+            symbol,
+            deferred_depth: 0,
+            captured: false,
+        };
+        capture.visit_formal_parameters(params);
+        capture.visit_function_body(body);
+        (!capture.captured).then_some(symbol)
+    }
+
     /// Recover both edges of a labeled branch join, preserving the original
     /// condition, intervening effects and lexical block scope.
     fn labeled_join(&self, statement: &Statement<'_>, symbol: SymbolId) -> Option<String> {
@@ -172,8 +246,8 @@ impl ReturnFlow<'_> {
             return None;
         }
         let condition = snippet(self.source, branch.test.span())?;
-        let branch_value = snippet(self.source, branch_rhs.span())?;
-        let last_value = snippet(self.source, last_rhs.span())?;
+        let branch_value = self.terminal_value(branch_rhs)?;
+        let last_value = self.terminal_value(last_rhs)?;
         let middle = if block.body.len() > 2 {
             snippet(
                 self.source,
@@ -205,7 +279,7 @@ impl ReturnFlow<'_> {
         if binding(self.scoping, target) != Some(symbol) {
             return None;
         }
-        let value = snippet(self.source, rhs.span())?;
+        let value = self.terminal_value(rhs)?;
         let source = snippet(self.source, statement.span())?;
         let start = (tail.span().start - statement.span().start) as usize;
         let end = (tail.span().end - statement.span().start) as usize;
@@ -218,38 +292,16 @@ impl ReturnFlow<'_> {
         }
     }
 
-    fn recover_body(&mut self, body: &FunctionBody<'_>) {
+    fn recover_body(
+        &mut self,
+        body: &FunctionBody<'_>,
+        params: &FormalParameters<'_>,
+        scope: Option<ScopeId>,
+    ) {
         let statements = &body.statements;
-        let Some(returned) = statements.last().and_then(ident_return) else {
+        let Some(symbol) = self.terminal_symbol(body, params, scope) else {
             return;
         };
-        let mut dynamic = DynamicScope::default();
-        dynamic.visit_function_body(body);
-        if dynamic.present {
-            return;
-        }
-        let Some(symbol) = binding(self.scoping, returned) else {
-            return;
-        };
-        // A symbol defined in an enclosing function/module is externally
-        // observable even when only the current function writes and returns it.
-        // Only rewrite a binding owned by THIS function's lexical environment.
-        if self.function_scope != Some(self.scoping.symbol_scope_id(symbol)) {
-            return;
-        }
-        // Earlier reads and writes have already executed before the terminal
-        // store, so only future observers matter. An escaped closure could
-        // still read that variable after this function returns.
-        let mut capture = CapturedBinding {
-            scoping: self.scoping,
-            symbol,
-            nested_functions: 0,
-            captured: false,
-        };
-        capture.visit_function_body(body);
-        if capture.captured {
-            return;
-        }
         let Some(before) = statements.get(statements.len().saturating_sub(2)) else {
             return;
         };
@@ -259,7 +311,7 @@ impl ReturnFlow<'_> {
 
         if let Some((target, rhs)) = assignment(before) {
             if binding(self.scoping, target) == Some(symbol) {
-                if let Some(expr) = snippet(self.source, rhs.span()) {
+                if let Some(expr) = self.terminal_value(rhs) {
                     self.edits.push(Candidate {
                         span: Span::new(before.span().start, return_statement.span().end),
                         replacement: format!("return ({expr});"),
@@ -326,22 +378,17 @@ impl ReturnFlow<'_> {
 
 impl<'a> Visit<'a> for ReturnFlow<'_> {
     fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
-        let enclosing = self.function_scope;
-        self.function_scope = function.scope_id.get();
+        if let Some(body) = &function.body {
+            self.recover_body(body, &function.params, function.scope_id.get());
+        }
         walk::walk_function(self, function, flags);
-        self.function_scope = enclosing;
     }
 
     fn visit_arrow_function_expression(&mut self, arrow: &ArrowFunctionExpression<'a>) {
-        let enclosing = self.function_scope;
-        self.function_scope = arrow.scope_id.get();
+        if let ArrowFunctionBody::FunctionBody(body) = &arrow.body {
+            self.recover_body(body, &arrow.params, arrow.scope_id.get());
+        }
         walk::walk_arrow_function_expression(self, arrow);
-        self.function_scope = enclosing;
-    }
-
-    fn visit_function_body(&mut self, body: &FunctionBody<'a>) {
-        self.recover_body(body);
-        walk::walk_function_body(self, body);
     }
 }
 
@@ -370,7 +417,6 @@ pub fn recover_terminal_returns(source: &str) -> RecoveredReturns {
         let mut analyzer = ReturnFlow {
             scoping: semantic.semantic.scoping(),
             source: &output,
-            function_scope: None,
             edits: Vec::new(),
         };
         analyzer.visit_program(&parsed.program);
@@ -668,6 +714,167 @@ mod tests {
             assert_eq!(out.source, src, "{src}: {}", out.source);
             assert_eq!(out.guarded_joins, 0);
         }
+    }
+
+    #[test]
+    fn immutable_terminal_targets_keep_abrupt_or_ignored_writes() {
+        for source in [
+            "function f(){const q=0;q=effect();return q;}",
+            "function f(x){const q=0;if(x)q=effect();return q;}",
+            "const f=function q(){q=effect();return q;};",
+            "const f=function q(){'use strict';q=effect();return q;};",
+        ] {
+            let out = recover_terminal_returns(source);
+            assert_eq!(out.source, source);
+        }
+    }
+
+    #[test]
+    fn terminal_assignment_preserves_named_evaluation() {
+        for (source, expected) in [
+            (
+                "function f(q){q=function(){};return q;}",
+                "return (q=function(){});",
+            ),
+            (
+                "function f(q){q=(async()=>0);return q;}",
+                "return (q=(async()=>0));",
+            ),
+            (
+                "function f(q,x){if(x)q=class{static seen=this.name};return q;}",
+                "return (q=class{static seen=this.name});",
+            ),
+            (
+                "function f(q,x){a:{if(x){q=()=>1;break a;}q=function(){};}return q;}",
+                "return (q=()=>1);",
+            ),
+            (
+                "function f(q){q=function named(){};return q;}",
+                "return (function named(){});",
+            ),
+            (
+                "function f(q){q=(0,function(){});return q;}",
+                "return ((0,function(){}));",
+            ),
+        ] {
+            let out = recover_terminal_returns(source);
+            assert!(out.source.contains(expected), "{source}: {}", out.source);
+            assert_eq!(
+                out.adjacent_returns + out.labeled_joins + out.guarded_joins,
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn parenthesized_terminal_assignment_and_return_preserve_named_evaluation() {
+        let source = "function f(q){(q = function(){});return (q);}";
+        let out = recover_terminal_returns(source);
+        assert_eq!(out.adjacent_returns, 1, "{}", out.source);
+        assert!(
+            out.source.contains("return (q = function(){});"),
+            "{}",
+            out.source
+        );
+    }
+
+    #[test]
+    fn deferred_initializers_keep_terminal_binding_observable() {
+        for source in [
+            "function f(q,read=()=>q){saved=read;q=9;return q;}",
+            "const f=(q,read=()=>q)=>{saved=read;q=9;return q;};",
+            "function f(q,read=eval('()=>q')){saved=read;q=9;return q;}",
+            "function f(q){saved=class {field=q};q=9;return q;}",
+            "function f(q){saved=class {#field=q;read(){return this.#field}};q=9;return q;}",
+            "function f(q){saved=class {static nested=class{field=q}};q=9;return q;}",
+        ] {
+            let out = recover_terminal_returns(source);
+            assert_eq!(out.source, source, "{source}: {}", out.source);
+        }
+    }
+
+    #[test]
+    fn eager_class_keys_and_static_initializers_do_not_capture_local() {
+        for source in [
+            "function f(q){saved=class {[q]=1};q=9;return q;}",
+            "function f(q){saved=class {static field=q};q=9;return q;}",
+            "function f(q=1){q=9;return q;}",
+            "function f(){let q=1;q=9;return q;}",
+            "function f(){var q=1;q=9;return q;}",
+        ] {
+            let out = recover_terminal_returns(source);
+            assert_eq!(out.adjacent_returns, 1, "{source}: {}", out.source);
+            assert!(out.source.contains("return (9);"), "{}", out.source);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires installed Node; terminal return semantics oracle"]
+    fn node_confirms_terminal_return_observability() -> anyhow::Result<()> {
+        use std::process::Command;
+        let cases = [
+            (
+                "function f(){const q=0;q=(events.push('rhs'),7);return q;}",
+                "try{f()}catch(e){events.push(e.name)}",
+            ),
+            (
+                "const f=function q(){q=(events.push('rhs'),7);return q;};",
+                "events.push(f()===f, f().name)",
+            ),
+            (
+                "const f=function q(){'use strict';q=(events.push('rhs'),7);return q;};",
+                "try{f()}catch(e){events.push(e.name)}",
+            ),
+            (
+                "function f(q,read=()=>q){saved=read;q=9;return q;}",
+                "events.push(f(2),saved())",
+            ),
+            (
+                "function f(q){saved=class{field=q};q=9;return q;}",
+                "events.push(f(2),new saved().field)",
+            ),
+            (
+                "function f(q){saved=class{static field=q;[q]=3};q=9;return q;}",
+                "events.push(f(2),saved.field,new saved()[2])",
+            ),
+            (
+                "function f(q){q=class{static seen=this.name};return q;}",
+                "const c=f();events.push(c.name,c.seen)",
+            ),
+            (
+                "function f(q){(q=async()=>0);return(q);}",
+                "events.push(f().name)",
+            ),
+            (
+                "function f(q,x){if(x)q=()=>1;else q=function(){};return q;}",
+                "events.push(f(0,true).name,f(0,false).name)",
+            ),
+            (
+                "function f(q){q=class{static seen=q};return q;}",
+                "events.push(f(7).seen,f(7).name)",
+            ),
+        ];
+        for (definition, observation) in cases {
+            let source = format!("const events=[];let saved;{definition}{observation};console.log(JSON.stringify(events));");
+            let recovered = recover_terminal_returns(&source);
+            let original = Command::new("node").arg("-e").arg(&source).output()?;
+            let derived = Command::new("node")
+                .arg("-e")
+                .arg(&recovered.source)
+                .output()?;
+            assert!(original.status.success(), "{source}: {original:?}");
+            assert!(
+                derived.status.success(),
+                "{}: {derived:?}",
+                recovered.source
+            );
+            assert_eq!(
+                original.stdout, derived.stdout,
+                "{source} -> {}",
+                recovered.source
+            );
+        }
+        Ok(())
     }
 
     #[test]
