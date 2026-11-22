@@ -524,9 +524,7 @@ fn semantic_affine_base91_signature_matches(
             .filter_map(|(index, value)| {
                 let expected = u32::try_from(expected).ok().map(f64::from);
                 let matches = expected.is_some_and(|expected| {
-                    value
-                        .number()
-                        .is_some_and(|number| crate::numeric::js_number_equal(number, expected))
+                    crate::numeric::js_number_equal(value.number(), expected)
                 });
                 matches
                     .then(|| i64::try_from(index).ok()?.checked_sub(offset))
@@ -837,11 +835,11 @@ impl Base91CallCollector<'_, '_> {
                     .and_then(|reference| statically_resolved_symbol(self.scoping, reference))?;
                 let values = self.arrays.get(&array_symbol)?;
                 let index = crate::value_eval::eval(&member.expression)
-                    .and_then(|value| value.number())
+                    .map(|value| value.number())
                     .and_then(crate::exact_usize)?;
                 values
                     .get(index)
-                    .and_then(Value::number)
+                    .map(Value::number)
                     .and_then(crate::exact_usize)
             }
             _ => None,

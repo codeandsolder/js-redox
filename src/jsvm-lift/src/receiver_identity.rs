@@ -3677,7 +3677,7 @@ fn proof_property_key(
             bindings.get(&symbol).cloned()
         }
         Expression::ArrayExpression(array) if array.elements.is_empty() => Some(String::new()),
-        expression => eval_static_primitive(expression)?.js_string(),
+        expression => Some(eval_static_primitive(expression)?.js_string()),
     }
 }
 

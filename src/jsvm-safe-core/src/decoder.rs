@@ -1080,7 +1080,7 @@ fn eval_from_char_code_concat(
                 .iter()
                 .map(|argument| {
                     let expression = argument.as_expression()?;
-                    let number = eval(expression)?.number()?;
+                    let number = eval(expression)?.number();
                     Some((js_to_uint32(number) & 0xffff) as u16)
                 })
                 .collect::<Option<Vec<_>>>()?;
@@ -1907,16 +1907,16 @@ pub fn decoder_call_rewrite(
         None => None,
     };
     let argument = call.arguments.first()?;
-    let primitive_number = |expression: &Expression<'_>| eval(expression)?.number();
+    let primitive_number = |expression: &Expression<'_>| eval(expression).map(|value| value.number());
     if let Some(raw) = argument.as_expression().and_then(primitive_number) {
-        return literal_decoder_rewrite(decoder.value_for_call(raw, key.as_deref())?);
+        return literal_decoder_rewrite(&decoder.value_for_call(raw, key.as_deref())?);
     }
     conditional_decoder_rewrite(source, argument, |expression| {
         decoder.value_for_call(primitive_number(expression)?, key.as_deref())
     })
 }
 
-fn literal_decoder_rewrite(value: Value) -> Option<DecoderCallRewrite> {
+fn literal_decoder_rewrite(value: &Value) -> Option<DecoderCallRewrite> {
     Some(DecoderCallRewrite {
         text: value.render_expression()?,
         stop: false,
@@ -2089,7 +2089,7 @@ impl DirectTableDecoder {
         }
         let argument = call.arguments.first()?;
         if let Some(value) = self.value(argument.as_expression()?) {
-            return literal_decoder_rewrite(value);
+            return literal_decoder_rewrite(&value);
         }
         conditional_decoder_rewrite(source, argument, |expression| self.value(expression))
     }

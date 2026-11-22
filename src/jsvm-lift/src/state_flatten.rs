@@ -86,7 +86,7 @@ pub struct DetectedStateMachines {
 }
 
 fn static_u64(expr: &Expression<'_>) -> Option<u64> {
-    eval_static(expr).and_then(|value| exact_u64(value.number()?))
+    eval_static(expr).and_then(|value| exact_u64(value.number()))
 }
 
 fn finite_static_state_targets(expr: &Expression<'_>) -> Option<BTreeSet<u64>> {

@@ -823,6 +823,7 @@ mod tests {
     #[test]
     fn identity_distinguishes_intercepted_global_and_lexical_references() {
         use oxc_ast::ast::IdentifierReference;
+        use ReferenceIdentity::{Dynamic, Global, Lexical};
         struct Probe<'a> {
             scoping: &'a Scoping,
             facts: &'a BindingFacts,
@@ -875,7 +876,6 @@ mod tests {
             unreachable!("block local must retain identity");
         };
         assert_ne!(block_local, outer);
-        use ReferenceIdentity::{Dynamic, Global, Lexical};
         assert_eq!(
             probe.identities,
             [

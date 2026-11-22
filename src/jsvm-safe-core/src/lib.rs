@@ -1287,7 +1287,7 @@ impl Collector<'_, '_> {
             .arguments
             .iter()
             .map(|argument| {
-                let number = eval_static_argument(argument)?.number()?;
+                let number = eval_static_argument(argument)?.number();
                 Some((js_to_uint32(number) & 0xffff) as u16)
             })
             .collect::<Option<Vec<_>>>()?;
@@ -1826,7 +1826,9 @@ fn argument_integer(arg: &Argument<'_>) -> Option<i64> {
 }
 
 /// Whether a call's syntax permits intrinsic eval to access its caller's
-/// lexical environment. Parentheses preserve the reference; optional calls,
+/// lexical environment.
+///
+/// Parentheses preserve the reference; optional calls,
 /// sequences and member calls do not. A shadowed binding may still hold the
 /// intrinsic, so this deliberately does not assert the callee's identity.
 #[must_use]

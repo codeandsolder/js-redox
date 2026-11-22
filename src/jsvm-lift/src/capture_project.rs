@@ -18,7 +18,7 @@ pub struct CaptureSource {
     pub extra: Map<String, Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CaptureManifest {
     pub schema: String,
     pub source: CaptureSource,

@@ -511,7 +511,7 @@ impl Callable {
         self.dispatch == Some("wrapper")
     }
 
-    pub(super) fn capture_as_argument(&mut self) {
+    pub(super) const fn capture_as_argument(&mut self) {
         self.captured = true;
         self.detached = !self.bound && self.kind.needs_receiver();
     }
@@ -583,7 +583,7 @@ impl Callable {
         }
     }
 
-    pub(super) fn callable_as(&self, constructor: bool) -> bool {
+    pub(super) const fn callable_as(&self, constructor: bool) -> bool {
         self.kind.is_constructor() == constructor && !self.detached
     }
 }

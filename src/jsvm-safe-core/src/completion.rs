@@ -194,10 +194,6 @@ mod tests {
     use rolldown_redox::ecmascript::parse_program;
 
     fn live_expressions(source: &str) -> Vec<String> {
-        let allocator = Allocator::default();
-        let parsed = parse_program(&allocator, source, SourceType::cjs());
-        assert!(parsed.is_clean());
-        let analysis = CompletionLiveness::analyze(&parsed.program);
         struct Probe<'a> {
             source: &'a str,
             analysis: &'a CompletionLiveness,
@@ -212,6 +208,10 @@ mod tests {
                 walk::walk_expression_statement(self, node);
             }
         }
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let analysis = CompletionLiveness::analyze(&parsed.program);
         let mut probe = Probe {
             source,
             analysis: &analysis,

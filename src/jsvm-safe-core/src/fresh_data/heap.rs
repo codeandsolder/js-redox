@@ -486,7 +486,7 @@ impl OwnData {
     }
 
     fn length_value(value: &Option<Fact>) -> Option<u32> {
-        exact_u32(value.as_ref()?.primitive()?.number()?)
+        exact_u32(value.as_ref()?.primitive()?.number())
     }
 
     fn exact_length(&self) -> Option<u32> {
@@ -540,6 +540,12 @@ impl OwnData {
         }
     }
 }
+
+/// An ordinary lookup may be unproved or proved with an unknown data value.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct UnprovenLookup;
+
+pub(super) type Lookup = Result<Option<Fact>, UnprovenLookup>;
 
 /// Merge an arbitrary number of possible property values without
 /// repeatedly allocating growing sorted location unions. Preserve the
@@ -1109,12 +1115,12 @@ impl Environment {
         locations: &Locations,
         key: &str,
         budget: &WorkBudget,
-    ) -> Result<Option<Option<Fact>>, BudgetExceeded> {
+    ) -> Result<Lookup, BudgetExceeded> {
         let mut values = LookupValues::default();
         if self.visit_resolved_data(locations, key, budget, |value| values.add(value, budget))? {
-            Ok(Some(values.finish(budget)?))
+            Ok(Ok(values.finish(budget)?))
         } else {
-            Ok(None)
+            Ok(Err(UnprovenLookup))
         }
     }
 
@@ -1268,7 +1274,7 @@ mod tests {
         let receivers = Rc::from(receivers);
         // A sequential union would traverse more than 500,000 IDs.
         let bounded = WorkBudget::new("lookup-many-values", work_budget::BudgetLimits::work(32768));
-        let Some(Some(Fact::Objects(result))) = heap.read(&receivers, "x", &bounded)? else {
+        let Ok(Some(Fact::Objects(result))) = heap.read(&receivers, "x", &bounded)? else {
             unreachable!()
         };
         assert_eq!(result.len(), count);
@@ -1313,7 +1319,7 @@ mod tests {
         )?);
         assert!(matches!(
             heap.read(&locations, "x", &unlimited)?,
-            Some(None)
+            Ok(None)
         ));
         // An opaque path must still reject a write, even when earlier
         // paths have already established unknown ordinary data.
@@ -1404,7 +1410,7 @@ mod tests {
         assert!(heap.read(&locations, "x", &bounded).is_err());
         assert!(matches!(
             heap.read(&locations, "x", &unlimited)?,
-            Some(Some(Fact::Primitive(Value::Number(7.0))))
+            Ok(Some(Fact::Primitive(Value::Number(7.0))))
         ));
 
         let mut data = OwnData::new(AllocationKind::Ordinary);
@@ -1429,7 +1435,7 @@ mod tests {
             .is_err());
         assert!(matches!(
             heap.read(&locations, "key0", &unlimited)?,
-            Some(Some(Fact::Primitive(Value::Number(7.0))))
+            Ok(Some(Fact::Primitive(Value::Number(7.0))))
         ));
         drop(shared);
         let bounded = WorkBudget::new("weak-write-local", work_budget::BudgetLimits::work(128));
@@ -1441,7 +1447,7 @@ mod tests {
         )?);
         assert!(matches!(
             heap.read(&locations, "key0", &unlimited)?,
-            Some(None)
+            Ok(None)
         ));
         Ok(())
     }
@@ -1530,10 +1536,10 @@ mod tests {
         assert!(!Rc::ptr_eq(&heap.allocations, &changed.allocations));
         assert!(matches!(
             heap.read(locations, "x", &budget)?,
-            Some(Some(Fact::Primitive(Value::Number(7.0))))
+            Ok(Some(Fact::Primitive(Value::Number(7.0))))
         ));
         heap.join(&changed, 1, &budget)?;
-        assert!(matches!(heap.read(locations, "x", &budget)?, Some(None)));
+        assert!(matches!(heap.read(locations, "x", &budget)?, Ok(None)));
 
         let mut invalidated = heap.clone();
         invalidated.clear();
@@ -1629,7 +1635,7 @@ mod tests {
         };
         assert!(matches!(
             heap.read(locations, "x", &budget)?,
-            Some(Some(Fact::Primitive(Value::Number(7.0))))
+            Ok(Some(Fact::Primitive(Value::Number(7.0))))
         ));
         let mut invalidated = other.clone();
         invalidated.clear();

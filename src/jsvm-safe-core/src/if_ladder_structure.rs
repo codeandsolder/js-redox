@@ -91,7 +91,7 @@ fn comparison_number(expr: &Expression<'_>, strict: bool) -> Option<u64> {
     let value = eval(expr)?;
     match &value {
         Value::Number(number) => exact_u64(*number),
-        Value::String(_) | Value::Bool(_) if !strict => value.number().and_then(exact_u64),
+        Value::String(_) | Value::Bool(_) if !strict => exact_u64(value.number()),
         _ => None,
     }
 }

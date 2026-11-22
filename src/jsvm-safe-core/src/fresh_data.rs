@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 use work_budget::{BudgetExceeded, WorkBudget};
 
 mod heap;
-use heap::{value_weight, AllocationId, AllocationKind, Environment, Fact, Locations, OwnData};
+use heap::{value_weight, AllocationId, AllocationKind, Environment, Fact, Locations, Lookup, OwnData};
 
 enum Reference {
     Binding(SymbolId),
@@ -34,9 +34,9 @@ impl Reference {
         &self,
         environment: &Environment,
         budget: &WorkBudget,
-    ) -> Result<Option<Option<Fact>>, BudgetExceeded> {
+    ) -> Result<Lookup, BudgetExceeded> {
         match self {
-            Self::Binding(symbol) => Ok(Some(environment.read_binding(symbol, budget)?)),
+            Self::Binding(symbol) => Ok(Ok(environment.read_binding(symbol, budget)?)),
             Self::Member { locations, key } => environment.read(locations, key, budget),
         }
     }
@@ -275,7 +275,7 @@ impl Analyzer<'_> {
         key: Evaluation,
         environment: &mut Environment,
     ) -> Evaluation {
-        let Some(name) = key.primitive_value().and_then(Value::js_string) else {
+        let Some(name) = key.primitive_value().map(Value::js_string) else {
             return Self::barrier(environment);
         };
         let Some(Fact::Objects(locations)) = object.fact else {
@@ -285,7 +285,7 @@ impl Analyzer<'_> {
         // be read *after* key evaluation, including any effects on aliases.
         let Some(fact) = self
             .heap_result(environment.read(&locations, &name, self.budget))
-            .flatten()
+            .and_then(Result::ok)
         else {
             return Self::barrier(environment);
         };
@@ -333,7 +333,7 @@ impl Analyzer<'_> {
         environment: &mut Environment,
     ) -> Option<Reference> {
         let (object, key) = self.member_components(member, environment)?;
-        let key = key.primitive_value()?.js_string()?;
+        let key = key.primitive_value()?.js_string();
         let Fact::Objects(locations) = object.fact? else {
             return None;
         };
@@ -395,7 +395,7 @@ impl Analyzer<'_> {
 
         let Some(previous) = self
             .heap_result(reference.read(environment, self.budget))
-            .flatten()
+            .and_then(Result::ok)
         else {
             return Self::barrier(environment);
         };
@@ -471,9 +471,9 @@ impl Analyzer<'_> {
         };
         let Some(previous) = self
             .heap_result(reference.read(environment, self.budget))
+            .and_then(Result::ok)
             .flatten()
-            .flatten()
-            .and_then(|fact| fact.primitive()?.number())
+            .and_then(|fact| Some(fact.primitive()?.number()))
         else {
             return Self::barrier(environment);
         };
@@ -747,7 +747,7 @@ impl Analyzer<'_> {
                                     .as_expression()
                                     .map_or_default(|key| self.key(key, environment));
                                 inert &= result.inert;
-                                let key = result.primitive_value().and_then(Value::js_string);
+                                let key = result.primitive_value().map(Value::js_string);
                                 if key.is_none() {
                                     environment.clear();
                                     inert = false;

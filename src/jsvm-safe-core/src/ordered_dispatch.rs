@@ -255,7 +255,7 @@ impl Collector<'_, '_> {
         let mut default = None;
         let mut first = true;
         for case in &switch.cases {
-            let Some(test) = &case.test else {
+            let Some(case_label) = &case.test else {
                 default = Some(case);
                 continue;
             };
@@ -266,7 +266,7 @@ impl Collector<'_, '_> {
             write!(
                 text,
                 "if ({name} === ({}\n)) {{\n{}\n}}",
-                fragment(self.source, test.span()),
+                fragment(self.source, case_label.span()),
                 statement_text(self.source, &case.consequent)?
             )
             .ok()?;

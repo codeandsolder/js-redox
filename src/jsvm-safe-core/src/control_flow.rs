@@ -1443,21 +1443,22 @@ impl Collector<'_, '_> {
         let property = member.property.name.as_str();
         if self.stable_global_alias(&member.object) {
             return match property {
-                "Number" if call.arguments.len() == 1 => self
-                    .reference_state_eval(call.arguments[0].as_expression()?, env)?
-                    .number()
-                    .map(Value::Number),
+                "Number" if call.arguments.len() == 1 => Some(Value::Number(
+                    self.reference_state_eval(call.arguments[0].as_expression()?, env)?
+                        .number(),
+                )),
                 "parseInt" if matches!(call.arguments.len(), 1 | 2) => {
                     let value =
                         self.reference_state_eval(call.arguments[0].as_expression()?, env)?;
                     let radix = if call.arguments.len() == 2 {
-                        self.reference_state_eval(call.arguments[1].as_expression()?, env)?
-                            .number()
-                            .and_then(exact_u32)?
+                        exact_u32(
+                            self.reference_state_eval(call.arguments[1].as_expression()?, env)?
+                                .number(),
+                        )?
                     } else {
                         0
                     };
-                    js_parse_int(&value.js_string()?, radix).map(Value::Number)
+                    js_parse_int(&value.js_string(), radix).map(Value::Number)
                 }
                 _ => None,
             };
@@ -1474,7 +1475,7 @@ impl Collector<'_, '_> {
         }
         let value = self
             .reference_state_eval(call.arguments[0].as_expression()?, env)?
-            .number()?;
+            .number();
         let result = match property {
             "floor" => value.floor(),
             "ceil" => value.ceil(),

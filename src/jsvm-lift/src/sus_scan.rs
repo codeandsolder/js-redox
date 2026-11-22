@@ -207,7 +207,7 @@ impl Collector<'_> {
     }
 
     fn argument_static_string(arg: &Argument<'_>) -> Option<String> {
-        eval_static_primitive(arg.as_expression()?)?.js_string()
+        Some(eval_static_primitive(arg.as_expression()?)?.js_string())
     }
 
     fn identifier(expr: &Expression<'_>) -> Option<String> {

@@ -101,7 +101,7 @@ fn computed_key(expr: &Expression<'_>) -> Option<String> {
 fn module_id(expr: &Expression<'_>) -> Option<String> {
     match eval_static_primitive(expr)? {
         StaticPrimitiveValue::String(value) => Some(value),
-        value @ StaticPrimitiveValue::Number(_) => value.js_string(),
+        value @ StaticPrimitiveValue::Number(_) => Some(value.js_string()),
         _ => None,
     }
 }

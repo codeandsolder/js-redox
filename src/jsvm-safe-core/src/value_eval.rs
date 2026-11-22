@@ -20,7 +20,7 @@ use oxc_syntax::number::ToJsString;
 /// Signed numeric zero becomes "0"; the string "-0" remains distinct.
 #[must_use]
 pub fn canonical_array_index(value: &Value) -> Option<u32> {
-    canonical_array_index_key(&value.js_string()?)
+    canonical_array_index_key(&value.js_string())
 }
 
 pub fn canonical_array_index_key(key: &str) -> Option<u32> {
@@ -62,11 +62,13 @@ pub fn exact_computed_property_key(
     if let Expression::BigIntLiteral(literal) = expression {
         return Some(literal.value.to_string());
     }
-    primitive(expression)?.js_string()
+    Some(primitive(expression)?.js_string())
 }
 
 /// Canonical ECMAScript property identity, with an explicit computed-key
-/// evaluator. In particular, never treat a computed `RegExp` or object literal
+/// evaluator.
+///
+/// In particular, never treat a computed `RegExp` or object literal
 /// as a statically known name: `ToPrimitive` can invoke user code.
 #[must_use]
 pub fn exact_property_key(
@@ -127,25 +129,25 @@ impl Value {
     }
 
     #[must_use]
-    pub fn number(&self) -> Option<f64> {
+    pub fn number(&self) -> f64 {
         match self {
-            Self::Number(n) => Some(*n),
-            Self::Bool(v) => Some(if *v { 1.0 } else { 0.0 }),
-            Self::Null => Some(0.0),
-            Self::Undefined => Some(f64::NAN),
-            Self::String(s) => Some(s.as_str().string_to_number()),
+            Self::Number(n) => *n,
+            Self::Bool(v) => f64::from(u8::from(*v)),
+            Self::Null => 0.0,
+            Self::Undefined => f64::NAN,
+            Self::String(s) => s.as_str().string_to_number(),
         }
     }
 
     #[must_use]
-    pub fn js_string(&self) -> Option<String> {
-        Some(match self {
+    pub fn js_string(&self) -> String {
+        match self {
             Self::String(s) => s.clone(),
             Self::Number(n) => n.to_js_string(),
             Self::Bool(v) => (if *v { "true" } else { "false" }).to_string(),
             Self::Null => "null".into(),
             Self::Undefined => "undefined".into(),
-        })
+        }
     }
 
     #[must_use]
@@ -236,7 +238,7 @@ where
             let mut quasis = v.quasis.iter();
             let mut text = template_element_value(quasis.next()?)?;
             for expression in &v.expressions {
-                text.push_str(&eval_with_resolver(expression, resolve)?.js_string()?);
+                text.push_str(&eval_with_resolver(expression, resolve)?.js_string());
                 text.push_str(&template_element_value(quasis.next()?)?);
             }
             Some(Value::String(text))
@@ -332,11 +334,9 @@ pub fn eval_unary(v: &UnaryExpression<'_>) -> Option<Value> {
 pub fn eval_unary_value(op: &str, value: &Value) -> Option<Value> {
     match op {
         "!" => Some(Value::Bool(!value.truthy())),
-        "+" => value.number().map(Value::Number),
-        "-" => value.number().map(|x| Value::Number(-x)),
-        "~" => value
-            .number()
-            .map(|x| Value::Number(f64::from(!js_to_int32(x)))),
+        "+" => Some(Value::Number(value.number())),
+        "-" => Some(Value::Number(-value.number())),
+        "~" => Some(Value::Number(f64::from(!js_to_int32(value.number())))),
         "void" => Some(Value::Undefined),
         "typeof" => Some(Value::String(
             match value {
@@ -401,47 +401,47 @@ pub fn eval_binary(op: &str, left: &Value, right: &Value) -> Option<Value> {
             if matches!(left, Value::String(_)) || matches!(right, Value::String(_)) {
                 Some(Value::String(format!(
                     "{}{}",
-                    left.js_string()?,
-                    right.js_string()?
+                    left.js_string(),
+                    right.js_string()
                 )))
             } else {
-                Some(Value::Number(left.number()? + right.number()?))
+                Some(Value::Number(left.number() + right.number()))
             }
         }
-        "-" => Some(Value::Number(left.number()? - right.number()?)),
-        "*" => Some(Value::Number(left.number()? * right.number()?)),
-        "/" => Some(Value::Number(left.number()? / right.number()?)),
-        "%" => Some(Value::Number(left.number()? % right.number()?)),
+        "-" => Some(Value::Number(left.number() - right.number())),
+        "*" => Some(Value::Number(left.number() * right.number())),
+        "/" => Some(Value::Number(left.number() / right.number())),
+        "%" => Some(Value::Number(left.number() % right.number())),
         "**" => Some(Value::Number(crate::numeric::js_number_exponentiate(
-            left.number()?,
-            right.number()?,
+            left.number(),
+            right.number(),
         ))),
         "<<" => {
-            let shift = js_to_uint32(right.number()?) & 31;
+            let shift = js_to_uint32(right.number()) & 31;
             Some(Value::Number(f64::from(
-                js_to_int32(left.number()?).wrapping_shl(shift),
+                js_to_int32(left.number()).wrapping_shl(shift),
             )))
         }
         ">>" => {
-            let shift = js_to_uint32(right.number()?) & 31;
+            let shift = js_to_uint32(right.number()) & 31;
             Some(Value::Number(f64::from(
-                js_to_int32(left.number()?) >> shift,
+                js_to_int32(left.number()) >> shift,
             )))
         }
         ">>>" => {
-            let shift = js_to_uint32(right.number()?) & 31;
+            let shift = js_to_uint32(right.number()) & 31;
             Some(Value::Number(f64::from(
-                js_to_uint32(left.number()?) >> shift,
+                js_to_uint32(left.number()) >> shift,
             )))
         }
         "|" => Some(Value::Number(f64::from(
-            js_to_int32(left.number()?) | js_to_int32(right.number()?),
+            js_to_int32(left.number()) | js_to_int32(right.number()),
         ))),
         "^" => Some(Value::Number(f64::from(
-            js_to_int32(left.number()?) ^ js_to_int32(right.number()?),
+            js_to_int32(left.number()) ^ js_to_int32(right.number()),
         ))),
         "&" => Some(Value::Number(f64::from(
-            js_to_int32(left.number()?) & js_to_int32(right.number()?),
+            js_to_int32(left.number()) & js_to_int32(right.number()),
         ))),
         "===" => Some(Value::Bool(same_value(left, right))),
         "!==" => Some(Value::Bool(!same_value(left, right))),
@@ -463,8 +463,8 @@ pub fn eval_binary(op: &str, left: &Value, right: &Value) -> Option<Value> {
                     _ => unreachable!(),
                 }
             } else {
-                let a = left.number()?;
-                let b = right.number()?;
+                let a = left.number();
+                let b = right.number();
                 match op {
                     "<" => a < b,
                     "<=" => a <= b,

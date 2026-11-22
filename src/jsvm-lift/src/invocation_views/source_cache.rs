@@ -29,7 +29,7 @@ impl VerifiedSource {
         }
     }
 
-    fn retained_bytes(&self, sha: &str) -> usize {
+    const fn retained_bytes(&self, sha: &str) -> usize {
         self.text
             .capacity()
             .saturating_add(self.lines.retained_bytes())
