@@ -7,6 +7,7 @@ use super::{
     array_field, bool_field, compact_key, digest_id, field, nonempty_string_field,
     runtime_evidence::RuntimeInstances, GraphBuilder,
 };
+use crate::runtime_identity::session_name;
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
@@ -57,11 +58,11 @@ fn resolve_initiator(
     runtime_instances: &RuntimeInstances,
     budget: &WorkBudget,
 ) -> Result<InitiatorResolution> {
-    let session = nonempty_string_field(observation, "cdp_session").unwrap_or("main");
+    let session = session_name(observation.get("cdp_session"));
     let expected_sha = nonempty_string_field(observation, "initiator_runtime_sha256");
     if let Some(node) = primary
         .get("script_id")
-        .and_then(|id| runtime_instances.observed_node(session, id, expected_sha))
+        .and_then(|id| runtime_instances.observed_node(session?, id, expected_sha))
     {
         return Ok(InitiatorResolution {
             nodes: vec![node],
@@ -153,15 +154,23 @@ pub(super) fn seed_runtime_wasm_observations(
     runtime_instances: &RuntimeInstances,
     budget: &WorkBudget,
 ) -> Result<()> {
-    for observation in array_field(wasm_resource_provenance, "observations") {
+    for (ordinal, observation) in array_field(wasm_resource_provenance, "observations")
+        .iter()
+        .enumerate()
+    {
         budget.consume(1)?;
-        let session = nonempty_string_field(observation, "cdp_session").unwrap_or("main");
-        let key = compact_key((
+        let session = session_name(observation.get("cdp_session"));
+        let request = (
             session,
             field(observation, "request_id"),
             field(observation, "url"),
             field(observation, "sha256"),
-        ))?;
+        );
+        let key = if session.is_some() && !field(observation, "request_id").is_null() {
+            compact_key(request)?
+        } else {
+            compact_key((request, ordinal))?
+        };
         let observation_id = digest_id("runtime-wasm-request:", &key);
         let primary = observation.get("primary_initiator").unwrap_or(&Value::Null);
         let response = ObservedResponse::from_observation(observation, budget)?;
@@ -171,6 +180,7 @@ pub(super) fn seed_runtime_wasm_observations(
             json!({
                 "type":"runtime_wasm_request",
                 "cdp_session":session,
+                "cdp_session_claim":field(observation,"cdp_session_claim"),
                 "request_id":field(observation,"request_id"),
                 "url":field(observation,"url"),
                 "sha256":field(observation,"sha256"),
@@ -398,6 +408,31 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn missing_session_keeps_request_occurrences_without_main_instance_identity() -> Result<()> {
+        let mut index = RuntimeInstances::default();
+        index.register("main", "7", "body");
+        let mut graph = GraphBuilder::default();
+        let observation = json!({"request_id":"request","sha256":"wasm","url":"https://fixture.test/module.wasm","primary_initiator":{"script_id":"7"},"initiator_runtime_sha256":"body"});
+        let report = json!({"observations":[observation,observation]});
+        seed_runtime_wasm_observations(
+            &mut graph,
+            &report,
+            &index,
+            &WorkBudget::unlimited("unscoped-wasm"),
+        )?;
+        let requests = graph
+            .node_values()
+            .filter(|node| node["type"] == "runtime_wasm_request")
+            .collect::<Vec<_>>();
+        assert_eq!(requests.len(), 2);
+        assert!(requests
+            .iter()
+            .all(|node| node["cdp_session"].is_null() && node["exact_runtime_instance"] == false));
+        assert!(graph.edges().is_empty());
         Ok(())
     }
 

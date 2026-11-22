@@ -9,7 +9,7 @@ use super::{
 };
 use crate::{
     runtime_coverage::{PositiveCoverageWitness, RuntimeCoverageIndex},
-    runtime_identity::{script_id_text, IdentityState, ScriptIdentityIndex},
+    runtime_identity::{script_id_text, session_name, IdentityState, ScriptIdentityIndex},
 };
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -206,7 +206,7 @@ fn runtime_family_counts(runtime: &Value, field_name: &str) -> BTreeMap<String, 
 /// observation. Resolve source content and session-local instance independently.
 struct GenerationParent<'a> {
     frame: &'a Value,
-    session: &'a str,
+    session: Option<&'a str>,
 }
 
 impl GenerationParent<'_> {
@@ -227,7 +227,10 @@ impl GenerationParent<'_> {
             .frame
             .get("script_id")
             .and_then(script_id_text)
-            .and_then(|id| instances.lookup(self.session, &id));
+            .and_then(|id| {
+                self.session
+                    .and_then(|session| instances.lookup(session, &id))
+            });
         let claimed = self.claimed_digest();
         let (digest, basis) = match (registered, claimed) {
             (Some(IdentityState::Conflict), _) => {
@@ -279,10 +282,14 @@ fn add_runtime_generated_code_edges(
         let Some(frame) = chain.first() else {
             continue;
         };
-        let child_session = nonempty_string_field(origin, "cdp_session").unwrap_or("main");
+        let child_session = session_name(origin.get("cdp_session"));
         let parent = GenerationParent {
             frame,
-            session: nonempty_string_field(frame, "cdp_session").unwrap_or(child_session),
+            session: if frame.get("cdp_session").is_some() {
+                session_name(frame.get("cdp_session"))
+            } else {
+                child_session
+            },
         };
         let mut fields = json!({
             "origin_ordinal":ordinal,
@@ -291,7 +298,9 @@ fn add_runtime_generated_code_edges(
             "parent_event_count":field(frame,"parent_event_count"),
             "parent_event_digest_claims":field(frame,"parent_event_digest_claims"),
             "cdp_session":child_session,
+            "cdp_session_claim":field(origin,"cdp_session_claim"),
             "parent_cdp_session":parent.session,
+            "parent_cdp_session_claim":field(frame,"cdp_session"),
             "child_script_id":field(origin,"child_script_id"),
             "parent_script_id":field(frame,"script_id"),
             "claimed_parent_sha256":parent.claimed_digest(),
@@ -358,35 +367,28 @@ fn add_runtime_document_inline_edges(
     graph: &mut GraphBuilder,
     source: &Value,
     runtime_node: &str,
+    budget: &work_budget::WorkBudget,
 ) -> Result<()> {
-    for origin in array_field(source, "document_inline_origins") {
-        let document_key = compact_key((
-            field(origin, "cdp_session"),
-            field(origin, "url"),
-            field(origin, "frame_id"),
-        ))?;
-        let document_node = digest_id("runtime-document:", &document_key);
-        graph.intern_node(
-            document_node.clone(),
-            json!({
-                "type":"runtime_document",
-                "cdp_session":field(origin,"cdp_session"),
-                "url":field(origin,"url"),
-                "frame_id":field(origin,"frame_id"),
-            }),
-        )?;
-        graph.add_edge(
-            &document_node,
-            runtime_node,
-            "runtime_document_inline",
-            json!({
-                "script_id":field(origin,"script_id"),
-                "start_line":field(origin,"start_line"),
-                "start_column":field(origin,"start_column"),
-                "end_line":field(origin,"end_line"),
-                "end_column":field(origin,"end_column"),
-            }),
-        )?;
+    for (ordinal, origin) in array_field(source, "document_inline_origins")
+        .iter()
+        .enumerate()
+    {
+        budget.consume(1)?;
+        let session = session_name(origin.get("cdp_session"));
+        let frame_id = nonempty_string_field(origin, "frame_id");
+        let exact_context = session.is_some() && frame_id.is_some();
+        let fields = json!({"type":if exact_context {"runtime_document"} else {"runtime_document_reference"},"cdp_session":session,"cdp_session_claim":field(origin,"cdp_session_claim"),"url":field(origin,"url"),"frame_id":frame_id});
+        let document_node = if exact_context {
+            let key = compact_key((session, field(origin, "url"), frame_id))?;
+            let node = digest_id("runtime-document:", &key);
+            graph.intern_node(node.clone(), fields)?;
+            node
+        } else {
+            let node = format!("runtime-document-reference:{runtime_node}:{ordinal}");
+            graph.insert_node(node.clone(), fields)?;
+            node
+        };
+        graph.add_edge(&document_node,runtime_node,if exact_context {"runtime_document_inline"} else {"runtime_document_inline_candidate"},json!({"script_id":field(origin,"script_id"),"start_line":field(origin,"start_line"),"start_column":field(origin,"start_column"),"end_line":field(origin,"end_line"),"end_column":field(origin,"end_column"),"exact_session_frame_context":exact_context}))?;
     }
     Ok(())
 }
@@ -495,7 +497,7 @@ fn add_runtime_classification_edges(
             }
         }
         Some("document_inline_script") => {
-            add_runtime_document_inline_edges(graph, source, runtime_node)?;
+            add_runtime_document_inline_edges(graph, source, runtime_node, context.budget)?;
         }
         Some("alpine_expression") => {
             add_runtime_alpine_edges(graph, alpine, runtime_node, context.family_counts)?;
@@ -702,7 +704,7 @@ mod tests {
         let other = "e".repeat(64);
         let origin = |session: &str, script: &str, sha: Value| json!({"cdp_session":session,"child_script_id":"9","chain":[{"cdp_session":session,"script_id":script,"sha256":sha,"url":"https://fixture.test/parent.js"}]});
         let artifact = json!({"sources":[
-            {"sha256":child,"generated":{"origins":[origin("main","1",json!(parent)),origin("other","1",json!(absent)),origin("main","1",json!(other)),origin("main","2",json!(parent)),origin("main","1",Value::Null),origin("unknown","1",Value::Null),origin("unknown","1",json!(parent))]}},
+            {"sha256":child,"generated":{"origins":[origin("main","1",json!(parent)),origin("other","1",json!(absent)),origin("main","1",json!(other)),origin("main","2",json!(parent)),origin("main","1",Value::Null),origin("unknown","1",Value::Null),origin("unknown","1",json!(parent)),json!({"cdp_session":"main","chain":[{"cdp_session":null,"script_id":"1","sha256":parent}]})]}},
             {"sha256":parent,"script_instances":[{"cdp_session":"main","script_id":"1"},{"cdp_session":"main","script_id":"2"}]},
             {"sha256":other,"script_instances":[{"cdp_session":"main","script_id":"2"}]}
         ]});
@@ -724,12 +726,12 @@ mod tests {
             .values()
             .filter(|edge| edge["to"] == child_node)
             .collect::<Vec<_>>();
-        assert_eq!(edges.len(), 7);
+        assert_eq!(edges.len(), 8);
         let proven = edges
             .iter()
             .filter(|edge| edge["kind"] == "runtime_generated_code")
             .collect::<Vec<_>>();
-        assert_eq!(proven.len(), 3);
+        assert_eq!(proven.len(), 4);
         assert!(proven.iter().all(
             |edge| edge["from"] == parent_node && edge["exact_parent_source_identity"] == true
         ));

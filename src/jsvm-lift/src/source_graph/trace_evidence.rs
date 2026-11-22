@@ -8,9 +8,13 @@ use super::{
     array_field, field, nonempty_string_field, runtime_evidence::RuntimeInstances, u64_field,
     GraphBuilder,
 };
-use crate::trace_identity::same_observed_call_stack;
+use crate::{
+    runtime_identity::{script_id_text, session_name},
+    trace_identity::same_observed_call_stack,
+};
 use anyhow::Result;
 use serde_json::{json, Value};
+use std::borrow::Cow;
 use work_budget::WorkBudget;
 
 /// An inspector function definition is exact only for its session, script ID
@@ -19,7 +23,7 @@ fn add_observed_callable_definition(
     graph: &mut GraphBuilder,
     runtime_nodes: &RuntimeInstances,
     invocation_id: &str,
-    session: &str,
+    session: Option<&str>,
     value: &Value,
     observed_as: &str,
     label: &str,
@@ -30,7 +34,7 @@ fn add_observed_callable_definition(
     if nonempty_string_field(definition, "source_identity") != Some("exact") {
         return Ok(());
     }
-    let Some(script_id) = nonempty_string_field(definition, "scriptId") else {
+    let Some(script_id) = definition.get("scriptId").and_then(script_id_text) else {
         return Ok(());
     };
     let Some(sha) = nonempty_string_field(definition, "sourceSha256") else {
@@ -42,7 +46,9 @@ fn add_observed_callable_definition(
     ) else {
         return Ok(());
     };
-    let Some(expected) = runtime_nodes.exact_node(session, script_id, sha) else {
+    let Some(expected) =
+        session.and_then(|session| runtime_nodes.exact_node(session, &script_id, sha))
+    else {
         return Ok(());
     };
     graph.add_edge(
@@ -67,7 +73,7 @@ fn add_observed_callable_definition(
 
 struct ExactFrame<'a> {
     node: String,
-    script_id: &'a str,
+    script_id: Cow<'a, str>,
     sha: &'a str,
     location: &'a Value,
 }
@@ -84,16 +90,16 @@ impl ExactFrame<'_> {
 /// A source identity does not itself establish a particular coordinate.
 fn exact_runtime_frame_identity<'a>(
     frame: &'a Value,
-    session: &str,
+    session: Option<&str>,
     instances: &RuntimeInstances,
 ) -> Option<ExactFrame<'a>> {
     if nonempty_string_field(frame, "source_identity") != Some("exact") {
         return None;
     }
     let location = frame.get("location")?;
-    let script_id = nonempty_string_field(location, "scriptId")?;
+    let script_id = location.get("scriptId").and_then(script_id_text)?;
     let sha = nonempty_string_field(frame, "sourceSha256")?;
-    let node = instances.exact_node(session, script_id, sha)?;
+    let node = instances.exact_node(session?, &script_id, sha)?;
     Some(ExactFrame {
         node,
         script_id,
@@ -105,7 +111,7 @@ fn exact_runtime_frame_identity<'a>(
 fn add_observed_pause_frames(
     graph: &mut GraphBuilder,
     hit: &Value,
-    session: &str,
+    session: Option<&str>,
     node_id: &str,
     runtime_node_by_instance: &RuntimeInstances,
     budget: &WorkBudget,
@@ -137,7 +143,7 @@ fn add_observed_steps(
     graph: &mut GraphBuilder,
     hit: &Value,
     ordinal: usize,
-    session: &str,
+    session: Option<&str>,
     node_id: &str,
     runtime_node_by_instance: &RuntimeInstances,
     budget: &WorkBudget,
@@ -205,7 +211,7 @@ fn add_observed_steps(
 fn exact_guard_identity<'a>(
     guard: &Value,
     step: &'a Value,
-    session: &str,
+    session: Option<&str>,
     instances: &RuntimeInstances,
     budget: &WorkBudget,
 ) -> Result<Option<ExactFrame<'a>>> {
@@ -219,7 +225,8 @@ fn exact_guard_identity<'a>(
         return Ok(None);
     };
     if frame.coordinates().is_none()
-        || nonempty_string_field(guard, "script_id") != Some(frame.script_id)
+        || guard.get("script_id").and_then(script_id_text).as_deref()
+            != Some(frame.script_id.as_ref())
         || nonempty_string_field(guard, "source_sha256") != Some(frame.sha)
     {
         return Ok(None);
@@ -251,7 +258,7 @@ fn add_observed_guard_witnesses(
     graph: &mut GraphBuilder,
     hit: &Value,
     ordinal: usize,
-    session: &str,
+    session: Option<&str>,
     instances: &RuntimeInstances,
     budget: &WorkBudget,
 ) -> Result<()> {
@@ -335,7 +342,7 @@ fn add_observed_guard_witnesses(
 fn add_observed_callable_witnesses(
     graph: &mut GraphBuilder,
     hit: &Value,
-    session: &str,
+    session: Option<&str>,
     node_id: &str,
     runtime_node_by_instance: &RuntimeInstances,
     budget: &WorkBudget,
@@ -411,7 +418,7 @@ pub(super) fn seed_selective_trace_witnesses(
                 "concrete_observation_only":true,
             }),
         )?;
-        let session = nonempty_string_field(hit, "cdpSession").unwrap_or("main");
+        let session = session_name(hit.get("cdpSession"));
         add_observed_pause_frames(
             graph,
             hit,
@@ -455,6 +462,48 @@ mod tests {
     use super::super::runtime_evidence::seed_runtime_script_evidence;
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn unscoped_trace_hits_retain_observations_without_main_source_proof() -> Result<()> {
+        let digest = "a".repeat(64);
+        let frame = json!({"source_identity":"exact","sourceSha256":digest,"location":{"scriptId":7,"lineNumber":1,"columnNumber":2}});
+        let hit = |session: Value| json!({"cdpSession":session,"frames":[frame],"steps":[{"frames":[frame]}]});
+        let mut absent = hit(Value::Null);
+        absent
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("fixture hit"))?
+            .remove("cdpSession");
+        let trace = json!({"hits":[hit(json!("main")),hit(json!(true)),hit(json!("")),absent]});
+        let mut index = RuntimeInstances::default();
+        index.register("main", "7", &digest);
+        let mut graph = GraphBuilder::default();
+        seed_selective_trace_witnesses(
+            &mut graph,
+            &trace,
+            &index,
+            &WorkBudget::unlimited("unscoped-trace"),
+        )?;
+        for ordinal in 0..4 {
+            let invocation = format!("observed-invocation:{ordinal}");
+            let step = format!("observed-step:{ordinal}:0");
+            assert!(graph.node(&invocation).is_some());
+            assert!(graph.node(&step).is_some());
+            assert!(graph.edges().values().any(|edge| edge["from"] == invocation
+                && edge["to"] == step
+                && edge["kind"] == "observed_next_step"));
+            assert_eq!(
+                graph
+                    .edges()
+                    .values()
+                    .filter(|edge| (edge["to"] == invocation
+                        && edge["kind"] == "observed_paused_call_frame")
+                        || (edge["to"] == step && edge["kind"] == "observed_executed_location"))
+                    .count(),
+                if ordinal == 0 { 2 } else { 0 }
+            );
+        }
+        Ok(())
+    }
 
     fn conflicting_runtime_instance_fixture() -> (String, Value, Value) {
         let first = "a".repeat(64);
@@ -615,16 +664,18 @@ mod tests {
         let mut hit = trace["hits"][1].clone();
         let guard = hit["observed_guard_witnesses"][0].clone();
         let step = hit["steps"][0].clone();
-        assert!(exact_guard_identity(&guard, &step, "other", &index, &budget)?.is_some());
+        assert!(exact_guard_identity(&guard, &step, Some("other"), &index, &budget)?.is_some());
         let mut wrong = guard.clone();
         wrong["source_sha256"] = json!(format!("{}{}", &sha[..20], "c".repeat(44)));
-        assert!(exact_guard_identity(&wrong, &step, "other", &index, &budget)?.is_none());
+        assert!(exact_guard_identity(&wrong, &step, Some("other"), &index, &budget)?.is_none());
         let mut wrong = guard.clone();
         wrong["observed_value"] = json!(false);
-        assert!(exact_guard_identity(&wrong, &step, "other", &index, &budget)?.is_none());
+        assert!(exact_guard_identity(&wrong, &step, Some("other"), &index, &budget)?.is_none());
         let mut wrong_step = step.clone();
         wrong_step["frames"][0]["location"]["lineNumber"] = Value::Null;
-        assert!(exact_guard_identity(&guard, &wrong_step, "other", &index, &budget)?.is_none());
+        assert!(
+            exact_guard_identity(&guard, &wrong_step, Some("other"), &index, &budget)?.is_none()
+        );
         hit["steps"][1]["frames"][0]["functionLocation"]["lineNumber"] = json!(9);
         seed_selective_trace_witnesses(&mut graph, &json!({"hits":[hit]}), &index, &budget)?;
         assert!(graph
@@ -636,7 +687,7 @@ mod tests {
             .values()
             .any(|edge| edge["kind"] == "observed_next_pause_in_selected_arm"));
         let limited = WorkBudget::new("guard-budget", work_budget::BudgetLimits::work(0));
-        assert!(exact_guard_identity(&guard, &step, "other", &index, &limited).is_err());
+        assert!(exact_guard_identity(&guard, &step, Some("other"), &index, &limited).is_err());
         Ok(())
     }
 }

@@ -3,7 +3,7 @@
 //! Zero/absent coverage is deliberately not evidence of non-execution.
 use crate::{
     analysis_artifacts::{write_artifact, EXECUTION_COVERAGE},
-    runtime_identity::{script_id_text, IdentityState, ScriptIdentityIndex},
+    runtime_identity::{script_id_text, session_name, IdentityState, ScriptIdentityIndex},
 };
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
@@ -59,7 +59,7 @@ impl CoverageIndex {
         let mut script_rows = Vec::new();
         for session in sessions {
             budget.consume(1)?;
-            let name = nonempty_text(session.get("cdpSession"))
+            let name = session_name(session.get("cdpSession"))
                 .context("execution coverage session missing cdpSession")?;
             if !seen_sessions.insert(name.to_owned()) {
                 bail!("duplicate execution coverage session: {name}");

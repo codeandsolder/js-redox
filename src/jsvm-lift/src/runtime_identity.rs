@@ -9,6 +9,12 @@ pub(crate) fn script_id_text(value: &serde_json::Value) -> Option<std::borrow::C
     }
 }
 
+/// A session is an explicit nonempty recorder label, never a default or an ID
+/// obtained by stringifying arbitrary JSON. Missing labels cannot join scripts.
+pub(crate) fn session_name(value: Option<&Value>) -> Option<&str> {
+    nonempty_text(value).filter(|session| !session.trim().is_empty())
+}
+
 use anyhow::{Context, Result};
 use serde_json::{Map, Value};
 use std::collections::{btree_map::Entry, BTreeMap};
@@ -100,7 +106,7 @@ impl<T: Eq> ScriptIdentityIndex<T> {
             };
             for instance in rows(source, "script_instances") {
                 budget.consume(1)?;
-                let Some(session) = nonempty_text(instance.get("cdp_session")) else {
+                let Some(session) = session_name(instance.get("cdp_session")) else {
                     continue;
                 };
                 let Some(script) = instance.get("script_id").and_then(script_id_text) else {
@@ -113,7 +119,7 @@ impl<T: Eq> ScriptIdentityIndex<T> {
         }
         for conflict in rows(report, "script_identity_conflicts") {
             budget.consume(1)?;
-            let session = nonempty_text(conflict.get("cdp_session"))
+            let session = session_name(conflict.get("cdp_session"))
                 .context("runtime identity conflict missing CDP session")?;
             let script = conflict
                 .get("script_id")

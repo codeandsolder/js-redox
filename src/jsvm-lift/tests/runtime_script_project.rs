@@ -152,6 +152,7 @@ fn recorder_runtime_provenance_flows_into_source_graph() -> Result<()> {
             let source = *source;
             let sha = digest(source);
             json!({
+                "cdpSession":"main",
                 "scriptId": (index + 1).to_string(),
                 "executionContextId": 1,
                 "url": if source == network {
