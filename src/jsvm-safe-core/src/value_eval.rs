@@ -277,47 +277,93 @@ where
 }
 
 /// A literal expression whose complete evaluation cannot access bindings,
-/// invoke user code, or throw. Fresh array/RegExp/object allocations have
-/// no externally visible effect until their values escape.
+/// invoke user code, or throw. Proving effects does not require proving the
+/// exact returned value (for example implementation-approximated powers).
 pub fn inert_literal_value(expr: &Expression<'_>) -> bool {
+    inert_literal_kind(expr).is_some()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InertKind {
+    /// A primitive accepted by ordinary primitive numeric/string coercion, including
+    /// strings with lone surrogates and unknown approximated numeric results.
+    NonBigIntPrimitive,
+    /// An inert value that may be `BigInt` or an object. Its coercion might
+    /// throw or call user code even though obtaining the value is inert.
+    Other,
+}
+
+impl InertKind {
+    const fn join(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::NonBigIntPrimitive, Self::NonBigIntPrimitive) => Self::NonBigIntPrimitive,
+            _ => Self::Other,
+        }
+    }
+}
+
+fn inert_literal_kind(expr: &Expression<'_>) -> Option<InertKind> {
+    use InertKind::{NonBigIntPrimitive, Other};
     match expr {
         Expression::StringLiteral(_)
         | Expression::NumericLiteral(_)
-        | Expression::BigIntLiteral(_)
-        | Expression::RegExpLiteral(_)
         | Expression::NullLiteral(_)
-        | Expression::BooleanLiteral(_) => true,
-        Expression::TemplateLiteral(template) => template.expressions.is_empty(),
-        Expression::ArrayExpression(array) => array.elements.iter().all(inert_array_element),
-        Expression::ObjectExpression(object) => object.properties.is_empty(),
-        Expression::ParenthesizedExpression(paren) => inert_literal_value(&paren.expression),
-        Expression::UnaryExpression(unary)
-            if matches!(unary.operator.as_str(), "!" | "void" | "typeof") =>
-        {
-            inert_literal_value(&unary.argument)
-        }
-        Expression::UnaryExpression(unary)
-            if matches!(unary.operator.as_str(), "+" | "-" | "~") =>
-        {
-            inert_literal_value(&unary.argument) && eval(&unary.argument).is_some()
+        | Expression::BooleanLiteral(_) => Some(NonBigIntPrimitive),
+        Expression::BigIntLiteral(_) | Expression::RegExpLiteral(_) => Some(Other),
+        Expression::TemplateLiteral(template) => template
+            .expressions
+            .iter()
+            .all(|expression| inert_literal_kind(expression) == Some(NonBigIntPrimitive))
+            .then_some(NonBigIntPrimitive),
+        Expression::ArrayExpression(array) => array
+            .elements
+            .iter()
+            .all(inert_array_element)
+            .then_some(Other),
+        Expression::ObjectExpression(object) => object.properties.is_empty().then_some(Other),
+        Expression::ParenthesizedExpression(paren) => inert_literal_kind(&paren.expression),
+        Expression::UnaryExpression(unary) => {
+            let kind = inert_literal_kind(&unary.argument)?;
+            match unary.operator.as_str() {
+                "!" | "void" | "typeof" => Some(NonBigIntPrimitive),
+                "+" | "-" | "~" if kind == NonBigIntPrimitive => Some(NonBigIntPrimitive),
+                _ => None,
+            }
         }
         Expression::BinaryExpression(binary) => {
-            inert_literal_value(&binary.left)
-                && inert_literal_value(&binary.right)
-                && eval(expr).is_some()
+            let left = inert_literal_kind(&binary.left)?;
+            let right = inert_literal_kind(&binary.right)?;
+            match binary.operator.as_str() {
+                "===" | "!==" => Some(NonBigIntPrimitive),
+                // Coercion of ordinary primitive values has no callbacks or
+                // language-level arithmetic errors. This must not be extended
+                // to arbitrary BigInts or object operands.
+                "+" | "-" | "*" | "/" | "%" | "**" | "<<" | ">>" | ">>>" | "&" | "|" | "^"
+                | "==" | "!=" | "<" | "<=" | ">" | ">="
+                    if left == NonBigIntPrimitive && right == NonBigIntPrimitive =>
+                {
+                    Some(NonBigIntPrimitive)
+                }
+                _ => None,
+            }
         }
         Expression::LogicalExpression(logical) => {
-            inert_literal_value(&logical.left) && inert_literal_value(&logical.right)
+            let left = inert_literal_kind(&logical.left)?;
+            let right = inert_literal_kind(&logical.right)?;
+            Some(left.join(right))
         }
         Expression::ConditionalExpression(conditional) => {
-            inert_literal_value(&conditional.test)
-                && inert_literal_value(&conditional.consequent)
-                && inert_literal_value(&conditional.alternate)
+            inert_literal_kind(&conditional.test)?;
+            let yes = inert_literal_kind(&conditional.consequent)?;
+            let no = inert_literal_kind(&conditional.alternate)?;
+            Some(yes.join(no))
         }
         Expression::SequenceExpression(sequence) => {
-            sequence.expressions.iter().all(inert_literal_value)
+            let mut expressions = sequence.expressions.iter();
+            let first = inert_literal_kind(expressions.next()?)?;
+            expressions.try_fold(first, |_, expression| inert_literal_kind(expression))
         }
-        _ => false,
+        _ => None,
     }
 }
 
@@ -594,6 +640,58 @@ mod tests {
                 (Some("__proto__".into()), false),
             ]
         );
+    }
+
+    #[test]
+    fn literal_effect_proof_is_independent_of_exact_value() {
+        use oxc_allocator::Allocator;
+        use oxc_ast::ast::Statement;
+        use oxc_span::SourceType;
+
+        for (expression, inert) in [
+            ("2 ** 1.5", true),
+            ("(2 ** 1.5) + (3 ** 2.5)", true),
+            ("+(2 ** 1.5)", true),
+            ("(2 ** 1.5) < 7", true),
+            ("(true ? 2 ** 1.5 : 1) * 2", true),
+            ("(false || 2 ** 1.5) * 2", true),
+            ("([], 2 ** 1.5) | 1", true),
+            ("[2 ** 1.5]", true),
+            ("void (2 ** 1.5)", true),
+            (r#"+'\ud800'"#, true),
+            ("[] === {}", true),
+            ("1n !== 0", true),
+            ("!1n", true),
+            ("`value=${2 ** 1.5}`", true),
+            ("1n / 0n", false),
+            ("2n ** (-1n)", false),
+            ("1n + 1", false),
+            ("+1n", false),
+            ("[] + 1", false),
+            ("({}) == 0", false),
+            ("1 instanceof 2", false),
+            ("'x' in 0", false),
+            ("[...[]]", false),
+            ("void effect()", false),
+            ("`value=${{}}`", false),
+            ("(false ? 1 : 2n) * 2", false),
+        ] {
+            let allocator = Allocator::default();
+            let source = format!("({expression});");
+            let program = crate::parse_as(&allocator, &source, SourceType::cjs())
+                .unwrap_or_else(|| unreachable!("{source}"));
+            let [Statement::ExpressionStatement(statement)] = program.body.as_slice() else {
+                unreachable!("one expression");
+            };
+            assert_eq!(
+                super::inert_literal_value(&statement.expression),
+                inert,
+                "{expression}"
+            );
+            if expression == "2 ** 1.5" {
+                assert!(super::eval(&statement.expression).is_none());
+            }
+        }
     }
 
     #[test]
