@@ -903,6 +903,23 @@ fn depythonify_safe_deob_fixed_rotation_runtime_equivalence() -> Result<()> {
     script_runtime_equivalence(&refs, "fixed-rotation", false)
 }
 
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_decoder_number_runtime_equivalence() -> Result<()> {
+    let prefix = "function p(){var t=['a','b','c'];p=function(){return t;};return p();}";
+    let sources = [
+        ("16","['0x10','+0x10','0b10000','0o20','1.6e1','16.00','16.5','Infinity','NaN'].map(x=>d(x))"),
+        ("-16","d('-0x10')"),
+        ("0","[d(null),d(true),d(false),d(''),d('  '),d(void 0),d(-0),d(1+1)]"),
+        ("9007199254740992","[d('9007199254740993'),d(9007199254740994)]"),
+        ("16","[d('0x10'),d('+0x10'),d('0b10000'),d('0o20'),d('1.6e1'),d('16.00'),d('16.5'),d('Infinity'),d('NaN')]"),
+        ("16","[d((events.push('test'),true)?'0x10':'17.0'),d((events.push('test2'),false)?'0x10':'17.0')]"),
+        ("0","d((events.push('keep'),0))"),
+    ].into_iter().map(|(offset, expression)|format!("{prefix}function d(i,t,v){{return i=i-({offset}),t=p(),v=t[i],v;}}{expression};")).collect::<Vec<_>>();
+    let refs = sources.iter().map(String::as_str).collect::<Vec<_>>();
+    script_runtime_equivalence(&refs, "decoder-number", false)
+}
+
 fn script_runtime_equivalence(sources: &[&str], suite: &str, browser_globals: bool) -> Result<()> {
     let scratch = TempDir::new()?;
     // Browser decoders assume standard atob. Node's isolated VM does not
