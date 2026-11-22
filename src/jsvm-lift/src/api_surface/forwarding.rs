@@ -455,9 +455,7 @@ pub(super) fn specialize<'a>(
     let mut args = builder.call(site.arguments)?;
     let mut witnesses = Vec::new();
     let mut dependencies = BTreeSet::new();
-    if builder.used_iterator {
-        dependencies.insert("rest_iterator".into());
-    }
+    builder.record_dependencies(&mut dependencies);
     let mut visited = BTreeSet::new();
     let mut constructor = site.constructor;
     let mut captured_target = false;
@@ -558,9 +556,7 @@ pub(super) fn specialize<'a>(
             if let Some(mut callable) =
                 forwarded_dispatch(target, forwarded, &next_args, sink, &mut builder, &context)?
             {
-                if builder.used_iterator {
-                    dependencies.insert("rest_iterator".into());
-                }
+                builder.record_dependencies(&mut dependencies);
                 callable.mark_forwarding(&witnesses, sink);
                 collector.emit_forwarded(site.callee, &callable, site.span, &dependencies);
                 return Ok(());
@@ -569,9 +565,7 @@ pub(super) fn specialize<'a>(
         let Some(target_expr) = builder.expression(target)?.expression() else {
             return Ok(());
         };
-        if builder.used_iterator {
-            dependencies.insert("rest_iterator".into());
-        }
+        builder.record_dependencies(&mut dependencies);
         captured_target = !std::ptr::eq(target, target_expr);
         args = next_args;
         callee = target_expr;

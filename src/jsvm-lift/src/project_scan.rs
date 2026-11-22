@@ -139,6 +139,311 @@ fn direct_summary(report: &ScanReport) -> Map<String, Value> {
     summary
 }
 
+struct GeneratedPaths {
+    string_tmp: PathBuf,
+    string_report: PathBuf,
+    deob_report: PathBuf,
+    safe_rel: PathBuf,
+    safe_dest: PathBuf,
+    readable_rel: PathBuf,
+    readable_dest: PathBuf,
+}
+
+impl GeneratedPaths {
+    fn create(project: &Path, scan_id: usize, ordinal: usize) -> Result<Self> {
+        let recovery_rel =
+            PathBuf::from("analysis/generated-recovery").join(format!("{scan_id:04}-{ordinal:03}"));
+        let recovery_dir = project.join(&recovery_rel);
+        fs::create_dir_all(&recovery_dir)
+            .with_context(|| format!("creating {}", recovery_dir.display()))?;
+        let string_tmp = recovery_dir.join("string-recovered.js");
+        let string_report = recovery_dir.join("string-recovery.json");
+        let deob_report = recovery_dir.join("deobfuscation.json");
+        let safe_rel = generated_output_path("_dynamic_deobfuscated", scan_id, ordinal);
+        let safe_dest = project.join(&safe_rel);
+        let readable_rel = generated_output_path("_dynamic", scan_id, ordinal);
+        let readable_dest = project.join(&readable_rel);
+        if let Some(parent) = safe_dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        if let Some(parent) = readable_dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        Ok(Self {
+            string_tmp,
+            string_report,
+            deob_report,
+            safe_rel,
+            safe_dest,
+            readable_rel,
+            readable_dest,
+        })
+    }
+}
+
+struct StringSelection {
+    input_path: PathBuf,
+    changed: bool,
+}
+
+#[derive(Clone, Copy)]
+enum AnalysisStage {
+    SafeDeobfuscation,
+    StringRecoveryOnly,
+    ExactFallback,
+}
+
+impl AnalysisStage {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::SafeDeobfuscation => "safe_deobfuscation",
+            Self::StringRecoveryOnly => "string_recovery_only",
+            Self::ExactFallback => "exact_fallback",
+        }
+    }
+}
+
+struct AnalysisSelection {
+    relative_path: PathBuf,
+    stage: AnalysisStage,
+}
+
+struct GeneratedRecovery<'a> {
+    project: &'a Path,
+    raw: &'a Path,
+    raw_rel: &'a str,
+    budget: &'a WorkBudget,
+    paths: GeneratedPaths,
+    row: Value,
+    raw_sha: String,
+}
+
+impl<'a> GeneratedRecovery<'a> {
+    fn new(
+        project: &'a Path,
+        raw: &'a Path,
+        raw_rel: &'a str,
+        scan_id: usize,
+        ordinal: usize,
+        budget: &'a WorkBudget,
+    ) -> Result<Self> {
+        let paths = GeneratedPaths::create(project, scan_id, ordinal)?;
+        let raw_sha = sha256_path(raw)?;
+        let row = json!({
+            "parent_scan_id": scan_id,
+            "ordinal": ordinal,
+            "raw_path": raw_rel,
+            "raw_sha256": raw_sha,
+            "string_recovery_report": relative_string(project, &paths.string_report)?,
+            "deobfuscation_report": relative_string(project, &paths.deob_report)?,
+        });
+
+        Ok(Self {
+            project,
+            raw,
+            raw_rel,
+            budget,
+            paths,
+            row,
+            raw_sha,
+        })
+    }
+
+    fn recover_strings(&mut self) -> Result<StringSelection> {
+        let raw_source = fs::read_to_string(self.raw)
+            .with_context(|| format!("reading {}", self.raw.display()))?;
+        if crate::sha256_hex(raw_source.as_bytes()) != self.raw_sha {
+            bail!(
+                "generated string recovery input hash mismatch for {}",
+                self.raw.display()
+            );
+        }
+        let string_budget = AnalysisOperation::StaticStringRecovery
+            .under(self.budget, self.raw.display().to_string());
+        match recover_static_strings(
+            &raw_source,
+            self.raw.display().to_string(),
+            SourceMode::Auto,
+            8,
+            &string_budget,
+        ) {
+            Ok(string_outcome) => {
+                crate::report_file::write_text(&self.paths.string_tmp, &string_outcome.source)?;
+                write_json(&self.paths.string_report, &string_outcome.report)?;
+                let output_sha = crate::sha256_hex(string_outcome.source.as_bytes());
+                let string_ok = string_outcome
+                    .report
+                    .get("safe_static_only")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                    && string_outcome
+                        .report
+                        .get("input_sha256")
+                        .and_then(Value::as_str)
+                        == Some(self.raw_sha.as_str())
+                    && string_outcome
+                        .report
+                        .get("output_sha256")
+                        .and_then(Value::as_str)
+                        == Some(output_sha.as_str());
+                if !string_ok {
+                    bail!(
+                        "generated string-recovery provenance/hash validation failed for {}",
+                        self.raw.display()
+                    );
+                }
+                let string_changed = string_outcome
+                    .report
+                    .get("changed")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                self.row["string_recovery"] = json!({
+                    "exit": 0,
+                    "changed": string_changed,
+                    "replacements": value_usize(&string_outcome.report, "replacements"),
+                    "output_sha256": output_sha,
+                });
+                Ok(StringSelection {
+                    input_path: self.paths.string_tmp.clone(),
+                    changed: string_changed,
+                })
+            }
+            Err(error) => {
+                let error = recoverable_unit_error(anyhow::Error::new(error))?;
+                self.row["string_recovery_report"] = Value::Null;
+                self.row["string_recovery"] = json!({
+                    "exit": 1,
+                    "changed": false,
+                    "error": error.to_string(),
+                });
+                Ok(StringSelection {
+                    input_path: self.raw.to_path_buf(),
+                    changed: false,
+                })
+            }
+        }
+    }
+
+    fn recover_analysis(&mut self, strings: &StringSelection) -> Result<AnalysisSelection> {
+        let selected = &strings.input_path;
+        let selected_source = fs::read_to_string(selected)
+            .with_context(|| format!("reading {}", selected.display()))?;
+        let selected_sha = sha256_path(selected)?;
+        let deob_budget =
+            AnalysisOperation::SafeDeobfuscation.under(self.budget, selected.display().to_string());
+        let deob = deobfuscate_source(
+            &selected_source,
+            selected.display().to_string(),
+            SourceMode::Auto,
+            16,
+            false,
+            &deob_budget,
+        );
+        match deob {
+            Ok(outcome) => {
+                let output_sha = crate::sha256_hex(outcome.source.as_bytes());
+                if outcome.report.input_sha256 != selected_sha
+                    || outcome.report.output_sha256 != output_sha
+                    || !outcome.report.guarantees.safe_static_only
+                    || !outcome
+                        .report
+                        .guarantees
+                        .runtime_semantics_preserved_by_design
+                    || outcome.report.guarantees.presentation_formatted
+                {
+                    bail!(
+                        "safe deobfuscation provenance invariant failed for {}",
+                        selected.display()
+                    );
+                }
+                crate::report_file::write_text(&self.paths.safe_dest, &outcome.source)?;
+                write_json(&self.paths.deob_report, &outcome.report)?;
+                self.row["deobfuscation"] = json!({
+                    "exit": 0,
+                    "changed": outcome.report.changed,
+                    "iterations": outcome.report.iterations,
+                    "transforms": outcome.report.transforms,
+                    "output_sha256": output_sha,
+                });
+                Ok(AnalysisSelection {
+                    relative_path: self.paths.safe_rel.clone(),
+                    stage: AnalysisStage::SafeDeobfuscation,
+                })
+            }
+            Err(error) => {
+                let error = recoverable_unit_error(error)?;
+                self.row["deobfuscation_report"] = Value::Null;
+                self.row["deobfuscation"] =
+                    json!({"exit": 1, "changed": false, "error": error.to_string()});
+                if strings.changed {
+                    link_or_copy(&self.paths.string_tmp, &self.paths.safe_dest)?;
+                    Ok(AnalysisSelection {
+                        relative_path: self.paths.safe_rel.clone(),
+                        stage: AnalysisStage::StringRecoveryOnly,
+                    })
+                } else {
+                    Ok(AnalysisSelection {
+                        relative_path: PathBuf::from(self.raw_rel),
+                        stage: AnalysisStage::ExactFallback,
+                    })
+                }
+            }
+        }
+    }
+
+    fn publish(mut self, selection: &AnalysisSelection) -> Result<Value> {
+        let analysis_source = self.project.join(&selection.relative_path);
+        let exact = fs::read_to_string(&analysis_source)
+            .with_context(|| format!("reading {}", analysis_source.display()))?;
+        let format_budget =
+            AnalysisOperation::Format.under(self.budget, analysis_source.display().to_string());
+        let formatted = format_source(&exact, &format_budget);
+        let (readable, readable_formatted, format_error) = match formatted {
+            Ok(formatted) => (formatted, true, None),
+            Err(error) => {
+                let error = recoverable_unit_error(error)?;
+                (exact, false, Some(error.to_string()))
+            }
+        };
+        crate::report_file::write_text(&self.paths.readable_dest, &readable)?;
+        let object = self
+            .row
+            .as_object_mut()
+            .context("generated recovery row must be an object")?;
+        object.insert("selected_stage".into(), selection.stage.name().into());
+        object.insert(
+            "analysis_path".into(),
+            selection
+                .relative_path
+                .to_string_lossy()
+                .into_owned()
+                .into(),
+        );
+        object.insert(
+            "analysis_sha256".into(),
+            sha256_path(&analysis_source)?.into(),
+        );
+        object.insert(
+            "readable_path".into(),
+            self.paths
+                .readable_rel
+                .to_string_lossy()
+                .into_owned()
+                .into(),
+        );
+        object.insert("readable_formatted".into(), readable_formatted.into());
+        object.insert(
+            "readable_sha256".into(),
+            sha256_path(&self.paths.readable_dest)?.into(),
+        );
+        if let Some(error) = format_error {
+            object.insert("readable_format_error".into(), error.into());
+        }
+        Ok(self.row)
+    }
+}
+
 fn recover_generated_unit(
     project: &Path,
     raw: &Path,
@@ -147,195 +452,11 @@ fn recover_generated_unit(
     ordinal: usize,
     parent_budget: &WorkBudget,
 ) -> Result<Value> {
-    let recovery_rel =
-        PathBuf::from("analysis/generated-recovery").join(format!("{scan_id:04}-{ordinal:03}"));
-    let recovery_dir = project.join(&recovery_rel);
-    fs::create_dir_all(&recovery_dir)
-        .with_context(|| format!("creating {}", recovery_dir.display()))?;
-    let string_tmp = recovery_dir.join("string-recovered.js");
-    let string_report = recovery_dir.join("string-recovery.json");
-    let deob_report = recovery_dir.join("deobfuscation.json");
-    let safe_rel = generated_output_path("_dynamic_deobfuscated", scan_id, ordinal);
-    let safe_dest = project.join(&safe_rel);
-    let readable_rel = generated_output_path("_dynamic", scan_id, ordinal);
-    let readable_dest = project.join(&readable_rel);
-    if let Some(parent) = safe_dest.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    if let Some(parent) = readable_dest.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    let raw_sha = sha256_path(raw)?;
-    let mut row = json!({
-        "parent_scan_id": scan_id,
-        "ordinal": ordinal,
-        "raw_path": raw_rel,
-        "raw_sha256": raw_sha,
-        "string_recovery_report": relative_string(project, &string_report)?,
-        "deobfuscation_report": relative_string(project, &deob_report)?,
-    });
-
-    let raw_source =
-        fs::read_to_string(raw).with_context(|| format!("reading {}", raw.display()))?;
-    if crate::sha256_hex(raw_source.as_bytes()) != raw_sha {
-        bail!(
-            "generated string recovery input hash mismatch for {}",
-            raw.display()
-        );
-    }
-    let string_budget =
-        AnalysisOperation::StaticStringRecovery.under(parent_budget, raw.display().to_string());
-    let (selected, string_ok, string_changed) = match recover_static_strings(
-        &raw_source,
-        raw.display().to_string(),
-        SourceMode::Auto,
-        8,
-        &string_budget,
-    ) {
-        Ok(string_outcome) => {
-            crate::report_file::write_text(&string_tmp, &string_outcome.source)?;
-            write_json(&string_report, &string_outcome.report)?;
-            let output_sha = crate::sha256_hex(string_outcome.source.as_bytes());
-            let string_ok = string_outcome
-                .report
-                .get("safe_static_only")
-                .and_then(Value::as_bool)
-                == Some(true)
-                && string_outcome
-                    .report
-                    .get("input_sha256")
-                    .and_then(Value::as_str)
-                    == Some(raw_sha.as_str())
-                && string_outcome
-                    .report
-                    .get("output_sha256")
-                    .and_then(Value::as_str)
-                    == Some(output_sha.as_str());
-            if !string_ok {
-                bail!(
-                    "generated string-recovery provenance/hash validation failed for {}",
-                    raw.display()
-                );
-            }
-            let string_changed = string_outcome
-                .report
-                .get("changed")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            row["string_recovery"] = json!({
-                "exit": 0,
-                "changed": string_changed,
-                "replacements": value_usize(&string_outcome.report, "replacements"),
-                "output_sha256": output_sha,
-            });
-            (string_tmp.clone(), true, string_changed)
-        }
-        Err(error) => {
-            let error = recoverable_unit_error(anyhow::Error::new(error))?;
-            row["string_recovery_report"] = Value::Null;
-            row["string_recovery"] = json!({
-                "exit": 1,
-                "changed": false,
-                "error": error.to_string(),
-            });
-            (raw.to_path_buf(), false, false)
-        }
-    };
-
-    let selected_source =
-        fs::read_to_string(&selected).with_context(|| format!("reading {}", selected.display()))?;
-    let selected_sha = sha256_path(&selected)?;
-    let deob_budget =
-        AnalysisOperation::SafeDeobfuscation.under(parent_budget, selected.display().to_string());
-    let deob = deobfuscate_source(
-        &selected_source,
-        selected.display().to_string(),
-        SourceMode::Auto,
-        16,
-        false,
-        &deob_budget,
-    );
-    let (analysis_rel, selected_stage) = match deob {
-        Ok(outcome) => {
-            let output_sha = crate::sha256_hex(outcome.source.as_bytes());
-            if outcome.report.input_sha256 != selected_sha
-                || outcome.report.output_sha256 != output_sha
-                || !outcome.report.guarantees.safe_static_only
-                || !outcome
-                    .report
-                    .guarantees
-                    .runtime_semantics_preserved_by_design
-                || outcome.report.guarantees.presentation_formatted
-            {
-                bail!(
-                    "safe deobfuscation provenance invariant failed for {}",
-                    selected.display()
-                );
-            }
-            crate::report_file::write_text(&safe_dest, &outcome.source)?;
-            write_json(&deob_report, &outcome.report)?;
-            row["deobfuscation"] = json!({
-                "exit": 0,
-                "changed": outcome.report.changed,
-                "iterations": outcome.report.iterations,
-                "transforms": outcome.report.transforms,
-                "output_sha256": output_sha,
-            });
-            (safe_rel, "safe_deobfuscation")
-        }
-        Err(error) => {
-            let error = recoverable_unit_error(error)?;
-            row["deobfuscation_report"] = Value::Null;
-            row["deobfuscation"] = json!({"exit": 1, "changed": false, "error": error.to_string()});
-            if string_ok && string_changed {
-                link_or_copy(&string_tmp, &safe_dest)?;
-                (safe_rel, "string_recovery_only")
-            } else {
-                (PathBuf::from(raw_rel), "exact_fallback")
-            }
-        }
-    };
-
-    let analysis_source = project.join(&analysis_rel);
-    let exact = fs::read_to_string(&analysis_source)
-        .with_context(|| format!("reading {}", analysis_source.display()))?;
-    let format_budget =
-        AnalysisOperation::Format.under(parent_budget, analysis_source.display().to_string());
-    let formatted = format_source(&exact, &format_budget);
-    let (readable, readable_formatted, format_error) = match formatted {
-        Ok(formatted) => (formatted, true, None),
-        Err(error) => {
-            let error = recoverable_unit_error(error)?;
-            (exact, false, Some(error.to_string()))
-        }
-    };
-    crate::report_file::write_text(&readable_dest, &readable)?;
-    let object = row
-        .as_object_mut()
-        .context("generated recovery row must be an object")?;
-    object.insert("selected_stage".into(), selected_stage.into());
-    object.insert(
-        "analysis_path".into(),
-        analysis_rel.to_string_lossy().into_owned().into(),
-    );
-    object.insert(
-        "analysis_sha256".into(),
-        sha256_path(&analysis_source)?.into(),
-    );
-    object.insert(
-        "readable_path".into(),
-        readable_rel.to_string_lossy().into_owned().into(),
-    );
-    object.insert("readable_formatted".into(), readable_formatted.into());
-    object.insert(
-        "readable_sha256".into(),
-        sha256_path(&readable_dest)?.into(),
-    );
-    if let Some(error) = format_error {
-        object.insert("readable_format_error".into(), error.into());
-    }
-    Ok(row)
+    let mut recovery =
+        GeneratedRecovery::new(project, raw, raw_rel, scan_id, ordinal, parent_budget)?;
+    let strings = recovery.recover_strings()?;
+    let analysis = recovery.recover_analysis(&strings)?;
+    recovery.publish(&analysis)
 }
 
 fn reuse_generated_unit(
@@ -345,40 +466,30 @@ fn reuse_generated_unit(
     ordinal: usize,
     cached: &Value,
 ) -> Result<Value> {
-    let recovery_rel =
-        PathBuf::from("analysis/generated-recovery").join(format!("{scan_id:04}-{ordinal:03}"));
-    let recovery_dir = project.join(&recovery_rel);
-    fs::create_dir_all(&recovery_dir)?;
-    let string_report_rel = recovery_rel.join("string-recovery.json");
-    let deob_report_rel = recovery_rel.join("deobfuscation.json");
+    let paths = GeneratedPaths::create(project, scan_id, ordinal)?;
+    let mut row = cached.clone();
     for (field, destination) in [
-        ("string_recovery_report", &string_report_rel),
-        ("deobfuscation_report", &deob_report_rel),
+        ("string_recovery_report", &paths.string_report),
+        ("deobfuscation_report", &paths.deob_report),
     ] {
         if let Some(source) = value_string(cached, field) {
-            let source = project.join(source);
-            if source.is_file() {
-                link_or_copy(&source, &project.join(destination))?;
-            }
+            link_or_copy(&project.join(source), destination)?;
+            row[field] = relative_string(project, destination)?.into();
         }
     }
-
-    let safe_rel = generated_output_path("_dynamic_deobfuscated", scan_id, ordinal);
-    let readable_rel = generated_output_path("_dynamic", scan_id, ordinal);
     let selected_stage = value_string(cached, "selected_stage").unwrap_or_default();
     let analysis_rel = if selected_stage == "exact_fallback" {
         PathBuf::from(raw_rel)
     } else {
         let source =
             value_string(cached, "analysis_path").context("cached analysis_path missing")?;
-        link_or_copy(&project.join(source), &project.join(&safe_rel))?;
-        safe_rel
+        link_or_copy(&project.join(source), &paths.safe_dest)?;
+        paths.safe_rel
     };
     let cached_readable =
         value_string(cached, "readable_path").context("cached readable_path missing")?;
-    link_or_copy(&project.join(cached_readable), &project.join(&readable_rel))?;
+    link_or_copy(&project.join(cached_readable), &paths.readable_dest)?;
 
-    let mut row = cached.clone();
     let object = row
         .as_object_mut()
         .context("cached generated recovery row must be object")?;
@@ -386,20 +497,12 @@ fn reuse_generated_unit(
     object.insert("ordinal".into(), ordinal.into());
     object.insert("raw_path".into(), raw_rel.into());
     object.insert(
-        "string_recovery_report".into(),
-        string_report_rel.to_string_lossy().into_owned().into(),
-    );
-    object.insert(
-        "deobfuscation_report".into(),
-        deob_report_rel.to_string_lossy().into_owned().into(),
-    );
-    object.insert(
         "analysis_path".into(),
         analysis_rel.to_string_lossy().into_owned().into(),
     );
     object.insert(
         "readable_path".into(),
-        readable_rel.to_string_lossy().into_owned().into(),
+        paths.readable_rel.to_string_lossy().into_owned().into(),
     );
     object.insert("deduplicated".into(), true.into());
     object.insert(
@@ -971,4 +1074,60 @@ pub fn scan_project(project: &Path, options: &ProjectScanOptions) -> Result<Proj
         scanner.rows.push(row);
     }
     scanner.publish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_queue_preserves_assigned_ids_across_recursive_enqueues() -> Result<()> {
+        let mut queue = ScanQueue::new(3);
+        assert_eq!(queue.enqueue(json!({"path":"a"})), Some(0));
+        assert_eq!(queue.enqueue(json!({"path":"b"})), Some(1));
+        assert_eq!(queue.enqueue(json!({"path":"a"})), None);
+        let (id, unit) = queue.pop().context("first source")?;
+        assert_eq!((id, unit["path"].as_str()), (0, Some("a")));
+        assert_eq!(queue.enqueue(json!({"path":"generated"})), Some(2));
+        assert_eq!(queue.enqueue(json!({"path":"a"})), None);
+        assert_eq!(queue.enqueue(json!({"path":"extra"})), None);
+        assert_eq!(queue.pop().map(|(id, _)| id), Some(1));
+        assert_eq!(queue.pop().map(|(id, _)| id), Some(2));
+        assert!(queue.pop().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn reused_generated_fallback_preserves_absent_proof_reports() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let project = temp.path();
+        let raw_rel = "resources/fallback.js";
+        let readable_rel = "src/_dynamic/0000/embedded-001.js";
+        for rel in [raw_rel, readable_rel] {
+            let path = project.join(rel);
+            fs::create_dir_all(path.parent().context("fixture parent")?)?;
+            fs::write(path, "void 0;")?;
+        }
+        let cached = json!({
+            "parent_scan_id": 0,
+            "ordinal": 1,
+            "selected_stage": "exact_fallback",
+            "string_recovery_report": null,
+            "deobfuscation_report": null,
+            "analysis_path": raw_rel,
+            "readable_path": readable_rel,
+        });
+        let reused = reuse_generated_unit(project, raw_rel, 7, 2, &cached)?;
+        assert_eq!(reused["parent_scan_id"], 7);
+        assert_eq!(reused["ordinal"], 2);
+        assert_eq!(reused["analysis_path"], raw_rel);
+        assert_eq!(reused["string_recovery_report"], Value::Null);
+        assert_eq!(reused["deobfuscation_report"], Value::Null);
+        assert_eq!(reused["deduplicated"], true);
+        assert_eq!(reused["deduplicated_from_parent_scan_id"], 0);
+        assert_eq!(reused["deduplicated_from_ordinal"], 1);
+        let readable = value_string(&reused, "readable_path").context("reused readable path")?;
+        assert_eq!(fs::read_to_string(project.join(readable))?, "void 0;");
+        Ok(())
+    }
 }

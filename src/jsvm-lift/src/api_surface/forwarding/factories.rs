@@ -5,6 +5,7 @@ use super::{
     BTreeSet, CallExpression, Callable, CallableIndex, Expression, FrameContext, GetSpan,
     ProvenConstantEnvironment, Result, Semantic, ValueBuilder, WorkBudget, WrapperIndex,
 };
+use super::{Span, Wrapper};
 
 pub(super) struct ReturnedCallable {
     pub(super) callable: Callable,
@@ -30,6 +31,101 @@ pub(super) fn resolve_returned_callable<'a>(
         return Ok(None);
     };
     resolve_factory_chain(factory, witnesses, semantic, wrappers, collector, budget)
+}
+
+/// Bind the native target in its original source context. The return
+/// expression's span describes the native operation; the outer factory
+/// invocation describes the allocated callable object.
+fn recover_bound_callable<'a>(
+    call: &'a CallExpression<'a>,
+    original_object: &'a Expression<'a>,
+    allocation: Span,
+    builder: &mut ValueBuilder<'_, 'a>,
+    collector: &FrameContext<'_, '_>,
+) -> Result<Option<Callable>> {
+    let Some(object) = builder.expression(original_object)?.expression() else {
+        return Ok(None);
+    };
+    let Some(mut target) = collector.callables.resolve(
+        object,
+        collector.source,
+        collector.scoping,
+        collector.constants,
+    ) else {
+        return Ok(None);
+    };
+    if !std::ptr::eq(object, original_object) {
+        target.capture_as_argument();
+    }
+    let arguments = builder.call(&call.arguments)?;
+    Ok(collector.callables.bind_values(
+        target,
+        &arguments,
+        BindingSite {
+            operation: call.span,
+            allocation,
+        },
+        collector.source,
+        collector.scoping,
+        collector.constants,
+    ))
+}
+
+fn append_factory_witnesses(
+    wrapper: &Wrapper<'_>,
+    factory: Span,
+    witnesses: &mut Vec<ApiBindingWitness>,
+) {
+    witnesses.push(ApiBindingWitness {
+        kind: "wrapper_definition".into(),
+        start: wrapper.span.start,
+        end: wrapper.span.end,
+    });
+    append_local_witnesses(wrapper, witnesses);
+    witnesses.push(ApiBindingWitness {
+        kind: "wrapper_return".into(),
+        start: wrapper.body.span().start,
+        end: wrapper.body.span().end,
+    });
+    witnesses.push(ApiBindingWitness {
+        kind: "returned_callable".into(),
+        start: factory.start,
+        end: factory.end,
+    });
+}
+
+/// A native bind operation creates a new function object; returning a
+/// pre-existing callable preserves its identity. Other invocation forms
+/// cannot be treated as values without interpreting arbitrary calls.
+enum FactoryResult<'a> {
+    Bind {
+        call: &'a CallExpression<'a>,
+        object: &'a Expression<'a>,
+    },
+    Existing(&'a Expression<'a>),
+}
+
+impl<'a> FactoryResult<'a> {
+    fn classify(wrapper: &Wrapper<'a>, context: &FrameContext<'_, '_>) -> Option<Self> {
+        if !wrapper.returns_value {
+            return None;
+        }
+        match unparenthesized(wrapper.body) {
+            Expression::CallExpression(call) if !call.optional => {
+                let (object, key) = member_parts(&call.callee, context.scoping, context.constants)?;
+                (key == "bind").then_some(Self::Bind { call, object })
+            }
+            _ if wrapper.invocation().is_some() => None,
+            _ => Some(Self::Existing(wrapper.body)),
+        }
+    }
+
+    fn span(&self) -> Span {
+        match self {
+            Self::Bind { call, .. } => call.span,
+            Self::Existing(expression) => expression.span(),
+        }
+    }
 }
 
 fn resolve_factory_chain<'a>(
@@ -58,27 +154,10 @@ fn resolve_factory_chain<'a>(
         else {
             return Ok(None);
         };
-        if !wrapper.returns_value {
+        let Some(returned) = FactoryResult::classify(&wrapper, collector) else {
             return Ok(None);
-        }
-        // Only recognized native bind returns may create a new callable.
-        // Ordinary sink calls and arbitrary factory calls are not values.
-        let bind = match unparenthesized(wrapper.body) {
-            Expression::CallExpression(call) if !call.optional => {
-                let Some((object, key)) =
-                    member_parts(&call.callee, collector.scoping, collector.constants)
-                else {
-                    return Ok(None);
-                };
-                if key != "bind" {
-                    return Ok(None);
-                }
-                Some((call, object))
-            }
-            _ if wrapper.invocation().is_some() => return Ok(None),
-            _ => None,
         };
-        let sink = bind.map_or_else(|| wrapper.body.span(), |(call, _)| call.span);
+        let sink = returned.span();
         let mut arguments = ValueBuilder::new(
             None,
             collector.scoping,
@@ -87,9 +166,7 @@ fn resolve_factory_chain<'a>(
             budget,
         );
         let args = arguments.call(&factory.arguments)?;
-        if arguments.used_iterator {
-            dependencies.insert("rest_iterator".into());
-        }
+        arguments.record_dependencies(&mut dependencies);
         let Some(proof) = wrappers.frame_proof(&wrapper, sink, semantic, collector, budget)? else {
             return Ok(None);
         };
@@ -104,58 +181,27 @@ fn resolve_factory_chain<'a>(
         else {
             return Ok(None);
         };
-        let bound = if let Some((call, original_object)) = bind {
-            let Some(object) = builder.expression(original_object)?.expression() else {
-                return Ok(None);
-            };
-            let Some(mut target) = collector.callables.resolve(
-                object,
-                collector.source,
-                collector.scoping,
-                collector.constants,
-            ) else {
-                return Ok(None);
-            };
-            if !std::ptr::eq(object, original_object) {
-                target.capture_as_argument();
-            }
-            let arguments = builder.call(&call.arguments)?;
-            let Some(bound) = collector.callables.bind_values(
-                target,
-                &arguments,
-                BindingSite {
-                    operation: call.span,
-                    allocation: factory.span,
-                },
-                collector.source,
-                collector.scoping,
-                collector.constants,
-            ) else {
+        let bound = if let FactoryResult::Bind {
+            call,
+            object: original_object,
+        } = returned
+        {
+            let Some(bound) = recover_bound_callable(
+                call,
+                original_object,
+                factory.span,
+                &mut builder,
+                collector,
+            )?
+            else {
                 return Ok(None);
             };
             Some(bound)
         } else {
             None
         };
-        if builder.used_iterator {
-            dependencies.insert("rest_iterator".into());
-        }
-        witnesses.push(ApiBindingWitness {
-            kind: "wrapper_definition".into(),
-            start: wrapper.span.start,
-            end: wrapper.span.end,
-        });
-        append_local_witnesses(&wrapper, &mut witnesses);
-        witnesses.push(ApiBindingWitness {
-            kind: "wrapper_return".into(),
-            start: wrapper.body.span().start,
-            end: wrapper.body.span().end,
-        });
-        witnesses.push(ApiBindingWitness {
-            kind: "returned_callable".into(),
-            start: factory.span.start,
-            end: factory.span.end,
-        });
+        builder.record_dependencies(&mut dependencies);
+        append_factory_witnesses(&wrapper, factory.span, &mut witnesses);
         if let Some(callable) = bound {
             return Ok(Some(ReturnedCallable {
                 callable,
@@ -166,9 +212,7 @@ fn resolve_factory_chain<'a>(
         let Some(origin) = wrapper.returned_origin(&mut builder, collector)? else {
             return Ok(None);
         };
-        if builder.used_iterator {
-            dependencies.insert("rest_iterator".into());
-        }
+        builder.record_dependencies(&mut dependencies);
         if let Some(mut callable) = collector.callables.resolve(
             origin,
             collector.source,

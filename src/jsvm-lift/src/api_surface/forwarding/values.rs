@@ -6,7 +6,10 @@ use super::super::{
 };
 use jsvm_safe_core::eval_static_primitive_with_resolver;
 use oxc_ast::ast::{Argument, ArrayExpression, ArrayExpressionElement};
-use std::{collections::BTreeMap, rc::Rc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    rc::Rc,
+};
 
 pub(super) type ArgumentList<'a> = PositionalArguments<'a, 'a>;
 pub(super) type ValueFrame<'a> = BTreeMap<SymbolId, ForwardedValue<'a, 'a>>;
@@ -21,7 +24,7 @@ pub(super) struct ValueBuilder<'s, 'a> {
     constants: &'s ProvenConstantEnvironment,
     limit: usize,
     pub(super) budget: &'s WorkBudget,
-    pub(super) used_iterator: bool,
+    used_iterator: bool,
 }
 
 impl<'s, 'a> ValueBuilder<'s, 'a> {
@@ -39,6 +42,14 @@ impl<'s, 'a> ValueBuilder<'s, 'a> {
             limit,
             budget,
             used_iterator: false,
+        }
+    }
+
+    /// Any spread that consumes known array positions still relies on the
+    /// standard iterator. Keep this proof dependency with value construction.
+    pub(super) fn record_dependencies(&self, dependencies: &mut BTreeSet<String>) {
+        if self.used_iterator {
+            dependencies.insert("rest_iterator".into());
         }
     }
 
