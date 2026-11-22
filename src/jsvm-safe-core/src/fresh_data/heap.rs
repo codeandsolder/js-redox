@@ -28,14 +28,25 @@ impl Fact {
                 equal.then(|| self.clone())
             }
             (Self::Objects(a), Self::Objects(b)) => {
-                if a == b {
+                if Rc::ptr_eq(a, b) || a == b {
                     return Some(self.clone());
                 }
                 let mut ids = Vec::with_capacity(a.len() + b.len());
-                ids.extend_from_slice(a);
-                ids.extend_from_slice(b);
-                ids.sort_unstable();
-                ids.dedup();
+                let mut left = a.iter().copied().peekable();
+                let mut right = b.iter().copied().peekable();
+                while let (Some(&x), Some(&y)) = (left.peek(), right.peek()) {
+                    match x.cmp(&y) {
+                        std::cmp::Ordering::Less => ids.extend(left.next()),
+                        std::cmp::Ordering::Greater => ids.extend(right.next()),
+                        std::cmp::Ordering::Equal => {
+                            ids.push(x);
+                            left.next();
+                            right.next();
+                        }
+                    }
+                }
+                ids.extend(left);
+                ids.extend(right);
                 Some(Self::Objects(ids.into()))
             }
             _ => None,
@@ -361,8 +372,8 @@ const MIN_COLLECTION_SIZE: usize = 64;
 
 #[derive(Clone)]
 pub(super) struct Environment {
-    bindings: HashMap<SymbolId, Fact>,
-    allocations: HashMap<AllocationId, Rc<OwnData>>,
+    bindings: Rc<HashMap<SymbolId, Fact>>,
+    allocations: Rc<HashMap<AllocationId, Rc<OwnData>>>,
     collection_threshold: usize,
     collection_floor: AllocationId,
 }
@@ -370,8 +381,8 @@ pub(super) struct Environment {
 impl Default for Environment {
     fn default() -> Self {
         Self {
-            bindings: HashMap::new(),
-            allocations: HashMap::new(),
+            bindings: Rc::default(),
+            allocations: Rc::default(),
             collection_threshold: MIN_COLLECTION_SIZE,
             collection_floor: 0,
         }
@@ -444,16 +455,27 @@ impl<'b> Reachability<'b> {
     }
 }
 
+// Avoid cloning an entire shared map merely to discard its contents.
+fn clear_shared<K, V>(map: &mut Rc<HashMap<K, V>>)
+where
+    K: std::hash::Hash + Eq,
+{
+    if let Some(unique) = Rc::get_mut(map) {
+        unique.clear();
+        unique.shrink_to(MIN_COLLECTION_SIZE);
+    } else {
+        *map = Rc::default();
+    }
+}
+
 impl Environment {
     pub(super) fn new() -> Self {
         Self::default()
     }
 
     pub(super) fn clear(&mut self) {
-        self.bindings.clear();
-        self.allocations.clear();
-        self.bindings.shrink_to(MIN_COLLECTION_SIZE);
-        self.allocations.shrink_to(MIN_COLLECTION_SIZE);
+        clear_shared(&mut self.bindings);
+        clear_shared(&mut self.allocations);
         self.collection_threshold = MIN_COLLECTION_SIZE;
     }
 
@@ -462,15 +484,26 @@ impl Environment {
     }
 
     pub(super) fn insert(&mut self, symbol: SymbolId, fact: Fact) {
-        self.bindings.insert(symbol, fact);
+        Rc::make_mut(&mut self.bindings).insert(symbol, fact);
     }
 
     pub(super) fn remove(&mut self, symbol: &SymbolId) {
-        self.bindings.remove(symbol);
+        self.remove_binding(symbol);
+    }
+
+    fn remove_binding(&mut self, symbol: &SymbolId) -> Option<Fact> {
+        if let Some(bindings) = Rc::get_mut(&mut self.bindings) {
+            return bindings.remove(symbol);
+        }
+        if self.bindings.contains_key(symbol) {
+            Rc::make_mut(&mut self.bindings).remove(symbol)
+        } else {
+            None
+        }
     }
 
     pub(super) fn allocate(&mut self, id: AllocationId, data: OwnData) -> Fact {
-        self.allocations.insert(id, Rc::new(data));
+        Rc::make_mut(&mut self.allocations).insert(id, Rc::new(data));
         Fact::Objects(Rc::from([id]))
     }
 
@@ -481,7 +514,7 @@ impl Environment {
     ) -> Result<(), BudgetExceeded> {
         let mut retired = 0usize;
         for symbol in symbols {
-            if let Some(Fact::Objects(locations)) = self.bindings.remove(symbol) {
+            if let Some(Fact::Objects(locations)) = self.remove_binding(symbol) {
                 retired = retired.saturating_add(locations.len());
             }
         }
@@ -527,15 +560,19 @@ impl Environment {
         for fact in self.bindings.values() {
             trace.fact(fact)?;
         }
+        let mut live_allocations = 0usize;
         while let Some(id) = trace.pending.pop() {
             // A captured identity can survive the invalidation of its
             // descriptor proof. Missing objects have no traversable edges.
             if let Some(data) = self.allocations.get(&id) {
+                live_allocations += 1;
                 trace.object(data)?;
             }
         }
         budget.consume(u64::try_from(self.allocations.capacity()).unwrap_or(u64::MAX))?;
-        self.allocations.retain(|id, _| trace.marked.contains(id));
+        if live_allocations != self.allocations.len() {
+            Rc::make_mut(&mut self.allocations).retain(|id, _| trace.marked.contains(id));
+        }
         // HashMap iteration follows capacity, not just length. Release
         // excess capacity after a large transient expression or scope.
         if self.allocations.capacity()
@@ -545,7 +582,7 @@ impl Environment {
                 .saturating_mul(4)
                 .max(MIN_COLLECTION_SIZE)
         {
-            self.allocations.shrink_to_fit();
+            Rc::make_mut(&mut self.allocations).shrink_to_fit();
         }
         if self.bindings.capacity()
             > self
@@ -554,7 +591,7 @@ impl Environment {
                 .saturating_mul(4)
                 .max(MIN_COLLECTION_SIZE)
         {
-            self.bindings.shrink_to_fit();
+            Rc::make_mut(&mut self.bindings).shrink_to_fit();
         }
         // Make the next trace proportional to the surviving graph, not
         // just the number of nodes. A single large object or many live
@@ -572,31 +609,34 @@ impl Environment {
     /// be valid in both branches: a missing entry means effects invalidated
     /// that proof, not that the allocation never existed.
     pub(super) fn join(&mut self, other: &Self, first_new: AllocationId) {
-        self.bindings.retain(|symbol, fact| {
-            let Some(joined) = other
-                .bindings
-                .get(symbol)
-                .and_then(|right| fact.join(right))
-            else {
-                return false;
-            };
-            *fact = joined;
-            true
-        });
-        self.allocations.retain(|id, data| {
-            let Some(right) = other.allocations.get(id) else {
-                return *id >= first_new;
-            };
-            if !Rc::ptr_eq(data, right) {
-                Rc::make_mut(data).join(right);
-            }
-            true
-        });
-        for (&id, data) in &other.allocations {
-            if id >= first_new {
-                self.allocations
-                    .entry(id)
-                    .or_insert_with(|| Rc::clone(data));
+        if !Rc::ptr_eq(&self.bindings, &other.bindings) {
+            Rc::make_mut(&mut self.bindings).retain(|symbol, fact| {
+                let Some(joined) = other
+                    .bindings
+                    .get(symbol)
+                    .and_then(|right| fact.join(right))
+                else {
+                    return false;
+                };
+                *fact = joined;
+                true
+            });
+        }
+        if !Rc::ptr_eq(&self.allocations, &other.allocations) {
+            let allocations = Rc::make_mut(&mut self.allocations);
+            allocations.retain(|id, data| {
+                let Some(right) = other.allocations.get(id) else {
+                    return *id >= first_new;
+                };
+                if !Rc::ptr_eq(data, right) {
+                    Rc::make_mut(data).join(right);
+                }
+                true
+            });
+            for (&id, data) in other.allocations.iter() {
+                if id >= first_new {
+                    allocations.entry(id).or_insert_with(|| Rc::clone(data));
+                }
             }
         }
     }
@@ -712,8 +752,9 @@ impl Environment {
         }
 
         let weak = locations.len() != 1;
+        let allocations = Rc::make_mut(&mut self.allocations);
         for id in locations.iter() {
-            let Some(data) = self.allocations.get_mut(id) else {
+            let Some(data) = allocations.get_mut(id) else {
                 return false;
             };
             if weak {
@@ -760,6 +801,67 @@ mod tests {
     use super::*;
 
     #[test]
+    fn location_join_is_ordered_unique_and_preserves_exact_identity() {
+        let left = Fact::Objects(Rc::from([0, 2, 4, 6]));
+        let right = Fact::Objects(Rc::from([1, 2, 3, 6, 7]));
+        let Some(Fact::Objects(joined)) = left.join(&right) else {
+            unreachable!()
+        };
+        assert_eq!(joined.as_ref(), &[0, 1, 2, 3, 4, 6, 7]);
+        assert_eq!(left.strict_equal(&right), None);
+        assert_eq!(
+            left.strict_equal(&Fact::Objects(Rc::from([1, 3]))),
+            Some(false)
+        );
+        let same = left.join(&left);
+        let (Fact::Objects(original), Some(Fact::Objects(same))) = (left, same) else {
+            unreachable!()
+        };
+        assert!(Rc::ptr_eq(&original, &same));
+    }
+
+    #[test]
+    fn fork_shares_unchanged_maps_and_isolates_the_first_mutation() {
+        let symbol = SymbolId::new(0);
+        let mut heap = Environment::new();
+        let mut data = OwnData::new(AllocationKind::Ordinary);
+        data.define_data("x".into(), Some(Fact::Primitive(Value::Number(7.0))));
+        let object = heap.allocate(0, data);
+        let Fact::Objects(locations) = &object else {
+            unreachable!()
+        };
+        heap.insert(symbol, object.clone());
+
+        let unchanged = heap.clone();
+        assert!(Rc::ptr_eq(&heap.bindings, &unchanged.bindings));
+        assert!(Rc::ptr_eq(&heap.allocations, &unchanged.allocations));
+        heap.join(&unchanged, 1);
+        assert!(Rc::ptr_eq(&heap.bindings, &unchanged.bindings));
+        assert!(Rc::ptr_eq(&heap.allocations, &unchanged.allocations));
+
+        let mut changed = heap.clone();
+        assert!(changed.write(locations, "x", Some(Fact::Primitive(Value::Number(9.0)))));
+        assert!(Rc::ptr_eq(&heap.bindings, &changed.bindings));
+        assert!(!Rc::ptr_eq(&heap.allocations, &changed.allocations));
+        assert!(matches!(
+            heap.read(locations, "x"),
+            Some(Some(Fact::Primitive(Value::Number(7.0))))
+        ));
+        heap.join(&changed, 1);
+        assert!(matches!(heap.read(locations, "x"), Some(None)));
+
+        let mut invalidated = heap.clone();
+        invalidated.clear();
+        assert!(invalidated.bindings.is_empty());
+        assert!(invalidated.allocations.is_empty());
+        assert!(heap.get(&symbol).is_some());
+        assert!(heap.allocations.contains_key(&0));
+        heap.join(&invalidated, 1);
+        assert!(heap.get(&symbol).is_none());
+        assert!(heap.allocations.is_empty());
+    }
+
+    #[test]
     fn collection_bounds_churn_and_preserves_reachable_cycles() -> Result<(), BudgetExceeded> {
         let budget = WorkBudget::unlimited("heap-collection");
         let mut heap = Environment::new();
@@ -773,7 +875,7 @@ mod tests {
         assert!(heap.write(root_locations, "next", Some(child)));
         let mut child_data = OwnData::new(AllocationKind::Ordinary);
         child_data.set_literal_prototype(Some(root.clone()));
-        heap.allocations.insert(1, Rc::new(child_data));
+        Rc::make_mut(&mut heap.allocations).insert(1, Rc::new(child_data));
         heap.insert(SymbolId::new(0), root);
         let mut uncollected = heap.clone();
         let mut peak = 0usize;
