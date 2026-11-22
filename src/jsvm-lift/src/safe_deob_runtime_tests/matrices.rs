@@ -8,6 +8,8 @@ use super::{
 use crate::safe_deob::{deobfuscate_source, SourceMode};
 use anyhow::Result;
 use std::fmt::Write as _;
+#[path = "number_boundaries.rs"]
+mod number_boundaries;
 
 /// Execute a batch of independently parsed scripts in one Node process rather
 /// than launching two processes for every tiny fixture.
