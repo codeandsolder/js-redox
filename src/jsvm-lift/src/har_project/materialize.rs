@@ -432,9 +432,9 @@ fn build_manifest(
 fn write_project_metadata(args: &HarProjectOptions, manifest: &ProjectManifest) -> Result<()> {
     let manifest_value = serde_json::to_value(manifest)?;
     crate::capture_project::validate_manifest_value(&manifest_value, "HAR capture manifest")?;
-    fs::write(
-        args.output.join(crate::capture_project::MANIFEST_NAME),
-        format!("{}\n", serde_json::to_string_pretty(&manifest_value)?),
+    crate::report_file::write_json(
+        &args.output.join(crate::capture_project::MANIFEST_NAME),
+        &manifest_value,
     )?;
     fs::create_dir_all(args.output.join(".vscode"))?;
     fs::write(
@@ -445,11 +445,11 @@ fn write_project_metadata(args: &HarProjectOptions, manifest: &ProjectManifest) 
     for (kind, count) in &manifest.counts {
         let _ = writeln!(summary, "- {kind}: {count}");
     }
-    fs::write(
-        args.output.join("README.md"),
-        format!(
+    crate::report_file::write_text(
+        &args.output.join("README.md"),
+        &format!(
             "# Capture source project\n\nGenerated from {}.\n\nResponse bodies are preserved by URL under resources/. Inline script bodies are extracted beside their parent HTML. capture-manifest.json keeps capture provenance and discovered script/source-map references.\n\n## Counts\n\n{}",
-            args.har.display(),
+            crate::report_markdown::code_span(&args.har.to_string_lossy()),
             summary
         ),
     )?;

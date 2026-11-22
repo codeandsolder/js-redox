@@ -487,13 +487,7 @@ Names come from readable source and statically resolved captured ESM exports. Th
     if fs::read_to_string(&path).is_ok_and(|existing| existing == output) {
         return Ok(());
     }
-    let parent = path.parent().context("symbol index has no parent folder")?;
-    fs::create_dir_all(parent)?;
-    let temp = tempfile::NamedTempFile::new_in(parent)?;
-    fs::write(temp.path(), output)?;
-    temp.persist(&path)
-        .with_context(|| format!("replacing symbol index {}", path.display()))?;
-    Ok(())
+    crate::report_file::write_text(&path, &output)
 }
 
 /// Make downstream imports use descriptive component names in the readable
@@ -617,15 +611,8 @@ pub fn propagate_imported_names(project: &Path) -> Result<usize> {
                 let exports = parse_exports(&named)
                     .context("renamed readable module failed export analysis")?;
                 let path = project.join(&module.readable_path);
-                let parent = path
-                    .parent()
-                    .context("readable source has no parent folder")?;
-                let temp = tempfile::NamedTempFile::new_in(parent)?;
-                fs::write(temp.path(), &named)?;
-                // Do not mutate project_deob's shared readable hardlink cache.
-                temp.persist(&path).with_context(|| {
-                    format!("replacing named presentation file {}", path.display())
-                })?;
+                // Atomically replace this view, never mutate the shared readable hardlink cache.
+                crate::report_file::write_text(&path, &named)?;
                 module.source = named;
                 module.exports = exports;
                 changed += renamed;

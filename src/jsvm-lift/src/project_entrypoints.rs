@@ -10,7 +10,6 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    fs,
     path::Path,
 };
 use work_budget::WorkBudget;
@@ -287,8 +286,7 @@ pub(crate) fn write_entrypoint_index(
     }
     budget.checkpoint()?;
     let output = project.join("src/ENTRYPOINTS.md");
-    fs::create_dir_all(output.parent().context("entrypoint index has no parent")?)?;
-    fs::write(&output, lines.join("\n"))
+    crate::report_file::write_text(&output, &lines.join("\n"))
         .with_context(|| format!("writing {}", output.display()))?;
     Ok(roots)
 }

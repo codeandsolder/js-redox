@@ -686,12 +686,7 @@ pub fn evaluate_manifest(manifest_path: &Path, corpus_root: &Path) -> Result<Cor
 ///
 /// Fails if the destination directory cannot be created, JSON serialization fails, or the report file cannot be written.
 pub fn write_report(report: &CorpusEvalReport, path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    }
-    let mut encoded = serde_json::to_string_pretty(report)?;
-    encoded.push('\n');
-    fs::write(path, encoded).with_context(|| format!("writing {}", path.display()))
+    crate::report_file::write_json(path, report)
 }
 
 #[cfg(test)]

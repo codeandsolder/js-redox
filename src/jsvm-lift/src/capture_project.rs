@@ -212,12 +212,7 @@ pub(crate) fn prepare_project_output(output: &Path, overwrite: bool) -> Result<(
 /// Fails on invalid manifest contents, directory creation or serialization errors, or writing the manifest.
 pub fn write_manifest(path: &Path, manifest: &CaptureManifest) -> Result<()> {
     validate_manifest(manifest, &path.display().to_string())?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    }
-    let mut encoded = serde_json::to_string_pretty(manifest)?;
-    encoded.push('\n');
-    fs::write(path, encoded).with_context(|| format!("writing {}", path.display()))
+    crate::report_file::write_json(path, manifest)
 }
 
 #[must_use]
@@ -256,6 +251,30 @@ mod tests {
             counts: BTreeMap::new(),
             extra: Map::new(),
         }
+    }
+
+    #[test]
+    fn manifest_replacement_preserves_previous_valid_snapshot() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = manifest_path(directory.path());
+        let first = valid_manifest();
+        write_manifest(&path, &first)?;
+        let original = fs::read(&path)?;
+        let mut invalid = first.clone();
+        invalid.resources = vec![json!({"id":0,"output_path":"../outside.js"})];
+        assert!(write_manifest(&path, &invalid).is_err());
+        assert_eq!(fs::read(&path)?, original);
+        let snapshot = directory.path().join("previous-manifest.json");
+        fs::hard_link(&path, &snapshot)?;
+        let mut next = first.clone();
+        next.source.input = "new capture".into();
+        next.extra
+            .insert("future_field".into(), json!({"value":42}));
+        write_manifest(&path, &next)?;
+        assert_eq!(read_manifest(&path)?, next);
+        assert_eq!(read_manifest(&snapshot)?, first);
+        assert_eq!(fs::read(snapshot)?, original);
+        Ok(())
     }
 
     #[test]
