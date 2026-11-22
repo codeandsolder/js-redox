@@ -2073,10 +2073,7 @@ mod tests {
                 return host.WebAssembly.instantiate(new Uint8Array([0,97,115,109,1,0,0,0]), imports);
             }
         ";
-        assert_eq!(
-            recover(early),
-            [] as [static_bytes::RecoveredByteArtifact; 0]
-        );
+        assert_eq!(recover(early), [] as [super::RecoveredByteArtifact; 0]);
     }
 
     #[test]

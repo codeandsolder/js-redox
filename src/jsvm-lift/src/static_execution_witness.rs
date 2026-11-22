@@ -247,7 +247,7 @@ mod tests {
         assert_eq!(conflicted.url_correlated_positive_instances, 0);
         assert_eq!(
             conflicted.roots[0].positive_instances,
-            [] as [static_execution_witness::PositiveScriptInstance; 0]
+            [] as [super::PositiveScriptInstance; 0]
         );
         Ok(())
     }
