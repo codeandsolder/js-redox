@@ -240,11 +240,8 @@ pub fn materialize_wasm(
 
     let mut seen_occurrences: BTreeSet<(String, &'static str, u32, u32)> = BTreeSet::new();
     for source in sources {
-        let budget = budgets.operation_under(
-            &stage_budget,
-            AnalysisOperation::WasmAnalysis,
-            source.path.display().to_string(),
-        );
+        let budget =
+            AnalysisOperation::WasmAnalysis.under(&stage_budget, source.path.display().to_string());
         budget.checkpoint()?;
         let raw =
             fs::read(&source.path).with_context(|| format!("reading {}", source.path.display()))?;
@@ -355,8 +352,7 @@ pub fn materialize_wasm(
             .get(digest)
             .with_context(|| format!("missing binary path for recovered WASM {digest}"))?;
         let output = modules_root.join(digest);
-        let budget =
-            budgets.operation_under(&stage_budget, AnalysisOperation::WasmAnalysis, digest);
+        let budget = AnalysisOperation::WasmAnalysis.under(&stage_budget, digest);
         let analysis = analyze_module(binary, &output, wax, &budget);
         let mut row = Map::new();
         row.insert("sha256".into(), Value::String(digest.clone()));

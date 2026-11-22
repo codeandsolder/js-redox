@@ -1901,7 +1901,6 @@ impl CopyLimitations {
 
 struct BoundaryCorrelation<'a> {
     project: &'a Path,
-    budgets: &'a AnalysisBudgets,
     stage_budget: WorkBudget,
     deob_by_raw: BTreeMap<String, String>,
     targeted_cache: HashMap<(String, String, String, u32), Value>,
@@ -1989,7 +1988,6 @@ impl BoundaryCorrelation<'_> {
         let function_imports = scope.function_imports;
         let carrier_candidates = scope.carrier_candidates;
         let project = self.project;
-        let budgets = self.budgets;
         let stage_budget = &self.stage_budget;
         let targeted_cache = &mut self.targeted_cache;
         let carrier_sources = &mut self.carrier_sources;
@@ -2021,11 +2019,8 @@ impl BoundaryCorrelation<'_> {
                 );
                 if !targeted_cache.contains_key(&key) {
                     targeted_cache.insert(key.clone(), {
-                        let budget = budgets.operation_under(
-                            stage_budget,
-                            AnalysisOperation::WasmAnalysis,
-                            source.display().to_string(),
-                        );
+                        let budget = AnalysisOperation::WasmAnalysis
+                            .under(stage_budget, source.display().to_string());
                         targeted_semantics_for_source(
                             &source, raw_module, raw_import, offset, &budget,
                         )?
@@ -2252,11 +2247,8 @@ impl BoundaryCorrelation<'_> {
                 }
                 self.carrier_sources.insert(relative.clone());
                 if !self.full_cache.contains_key(relative) {
-                    let budget = self.budgets.operation_under(
-                        &self.stage_budget,
-                        AnalysisOperation::WasmAnalysis,
-                        source.display().to_string(),
-                    );
+                    let budget = AnalysisOperation::WasmAnalysis
+                        .under(&self.stage_budget, source.display().to_string());
                     self.full_cache
                         .insert(relative.clone(), semantics_for_source(&source, &budget)?);
                 }
@@ -2624,7 +2616,6 @@ pub fn correlate_project(
         .collect::<BTreeMap<_, _>>();
     let mut context = BoundaryCorrelation {
         project,
-        budgets,
         stage_budget,
         deob_by_raw,
         targeted_cache: HashMap::new(),

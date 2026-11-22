@@ -545,15 +545,11 @@ pub fn evaluate_manifest(manifest_path: &Path, corpus_root: &Path) -> Result<Cor
         // Module/CommonJS semantics belong to the manifest's logical filename,
         // not to a canonical symlink target whose suffix may differ.
         let source_mode = SourceMode::for_path(&sample.path);
-        let format_budget =
-            budgets.operation_under(&sample_budget, AnalysisOperation::Format, &sample.id);
+        let format_budget = AnalysisOperation::Format.under(&sample_budget, &sample.id);
         let pretty = format_source(raw_source, &format_budget)
             .with_context(|| format!("{}: formatting", sample.id))?;
-        let syntax_budget = budgets.operation_under(
-            &sample_budget,
-            AnalysisOperation::SyntaxCheck,
-            format!("{}:pretty", sample.id),
-        );
+        let syntax_budget =
+            AnalysisOperation::SyntaxCheck.under(&sample_budget, format!("{}:pretty", sample.id));
         assert_node_syntax(
             &temp,
             &sample.id,
@@ -580,11 +576,7 @@ pub fn evaluate_manifest(manifest_path: &Path, corpus_root: &Path) -> Result<Cor
             }
         }
 
-        let deob_budget = budgets.operation_under(
-            &sample_budget,
-            AnalysisOperation::SafeDeobfuscation,
-            &sample.id,
-        );
+        let deob_budget = AnalysisOperation::SafeDeobfuscation.under(&sample_budget, &sample.id);
         let deob = deobfuscate_source(
             raw_source,
             raw_path.display().to_string(),
@@ -594,11 +586,8 @@ pub fn evaluate_manifest(manifest_path: &Path, corpus_root: &Path) -> Result<Cor
             &deob_budget,
         )
         .with_context(|| format!("{}: safe deobfuscation", sample.id))?;
-        let syntax_budget = budgets.operation_under(
-            &sample_budget,
-            AnalysisOperation::SyntaxCheck,
-            format!("{}:deob", sample.id),
-        );
+        let syntax_budget =
+            AnalysisOperation::SyntaxCheck.under(&sample_budget, format!("{}:deob", sample.id));
         assert_node_syntax(
             &temp,
             &sample.id,
@@ -607,9 +596,9 @@ pub fn evaluate_manifest(manifest_path: &Path, corpus_root: &Path) -> Result<Cor
             source_mode,
             &syntax_budget,
         )?;
-        if !deob.report.safe_static_only
-            || deob.report.presentation_formatted
-            || !deob.report.runtime_semantics_preserved_by_design
+        if !deob.report.guarantees.safe_static_only
+            || deob.report.guarantees.presentation_formatted
+            || !deob.report.guarantees.runtime_semantics_preserved_by_design
             || deob.report.transforms.contains_key("presentation_codegen")
         {
             bail!("{}: safe-deob report contract violated", sample.id);
@@ -624,11 +613,7 @@ pub fn evaluate_manifest(manifest_path: &Path, corpus_root: &Path) -> Result<Cor
             .map(|(_, count)| *count)
             .sum::<usize>();
 
-        let scan_budget = budgets.operation_under(
-            &sample_budget,
-            AnalysisOperation::StructuralScan,
-            &sample.id,
-        );
+        let scan_budget = AnalysisOperation::StructuralScan.under(&sample_budget, &sample.id);
         let scan = scan_source(&pretty, sample.id.clone(), None, source_mode, &scan_budget)?;
         if scan.fatal_error {
             bail!("{}: scanner fatal error", sample.id);

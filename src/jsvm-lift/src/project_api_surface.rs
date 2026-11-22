@@ -143,11 +143,8 @@ pub fn analyze_project_api_surface(project: &Path, budgets: &AnalysisBudgets) ->
                 continue;
             }
         };
-        let budget = budgets.operation_under(
-            &stage_budget,
-            AnalysisOperation::ApiSurface,
-            source_path.display().to_string(),
-        );
+        let budget =
+            AnalysisOperation::ApiSurface.under(&stage_budget, source_path.display().to_string());
         let rows = match analyze_api_surface(&source, &budget) {
             Ok(rows) => rows,
             Err(error) => {

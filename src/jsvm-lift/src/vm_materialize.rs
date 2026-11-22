@@ -655,11 +655,8 @@ pub fn materialize_project(
             .with_context(|| {
                 format!("code_units[{row_index}].scan_id must be a non-negative integer")
             })?;
-        let budget = budgets.operation_under(
-            &stage_budget,
-            AnalysisOperation::VmMaterialization,
-            format!("scan-{scan_id}"),
-        );
+        let budget =
+            AnalysisOperation::VmMaterialization.under(&stage_budget, format!("scan-{scan_id}"));
         budget.checkpoint()?;
         let switch_ir = row
             .get("switch_ir")

@@ -29,17 +29,17 @@ use url::Url;
 
 #[derive(Debug, Clone, Copy)]
 pub struct HttpCaptureLimits {
-    pub max_resources: usize,
-    pub max_resource_bytes: usize,
-    pub max_total_bytes: usize,
+    pub resources: usize,
+    pub per_resource_bytes: usize,
+    pub total_bytes: usize,
 }
 
 impl Default for HttpCaptureLimits {
     fn default() -> Self {
         Self {
-            max_resources: 128,
-            max_resource_bytes: 8 * 1024 * 1024,
-            max_total_bytes: 64 * 1024 * 1024,
+            resources: 128,
+            per_resource_bytes: 8 * 1024 * 1024,
+            total_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -242,7 +242,7 @@ pub fn capture_url_to_har(
     limits: HttpCaptureLimits,
 ) -> Result<HttpCaptureSummary> {
     ensure!(
-        limits.max_resources > 0 && limits.max_resource_bytes > 0 && limits.max_total_bytes > 0,
+        limits.resources > 0 && limits.per_resource_bytes > 0 && limits.total_bytes > 0,
         "HTTP capture limits must be positive"
     );
     let root = Url::parse(requested).context("expected a full http(s) URL")?;
@@ -271,7 +271,7 @@ pub fn capture_url_to_har(
     let budgets = AnalysisBudgets::standard("http-static-capture");
 
     while let Some(pending) = queue.pop_front() {
-        if entries.len() >= limits.max_resources || total_bytes >= limits.max_total_bytes {
+        if entries.len() >= limits.resources || total_bytes >= limits.total_bytes {
             queue.push_front(pending);
             break;
         }
@@ -305,8 +305,8 @@ pub fn capture_url_to_har(
                     Kind::Asset => "application/octet-stream",
                 })
                 .to_owned();
-            let left = limits.max_total_bytes.saturating_sub(total_bytes);
-            let cap = limits.max_resource_bytes.min(left);
+            let left = limits.total_bytes.saturating_sub(total_bytes);
+            let cap = limits.per_resource_bytes.min(left);
             let mut body = Vec::new();
             response
                 .take(u64::try_from(cap)?.saturating_add(1))

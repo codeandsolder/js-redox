@@ -108,7 +108,6 @@ fn run_string_recovery(
     work: &Path,
     key: &ContentKey,
     group: &[Occurrence],
-    budgets: &AnalysisBudgets,
     parent_budget: &WorkBudget,
 ) -> Result<StringResult> {
     let (raw_sha, mode) = key;
@@ -125,11 +124,8 @@ fn run_string_recovery(
             canonical.source.display()
         );
     }
-    let budget = budgets.operation_under(
-        parent_budget,
-        AnalysisOperation::StaticStringRecovery,
-        canonical.source.display().to_string(),
-    );
+    let budget = AnalysisOperation::StaticStringRecovery
+        .under(parent_budget, canonical.source.display().to_string());
     let outcome = match recover_static_strings(
         &original,
         canonical.source.display().to_string(),
@@ -197,7 +193,6 @@ fn run_safe_deob(
     raw_group_keys: &[ContentKey],
     string_results: &BTreeMap<ContentKey, StringResult>,
     max_iterations: usize,
-    budgets: &AnalysisBudgets,
     parent_budget: &WorkBudget,
 ) -> Result<DeobResult> {
     let (selected_sha, mode) = key;
@@ -216,11 +211,8 @@ fn run_safe_deob(
         );
     }
 
-    let budget = budgets.operation_under(
-        parent_budget,
-        AnalysisOperation::SafeDeobfuscation,
-        representative.canonical_raw_path.clone(),
-    );
+    let budget = AnalysisOperation::SafeDeobfuscation
+        .under(parent_budget, representative.canonical_raw_path.clone());
     match deobfuscate_source(
         &selected,
         representative.canonical_raw_path.clone(),
@@ -260,7 +252,6 @@ fn format_output(
     work: &Path,
     key: &ContentKey,
     deob: &DeobResult,
-    budgets: &AnalysisBudgets,
     parent_budget: &WorkBudget,
 ) -> Result<ReadableResult> {
     let (output_sha, mode) = key;
@@ -270,11 +261,7 @@ fn format_output(
         .context("missing deobfuscated output")?;
     let exact = fs::read_to_string(output_path)
         .with_context(|| format!("reading {}", output_path.display()))?;
-    let budget = budgets.operation_under(
-        parent_budget,
-        AnalysisOperation::Format,
-        output_path.display().to_string(),
-    );
+    let budget = AnalysisOperation::Format.under(parent_budget, output_path.display().to_string());
     // Analyst-only semantic naming: keep the exact, proof-checked source in
     // `src/_deobfuscated/` and enrich only the navigable presentation copy.
     let renamed = recover_readable_names(&exact);
@@ -397,7 +384,7 @@ pub fn materialize_project_deobfuscation(
             raw_group_refs
                 .par_iter()
                 .map(|(key, group)| {
-                    run_string_recovery(work_path, key, group, &options.budgets, &stage_budget)
+                    run_string_recovery(work_path, key, group, &stage_budget)
                         .map(|result| ((*key).clone(), result))
                 })
                 .collect::<Vec<_>>()
@@ -428,7 +415,6 @@ pub fn materialize_project_deobfuscation(
                         raw_keys,
                         &string_results,
                         options.max_iterations,
-                        &options.budgets,
                         &stage_budget,
                     )
                     .map(|result| ((*key).clone(), result))
@@ -462,14 +448,8 @@ pub fn materialize_project_deobfuscation(
                         .first()
                         .and_then(|pre_key| deob_results.get(pre_key))
                         .context("missing representative deob result")?;
-                    format_output(
-                        work_path,
-                        key,
-                        representative,
-                        &options.budgets,
-                        &stage_budget,
-                    )
-                    .map(|result| ((*key).clone(), result))
+                    format_output(work_path, key, representative, &stage_budget)
+                        .map(|result| ((*key).clone(), result))
                 })
                 .collect::<Vec<_>>()
         })
@@ -596,15 +576,15 @@ pub fn materialize_project_deobfuscation(
             ),
             (
                 "safe_static_only".into(),
-                Value::Bool(report.safe_static_only),
+                Value::Bool(report.guarantees.safe_static_only),
             ),
             (
                 "presentation_formatted".into(),
-                Value::Bool(report.presentation_formatted),
+                Value::Bool(report.guarantees.presentation_formatted),
             ),
             (
                 "runtime_semantics_preserved_by_design".into(),
-                Value::Bool(report.runtime_semantics_preserved_by_design),
+                Value::Bool(report.guarantees.runtime_semantics_preserved_by_design),
             ),
             (
                 "output_sha256".into(),

@@ -512,7 +512,7 @@ fn missing_conflicting_parent_body_does_not_turn_claim_into_exact_graph_link() -
     assert_eq!(child_witnesses[0]["positive_ranges"], 1);
     let observed =
         jsvm_lift::observed_runtime::materialize_observed_runtime_sources(&project, &budget)?;
-    assert_eq!(observed.witnessed_sources, 1);
+    assert_eq!(observed.witnessed, 1);
     assert!(project
         .join(format!("src/_observed/{}.js", digest(child)))
         .is_file());

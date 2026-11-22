@@ -84,6 +84,14 @@ impl AnalysisOperation {
         };
         BudgetLimits::wall_time(Duration::from_secs(seconds))
     }
+    /// Derive an operation-specific envelope from its actual parent.
+    /// The parent carries the cancellation and resource limits; the root
+    /// budget container is not involved once a stage is already established.
+    #[must_use]
+    pub fn under(self, parent: &WorkBudget, label: impl AsRef<str>) -> WorkBudget {
+        let scope = format!("{}:{}", self.as_str(), label.as_ref());
+        parent.child(scope, self.limits())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -114,18 +122,7 @@ impl AnalysisBudgets {
 
     #[must_use]
     pub fn operation(&self, operation: AnalysisOperation, label: impl AsRef<str>) -> WorkBudget {
-        self.operation_under(&self.root, operation, label)
-    }
-
-    #[must_use]
-    pub fn operation_under(
-        &self,
-        parent: &WorkBudget,
-        operation: AnalysisOperation,
-        label: impl AsRef<str>,
-    ) -> WorkBudget {
-        let scope = format!("{}:{}", operation.as_str(), label.as_ref());
-        parent.child(scope, operation.limits())
+        operation.under(&self.root, label)
     }
 
     #[must_use]
@@ -169,9 +166,8 @@ mod tests {
 
     #[test]
     fn nested_operation_reports_stage_exhaustion_as_inherited() {
-        let budgets = AnalysisBudgets::standard("project");
         let stage = WorkBudget::new("stage", BudgetLimits::work(1));
-        let unit = budgets.operation_under(&stage, AnalysisOperation::StructuralScan, "fixture.js");
+        let unit = AnalysisOperation::StructuralScan.under(&stage, "fixture.js");
         assert!(unit.consume(1).is_ok());
         assert!(matches!(
             unit.consume(1),

@@ -23,9 +23,9 @@ use std::{
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ObservedSourceSummary {
-    pub witnessed_sources: usize,
-    pub formatted_sources: usize,
-    pub unformatted_sources: usize,
+    pub witnessed: usize,
+    pub formatted: usize,
+    pub unformatted: usize,
 }
 
 /// A compact human-facing locator, not a replacement for the recorded URL.
@@ -210,11 +210,11 @@ pub fn materialize_observed_runtime_sources(
         let absolute = project.join(&target);
         crate::report_file::write_text(&absolute, &text)?;
         stale_paths.remove(&target);
-        summary.witnessed_sources += 1;
+        summary.witnessed += 1;
         if was_formatted {
-            summary.formatted_sources += 1;
+            summary.formatted += 1;
         } else {
-            summary.unformatted_sources += 1;
+            summary.unformatted += 1;
         }
         let category = source
             .get("classification")
@@ -276,7 +276,7 @@ pub fn materialize_observed_runtime_sources(
             Err(error) => return Err(error.into()),
         }
     }
-    if summary.witnessed_sources > 0 || project.join("src/_observed/README.md").is_file() {
+    if summary.witnessed > 0 || project.join("src/_observed/README.md").is_file() {
         for (heading, links) in grouped_links {
             let _ = write!(readme, "## {heading} ({})\n\n", links.len());
             for link in links {
@@ -290,9 +290,9 @@ pub fn materialize_observed_runtime_sources(
     let doc = json!({
         "schema":OBSERVED_SOURCE.schema,
         "summary":{
-            "witnessed_sources":summary.witnessed_sources,
-            "formatted_sources":summary.formatted_sources,
-            "unformatted_sources":summary.unformatted_sources,
+            "witnessed_sources":summary.witnessed,
+            "formatted_sources":summary.formatted,
+            "unformatted_sources":summary.unformatted,
             "positive_coverage_only":true,
         },
         "sources":entries,
@@ -385,8 +385,8 @@ mod tests {
             &project,
             &AnalysisBudgets::standard("observed-test"),
         )?;
-        assert_eq!(result.witnessed_sources, 1);
-        assert_eq!(result.formatted_sources, 1);
+        assert_eq!(result.witnessed, 1);
+        assert_eq!(result.formatted, 1);
         let readme = fs::read_to_string(project.join("src/_observed/README.md"))?;
         assert!(readme.contains("## Network scripts (1)"));
         assert!(readme.contains("1 witnessed script instance(s)"));
@@ -404,7 +404,7 @@ mod tests {
             &project,
             &AnalysisBudgets::standard("observed-conflicting"),
         )?;
-        assert_eq!(again.witnessed_sources, 0);
+        assert_eq!(again.witnessed, 0);
         assert!(!project.join(format!("src/_observed/{digest}.js")).is_file());
         let runtime = load_artifact(&project, RUNTIME_SCRIPTS).context("index")?;
         assert_eq!(runtime["sources"][0]["observed_executed"], false);

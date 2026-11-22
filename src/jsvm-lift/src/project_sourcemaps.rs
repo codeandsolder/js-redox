@@ -823,11 +823,8 @@ pub fn recover_project_sourcemaps(
         let Some(resource_id) = resource_id(resource) else {
             continue;
         };
-        let budget = budgets.operation_under(
-            &stage_budget,
-            AnalysisOperation::SourcemapRecovery,
-            format!("{resource_id}:{code_url}"),
-        );
+        let budget = AnalysisOperation::SourcemapRecovery
+            .under(&stage_budget, format!("{resource_id}:{code_url}"));
         budget.checkpoint()?;
         let loaded = match load_map(&raw_reference, code_url, &by_url, &project, &budget) {
             Ok(loaded) => loaded,

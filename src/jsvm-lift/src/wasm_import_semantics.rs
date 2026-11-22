@@ -23,9 +23,11 @@ pub use bulk_import::{
     AliasInitializationWitness, WasmImportHandlerSemantic, WasmImportHandlerShape,
 };
 use import_object::{assignment_import_object, collect_instantiation_sites};
-pub use import_object::{WasmImportObjectUsage, WasmInstantiationSite};
+pub use import_object::{ModuleIdentityEvidence, WasmImportObjectUsage, WasmInstantiationSite};
 use memory_identity::collect_module_memory_identity_proofs;
-pub use memory_identity::{WasmInstanceExportCall, WasmModuleMemoryIdentityProof};
+pub use memory_identity::{
+    InitializerEvidence, WasmInstanceExportCall, WasmModuleMemoryIdentityProof,
+};
 use module_identity::collect_exact_module_sites;
 
 /// Independent JavaScript-side proofs relevant to WebAssembly import correlation.
@@ -1424,13 +1426,13 @@ mod tests {
         assert!(site.webassembly_builtin_reference_proven);
         assert!(site.exact_import_object_identity_proven);
         assert_eq!(site.import_object_identity_kind, "returned_object_call");
-        assert!(site.exact_module_identity_proven);
+        assert!(site.module.exact_module_identity_proven);
         assert_eq!(
-            site.module_sha256.as_deref(),
+            site.module.module_sha256.as_deref(),
             Some(crate::sha256_hex(b"\0asm\x01\0\0\0").as_str())
         );
-        assert_eq!(site.module_identity_kind, Some("exact_bytes"));
-        assert!(site.standard_module_decode_builtins_required);
+        assert_eq!(site.module.module_identity_kind, Some("exact_bytes"));
+        assert!(site.module.standard_module_decode_builtins_required);
     }
 
     #[test]
@@ -1471,9 +1473,9 @@ mod tests {
             return;
         };
         assert!(site.exact_import_object_identity_proven);
-        assert!(site.exact_module_identity_proven);
+        assert!(site.module.exact_module_identity_proven);
         assert_eq!(
-            site.module_sha256.as_deref(),
+            site.module.module_sha256.as_deref(),
             Some(crate::sha256_hex(b"\0asm\x01\0\0\0").as_str())
         );
     }
@@ -1511,8 +1513,8 @@ mod tests {
             return;
         };
         assert!(site.exact_import_object_identity_proven);
-        assert!(!site.exact_module_identity_proven);
-        assert!(site.module_sha256.is_none());
+        assert!(!site.module.exact_module_identity_proven);
+        assert!(site.module.module_sha256.is_none());
 
         let shadowed = r#"
             var m = window;
@@ -1543,7 +1545,7 @@ mod tests {
         assert!(usage
             .instantiation_sites
             .iter()
-            .all(|site| !site.exact_module_identity_proven));
+            .all(|site| !site.module.exact_module_identity_proven));
 
         let shadowed_alias = r#"
             var m = window;
@@ -1573,7 +1575,7 @@ mod tests {
         assert!(usage
             .instantiation_sites
             .iter()
-            .all(|site| !site.exact_module_identity_proven));
+            .all(|site| !site.module.exact_module_identity_proven));
     }
 
     #[test]
@@ -1770,7 +1772,7 @@ mod tests {
             proof.import_module == "wbg"
                 && proof.import_name == "__wbindgen_memory"
                 && proof.memory_export_name == "memory"
-                && proof.instantiation_site.exact_module_identity_proven
+                && proof.instantiation_site.module.exact_module_identity_proven
                 && proof.instantiation_site.exact_import_object_identity_proven
                 && proof.export_calls.iter().any(|call| {
                     call.export_name == "copy"

@@ -89,6 +89,24 @@ pub struct StaticAliasInstallerCallReport {
     pub semantics_proven: bool,
 }
 
+/// Guarantees of the emitted source, independent of iteration convergence.
+#[derive(Debug, Clone, Serialize)]
+pub struct OutputGuarantees {
+    pub safe_static_only: bool,
+    pub presentation_formatted: bool,
+    pub runtime_semantics_preserved_by_design: bool,
+}
+
+impl OutputGuarantees {
+    const fn new(format_output: bool) -> Self {
+        Self {
+            safe_static_only: true,
+            presentation_formatted: format_output,
+            runtime_semantics_preserved_by_design: !format_output,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SafeDeobReport {
     pub schema: &'static str,
@@ -102,9 +120,8 @@ pub struct SafeDeobReport {
     pub arithmetic_state_proofs: Vec<ArithmeticStateProofReport>,
     pub analysis_source_sha256: String,
     pub static_alias_installer_calls: Vec<StaticAliasInstallerCallReport>,
-    pub safe_static_only: bool,
-    pub presentation_formatted: bool,
-    pub runtime_semantics_preserved_by_design: bool,
+    #[serde(flatten)]
+    pub guarantees: OutputGuarantees,
     /// A validated no-op pass was observed before the iteration limit.
     pub analysis_complete: bool,
     /// Nontrivial multi-pass cycle (the ordinary no-op fixed point is separate).
@@ -233,9 +250,7 @@ pub fn deobfuscate_source(
         arithmetic_state_proofs,
         analysis_source_sha256,
         static_alias_installer_calls,
-        safe_static_only: true,
-        presentation_formatted: format_output,
-        runtime_semantics_preserved_by_design: !format_output,
+        guarantees: OutputGuarantees::new(format_output),
         analysis_complete,
         iteration_cycle,
         source_recovery,
@@ -281,8 +296,13 @@ mod tests {
         let budget = WorkBudget::unlimited("safe-deob-test");
         let outcome =
             deobfuscate_source(source, "fixture.js", SourceMode::Auto, 8, false, &budget)?;
-        assert!(outcome.report.safe_static_only);
-        assert!(outcome.report.runtime_semantics_preserved_by_design);
+        assert!(outcome.report.guarantees.safe_static_only);
+        assert!(
+            outcome
+                .report
+                .guarantees
+                .runtime_semantics_preserved_by_design
+        );
         assert_eq!(
             outcome.report.analysis_source_sha256,
             sha256_hex(outcome.source.as_bytes())

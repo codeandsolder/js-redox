@@ -358,18 +358,14 @@ fn report_for_group(
     digest: &str,
     group: &[usize],
     units: &[EligibleUnit],
-    budgets: &AnalysisBudgets,
     parent_budget: &work_budget::WorkBudget,
 ) -> Result<(String, Result<BundleInventoryReport, String>)> {
     let Some(&index) = group.first() else {
         return Ok((digest.to_owned(), Err("empty inventory group".to_owned())));
     };
     let unit = &units[index];
-    let budget = budgets.operation_under(
-        parent_budget,
-        AnalysisOperation::BundleMaterialization,
-        unit.parent.display().to_string(),
-    );
+    let budget = AnalysisOperation::BundleMaterialization
+        .under(parent_budget, unit.parent.display().to_string());
     if let Err(error) = budget.checkpoint() {
         let error = recoverable_unit_error(anyhow::Error::new(error))?;
         return Ok((digest.to_owned(), Err(error.to_string())));
@@ -456,7 +452,7 @@ pub fn materialize_bundle_modules(
     let inventory_rows = pool.install(|| {
         grouped
             .par_iter()
-            .map(|(digest, group)| report_for_group(digest, group, &units, budgets, &stage_budget))
+            .map(|(digest, group)| report_for_group(digest, group, &units, &stage_budget))
             .collect::<Vec<_>>()
     });
     let inventory = inventory_rows
@@ -563,11 +559,8 @@ pub fn materialize_bundle_modules(
                     return Ok::<_, anyhow::Error>(((*digest).clone(), String::new(), false));
                 };
                 let task = &tasks[index];
-                let budget = budgets.operation_under(
-                    &stage_budget,
-                    AnalysisOperation::Format,
-                    task.dest.display().to_string(),
-                );
+                let budget =
+                    AnalysisOperation::Format.under(&stage_budget, task.dest.display().to_string());
                 let raw = &task.raw;
                 let result = match format_source(raw, &budget) {
                     Ok(formatted) => ((*digest).clone(), formatted, true),

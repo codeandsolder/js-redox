@@ -209,14 +209,9 @@ fn materialize_text(
 fn format_javascript(
     source: &Path,
     resource: Option<&Value>,
-    budgets: &AnalysisBudgets,
     parent_budget: &work_budget::WorkBudget,
 ) -> Result<JsGroupResult> {
-    let budget = budgets.operation_under(
-        parent_budget,
-        AnalysisOperation::Format,
-        source.display().to_string(),
-    );
+    let budget = AnalysisOperation::Format.under(parent_budget, source.display().to_string());
     let raw = fs::read(source).with_context(|| format!("reading {}", source.display()))?;
     let decoded = decode_text_bytes(&raw, resource)?;
     let formatted = format_source(&decoded.text, &budget);
@@ -507,7 +502,6 @@ pub fn materialize_capture_source(
                 let result = format_javascript(
                     &canonical.source,
                     canonical.resource.as_ref(),
-                    budgets,
                     &stage_budget,
                 )?;
                 Ok::<_, anyhow::Error>(((*key).clone(), result))

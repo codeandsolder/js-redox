@@ -52,13 +52,13 @@ fn print_text(report: &SusScanReport) {
             file.signal_count,
             file.top_score,
             file.diagnostics,
-            file.decode_encoding,
-            if file.decode_had_errors {
+            file.decoding.encoding,
+            if file.decoding.had_errors {
                 " DECODE_ERRORS"
             } else {
                 ""
             },
-            if file.decode_uncertain {
+            if file.decoding.uncertain {
                 " DECODE_UNCERTAIN"
             } else {
                 ""

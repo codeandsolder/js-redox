@@ -293,21 +293,21 @@ impl Setup<'_> {
         {
             return None;
         }
-        let Expression::CallExpression(decoded) =
+        let Expression::CallExpression(decode_call) =
             unparenthesized(call.arguments.first()?.as_expression()?)
         else {
             return None;
         };
-        if decoded.optional || !(1..=2).contains(&decoded.arguments.len()) {
+        if decode_call.optional || !(1..=2).contains(&decode_call.arguments.len()) {
             return None;
         }
-        let callee_symbol = self.identifier(&decoded.callee)?;
+        let callee_symbol = self.identifier(&decode_call.callee)?;
         let decoder = self.aliases.get(&callee_symbol).copied().or_else(|| {
             (!self.local(callee_symbol) && self.scoping.symbol_flags(callee_symbol).is_function())
                 .then_some(callee_symbol)
         })?;
-        let raw = self.integer(decoded.arguments.first()?.as_expression()?)?;
-        let key = match decoded.arguments.get(1) {
+        let raw = self.integer(decode_call.arguments.first()?.as_expression()?)?;
+        let key = match decode_call.arguments.get(1) {
             Some(argument) => {
                 let Expression::StringLiteral(literal) = unparenthesized(argument.as_expression()?)
                 else {

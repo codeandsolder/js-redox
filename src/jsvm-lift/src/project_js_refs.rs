@@ -252,11 +252,8 @@ pub fn scan_project_references(
             .map(|(digest, group)| {
                 let canonical_index = *group.first().context("empty JS-reference group")?;
                 let canonical = &javascript_units[canonical_index];
-                let budget = budgets.operation_under(
-                    &stage_budget,
-                    AnalysisOperation::ReferenceScan,
-                    canonical.source.display().to_string(),
-                );
+                let budget = AnalysisOperation::ReferenceScan
+                    .under(&stage_budget, canonical.source.display().to_string());
                 if let Err(error) = budget.checkpoint() {
                     let error = recoverable_unit_error(anyhow::Error::new(error))?;
                     return Ok::<_, anyhow::Error>((

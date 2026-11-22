@@ -144,7 +144,6 @@ fn recover_generated_unit(
     raw_rel: &str,
     scan_id: usize,
     ordinal: usize,
-    budgets: &AnalysisBudgets,
     parent_budget: &WorkBudget,
 ) -> Result<Value> {
     let recovery_rel =
@@ -184,11 +183,8 @@ fn recover_generated_unit(
             raw.display()
         );
     }
-    let string_budget = budgets.operation_under(
-        parent_budget,
-        AnalysisOperation::StaticStringRecovery,
-        raw.display().to_string(),
-    );
+    let string_budget =
+        AnalysisOperation::StaticStringRecovery.under(parent_budget, raw.display().to_string());
     let (selected, string_ok, string_changed) = match recover_static_strings(
         &raw_source,
         raw.display().to_string(),
@@ -249,11 +245,8 @@ fn recover_generated_unit(
     let selected_source =
         fs::read_to_string(&selected).with_context(|| format!("reading {}", selected.display()))?;
     let selected_sha = sha256_path(&selected)?;
-    let deob_budget = budgets.operation_under(
-        parent_budget,
-        AnalysisOperation::SafeDeobfuscation,
-        selected.display().to_string(),
-    );
+    let deob_budget =
+        AnalysisOperation::SafeDeobfuscation.under(parent_budget, selected.display().to_string());
     let deob = deobfuscate_source(
         &selected_source,
         selected.display().to_string(),
@@ -267,9 +260,12 @@ fn recover_generated_unit(
             let output_sha = crate::sha256_hex(outcome.source.as_bytes());
             if outcome.report.input_sha256 != selected_sha
                 || outcome.report.output_sha256 != output_sha
-                || !outcome.report.safe_static_only
-                || !outcome.report.runtime_semantics_preserved_by_design
-                || outcome.report.presentation_formatted
+                || !outcome.report.guarantees.safe_static_only
+                || !outcome
+                    .report
+                    .guarantees
+                    .runtime_semantics_preserved_by_design
+                || outcome.report.guarantees.presentation_formatted
             {
                 bail!(
                     "safe deobfuscation provenance invariant failed for {}",
@@ -303,11 +299,8 @@ fn recover_generated_unit(
     let analysis_source = project.join(&analysis_rel);
     let exact = fs::read_to_string(&analysis_source)
         .with_context(|| format!("reading {}", analysis_source.display()))?;
-    let format_budget = budgets.operation_under(
-        parent_budget,
-        AnalysisOperation::Format,
-        analysis_source.display().to_string(),
-    );
+    let format_budget =
+        AnalysisOperation::Format.under(parent_budget, analysis_source.display().to_string());
     let formatted = format_source(&exact, &format_budget);
     let (readable, readable_formatted, format_error) = match formatted {
         Ok(formatted) => (formatted, true, None),
@@ -560,11 +553,8 @@ pub fn scan_project(project: &Path, options: &ProjectScanOptions) -> Result<Proj
             _ => {
                 let dump_dir = outdir.join("embedded").join(format!("{scan_id:04}"));
                 scanner_invocations += 1;
-                let scan_budget = options.budgets.operation_under(
-                    &stage_budget,
-                    AnalysisOperation::StructuralScan,
-                    source.display().to_string(),
-                );
+                let scan_budget = AnalysisOperation::StructuralScan
+                    .under(&stage_budget, source.display().to_string());
                 let report = match scan_file(&source, Some(&dump_dir), &scan_budget) {
                     Ok(report) => report,
                     Err(error) => {
@@ -666,7 +656,6 @@ pub fn scan_project(project: &Path, options: &ProjectScanOptions) -> Result<Proj
                     &raw_rel,
                     scan_id,
                     ordinal,
-                    &options.budgets,
                     &stage_budget,
                 )?;
                 recovery["deduplicated"] = false.into();
@@ -725,11 +714,8 @@ pub fn scan_project(project: &Path, options: &ProjectScanOptions) -> Result<Proj
 
         if value_usize(&row, "confirmed_direct_switch_maps") > 0 {
             let output_path = outdir.join(format!("{scan_id:04}.switch-ir.json"));
-            let ir_budget = options.budgets.operation_under(
-                &stage_budget,
-                AnalysisOperation::IrMaterialization,
-                format!("switch-ir:{}", source.display()),
-            );
+            let ir_budget = AnalysisOperation::IrMaterialization
+                .under(&stage_budget, format!("switch-ir:{}", source.display()));
             match crate::switch_ir::materialize(&source, &report_path, &output_path, &ir_budget) {
                 Ok(()) => {
                     row["switch_ir_exit"] = 0.into();
@@ -744,11 +730,8 @@ pub fn scan_project(project: &Path, options: &ProjectScanOptions) -> Result<Proj
         }
         if value_usize(&row, "table_vms") > 0 {
             let output_path = outdir.join(format!("{scan_id:04}.table-ir.json"));
-            let ir_budget = options.budgets.operation_under(
-                &stage_budget,
-                AnalysisOperation::IrMaterialization,
-                format!("table-ir:{}", source.display()),
-            );
+            let ir_budget = AnalysisOperation::IrMaterialization
+                .under(&stage_budget, format!("table-ir:{}", source.display()));
             match crate::table_ir::materialize(&source, &report_path, &output_path, &ir_budget) {
                 Ok(()) => {
                     row["table_ir_exit"] = 0.into();

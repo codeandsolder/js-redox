@@ -520,6 +520,269 @@ impl Analyzer<'_> {
         }
     }
 
+    fn unary_expression(
+        &mut self,
+        unary: &oxc_ast::ast::UnaryExpression<'_>,
+        environment: &mut Environment,
+    ) -> Evaluation {
+        let operator = unary.operator.as_str();
+        if operator == "delete" {
+            return self.delete_expression(&unary.argument, environment);
+        }
+        let argument = self.expression(&unary.argument, environment);
+        let value = if let Some(value) = argument.primitive_value() {
+            if !self.charge_values([value]) {
+                return Self::barrier(environment);
+            }
+            eval_unary_value(operator, value)
+        } else {
+            None
+        };
+        if let Some(value) = value {
+            return Evaluation::primitive(value, argument.inert);
+        }
+        match operator {
+            "!" => argument.fact.as_ref().map_or(
+                Evaluation {
+                    fact: None,
+                    inert: argument.inert,
+                },
+                |value| Evaluation::primitive(Value::Bool(!value.truthy()), argument.inert),
+            ),
+            "void" => Evaluation::primitive(Value::Undefined, argument.inert),
+            "typeof" if matches!(argument.fact, Some(Fact::Objects(_))) => {
+                Evaluation::primitive(Value::String("object".into()), argument.inert)
+            }
+            "typeof" => Evaluation {
+                fact: None,
+                inert: argument.inert,
+            },
+            _ => Self::barrier(environment),
+        }
+    }
+
+    fn binary_expression(
+        &mut self,
+        binary: &oxc_ast::ast::BinaryExpression<'_>,
+        environment: &mut Environment,
+    ) -> Evaluation {
+        let left = self.expression(&binary.left, environment);
+        let right = self.expression(&binary.right, environment);
+        let operator = binary.operator.as_str();
+        if let (Some(left_value), Some(right_value)) =
+            (left.primitive_value(), right.primitive_value())
+        {
+            if !self.charge_values([left_value, right_value]) {
+                return Self::barrier(environment);
+            }
+            if let Some(value) = eval_binary(operator, left_value, right_value) {
+                return Evaluation::primitive(value, left.inert && right.inert);
+            }
+        }
+        if matches!(operator, "===" | "!==") {
+            let equal = if let (Some(left), Some(right)) =
+                (left.fact.as_ref(), right.fact.as_ref())
+            {
+                self.heap_result(left.strict_equal(right, self.budget))
+                    .flatten()
+            } else {
+                None
+            };
+            Evaluation {
+                fact: equal.map(|equal| {
+                    Fact::Primitive(Value::Bool(equal == (operator == "===")))
+                }),
+                inert: left.inert && right.inert,
+            }
+        } else {
+            Self::barrier(environment)
+        }
+    }
+
+    fn logical_expression(
+        &mut self,
+        logical: &oxc_ast::ast::LogicalExpression<'_>,
+        environment: &mut Environment,
+    ) -> Evaluation {
+        let left = self.expression(&logical.left, environment);
+        let decision = left
+            .fact
+            .as_ref()
+            .and_then(|fact| Self::logical_decision(logical.operator.as_str(), fact));
+        match decision {
+            Some(false) => left,
+            Some(true) => {
+                let mut right = self.expression(&logical.right, environment);
+                right.inert &= left.inert;
+                right
+            }
+            None => {
+                let skip = environment.clone();
+                let first_new = self.next_allocation;
+                let right = self.expression(&logical.right, environment);
+                if !self.join_heap(environment, &skip, first_new) {
+                    return Self::barrier(environment);
+                }
+                Evaluation {
+                    fact: None,
+                    inert: left.inert && right.inert,
+                }
+            }
+        }
+    }
+
+    fn conditional_expression(
+        &mut self,
+        conditional: &oxc_ast::ast::ConditionalExpression<'_>,
+        environment: &mut Environment,
+    ) -> Evaluation {
+        let test = self.expression(&conditional.test, environment);
+        if let Some(fact) = &test.fact {
+            let selected = if fact.truthy() {
+                &conditional.consequent
+            } else {
+                &conditional.alternate
+            };
+            let mut result = self.expression(selected, environment);
+            result.inert &= test.inert;
+            return result;
+        }
+        let mut other = environment.clone();
+        let first_new = self.next_allocation;
+        let left = self.expression(&conditional.consequent, environment);
+        let right = self.expression(&conditional.alternate, &mut other);
+        if !self.join_heap(environment, &other, first_new) {
+            return Self::barrier(environment);
+        }
+        let fact =
+            if let (Some(left), Some(right)) = (left.fact.as_ref(), right.fact.as_ref()) {
+                self.heap_result(left.join(right, self.budget)).flatten()
+            } else {
+                None
+            };
+        Evaluation {
+            fact,
+            inert: test.inert && left.inert && right.inert,
+        }
+    }
+
+    fn array_expression(
+        &mut self,
+        array: &oxc_ast::ast::ArrayExpression<'_>,
+        environment: &mut Environment,
+    ) -> Evaluation {
+        let mut data = OwnData::new(AllocationKind::Array);
+        let mut inert = true;
+        let mut known_index = true;
+        for (index, element) in array.elements.iter().enumerate() {
+            match element {
+                ArrayExpressionElement::Elision(_) => {}
+                ArrayExpressionElement::SpreadElement(spread) => {
+                    self.expression(&spread.argument, environment);
+                    environment.clear();
+                    known_index = false;
+                    data.unknown_array_tail();
+                    inert = false;
+                }
+                _ => {
+                    let Some(value) = element.as_expression() else {
+                        return Self::barrier(environment);
+                    };
+                    let result = self.expression(value, environment);
+                    inert &= result.inert;
+                    if known_index {
+                        data.define_data(index.to_string(), result.fact);
+                    }
+                }
+            }
+        }
+        let length = known_index
+            .then(|| u32::try_from(array.elements.len()).ok())
+            .flatten()
+            .map(|length| Fact::Primitive(Value::Number(f64::from(length))));
+        data.define_data("length".into(), length);
+        self.allocate(environment, data, inert)
+    }
+
+    fn object_expression(
+        &mut self,
+        object: &oxc_ast::ast::ObjectExpression<'_>,
+        environment: &mut Environment,
+    ) -> Evaluation {
+        let mut data = OwnData::new(AllocationKind::Ordinary);
+        let mut inert = true;
+        for item in &object.properties {
+            match item {
+                ObjectPropertyKind::SpreadProperty(spread) => {
+                    let value = self.expression(&spread.argument, environment);
+                    let copied = match value.fact.as_ref() {
+                        Some(fact) => match data.spread(environment, fact, self.budget) {
+                            Ok(copied) => copied,
+                            Err(failure) => {
+                                self.failure = Some(failure);
+                                return Self::barrier(environment);
+                            }
+                        },
+                        None => false,
+                    };
+                    if copied {
+                        inert &= value.inert;
+                    } else {
+                        environment.clear();
+                        if self
+                            .heap_result(data.define_unknown_key(true, None, self.budget))
+                            .is_none()
+                        {
+                            return Self::barrier(environment);
+                        }
+                        inert = false;
+                    }
+                }
+                ObjectPropertyKind::ObjectProperty(property) => {
+                    let key = if property.computed {
+                        let result = property
+                            .key
+                            .as_expression()
+                            .map_or_default(|key| self.key(key, environment));
+                        inert &= result.inert;
+                        let key = result.primitive_value().map(Value::js_string);
+                        if key.is_none() {
+                            environment.clear();
+                            inert = false;
+                        }
+                        key
+                    } else {
+                        literal_property_key(&property.key)
+                    };
+                    let value = self.expression(&property.value, environment);
+                    inert &= value.inert;
+                    let is_data = property.kind == PropertyKind::Init;
+                    let Some(key) = key else {
+                        if self
+                            .heap_result(data.define_unknown_key(
+                                is_data,
+                                value.fact,
+                                self.budget,
+                            ))
+                            .is_none()
+                        {
+                            return Self::barrier(environment);
+                        }
+                        continue;
+                    };
+                    if is_prototype_setter(property, &key) {
+                        data.set_literal_prototype(value.fact);
+                    } else if is_data {
+                        data.define_data(key, value.fact);
+                    } else {
+                        data.define_accessor(key);
+                    }
+                }
+            }
+        }
+        self.allocate(environment, data, inert)
+    }
+
     fn expression(
         &mut self,
         expression: &Expression<'_>,
@@ -551,239 +814,14 @@ impl Analyzer<'_> {
                 }
                 result
             }
-            Expression::UnaryExpression(unary) => {
-                let operator = unary.operator.as_str();
-                if operator == "delete" {
-                    return self.delete_expression(&unary.argument, environment);
-                }
-                let argument = self.expression(&unary.argument, environment);
-                let value = if let Some(value) = argument.primitive_value() {
-                    if !self.charge_values([value]) {
-                        return Self::barrier(environment);
-                    }
-                    eval_unary_value(operator, value)
-                } else {
-                    None
-                };
-                if let Some(value) = value {
-                    return Evaluation::primitive(value, argument.inert);
-                }
-                match operator {
-                    "!" => argument.fact.as_ref().map_or(
-                        Evaluation {
-                            fact: None,
-                            inert: argument.inert,
-                        },
-                        |value| Evaluation::primitive(Value::Bool(!value.truthy()), argument.inert),
-                    ),
-                    "void" => Evaluation::primitive(Value::Undefined, argument.inert),
-                    "typeof" if matches!(argument.fact, Some(Fact::Objects(_))) => {
-                        Evaluation::primitive(Value::String("object".into()), argument.inert)
-                    }
-                    "typeof" => Evaluation {
-                        fact: None,
-                        inert: argument.inert,
-                    },
-                    _ => Self::barrier(environment),
-                }
-            }
-            Expression::BinaryExpression(binary) => {
-                let left = self.expression(&binary.left, environment);
-                let right = self.expression(&binary.right, environment);
-                let operator = binary.operator.as_str();
-                if let (Some(left_value), Some(right_value)) =
-                    (left.primitive_value(), right.primitive_value())
-                {
-                    if !self.charge_values([left_value, right_value]) {
-                        return Self::barrier(environment);
-                    }
-                    if let Some(value) = eval_binary(operator, left_value, right_value) {
-                        return Evaluation::primitive(value, left.inert && right.inert);
-                    }
-                }
-                if matches!(operator, "===" | "!==") {
-                    let equal = if let (Some(left), Some(right)) =
-                        (left.fact.as_ref(), right.fact.as_ref())
-                    {
-                        self.heap_result(left.strict_equal(right, self.budget))
-                            .flatten()
-                    } else {
-                        None
-                    };
-                    Evaluation {
-                        fact: equal.map(|equal| {
-                            Fact::Primitive(Value::Bool(equal == (operator == "===")))
-                        }),
-                        inert: left.inert && right.inert,
-                    }
-                } else {
-                    Self::barrier(environment)
-                }
-            }
-            Expression::LogicalExpression(logical) => {
-                let left = self.expression(&logical.left, environment);
-                let decision = left
-                    .fact
-                    .as_ref()
-                    .and_then(|fact| Self::logical_decision(logical.operator.as_str(), fact));
-                match decision {
-                    Some(false) => left,
-                    Some(true) => {
-                        let mut right = self.expression(&logical.right, environment);
-                        right.inert &= left.inert;
-                        right
-                    }
-                    None => {
-                        let skip = environment.clone();
-                        let first_new = self.next_allocation;
-                        let right = self.expression(&logical.right, environment);
-                        if !self.join_heap(environment, &skip, first_new) {
-                            return Self::barrier(environment);
-                        }
-                        Evaluation {
-                            fact: None,
-                            inert: left.inert && right.inert,
-                        }
-                    }
-                }
-            }
+            Expression::UnaryExpression(unary) => self.unary_expression(unary, environment),
+            Expression::BinaryExpression(binary) => self.binary_expression(binary, environment),
+            Expression::LogicalExpression(logical) => self.logical_expression(logical, environment),
             Expression::ConditionalExpression(conditional) => {
-                let test = self.expression(&conditional.test, environment);
-                if let Some(fact) = &test.fact {
-                    let selected = if fact.truthy() {
-                        &conditional.consequent
-                    } else {
-                        &conditional.alternate
-                    };
-                    let mut result = self.expression(selected, environment);
-                    result.inert &= test.inert;
-                    return result;
-                }
-                let mut other = environment.clone();
-                let first_new = self.next_allocation;
-                let left = self.expression(&conditional.consequent, environment);
-                let right = self.expression(&conditional.alternate, &mut other);
-                if !self.join_heap(environment, &other, first_new) {
-                    return Self::barrier(environment);
-                }
-                let fact =
-                    if let (Some(left), Some(right)) = (left.fact.as_ref(), right.fact.as_ref()) {
-                        self.heap_result(left.join(right, self.budget)).flatten()
-                    } else {
-                        None
-                    };
-                Evaluation {
-                    fact,
-                    inert: test.inert && left.inert && right.inert,
-                }
+                self.conditional_expression(conditional, environment)
             }
-            Expression::ArrayExpression(array) => {
-                let mut data = OwnData::new(AllocationKind::Array);
-                let mut inert = true;
-                let mut known_index = true;
-                for (index, element) in array.elements.iter().enumerate() {
-                    match element {
-                        ArrayExpressionElement::Elision(_) => {}
-                        ArrayExpressionElement::SpreadElement(spread) => {
-                            self.expression(&spread.argument, environment);
-                            environment.clear();
-                            known_index = false;
-                            data.unknown_array_tail();
-                            inert = false;
-                        }
-                        _ => {
-                            let Some(value) = element.as_expression() else {
-                                return Self::barrier(environment);
-                            };
-                            let result = self.expression(value, environment);
-                            inert &= result.inert;
-                            if known_index {
-                                data.define_data(index.to_string(), result.fact);
-                            }
-                        }
-                    }
-                }
-                let length = known_index
-                    .then(|| u32::try_from(array.elements.len()).ok())
-                    .flatten()
-                    .map(|length| Fact::Primitive(Value::Number(f64::from(length))));
-                data.define_data("length".into(), length);
-                self.allocate(environment, data, inert)
-            }
-            Expression::ObjectExpression(object) => {
-                let mut data = OwnData::new(AllocationKind::Ordinary);
-                let mut inert = true;
-                for item in &object.properties {
-                    match item {
-                        ObjectPropertyKind::SpreadProperty(spread) => {
-                            let value = self.expression(&spread.argument, environment);
-                            let copied = match value.fact.as_ref() {
-                                Some(fact) => match data.spread(environment, fact, self.budget) {
-                                    Ok(copied) => copied,
-                                    Err(failure) => {
-                                        self.failure = Some(failure);
-                                        return Self::barrier(environment);
-                                    }
-                                },
-                                None => false,
-                            };
-                            if copied {
-                                inert &= value.inert;
-                            } else {
-                                environment.clear();
-                                if self
-                                    .heap_result(data.define_unknown_key(true, None, self.budget))
-                                    .is_none()
-                                {
-                                    return Self::barrier(environment);
-                                }
-                                inert = false;
-                            }
-                        }
-                        ObjectPropertyKind::ObjectProperty(property) => {
-                            let key = if property.computed {
-                                let result = property
-                                    .key
-                                    .as_expression()
-                                    .map_or_default(|key| self.key(key, environment));
-                                inert &= result.inert;
-                                let key = result.primitive_value().map(Value::js_string);
-                                if key.is_none() {
-                                    environment.clear();
-                                    inert = false;
-                                }
-                                key
-                            } else {
-                                literal_property_key(&property.key)
-                            };
-                            let value = self.expression(&property.value, environment);
-                            inert &= value.inert;
-                            let is_data = property.kind == PropertyKind::Init;
-                            let Some(key) = key else {
-                                if self
-                                    .heap_result(data.define_unknown_key(
-                                        is_data,
-                                        value.fact,
-                                        self.budget,
-                                    ))
-                                    .is_none()
-                                {
-                                    return Self::barrier(environment);
-                                }
-                                continue;
-                            };
-                            if is_prototype_setter(property, &key) {
-                                data.set_literal_prototype(value.fact);
-                            } else if is_data {
-                                data.define_data(key, value.fact);
-                            } else {
-                                data.define_accessor(key);
-                            }
-                        }
-                    }
-                }
-                self.allocate(environment, data, inert)
-            }
+            Expression::ArrayExpression(array) => self.array_expression(array, environment),
+            Expression::ObjectExpression(object) => self.object_expression(object, environment),
             Expression::CallExpression(call) => {
                 // Callee lookup precedes argument evaluation. An unknown
                 // getter/global lookup can mutate anything visible to it.

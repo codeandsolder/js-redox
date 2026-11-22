@@ -41,6 +41,34 @@ pub(super) struct Reference {
     pub(super) resolved_url: Option<String>,
 }
 
+/// Availability is distinct from transfer completion: a missing body in a
+/// capture does not by itself prove that the network response failed.
+#[derive(Debug, Clone, Serialize)]
+struct BodyAvailability {
+    body_expected: bool,
+    body_present: bool,
+    body_complete: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct DocumentMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "document_encoding")]
+    encoding: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "document_base_url")]
+    base_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "document_decode_source")]
+    decode_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "document_decode_had_errors")]
+    had_errors: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "document_decode_uncertain")]
+    uncertain: Option<bool>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct ResourceMeta {
     id: usize,
@@ -55,9 +83,8 @@ struct ResourceMeta {
     resource_type: Option<String>,
     declared_size: i64,
     encoding: Option<String>,
-    body_expected: bool,
-    body_present: bool,
-    body_complete: bool,
+    #[serde(flatten)]
+    availability: BodyAvailability,
     body_bytes: usize,
     sha256: Option<String>,
     transport_kind: String,
@@ -72,16 +99,8 @@ struct ResourceMeta {
     request_headers: Vec<HeaderMeta>,
     response_headers: Vec<HeaderMeta>,
     references: Vec<Reference>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    document_encoding: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    document_base_url: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    document_decode_source: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    document_decode_had_errors: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    document_decode_uncertain: Option<bool>,
+    #[serde(flatten)]
+    document: DocumentMetadata,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -136,81 +155,80 @@ fn page_metadata(har: &Har) -> Vec<PageMeta> {
         .collect()
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "materialization keeps the per-resource context explicit at this boundary"
-)]
-fn materialize_inline_scripts(
-    parent_resource_id: usize,
-    base_url: &str,
-    html: &str,
-    inline_base: &str,
-    store: &mut ResourceStore<'_>,
-    counts: &mut BTreeMap<String, usize>,
-    references: &mut Vec<Reference>,
-    inline_scripts: &mut Vec<InlineScriptMeta>,
-    document_encoding: &str,
-    document_decode_source: &str,
-    document_decode_uncertain: bool,
-) -> Result<()> {
-    for (ordinal0, script) in extract_script_tags(html).into_iter().enumerate() {
-        let ordinal = ordinal0 + 1;
-        let ty = script_type(&script.attrs);
-        let src = script.attrs.get("src").cloned();
-        let resolved_src = src.as_deref().and_then(|src| resolve_ref(base_url, src));
-        if let Some(raw_src) = src.as_ref() {
-            if is_executable_script_type(&ty) {
-                references.push(Reference {
-                    kind: "script_src".into(),
-                    raw: raw_src.clone(),
-                    resolved_url: resolved_src.clone(),
+struct EntryMaterializer<'a, 'store> {
+    store: &'a mut ResourceStore<'store>,
+    counts: &'a mut BTreeMap<String, usize>,
+    inline_scripts: &'a mut Vec<InlineScriptMeta>,
+}
+
+impl EntryMaterializer<'_, '_> {
+    fn materialize_inline_scripts(
+        &mut self,
+        parent_resource_id: usize,
+        base_url: &str,
+        decoded: &crate::browser_decode::DecodedHtml,
+        inline_base: &str,
+        references: &mut Vec<Reference>,
+    ) -> Result<()> {
+        for (ordinal0, script) in extract_script_tags(&decoded.source).into_iter().enumerate() {
+            let ordinal = ordinal0 + 1;
+            let ty = script_type(&script.attrs);
+            let src = script.attrs.get("src").cloned();
+            let resolved_src = src.as_deref().and_then(|src| resolve_ref(base_url, src));
+            if let Some(raw_src) = src.as_ref() {
+                if is_executable_script_type(&ty) {
+                    references.push(Reference {
+                        kind: "script_src".into(),
+                        raw: raw_src.clone(),
+                        resolved_url: resolved_src.clone(),
+                    });
+                }
+                self.inline_scripts.push(InlineScriptMeta {
+                    parent_resource_id,
+                    ordinal,
+                    script_type: ty,
+                    src,
+                    resolved_src,
+                    output_path: None,
+                    body_bytes: 0,
+                    sha256: None,
+                    charset: script.attrs.get("charset").cloned(),
+                    parent_document_encoding: Some(decoded.encoding.clone()),
+                    parent_decode_source: Some(decoded.decode_source.as_str().to_string()),
+                    parent_decode_uncertain: Some(decoded.uncertain),
                 });
+                continue;
             }
-            inline_scripts.push(InlineScriptMeta {
+
+            let body = if is_json_script_type(&ty) {
+                format_json_if_possible(script.body.as_bytes())
+            } else {
+                script.body.into_bytes()
+            };
+            if body.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            let ext = inline_script_extension(&ty);
+            let desired = format!("{inline_base}.inline/script-{ordinal:03}.{ext}");
+            let stored = self.store.write(&desired, &body)?;
+            *self.counts.entry("inline_scripts".into()).or_insert(0) += 1;
+            self.inline_scripts.push(InlineScriptMeta {
                 parent_resource_id,
                 ordinal,
                 script_type: ty,
-                src,
-                resolved_src,
-                output_path: None,
-                body_bytes: 0,
-                sha256: None,
+                src: None,
+                resolved_src: None,
+                output_path: Some(stored.path),
+                body_bytes: body.len(),
+                sha256: Some(stored.sha256),
                 charset: script.attrs.get("charset").cloned(),
-                parent_document_encoding: Some(document_encoding.to_string()),
-                parent_decode_source: Some(document_decode_source.to_string()),
-                parent_decode_uncertain: Some(document_decode_uncertain),
+                parent_document_encoding: Some(decoded.encoding.clone()),
+                parent_decode_source: Some(decoded.decode_source.as_str().to_string()),
+                parent_decode_uncertain: Some(decoded.uncertain),
             });
-            continue;
         }
-
-        let body = if is_json_script_type(&ty) {
-            format_json_if_possible(script.body.as_bytes())
-        } else {
-            script.body.into_bytes()
-        };
-        if body.iter().all(u8::is_ascii_whitespace) {
-            continue;
-        }
-        let ext = inline_script_extension(&ty);
-        let desired = format!("{inline_base}.inline/script-{ordinal:03}.{ext}");
-        let stored = store.write(&desired, &body)?;
-        *counts.entry("inline_scripts".into()).or_insert(0) += 1;
-        inline_scripts.push(InlineScriptMeta {
-            parent_resource_id,
-            ordinal,
-            script_type: ty,
-            src: None,
-            resolved_src: None,
-            output_path: Some(stored.path),
-            body_bytes: body.len(),
-            sha256: Some(stored.sha256),
-            charset: script.attrs.get("charset").cloned(),
-            parent_document_encoding: Some(document_encoding.to_string()),
-            parent_decode_source: Some(document_decode_source.to_string()),
-            parent_decode_uncertain: Some(document_decode_uncertain),
-        });
+        Ok(())
     }
-    Ok(())
 }
 
 fn response_body_expected(method: &str, status: i64) -> bool {
@@ -224,144 +242,154 @@ const fn response_body_complete(body_expected: bool, network_failed: bool) -> bo
     !body_expected || !network_failed
 }
 
-fn materialize_entry(
-    id: usize,
-    entry: &HarEntry,
-    har_root: &Path,
-    store: &mut ResourceStore<'_>,
-    counts: &mut BTreeMap<String, usize>,
-    inline_scripts: &mut Vec<InlineScriptMeta>,
-) -> Result<ResourceMeta> {
-    let transport_kind =
-        resource_kind(&entry.request.url, &entry.response.content.mime_type).to_string();
-    let body = decode_body(
-        &entry.response.content,
-        entry.response.js_redox_body.as_ref(),
-        har_root,
-    )
-    .with_context(|| format!("entry {id}: {}", entry.request.url))?;
-    let body_expected = response_body_expected(&entry.request.method, entry.response.status);
-    let body_present = body.is_some();
-    let body_complete = response_body_complete(body_expected, entry.failure.is_some());
-    let mut kind = transport_kind.clone();
-    let mut output_path = None;
-    let mut body_bytes = 0;
-    let mut sha256 = None;
-    let mut reused_body = false;
-    let mut references = Vec::new();
-    let mut document_encoding = None;
-    let mut document_base_url = None;
-    let mut document_decode_source = None;
-    let mut document_decode_had_errors = None;
-    let mut document_decode_uncertain = None;
+impl EntryMaterializer<'_, '_> {
+    fn materialize_entry(
+        &mut self,
+        id: usize,
+        entry: &HarEntry,
+        har_root: &Path,
+    ) -> Result<ResourceMeta> {
+        let transport_kind =
+            resource_kind(&entry.request.url, &entry.response.content.mime_type).to_string();
+        let body = decode_body(
+            &entry.response.content,
+            entry.response.js_redox_body.as_ref(),
+            har_root,
+        )
+        .with_context(|| format!("entry {id}: {}", entry.request.url))?;
+        let body_expected = response_body_expected(&entry.request.method, entry.response.status);
+        let availability = BodyAvailability {
+            body_expected,
+            body_present: body.is_some(),
+            body_complete: response_body_complete(body_expected, entry.failure.is_some()),
+        };
+        let mut kind = transport_kind.clone();
+        let mut output_path = None;
+        let mut body_bytes = 0;
+        let mut sha256 = None;
+        let mut reused_body = false;
+        let mut references = Vec::new();
+        let mut document = DocumentMetadata::default();
 
-    if let Some(body) = body {
-        body_bytes = body.len();
-        kind = refine_resource_kind(
-            &transport_kind,
-            entry.resource_type.as_deref(),
-            &entry.response.content.mime_type,
-            &body,
-        );
-        if kind != transport_kind {
-            *counts
-                .entry("resources_content_reclassified".into())
+        if let Some(body) = body {
+            body_bytes = body.len();
+            kind = refine_resource_kind(
+                &transport_kind,
+                entry.resource_type.as_deref(),
+                &entry.response.content.mime_type,
+                &body,
+            );
+            if kind != transport_kind {
+                *self
+                    .counts
+                    .entry("resources_content_reclassified".into())
+                    .or_insert(0) += 1;
+            }
+            if kind == "javascript" && availability.body_complete {
+                if let Ok(source) = std::str::from_utf8(&body) {
+                    references.extend(source_refs(source, &entry.request.url));
+                }
+            }
+            let desired =
+                output_path_for(&entry.request.url, &kind, &entry.response.content.mime_type);
+            let stored = self.store.write(&desired, &body)?;
+            let written = stored.path;
+            output_path = Some(written.clone());
+            reused_body = stored.reused;
+            sha256 = Some(stored.sha256);
+            if kind == "html" && availability.body_complete {
+                document = self.materialize_document(
+                    id,
+                    entry,
+                    &body,
+                    &desired,
+                    &written,
+                    &mut references,
+                )?;
+            }
+        } else {
+            *self
+                .counts
+                .entry("resources_without_body".into())
                 .or_insert(0) += 1;
         }
-        if kind == "javascript" && body_complete {
-            if let Ok(source) = std::str::from_utf8(&body) {
-                references.extend(source_refs(source, &entry.request.url));
-            }
+        *self.counts.entry(format!("resource_{kind}")).or_insert(0) += 1;
+        if !availability.body_complete {
+            *self
+                .counts
+                .entry("resources_incomplete".into())
+                .or_insert(0) += 1;
         }
-        let desired = output_path_for(&entry.request.url, &kind, &entry.response.content.mime_type);
-        let stored = store.write(&desired, &body)?;
-        let written = stored.path;
-        output_path = Some(written.clone());
-        reused_body = stored.reused;
-        sha256 = Some(stored.sha256);
-        if kind == "html" && body_complete {
-            let transport_content_type = header_value(&entry.response.headers, "content-type")
-                .or_else(|| {
-                    (!entry.response.content.mime_type.is_empty())
-                        .then_some(entry.response.content.mime_type.as_str())
-                });
-            let decoded = decode_html(&body, transport_content_type, None);
-            document_encoding = Some(decoded.encoding.clone());
-            document_base_url = Url::parse(&entry.request.url)
-                .ok()
-                .map(|url| document_base(&decoded.source, &url).to_string());
-            document_decode_source = Some(decoded.decode_source.as_str().to_string());
-            document_decode_had_errors = Some(decoded.had_errors);
-            document_decode_uncertain = Some(decoded.uncertain);
-            let base_url = document_base_url.as_deref().unwrap_or(&entry.request.url);
-            for (href, kind) in script_preload_links(&decoded.source) {
-                references.push(Reference {
-                    kind: kind.into(),
-                    resolved_url: resolve_ref(base_url, &href),
-                    raw: href,
-                });
-            }
-            // The store maps logical directories to physical directories. Keep
-            // the original logical parent and the allocated leaf name so an
-            // inline body remains adjacent to its document even after a collision.
-            let (logical_parent, _) = desired.rsplit_once('/').context("resource parent")?;
-            let (_, physical_leaf) = written.rsplit_once('/').context("resource filename")?;
-            let inline_base = format!("{logical_parent}/{physical_leaf}");
-            materialize_inline_scripts(
-                id,
-                document_base_url.as_deref().unwrap_or(&entry.request.url),
-                &decoded.source,
-                &inline_base,
-                store,
-                counts,
-                &mut references,
-                inline_scripts,
-                &decoded.encoding,
-                decoded.decode_source.as_str(),
-                decoded.uncertain,
-            )?;
-        }
-    } else {
-        *counts.entry("resources_without_body".into()).or_insert(0) += 1;
-    }
-    *counts.entry(format!("resource_{kind}")).or_insert(0) += 1;
-    if !body_complete {
-        *counts.entry("resources_incomplete".into()).or_insert(0) += 1;
+
+        Ok(ResourceMeta {
+            id,
+            pageref: entry.pageref.clone(),
+            started_date_time: entry.started_date_time.clone(),
+            time_ms: entry.time,
+            method: entry.request.method.clone(),
+            url: entry.request.url.clone(),
+            status: entry.response.status,
+            status_text: entry.response.status_text.clone(),
+            mime_type: entry.response.content.mime_type.clone(),
+            resource_type: entry.resource_type.clone(),
+            declared_size: entry.response.content.size,
+            encoding: entry.response.content.encoding.clone(),
+            availability,
+            body_bytes,
+            sha256,
+            transport_kind,
+            kind,
+            network_failure: entry.failure.clone(),
+            body_capture: entry.response.js_redox_body_capture.clone(),
+            output_path,
+            reused_body,
+            request_headers: headers(&entry.request.headers),
+            response_headers: headers(&entry.response.headers),
+            references,
+            document,
+        })
     }
 
-    Ok(ResourceMeta {
-        id,
-        pageref: entry.pageref.clone(),
-        started_date_time: entry.started_date_time.clone(),
-        time_ms: entry.time,
-        method: entry.request.method.clone(),
-        url: entry.request.url.clone(),
-        status: entry.response.status,
-        status_text: entry.response.status_text.clone(),
-        mime_type: entry.response.content.mime_type.clone(),
-        resource_type: entry.resource_type.clone(),
-        declared_size: entry.response.content.size,
-        encoding: entry.response.content.encoding.clone(),
-        body_expected,
-        body_present,
-        body_complete,
-        body_bytes,
-        sha256,
-        transport_kind,
-        kind,
-        network_failure: entry.failure.clone(),
-        body_capture: entry.response.js_redox_body_capture.clone(),
-        output_path,
-        reused_body,
-        request_headers: headers(&entry.request.headers),
-        response_headers: headers(&entry.response.headers),
-        references,
-        document_encoding,
-        document_base_url,
-        document_decode_source,
-        document_decode_had_errors,
-        document_decode_uncertain,
-    })
+    fn materialize_document(
+        &mut self,
+        id: usize,
+        entry: &HarEntry,
+        body: &[u8],
+        desired: &str,
+        written: &str,
+        references: &mut Vec<Reference>,
+    ) -> Result<DocumentMetadata> {
+        let transport_content_type =
+            header_value(&entry.response.headers, "content-type").or_else(|| {
+                (!entry.response.content.mime_type.is_empty())
+                    .then_some(entry.response.content.mime_type.as_str())
+            });
+        let decoded = decode_html(body, transport_content_type, None);
+        let document_base_url = Url::parse(&entry.request.url)
+            .ok()
+            .map(|url| document_base(&decoded.source, &url).to_string());
+        let base_url = document_base_url.as_deref().unwrap_or(&entry.request.url);
+        for (href, kind) in script_preload_links(&decoded.source) {
+            references.push(Reference {
+                kind: kind.into(),
+                resolved_url: resolve_ref(base_url, &href),
+                raw: href,
+            });
+        }
+        // Keep the physical leaf name but the logical parent: the store is
+        // responsible for mapping logical directories to collision-free paths.
+        let (logical_parent, _) = desired.rsplit_once('/').context("resource parent")?;
+        let (_, physical_leaf) = written.rsplit_once('/').context("resource filename")?;
+        let inline_base = format!("{logical_parent}/{physical_leaf}");
+        self.materialize_inline_scripts(id, base_url, &decoded, &inline_base, references)?;
+        Ok(DocumentMetadata {
+            encoding: Some(decoded.encoding),
+            base_url: document_base_url,
+            decode_source: Some(decoded.decode_source.as_str().to_owned()),
+            had_errors: Some(decoded.had_errors),
+            uncertain: Some(decoded.uncertain),
+        })
+    }
 }
 
 fn build_manifest(
@@ -382,16 +410,16 @@ fn build_manifest(
     let mut inline_scripts = Vec::new();
     let mut resources = Vec::with_capacity(har.log.entries.len());
     let har_root = args.har.parent().unwrap_or_else(|| Path::new("."));
+    let mut materializer = EntryMaterializer {
+        store: &mut store,
+        counts: &mut counts,
+        inline_scripts: &mut inline_scripts,
+    };
     for (id, entry) in har.log.entries.into_iter().enumerate() {
         budget.checkpoint()?;
-        resources.push(serde_json::to_value(materialize_entry(
-            id,
-            &entry,
-            har_root,
-            &mut store,
-            &mut counts,
-            &mut inline_scripts,
-        )?)?);
+        resources.push(serde_json::to_value(
+            materializer.materialize_entry(id, &entry, har_root)?,
+        )?);
     }
     counts.insert("resources_total".into(), resources.len());
     counts.insert("pages".into(), pages.len());

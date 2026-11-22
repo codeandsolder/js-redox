@@ -297,9 +297,9 @@ fn main() -> Result<()> {
             &args.capture,
             &temp.path().join("capture.har"),
             HttpCaptureLimits {
-                max_resources: args.http_max_resources,
-                max_resource_bytes: args.http_max_resource_mib.saturating_mul(1024 * 1024),
-                max_total_bytes: args.http_max_total_mib.saturating_mul(1024 * 1024),
+                resources: args.http_max_resources,
+                per_resource_bytes: args.http_max_resource_mib.saturating_mul(1024 * 1024),
+                total_bytes: args.http_max_total_mib.saturating_mul(1024 * 1024),
             },
         )?)
     } else {

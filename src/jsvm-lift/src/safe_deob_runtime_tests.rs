@@ -110,10 +110,13 @@ fn count(report: &SafeDeobReport, kind: &str) -> usize {
 
 fn assert_invariants(label: &str, outcome: &SafeDeobOutcome) {
     assert_eq!(outcome.report.schema, "js-safe-deobfuscate/v2", "{label}");
-    assert!(outcome.report.safe_static_only, "{label}");
-    assert!(!outcome.report.presentation_formatted, "{label}");
+    assert!(outcome.report.guarantees.safe_static_only, "{label}");
+    assert!(!outcome.report.guarantees.presentation_formatted, "{label}");
     assert!(
-        outcome.report.runtime_semantics_preserved_by_design,
+        outcome
+            .report
+            .guarantees
+            .runtime_semantics_preserved_by_design,
         "{label}"
     );
     assert_eq!(
@@ -1508,7 +1511,7 @@ fn depythonify_safe_deob_generated_runtime_equivalence() -> Result<()> {
         true,
         &work_budget,
     )?;
-    assert!(formatted.report.presentation_formatted);
+    assert!(formatted.report.guarantees.presentation_formatted);
     assert_ne!(
         formatted.report.analysis_source_sha256,
         formatted.report.output_sha256
