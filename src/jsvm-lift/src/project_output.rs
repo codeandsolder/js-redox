@@ -139,8 +139,8 @@ impl ProjectOutput {
         &self.staged
     }
 
-    /// Publish the validated import. Directory replacement uses two renames
-    /// when an old project exists, not a crash-durable filesystem transaction.
+    /// Publish the validated import. Prefer an atomic exchange where the
+    /// filesystem supports it; neither path promises crash durability.
     pub(crate) fn publish(self) -> Result<()> {
         validate_project_directory(&self.staged).context("validating staged capture project")?;
         ensure!(
@@ -148,6 +148,37 @@ impl ProjectOutput {
             "project destination changed during import: {}",
             self.destination.display()
         );
+        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        if self.try_atomic_publish()? {
+            return self.finish();
+        }
+        self.publish_portable()
+    }
+
+    /// Exchange directories atomically, or use an exclusive rename for new
+    /// projects. Fall back only when the platform/filesystem lacks the flags.
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    fn try_atomic_publish(&self) -> Result<bool> {
+        use rustix::{
+            fs::{renameat_with, RenameFlags, CWD},
+            io::Errno,
+        };
+        let flags = if self.existed {
+            RenameFlags::EXCHANGE
+        } else {
+            RenameFlags::NOREPLACE
+        };
+        match renameat_with(CWD, &self.staged, CWD, &self.destination, flags) {
+            Ok(()) => Ok(true),
+            Err(Errno::NOSYS | Errno::NOTSUP | Errno::INVAL) => Ok(false),
+            Err(error) => Err(std::io::Error::from(error))
+                .with_context(|| format!("publishing {}", self.destination.display())),
+        }
+    }
+
+    // A single-writer fallback for other filesystems: preserve the old
+    // directory until staging succeeds and attempt rollback on rename failure.
+    fn publish_portable(self) -> Result<()> {
         let previous = self.directory.path().join("previous");
         if self.existed {
             fs::rename(&self.destination, &previous).with_context(|| {
@@ -167,6 +198,10 @@ impl ProjectOutput {
             return Err(error)
                 .with_context(|| format!("publishing {}", self.destination.display()));
         }
+        self.finish()
+    }
+
+    fn finish(self) -> Result<()> {
         self.directory.close().with_context(|| {
             format!(
                 "project {} published but staging cleanup failed",
@@ -215,6 +250,57 @@ mod tests {
         );
         assert!(!output.join("old.txt").exists());
         assert_eq!(fs::read_dir(root.path())?.count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn portable_publication_replaces_only_completed_project() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let output = root.path().join("output");
+        manifest(&output, "old")?;
+        let pending = ProjectOutput::new(&output, true, &[])?;
+        manifest(pending.path(), "new")?;
+        pending.publish_portable()?;
+        assert_eq!(
+            read_manifest(&output.join(MANIFEST_NAME))?.source.input,
+            "new"
+        );
+        assert_eq!(fs::read_dir(root.path())?.count(), 1);
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn native_exchange_retains_old_project_in_staging_until_cleanup() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let output = root.path().join("output");
+        manifest(&output, "old")?;
+        let pending = ProjectOutput::new(&output, true, &[])?;
+        manifest(pending.path(), "new")?;
+        if pending.try_atomic_publish()? {
+            assert_eq!(
+                read_manifest(&output.join(MANIFEST_NAME))?.source.input,
+                "new"
+            );
+            assert_eq!(
+                read_manifest(&pending.path().join(MANIFEST_NAME))?
+                    .source
+                    .input,
+                "old"
+            );
+            pending.finish()?;
+            assert_eq!(fs::read_dir(root.path())?.count(), 1);
+        } else {
+            assert_eq!(
+                read_manifest(&output.join(MANIFEST_NAME))?.source.input,
+                "old"
+            );
+            pending.publish_portable()?;
+            assert_eq!(
+                read_manifest(&output.join(MANIFEST_NAME))?.source.input,
+                "new"
+            );
+        }
         Ok(())
     }
 
