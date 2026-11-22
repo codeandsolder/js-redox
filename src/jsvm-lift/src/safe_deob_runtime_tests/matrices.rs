@@ -428,3 +428,20 @@ fn depythonify_safe_deob_literal_path_facts_runtime_equivalence() -> Result<()> 
         ].into_iter().map(str::to_owned).collect(),
     )
 }
+
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_literal_object_construction_runtime_equivalence() -> Result<()> {
+    compare_sources(
+        "literal-object-construction",
+        [
+            "events.push(typeof {x:2 ** 1.5}, !{get x(){events.push('getter')},m(){events.push('method')}}, void {set x(v){events.push(v)}}); ( {'x':3}, 7 );",
+            "Object.defineProperty(Object.prototype,'x',{set(v){events.push('setter')}}); void {'x':3}; delete Object.prototype.x; events;",
+            "events.push(typeof {[2 ** 1.5]:2,[1n]:3}, typeof {__proto__:{m(){events.push('method')}}});",
+            "function effect(v){events.push(v);return 1} events.push(typeof {[effect('key')]:effect('value')});",
+            "let k={toString(){events.push('coercion');return 'x'}}; void {[k]:1}; events;",
+            "void {...{get x(){events.push('spread');return 1}}}; events;",
+            "let x=3; void {x}; try{void {[1n/0n]:1}}catch(e){events.push(e.name)} events;",
+        ].into_iter().map(str::to_owned).collect(),
+    )
+}
