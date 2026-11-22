@@ -4,6 +4,7 @@ use crate::decoder_encoding::{
 };
 mod fixed_base64_proof;
 
+use crate::binding_facts::BindingFacts;
 use crate::rewrite::Replacement;
 use crate::value_eval::{
     eval, js_to_uint32, literal_property_key, render_value_array, same_values, Value,
@@ -1557,7 +1558,8 @@ pub fn static_decoder_pass(
     scoping: &Scoping,
     reference_spans: &HashMap<ReferenceId, Span>,
 ) -> StaticDecoderPass {
-    let analysis = analyze_decoders(source, program, scoping, reference_spans);
+    let facts = BindingFacts::analyze(program, scoping);
+    let analysis = analyze_decoders(source, program, scoping, &facts, reference_spans);
     let decoder_count = analysis.decoders.len();
     let mut collector = DecoderOnlyCallCollector {
         source,
@@ -3692,10 +3694,11 @@ pub fn analyze_decoders(
     source: &str,
     program: &oxc_ast::ast::Program<'_>,
     scoping: &Scoping,
+    facts: &BindingFacts,
     reference_spans: &HashMap<ReferenceId, Span>,
 ) -> DecoderAnalysis {
     let arrays = decoder_static_arrays(program, scoping);
-    let from_char_code_aliases = crate::collect_from_char_code_aliases(program, scoping);
+    let from_char_code_aliases = crate::collect_from_char_code_aliases(program, scoping, facts);
     let direct_functions =
         all_functions(program, scoping, &from_char_code_aliases, reference_spans);
     let functions = all_function_declarations(program, scoping);

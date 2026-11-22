@@ -1,5 +1,6 @@
 use super::{assignment_property, module_identity::ExactModuleSite, symbol_of, unparenthesized};
 use crate::global_builtin::namespace_member_name;
+use crate::global_builtin::GlobalAliases;
 use oxc_ast::ast::{
     Argument, AssignmentTarget, BindingPattern, BlockStatement, CallExpression, Expression,
     Function, Program, Statement, SwitchCase,
@@ -132,7 +133,7 @@ fn site_record(
 
 struct InstantiationSiteCollector<'c, 'g, 'm> {
     scoping: &'c Scoping,
-    global_aliases: &'g HashMap<SymbolId, String>,
+    global_aliases: &'g GlobalAliases,
     exact_sites: &'m HashMap<(u32, u32), ExactModuleSite>,
     sites: HashMap<SymbolId, Vec<WasmInstantiationSite>>,
 }
@@ -637,7 +638,7 @@ fn site_is_later_in_region(
 pub(super) fn collect_instantiation_sites(
     program: &Program<'_>,
     scoping: &Scoping,
-    global_aliases: &HashMap<SymbolId, String>,
+    global_aliases: &GlobalAliases,
     exact_sites: &HashMap<(u32, u32), ExactModuleSite>,
 ) -> HashMap<(u32, u32), Vec<WasmInstantiationSite>> {
     let mut collector = InstantiationSiteCollector {

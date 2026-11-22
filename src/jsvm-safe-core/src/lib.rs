@@ -29,6 +29,7 @@ mod switch_constant;
 mod trivial_loops;
 mod value_eval;
 
+pub use binding_facts::{BindingFacts, ReferenceIdentity};
 pub use browser_legacy::{
     recover_browser_legacy_call_assignments, BrowserLegacyCallAssignmentRecovery,
     BrowserLegacyOpaqueSpan,
@@ -244,16 +245,10 @@ impl ProvenConstantEnvironment {
         id: &oxc_ast::ast::IdentifierReference<'_>,
         scoping: &Scoping,
     ) -> Option<StaticPrimitiveValue> {
-        let reference_id = id.reference_id.get()?;
-        let symbol = statically_resolved_symbol(scoping, reference_id)?;
-        if !reference_is_statically_resolved_read(scoping, reference_id, symbol) {
-            return None;
-        }
-        let value = self.bindings.get(&symbol)?;
-        let scope = scoping.get_reference(reference_id).scope_id();
-        self.initialization
-            .proves_value_initialized(scoping, symbol, scope, id.span)
-            .then(|| value.clone())
+        let symbol =
+            self.initialization
+                .initialized_reference(scoping, id.reference_id.get()?, id.span)?;
+        self.bindings.get(&symbol).cloned()
     }
 
     #[must_use]
@@ -419,6 +414,7 @@ fn collect_shorthand_spans(program: &oxc_ast::ast::Program<'_>) -> HashSet<(u32,
 
 struct FromCharCodeAliasCollector<'c> {
     scoping: &'c Scoping,
+    facts: &'c BindingFacts,
     candidates: HashMap<SymbolId, u32>,
 }
 
@@ -442,7 +438,11 @@ impl<'a> Visit<'a> for FromCharCodeAliasCollector<'_> {
             };
             // Match the ordinary global String builtin only. A locally shadowed
             // `String` binding is not evidence for builtin fromCharCode semantics.
-            if object.name.as_str() == "String" && symbol_of(self.scoping, &member.object).is_none()
+            if object.name.as_str() == "String"
+                && object.reference_id.get().is_some_and(|reference| {
+                    self.facts.proves_global_reference(self.scoping, reference)
+                })
+                && self.facts.binding_has_stable_value(self.scoping, symbol)
             {
                 self.candidates.insert(symbol, declaration.span().end);
             }
@@ -454,20 +454,27 @@ impl<'a> Visit<'a> for FromCharCodeAliasCollector<'_> {
 fn collect_from_char_code_aliases(
     program: &oxc_ast::ast::Program<'_>,
     scoping: &Scoping,
+    facts: &BindingFacts,
 ) -> HashMap<SymbolId, u32> {
     let mut collector = FromCharCodeAliasCollector {
         scoping,
+        facts,
         candidates: HashMap::new(),
     };
     collector.visit_program(program);
-    collector
-        .candidates
-        .retain(|symbol, _| symbol_has_only_read_references(scoping, *symbol));
+    collector.candidates.retain(|symbol, _| {
+        symbol_has_only_read_references(scoping, *symbol)
+            && scoping
+                .get_resolved_reference_ids(*symbol)
+                .iter()
+                .all(|&reference| facts.resolved_symbol(scoping, reference) == Some(*symbol))
+    });
     collector.candidates
 }
 
 fn direct_global_object_name<'a>(
     scoping: &Scoping,
+    facts: &BindingFacts,
     expression: &'a Expression<'a>,
 ) -> Option<&'a str> {
     let Expression::Identifier(identifier) = expression else {
@@ -476,19 +483,19 @@ fn direct_global_object_name<'a>(
     if !matches!(identifier.name.as_str(), "window" | "globalThis" | "self") {
         return None;
     }
-    let reference = scoping.get_reference(identifier.reference_id.get()?);
-    reference
-        .symbol_id()
-        .is_none()
+    facts
+        .proves_global_reference(scoping, identifier.reference_id.get()?)
         .then_some(identifier.name.as_str())
 }
 
 fn collect_global_object_aliases(
     program: &oxc_ast::ast::Program<'_>,
     scoping: &Scoping,
+    facts: &BindingFacts,
 ) -> HashSet<SymbolId> {
     struct AliasCollector<'c> {
         scoping: &'c Scoping,
+        facts: &'c BindingFacts,
         aliases: HashSet<SymbolId>,
     }
     impl<'a> Visit<'a> for AliasCollector<'_> {
@@ -506,15 +513,18 @@ fn collect_global_object_aliases(
                 let Some(initializer) = &declarator.init else {
                     continue;
                 };
-                if direct_global_object_name(self.scoping, initializer).is_none() {
+                if direct_global_object_name(self.scoping, self.facts, initializer).is_none() {
                     continue;
                 }
-                let stable = self
-                    .scoping
-                    .get_resolved_reference_ids(symbol)
-                    .iter()
-                    .all(|reference_id| !self.scoping.get_reference(*reference_id).is_write());
-                if stable {
+                if self.facts.binding_has_stable_value(self.scoping, symbol)
+                    && self
+                        .scoping
+                        .get_resolved_reference_ids(symbol)
+                        .iter()
+                        .all(|&reference| {
+                            self.facts.resolved_symbol(self.scoping, reference) == Some(symbol)
+                        })
+                {
                     self.aliases.insert(symbol);
                 }
             }
@@ -523,6 +533,7 @@ fn collect_global_object_aliases(
     }
     let mut collector = AliasCollector {
         scoping,
+        facts,
         aliases: HashSet::new(),
     };
     collector.visit_program(program);
@@ -2067,7 +2078,13 @@ fn transform_once(
     budget.checkpoint()?;
     let reference_spans = collect_reference_spans(&program);
     budget.checkpoint()?;
-    let decoder_analysis = analyze_decoders(source, &program, scoping, &reference_spans);
+    let decoder_analysis = analyze_decoders(
+        source,
+        &program,
+        scoping,
+        &constants.initialization,
+        &reference_spans,
+    );
     budget.checkpoint()?;
     let decoders = decoder_analysis.decoders;
     let mut protected_spans = decoder_analysis.protected_spans;
@@ -2077,8 +2094,10 @@ fn transform_once(
     let proxies = collect_proxy_objects(&program, scoping, &constants.initialization);
     budget.checkpoint()?;
     let pure_functions = collect_pure_functions(&program, scoping);
-    let from_char_code_aliases = collect_from_char_code_aliases(&program, scoping);
-    let global_object_aliases = collect_global_object_aliases(&program, scoping);
+    let from_char_code_aliases =
+        collect_from_char_code_aliases(&program, scoping, &constants.initialization);
+    let global_object_aliases =
+        collect_global_object_aliases(&program, scoping, &constants.initialization);
     budget.checkpoint()?;
     let reference_identity_tables =
         detect_reference_identity_tables(source, scoping, &reference_spans);
@@ -7720,6 +7739,8 @@ mod tests {
             "function f(x){return x+1}eval('f=function(x){return x+9}');f(2)",
             "function f(x){return x+1}const g=()=>{eval('var f=function(x){return x+9}');return f(2)};g()",
             "function f(x){return x+1}function g(){'use strict';eval('f=function(x){return x+9}')}g();f(2)",
+            "function f(x){return x+1}function g(a=eval('f=x=>x+8')){function f(x){return x+2}}g();f(2)",
+            "function f(x){return x+1}function g(a=()=>eval('f=x=>x+8')){function f(x){return x+2}a()}g();f(2)",
         ] {
             let result = deobfuscate(source, 32).unwrap_or_else(|| unreachable!("{source}"));
             assert!(!result.transforms.contains_key("pure_function_eval"), "{source} -> {}", result.source);

@@ -1,3 +1,4 @@
+use crate::global_builtin::GlobalAliases;
 use crate::{
     global_builtin::{collect_global_aliases, global_constructor, namespace_member_name},
     sha256_hex,
@@ -6,10 +7,7 @@ use base64::{
     engine::general_purpose::{STANDARD, STANDARD_NO_PAD},
     Engine as _,
 };
-use jsvm_safe_core::{
-    exact_usize as exact_static_usize, statically_resolved_symbol,
-    statically_unresolved_global_reference,
-};
+use jsvm_safe_core::{exact_usize as exact_static_usize, statically_resolved_symbol};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, AssignmentTarget, BindingPattern, Expression, ForStatementInit, Function,
@@ -184,7 +182,12 @@ fn assignment_target_symbol(scoping: &Scoping, target: &AssignmentTarget<'_>) ->
     statically_resolved_symbol(scoping, identifier.reference_id.get()?)
 }
 
-fn unresolved_global(scoping: &Scoping, expression: &Expression<'_>, expected: &str) -> bool {
+fn unresolved_global(
+    scoping: &Scoping,
+    facts: &jsvm_safe_core::BindingFacts,
+    expression: &Expression<'_>,
+    expected: &str,
+) -> bool {
     let Expression::Identifier(identifier) = unparenthesized(expression) else {
         return false;
     };
@@ -194,7 +197,7 @@ fn unresolved_global(scoping: &Scoping, expression: &Expression<'_>, expected: &
     let Some(reference_id) = identifier.reference_id.get() else {
         return false;
     };
-    statically_unresolved_global_reference(scoping, reference_id)
+    facts.proves_global_reference(scoping, reference_id)
 }
 
 fn exact_usize(expression: &Expression<'_>) -> Option<usize> {
@@ -574,7 +577,7 @@ struct Sink {
 
 struct SinkCollector<'c, 'g, 'e, 'h> {
     scoping: &'c Scoping,
-    global_aliases: &'g HashMap<SymbolId, String>,
+    global_aliases: &'g GlobalAliases,
     evaluator: &'e Evaluator<'c, 'h, 'g>,
     sinks: Vec<Sink>,
     direct_artifacts: HashMap<(u32, u32), RecoveredByteArtifact>,
@@ -859,7 +862,7 @@ fn exact_byte_array(array: &oxc_ast::ast::ArrayExpression<'_>) -> Option<Vec<u8>
 struct Evaluator<'c, 'h, 'g> {
     scoping: &'c Scoping,
     helpers: &'h HashMap<SymbolId, CopyHelper>,
-    global_aliases: &'g HashMap<SymbolId, String>,
+    global_aliases: &'g GlobalAliases,
     budget: WorkBudget,
 }
 
@@ -876,7 +879,12 @@ impl Evaluator<'_, '_, '_> {
                 .as_str()
                 .map(|value| StaticValue::Text(value.to_string())),
             Expression::Identifier(_) => {
-                if unresolved_global(self.scoping, expression, "atob") {
+                if unresolved_global(
+                    self.scoping,
+                    self.global_aliases.facts(),
+                    expression,
+                    "atob",
+                ) {
                     return Some(StaticValue::Base64Decoder);
                 }
                 state
@@ -1128,7 +1136,7 @@ fn normal_expression(
                 return Ok(());
             }
             let local_callee = symbol_of(evaluator.scoping, &call.callee).is_some();
-            let direct_eval = unresolved_global(evaluator.scoping, &call.callee, "eval");
+            let direct_eval = jsvm_safe_core::is_potential_direct_eval(call);
             if local_callee || direct_eval {
                 state.invalidate_all_buffers("unknown_local_call_or_direct_eval");
                 return Ok(());
@@ -2042,7 +2050,7 @@ mod tests {
         let source = r#"
             var host = window;
             var host2 = host;
-            function load(imports) {
+            var load = function(imports) {
                 var bytes = new Uint8Array(8), decode = atob;
                 var copy = function(offset, chunk) {
                     for (var i = 0; i < chunk.length; i++)
@@ -2050,11 +2058,22 @@ mod tests {
                 };
                 copy(0, decode("AGFzbQEAAAA="));
                 return host2["WebAssembly"]["instantiate"](bytes, imports);
-            }
+            };
         "#;
         let artifacts = recover(source);
         assert_eq!(artifacts.len(), 1);
         assert_eq!(artifacts[0].bytes, b"\0asm\x01\0\0\0");
+
+        // A hoisted declaration can run before the alias initializer.
+        // Textual order alone does not establish a stable acquisition.
+        let early = r#"
+            load({});
+            var host = window;
+            function load(imports) {
+                return host.WebAssembly.instantiate(new Uint8Array([0,97,115,109,1,0,0,0]), imports);
+            }
+        "#;
+        assert!(recover(early).is_empty());
     }
 
     #[test]

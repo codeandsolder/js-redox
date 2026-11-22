@@ -1,4 +1,4 @@
-use jsvm_safe_core::{statically_resolved_symbol, statically_unresolved_global_reference};
+use jsvm_safe_core::BindingFacts;
 use oxc_ast::ast::{BindingPattern, Expression, Program};
 use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::Scoping;
@@ -13,53 +13,68 @@ fn unparenthesized<'a>(mut expression: &'a Expression<'a>) -> &'a Expression<'a>
     expression
 }
 
-fn symbol_of(scoping: &Scoping, expression: &Expression<'_>) -> Option<SymbolId> {
-    let Expression::Identifier(identifier) = unparenthesized(expression) else {
-        return None;
-    };
-    statically_resolved_symbol(scoping, identifier.reference_id.get()?)
-}
-
-fn stable_binding(scoping: &Scoping, symbol: SymbolId) -> bool {
-    scoping
-        .get_resolved_reference_ids(symbol)
-        .iter()
-        .all(|reference_id| !scoping.get_reference(*reference_id).is_write())
-}
-
-fn direct_global_name(scoping: &Scoping, expression: &Expression<'_>) -> Option<String> {
+fn direct_global_name(
+    scoping: &Scoping,
+    facts: &BindingFacts,
+    expression: &Expression<'_>,
+) -> Option<String> {
     let Expression::Identifier(identifier) = unparenthesized(expression) else {
         return None;
     };
     let reference_id = identifier.reference_id.get()?;
-    if !statically_unresolved_global_reference(scoping, reference_id) {
+    if !facts.proves_global_reference(scoping, reference_id) {
         return None;
     }
     matches!(identifier.name.as_str(), "window" | "globalThis" | "self")
         .then(|| identifier.name.to_string())
 }
 
-fn global_object_name(
-    scoping: &Scoping,
-    global_aliases: &HashMap<SymbolId, String>,
-    expression: &Expression<'_>,
-) -> Option<String> {
-    direct_global_name(scoping, expression).or_else(|| {
-        global_aliases
-            .get(&symbol_of(scoping, expression)?)
-            .cloned()
-    })
+/// Namespace aliases and the exact lexical proof for the source snapshot.
+/// Keep the two together so no consumer can mistake a dynamically shadowed
+/// identifier for the global alias whose static symbol it shares.
+#[derive(Debug)]
+pub(crate) struct GlobalAliases {
+    facts: BindingFacts,
+    aliases: HashMap<SymbolId, String>,
+}
+
+impl GlobalAliases {
+    pub(crate) const fn facts(&self) -> &BindingFacts {
+        &self.facts
+    }
+
+    pub(crate) fn alias_symbol(
+        &self,
+        scoping: &Scoping,
+        expression: &Expression<'_>,
+    ) -> Option<SymbolId> {
+        let symbol = self
+            .facts
+            .initialized_read(scoping, unparenthesized(expression))?;
+        self.aliases.contains_key(&symbol).then_some(symbol)
+    }
+
+    fn global_object_name(&self, scoping: &Scoping, expression: &Expression<'_>) -> Option<String> {
+        direct_global_name(scoping, &self.facts, expression).or_else(|| {
+            self.aliases
+                .get(&self.alias_symbol(scoping, expression)?)
+                .cloned()
+        })
+    }
+
+    pub(crate) fn symbols(&self) -> impl Iterator<Item = SymbolId> + '_ {
+        self.aliases.keys().copied()
+    }
 }
 
 pub fn collect_global_aliases(
     program: &Program<'_>,
     scoping: &Scoping,
     budget: &WorkBudget,
-) -> Result<HashMap<SymbolId, String>, BudgetExceeded> {
+) -> Result<GlobalAliases, BudgetExceeded> {
     struct Collector<'c, 'm> {
         scoping: &'c Scoping,
-        known: &'m HashMap<SymbolId, String>,
-        discovered: HashMap<SymbolId, String>,
+        known: &'m mut GlobalAliases,
         poller: BudgetPoller,
     }
 
@@ -78,47 +93,46 @@ pub fn collect_global_aliases(
                 let Some(symbol) = identifier.symbol_id.get() else {
                     continue;
                 };
-                if !stable_binding(self.scoping, symbol) {
+                if !self
+                    .known
+                    .facts
+                    .binding_has_stable_value(self.scoping, symbol)
+                {
                     continue;
                 }
                 let Some(initializer) = &declarator.init else {
                     continue;
                 };
-                let global = direct_global_name(self.scoping, initializer).or_else(|| {
-                    self.known
-                        .get(&symbol_of(self.scoping, initializer)?)
-                        .cloned()
-                });
+                let global = self.known.global_object_name(self.scoping, initializer);
                 if let Some(global) = global {
-                    self.discovered.insert(symbol, global);
+                    self.known.aliases.insert(symbol, global);
                 }
             }
             walk::walk_variable_declaration(self, declaration);
         }
     }
 
-    let mut aliases = HashMap::new();
-    loop {
-        budget.consume(1)?;
-        let mut collector = Collector {
-            scoping,
-            known: &aliases,
-            discovered: HashMap::new(),
-            poller: BudgetPoller::new(budget, 256),
-        };
-        collector.visit_program(program);
-        collector.poller.finish()?;
-        let before = aliases.len();
-        aliases.extend(collector.discovered);
-        if aliases.len() == before {
-            return Ok(aliases);
-        }
-    }
+    budget.checkpoint()?;
+    let mut aliases = GlobalAliases {
+        facts: BindingFacts::analyze(program, scoping),
+        aliases: HashMap::new(),
+    };
+    // Each admitted alias dependency has a strictly earlier initialized
+    // declaration region. Source order is therefore sufficient; additional
+    // whole-AST passes cannot establish new initializer dominance.
+    let mut collector = Collector {
+        scoping,
+        known: &mut aliases,
+        poller: BudgetPoller::new(budget, 256),
+    };
+    collector.visit_program(program);
+    collector.poller.finish()?;
+    Ok(aliases)
 }
 
 pub fn global_constructor(
     scoping: &Scoping,
-    global_aliases: &HashMap<SymbolId, String>,
+    global_aliases: &GlobalAliases,
     callee: &Expression<'_>,
     constructor: &str,
 ) -> Option<String> {
@@ -129,14 +143,17 @@ pub fn global_constructor(
 
 fn namespace_global(
     scoping: &Scoping,
-    global_aliases: &HashMap<SymbolId, String>,
+    global_aliases: &GlobalAliases,
     expression: &Expression<'_>,
     namespace: &str,
 ) -> Option<String> {
     if let Expression::Identifier(identifier) = unparenthesized(expression) {
         if identifier.name.as_str() == namespace {
             let reference_id = identifier.reference_id.get()?;
-            if statically_unresolved_global_reference(scoping, reference_id) {
+            if global_aliases
+                .facts
+                .proves_global_reference(scoping, reference_id)
+            {
                 return Some("globalThis".to_string());
             }
         }
@@ -146,7 +163,7 @@ fn namespace_global(
         Expression::StaticMemberExpression(member)
             if !member.optional && member.property.name.as_str() == namespace =>
         {
-            global_object_name(scoping, global_aliases, &member.object)
+            global_aliases.global_object_name(scoping, &member.object)
         }
         Expression::ComputedMemberExpression(member) if !member.optional => {
             let Expression::StringLiteral(property) = unparenthesized(&member.expression) else {
@@ -155,7 +172,7 @@ fn namespace_global(
             if property.value.as_str()? != namespace {
                 return None;
             }
-            global_object_name(scoping, global_aliases, &member.object)
+            global_aliases.global_object_name(scoping, &member.object)
         }
         _ => None,
     }
@@ -163,7 +180,7 @@ fn namespace_global(
 
 pub fn namespace_member_name<'a>(
     scoping: &Scoping,
-    global_aliases: &HashMap<SymbolId, String>,
+    global_aliases: &GlobalAliases,
     expression: &'a Expression<'a>,
     namespace: &str,
 ) -> Option<(&'a str, String)> {
@@ -200,7 +217,7 @@ mod tests {
 
     struct ResolvedBuiltinsProbe<'c, 'g> {
         scoping: &'c Scoping,
-        aliases: &'g HashMap<SymbolId, String>,
+        aliases: &'g GlobalAliases,
         wasm: bool,
         data_view: bool,
         constructor_resolutions: Vec<Option<String>>,
@@ -228,7 +245,7 @@ mod tests {
 
     struct DynamicGlobalProbe<'c, 'g> {
         scoping: &'c Scoping,
-        aliases: &'g HashMap<SymbolId, String>,
+        aliases: &'g GlobalAliases,
         resolved: bool,
     }
     impl<'a> Visit<'a> for DynamicGlobalProbe<'_, '_> {
@@ -262,7 +279,7 @@ mod tests {
         assert!(semantic.diagnostics.is_empty());
         let scoping = semantic.semantic.scoping();
         let aliases = collect_global_aliases(&parsed.program, scoping, &test_budget())?;
-        assert_eq!(aliases.len(), 2);
+        assert_eq!(aliases.aliases.len(), 2);
 
         let mut probe = ResolvedBuiltinsProbe {
             scoping,
@@ -287,6 +304,94 @@ mod tests {
     }
 
     #[test]
+    fn resolves_aliases_only_at_stable_initialized_reference_sites() -> Result<(), BudgetExceeded> {
+        let source = r#"
+            const host = globalThis;
+            function shadow_direct() {
+                (eval)("var DataView = Fake");
+                new DataView(buffer);
+            }
+            function shadow_namespace() {
+                eval("var globalThis = fake");
+                new globalThis.DataView(buffer);
+            }
+            function shadow_alias() {
+                eval("var host = fake");
+                new host.DataView(buffer);
+            }
+            function stable_strict() {
+                "use strict";
+                eval("var DataView = Fake");
+                new DataView(buffer);
+            }
+            function sibling() {
+                new DataView(buffer);
+            }
+            function local_mutable() {
+                let h = globalThis;
+                eval("h = fake");
+                new h.DataView(buffer);
+            }
+            function local_constant() {
+                const h = globalThis;
+                eval("1");
+                new h.DataView(buffer);
+            }
+            let outer = globalThis;
+            function parameter(a = eval("outer = fake")) {
+                let outer = globalThis;
+                new outer.DataView(buffer);
+            }
+            new outer.DataView(buffer);
+            new host.DataView(buffer);
+            new later.DataView(buffer);
+            const later = globalThis;
+            new later.DataView(buffer);
+            var redeclared = globalThis;
+            var redeclared = fake;
+            new redeclared.DataView(buffer);
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new()
+            .with_check_syntax_error(true)
+            .build(&parsed.program);
+        assert!(semantic.diagnostics.is_empty());
+        let scoping = semantic.semantic.scoping();
+        let aliases = collect_global_aliases(&parsed.program, scoping, &test_budget())?;
+        let mut probe = ResolvedBuiltinsProbe {
+            scoping,
+            aliases: &aliases,
+            wasm: false,
+            data_view: false,
+            constructor_resolutions: Vec::new(),
+        };
+        probe.visit_program(&parsed.program);
+        let expected = [
+            None,
+            None,
+            None,
+            Some("globalThis"),
+            Some("globalThis"),
+            None,
+            None,
+            None,
+            None,
+            Some("globalThis"),
+            None,
+            Some("globalThis"),
+            None,
+        ];
+        assert_eq!(
+            probe.constructor_resolutions,
+            expected.map(|value| value.map(str::to_owned)),
+            "{source}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn rejects_reassigned_aliases_and_dynamic_global_resolution() -> Result<(), BudgetExceeded> {
         let source = r"
             var host = window;
@@ -302,7 +407,7 @@ mod tests {
         assert!(semantic.diagnostics.is_empty());
         let aliases =
             collect_global_aliases(&parsed.program, semantic.semantic.scoping(), &test_budget())?;
-        assert!(aliases.is_empty());
+        assert!(aliases.aliases.is_empty());
 
         let source = r"
             function f(scope) {

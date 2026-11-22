@@ -4,6 +4,7 @@ use super::{
     assignment_import_object, collect_global_aliases, global_constructor, parameter_symbols,
     symbol_binding_is_stable, symbol_of, unparenthesized,
 };
+use crate::global_builtin::GlobalAliases;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, ArrayExpressionElement, AssignmentTarget, BindingPattern, BlockStatement,
@@ -512,7 +513,7 @@ fn fixed_array_literal_length(expression: &Expression<'_>) -> Option<usize> {
 
 fn direct_uint32_array_length(
     scoping: &Scoping,
-    global_aliases: &HashMap<SymbolId, String>,
+    global_aliases: &GlobalAliases,
     expression: &Expression<'_>,
 ) -> Option<usize> {
     let Expression::NewExpression(new_expression) = unparenthesized(expression) else {
@@ -532,7 +533,7 @@ fn direct_uint32_array_length(
 
 struct StableUint32ArrayLengthCollector<'c, 'g> {
     scoping: &'c Scoping,
-    global_aliases: &'g HashMap<SymbolId, String>,
+    global_aliases: &'g GlobalAliases,
     lengths: HashMap<SymbolId, usize>,
 }
 
@@ -563,7 +564,7 @@ impl<'a> Visit<'a> for StableUint32ArrayLengthCollector<'_, '_> {
 
 fn static_uint32_array_length(
     scoping: &Scoping,
-    global_aliases: &HashMap<SymbolId, String>,
+    global_aliases: &GlobalAliases,
     known_lengths: &HashMap<SymbolId, usize>,
     expression: &Expression<'_>,
 ) -> Option<usize> {
@@ -582,7 +583,7 @@ fn static_uint32_array_length(
 
 struct ExportCallCollector<'c, 'g, 'l> {
     scoping: &'c Scoping,
-    global_aliases: &'g HashMap<SymbolId, String>,
+    global_aliases: &'g GlobalAliases,
     uint32_array_lengths: &'l HashMap<SymbolId, usize>,
     calls: Vec<(InstanceKey, WasmInstanceExportCall)>,
 }
@@ -683,7 +684,7 @@ struct RegionFacts {
 fn analyze_region(
     statements: &[Statement<'_>],
     scoping: &Scoping,
-    global_aliases: &HashMap<SymbolId, String>,
+    global_aliases: &GlobalAliases,
     uint32_array_lengths: &HashMap<SymbolId, usize>,
     helper: SymbolId,
     parameter: usize,
@@ -728,7 +729,7 @@ fn analyze_region(
 
 struct RegionCollector<'c, 'g, 'l> {
     scoping: &'c Scoping,
-    global_aliases: &'g HashMap<SymbolId, String>,
+    global_aliases: &'g GlobalAliases,
     uint32_array_lengths: &'l HashMap<SymbolId, usize>,
     helper: SymbolId,
     parameter: usize,
@@ -1070,7 +1071,7 @@ fn normalized_initializer_proof(
 
 struct NormalizedInitializerVerifier<'c, 'g> {
     scoping: &'c Scoping,
-    global_aliases: &'g HashMap<SymbolId, String>,
+    global_aliases: &'g GlobalAliases,
     parameter_symbol: SymbolId,
     target_symbol: SymbolId,
     primitive_symbols: HashSet<SymbolId>,
@@ -1198,7 +1199,7 @@ struct NormalizedInitializerHelperFinder<'c, 's> {
     helper_name: &'s str,
     exports_binding: &'s str,
     parameter: usize,
-    global_aliases: &'s HashMap<SymbolId, String>,
+    global_aliases: &'s GlobalAliases,
     proven: &'s mut Vec<NormalizedInitializerProof>,
 }
 impl NormalizedInitializerHelperFinder<'_, '_> {
@@ -1345,7 +1346,7 @@ struct MemoryProofContext<'p, 'a> {
     source: &'p str,
     program: &'p Program<'a>,
     scoping: &'p Scoping,
-    global_aliases: &'p HashMap<SymbolId, String>,
+    global_aliases: &'p GlobalAliases,
     instantiation_sites: &'p HashMap<(u32, u32), Vec<WasmInstantiationSite>>,
     budget: &'p WorkBudget,
 }
@@ -1629,7 +1630,7 @@ pub(super) fn collect_module_memory_identity_proofs(
     source: &str,
     program: &Program<'_>,
     scoping: &Scoping,
-    global_aliases: &HashMap<SymbolId, String>,
+    global_aliases: &GlobalAliases,
     instantiation_sites: &HashMap<(u32, u32), Vec<WasmInstantiationSite>>,
     budget: &WorkBudget,
 ) -> Result<Vec<WasmModuleMemoryIdentityProof>, BudgetExceeded> {

@@ -341,6 +341,8 @@ fn depythonify_safe_deob_script_completion_runtime_equivalence() -> Result<()> {
     let scratch = TempDir::new()?;
     let sources = [
         "function f(x){return x+1}eval('f=function(x){return x+9}');f(2)",
+        "function f(x){return x+1}function g(a=eval('f=x=>x+8')){function f(x){return x+2}}g();f(2)",
+        "function f(x){return x+1}function g(a=()=>eval('f=x=>x+8')){function f(x){return x+2}a()}g();f(2)",
         "function f(x){return x+1}const g=()=>{eval('var f=function(x){return x+9}');return f(2)};g()",
         "function f(x){return x+1}function g(){'use strict';eval('f=function(x){return x+9}')}g();f(2)",
         "function g(){function f(x){return x+1}return f(2)}function h(){eval('1')}h();g()",

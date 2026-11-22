@@ -3,6 +3,7 @@ use super::{
     parameter_symbols, static_member_of_symbol, symbol_binding_is_stable, symbol_of,
     unparenthesized,
 };
+use crate::global_builtin::GlobalAliases;
 use crate::numeric::exact_u64;
 use oxc_ast::ast::{
     Argument, AssignmentTarget, BindingPattern, CallExpression, Expression, Function, Statement,
@@ -12,7 +13,7 @@ use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::Scoping;
 use oxc_syntax::symbol::SymbolId;
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 /// Proven syntax-level semantics for a simple WebAssembly import handler.
 ///
@@ -114,7 +115,7 @@ fn property_getter(
 fn uint32_array_constructor(
     function: &Function<'_>,
     scoping: &Scoping,
-    global_aliases: &HashMap<SymbolId, String>,
+    global_aliases: &GlobalAliases,
 ) -> Option<WasmImportHandlerSemantic> {
     let params = stable_parameters(function, scoping)?;
     let [source] = params.as_slice() else {
@@ -217,7 +218,7 @@ fn static_member_parts<'a>(
 pub(super) fn standard_numeric_builtin_call(
     call: &CallExpression<'_>,
     scoping: &Scoping,
-    global_aliases: &HashMap<SymbolId, String>,
+    global_aliases: &GlobalAliases,
 ) -> bool {
     if call.optional || call.arguments.iter().any(Argument::is_spread) {
         return false;
@@ -225,14 +226,14 @@ pub(super) fn standard_numeric_builtin_call(
     let Some((object, property)) = static_member_parts(&call.callee) else {
         return false;
     };
-    if symbol_of(scoping, object).is_some_and(|symbol| global_aliases.contains_key(&symbol)) {
+    if global_aliases.alias_symbol(scoping, object).is_some() {
         return matches!((property, call.arguments.len()), ("Number" | "parseInt", 1));
     }
     let Some((global, namespace)) = static_member_parts(object) else {
         return false;
     };
     namespace == "Math"
-        && symbol_of(scoping, global).is_some_and(|symbol| global_aliases.contains_key(&symbol))
+        && global_aliases.alias_symbol(scoping, global).is_some()
         && matches!(property, "floor" | "ceil" | "trunc")
         && call.arguments.len() == 1
 }
@@ -240,7 +241,7 @@ pub(super) fn standard_numeric_builtin_call(
 pub(super) fn proof_primitive_expression(
     expression: &Expression<'_>,
     scoping: &Scoping,
-    global_aliases: &HashMap<SymbolId, String>,
+    global_aliases: &GlobalAliases,
     primitive_locals: &HashSet<SymbolId>,
 ) -> bool {
     match unparenthesized(expression) {
@@ -306,7 +307,7 @@ fn table_initializer_receiver_call<'a>(
 
 struct TableInitializerVerifier<'c, 'g, 'l> {
     scoping: &'c Scoping,
-    global_aliases: &'g HashMap<SymbolId, String>,
+    global_aliases: &'g GlobalAliases,
     locals: &'l HashSet<SymbolId>,
     receiver: SymbolId,
     exports: SymbolId,
@@ -534,7 +535,7 @@ impl<'a> Visit<'a> for TableLocalDeclarationCollector {
 fn table_initializer_only(
     function: &Function<'_>,
     scoping: &Scoping,
-    global_aliases: &HashMap<SymbolId, String>,
+    global_aliases: &GlobalAliases,
 ) -> Option<WasmImportHandlerSemantic> {
     if function.r#async || function.generator || !function.params.items.is_empty() {
         return None;
@@ -608,7 +609,7 @@ fn table_initializer_only(
 pub(super) fn analyze_import_handler(
     function: &Function<'_>,
     scoping: &Scoping,
-    global_aliases: &HashMap<SymbolId, String>,
+    global_aliases: &GlobalAliases,
 ) -> Option<WasmImportHandlerSemantic> {
     uint32_array_constructor(function, scoping, global_aliases)
         .or_else(|| typed_array_set(function, scoping))

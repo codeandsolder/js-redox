@@ -1,3 +1,4 @@
+use crate::global_builtin::GlobalAliases;
 use crate::global_builtin::{collect_global_aliases, global_constructor};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
@@ -227,7 +228,7 @@ fn static_member_of_symbol(
 
 fn data_view_binding(
     scoping: &Scoping,
-    global_aliases: &HashMap<SymbolId, String>,
+    global_aliases: &GlobalAliases,
     declaration: &VariableDeclaration<'_>,
     memory_param: SymbolId,
 ) -> Option<(SymbolId, String)> {
@@ -485,7 +486,7 @@ fn every_normal_result_is_write(
 fn analyze_direct_write_function(
     function: &Function<'_>,
     scoping: &Scoping,
-    global_aliases: &HashMap<SymbolId, String>,
+    global_aliases: &GlobalAliases,
     offset_value: Option<u32>,
 ) -> Option<String> {
     if function.r#async || function.generator {
@@ -562,7 +563,7 @@ fn unwrap_iife_call<'a>(expression: &'a Expression<'a>) -> Option<&'a CallExpres
 fn analyze_wrapped_write_function(
     function: &Function<'_>,
     scoping: &Scoping,
-    global_aliases: &HashMap<SymbolId, String>,
+    global_aliases: &GlobalAliases,
     offset_value: Option<u32>,
 ) -> Option<String> {
     if function.r#async || function.generator {
@@ -602,7 +603,7 @@ fn analyze_wrapped_write_function(
 fn analyze_handler(
     function: &Function<'_>,
     scoping: &Scoping,
-    global_aliases: &HashMap<SymbolId, String>,
+    global_aliases: &GlobalAliases,
     offset_value: Option<u32>,
 ) -> Option<String> {
     analyze_direct_write_function(function, scoping, global_aliases, offset_value)
@@ -611,7 +612,7 @@ fn analyze_handler(
 
 struct HandlerCollector<'c, 'g, 'i, 'f> {
     scoping: &'c Scoping,
-    global_aliases: &'g HashMap<SymbolId, String>,
+    global_aliases: &'g GlobalAliases,
     instantiation_sites: &'i HashMap<(u32, u32), Vec<WasmInstantiationSite>>,
     module_filter: Option<&'f str>,
     import_filter: Option<&'f str>,
@@ -783,7 +784,7 @@ fn analyze_program(
 
 struct NormalizedHandlerSemanticsCollector<'c, 'g> {
     scoping: &'c Scoping,
-    global_aliases: &'g HashMap<SymbolId, String>,
+    global_aliases: &'g GlobalAliases,
     shapes: Vec<WasmImportHandlerShape>,
     assignment_counts: HashMap<(Option<String>, String), usize>,
 }
