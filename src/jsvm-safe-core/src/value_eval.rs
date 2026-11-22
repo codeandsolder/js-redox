@@ -8,8 +8,8 @@
 //! binding identity, initialization and side-effect-free property access.
 
 use oxc_ast::ast::{
-    ArrayExpressionElement, Expression, LogicalExpression, PropertyKey, StringLiteral,
-    TemplateElement, UnaryExpression,
+    ArrayExpressionElement, BinaryExpression, Expression, LogicalExpression, PropertyKey,
+    StringLiteral, TemplateElement, UnaryExpression,
 };
 use oxc_ecmascript::{StringToNumber, ToInt32, ToUint32};
 use oxc_syntax::number::ToJsString;
@@ -314,6 +314,8 @@ impl LiteralTypes {
     const ORDINARY_PRIMITIVE: Self =
         Self(Self::NUMBER.0 | Self::STRING.0 | Self::BOOLEAN.0 | Self::NULL.0 | Self::UNDEFINED.0);
     const OBJECT_TYPEOF: Self = Self(Self::NULL.0 | Self::OBJECT.0);
+    const ALWAYS_TRUTHY: Self = Self(Self::OBJECT.0 | Self::FUNCTION.0);
+    const NULLISH: Self = Self(Self::NULL.0 | Self::UNDEFINED.0);
 
     const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
@@ -325,6 +327,10 @@ impl LiteralTypes {
 
     const fn includes(self, other: Self) -> bool {
         self.0 & other.0 != 0
+    }
+
+    const fn without(self, excluded: Self) -> Self {
+        Self(self.0 & !excluded.0)
     }
 
     const fn typeof_name(self) -> Option<&'static str> {
@@ -343,9 +349,9 @@ impl LiteralTypes {
     }
 
     const fn truthiness(self) -> Option<bool> {
-        if self.subset_of(Self::OBJECT.union(Self::FUNCTION)) {
+        if self.subset_of(Self::ALWAYS_TRUTHY) {
             Some(true)
-        } else if self.subset_of(Self::NULL.union(Self::UNDEFINED)) {
+        } else if self.subset_of(Self::NULLISH) {
             Some(false)
         } else {
             None
@@ -398,11 +404,25 @@ impl LiteralFacts {
         }
     }
 
+    /// Restrict the LHS result to the branch where the RHS is skipped.
+    fn short_circuit_left(self, op: &str) -> Option<Self> {
+        let (excluded, truthiness) = match op {
+            "&&" => (LiteralTypes::ALWAYS_TRUTHY, Some(false)),
+            "||" => (LiteralTypes::NULLISH, Some(true)),
+            "??" => (LiteralTypes::NULLISH, self.truthiness),
+            _ => return None,
+        };
+        let types = self.types.without(excluded);
+        (types.0 != 0).then_some(Self {
+            types,
+            truthiness: truthiness.or(types.truthiness()),
+        })
+    }
+
     const fn nullish(self) -> Option<bool> {
-        let nullish = LiteralTypes::NULL.union(LiteralTypes::UNDEFINED);
-        if self.types.subset_of(nullish) {
+        if self.types.subset_of(LiteralTypes::NULLISH) {
             Some(true)
-        } else if !self.types.includes(nullish) {
+        } else if !self.types.includes(LiteralTypes::NULLISH) {
             Some(false)
         } else {
             None
@@ -471,41 +491,8 @@ fn inert_literal_facts(expr: &Expression<'_>) -> Option<LiteralFacts> {
                 _ => None,
             }
         }
-        Expression::BinaryExpression(binary) => {
-            let left = inert_literal_facts(&binary.left)?.types;
-            let right = inert_literal_facts(&binary.right)?.types;
-            let ordinary = left
-                .union(right)
-                .subset_of(LiteralTypes::ORDINARY_PRIMITIVE);
-            match binary.operator.as_str() {
-                "===" | "!==" => of_type(LiteralTypes::BOOLEAN),
-                // Ordinary primitive coercion cannot invoke user callbacks
-                // or cause language-level arithmetic errors.
-                "+" if ordinary => of_type(left.addition(right)),
-                "-" | "*" | "/" | "%" | "**" | "<<" | ">>" | ">>>" | "&" | "|" | "^"
-                    if ordinary =>
-                {
-                    of_type(LiteralTypes::NUMBER)
-                }
-                "==" | "!=" | "<" | "<=" | ">" | ">=" if ordinary => of_type(LiteralTypes::BOOLEAN),
-                _ => None,
-            }
-        }
-        Expression::LogicalExpression(logical) => {
-            let left = inert_literal_facts(&logical.left)?;
-            match logical_evaluates_right(
-                logical.operator.as_str(),
-                left.truthiness,
-                left.nullish(),
-            ) {
-                Some(false) => Some(left),
-                Some(true) => inert_literal_facts(&logical.right),
-                None => {
-                    let right = inert_literal_facts(&logical.right)?;
-                    Some(left.join(right))
-                }
-            }
-        }
+        Expression::BinaryExpression(binary) => binary_literal_facts(binary),
+        Expression::LogicalExpression(logical) => logical_literal_facts(logical),
         Expression::ConditionalExpression(conditional) => {
             let test = inert_literal_facts(&conditional.test)?;
             match test.truthiness {
@@ -523,6 +510,39 @@ fn inert_literal_facts(expr: &Expression<'_>) -> Option<LiteralFacts> {
             expressions.try_fold(first, |_, expression| inert_literal_facts(expression))
         }
         _ => None,
+    }
+}
+
+fn binary_literal_facts(binary: &BinaryExpression<'_>) -> Option<LiteralFacts> {
+    let left = inert_literal_facts(&binary.left)?.types;
+    let right = inert_literal_facts(&binary.right)?.types;
+    let ordinary = left
+        .union(right)
+        .subset_of(LiteralTypes::ORDINARY_PRIMITIVE);
+    let types = match binary.operator.as_str() {
+        "===" | "!==" => LiteralTypes::BOOLEAN,
+        // Ordinary primitive coercion cannot invoke user callbacks
+        // or cause language-level arithmetic errors.
+        "+" if ordinary => left.addition(right),
+        "-" | "*" | "/" | "%" | "**" | "<<" | ">>" | ">>>" | "&" | "|" | "^" if ordinary => {
+            LiteralTypes::NUMBER
+        }
+        "==" | "!=" | "<" | "<=" | ">" | ">=" if ordinary => LiteralTypes::BOOLEAN,
+        _ => return None,
+    };
+    Some(LiteralFacts::of_type(types))
+}
+
+fn logical_literal_facts(logical: &LogicalExpression<'_>) -> Option<LiteralFacts> {
+    let op = logical.operator.as_str();
+    let left = inert_literal_facts(&logical.left)?;
+    match logical_evaluates_right(op, left.truthiness, left.nullish()) {
+        Some(false) => Some(left),
+        Some(true) => inert_literal_facts(&logical.right),
+        None => {
+            let right = inert_literal_facts(&logical.right)?;
+            Some(left.short_circuit_left(op)?.join(right))
+        }
     }
 }
 
@@ -954,6 +974,14 @@ mod tests {
             ("0x1n && 7", Some("7")),
             ("!(2 ** 1.5 ? null : 0n)", Some("true")),
             ("!('' || /x/)", Some("false")),
+            ("!((2 ** 1.5) && null)", Some("true")),
+            ("!((2 ** 1.5) || [])", Some("false")),
+            ("typeof ((2 ** 1.5 ? null : 1) ?? 2)", Some(r#""number""#)),
+            (
+                "typeof ((2 ** 1.5 ? void 0 : 's') || 't')",
+                Some(r#""string""#),
+            ),
+            ("typeof ((2 ** 1.5 ? [] : null) && 1)", None),
             (r"!('\ud800' && null)", Some("true")),
             ("typeof (2 ** 1.5 && effect())", None),
             ("typeof (2 ** 1.5 ? effect() : 1)", None),
