@@ -272,15 +272,18 @@ pub fn read_artifact(path: &Path, spec: ArtifactSpec) -> Result<Value> {
 ///
 /// Propagates read, parse and validation failures; a missing optional artifact returns `Ok(None)`.
 pub fn load_artifact(project: &Path, spec: ArtifactSpec, optional: bool) -> Result<Option<Value>> {
-    let path = artifact_path(project, spec);
-    if optional
-        && !path
-            .try_exists()
-            .with_context(|| format!("checking {}", path.display()))?
-    {
-        return Ok(None);
+    match read_artifact(&artifact_path(project, spec), spec) {
+        Ok(document) => Ok(Some(document)),
+        Err(error)
+            if optional
+                && error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|cause| cause.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
     }
-    read_artifact(&path, spec).map(Some)
 }
 
 /// Validate and write a pretty-printed artifact to a path.
@@ -312,6 +315,24 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn optional_artifact_ignores_missing_file_not_other_read_failures() -> Result<()> {
+        let temp = tempfile::TempDir::new()?;
+        let project = temp.path();
+        assert!(load_artifact(project, SOURCE_INDEX, true)?.is_none());
+        assert!(load_artifact(project, SOURCE_INDEX, false).is_err());
+        // A non-directory path component makes the requested artifact
+        // inaccessible, rather than an optional missing artifact.
+        let directory = project.join("analysis");
+        fs::write(&directory, "not a directory")?;
+        assert!(load_artifact(project, SOURCE_INDEX, true).is_err());
+        fs::remove_file(&directory)?;
+        fs::create_dir(&directory)?;
+        fs::write(artifact_path(project, SOURCE_INDEX), "invalid JSON")?;
+        assert!(load_artifact(project, SOURCE_INDEX, true).is_err());
+        Ok(())
+    }
 
     #[test]
     fn artifact_contracts_are_unique_and_fail_closed() -> Result<()> {
