@@ -698,12 +698,11 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn exact_origin_lazy_join_requires_same_call_and_registry_path() -> TestResult {
-        use super::{
-            join_exact_origin_lazy_accessor_results, LazyRegistryAccessorResultUse,
-            RegistryAccessorResultUse,
-        };
+    fn origin_lazy_join_fixture() -> (
+        super::LazyRegistryAccessorResultUse,
+        crate::registry_identity::ProvenOriginRegistryReadCall,
+    ) {
+        use super::{LazyRegistryAccessorResultUse, RegistryAccessorResultUse};
         use crate::forwarding_semantics::ProvenRegistryReadCall;
         use crate::registry_identity::{ProvenOriginRegistryReadCall, ProvenRegistryObjectOrigin};
         let lazy = LazyRegistryAccessorResultUse {
@@ -747,6 +746,13 @@ mod tests {
             },
             exact_key: None,
         };
+        (lazy, origin)
+    }
+
+    #[test]
+    fn exact_origin_lazy_join_requires_same_call_and_registry_path() -> TestResult {
+        use super::join_exact_origin_lazy_accessor_results;
+        let (lazy, origin) = origin_lazy_join_fixture();
         let budget = WorkBudget::unlimited("origin lazy join");
         let joined = join_exact_origin_lazy_accessor_results(
             std::slice::from_ref(&lazy),
@@ -760,52 +766,29 @@ mod tests {
         assert_eq!(joined[0].exact_key, None);
         let mut wrong_path = origin.clone();
         wrong_path.read.registry_path = vec!["unrelated".into()];
-        assert_eq!(
-            join_exact_origin_lazy_accessor_results(
-                std::slice::from_ref(&lazy),
-                &[wrong_path],
-                &budget,
-            )
-            .test_value("path reject")?
-            .len(),
-            0
-        );
         let mut wrong_receiver = origin.clone();
         wrong_receiver.read.receiver_start = 6;
-        assert_eq!(
-            join_exact_origin_lazy_accessor_results(
-                std::slice::from_ref(&lazy),
-                &[wrong_receiver],
-                &budget,
-            )
-            .test_value("receiver reject")?
-            .len(),
-            0
-        );
         let mut wrong_key = origin.clone();
         wrong_key.read.key_end = 11;
-        assert_eq!(
-            join_exact_origin_lazy_accessor_results(
-                std::slice::from_ref(&lazy),
-                &[wrong_key],
-                &budget,
-            )
-            .test_value("key reject")?
-            .len(),
-            0
-        );
         let mut wrong_call = origin.clone();
         wrong_call.read.call_start = 6;
-        assert_eq!(
-            join_exact_origin_lazy_accessor_results(
-                std::slice::from_ref(&lazy),
-                &[wrong_call],
-                &budget,
-            )
-            .test_value("call reject")?
-            .len(),
-            0
-        );
+        for (wrong, label) in [
+            (wrong_path, "path reject"),
+            (wrong_receiver, "receiver reject"),
+            (wrong_key, "key reject"),
+            (wrong_call, "call reject"),
+        ] {
+            assert!(
+                join_exact_origin_lazy_accessor_results(
+                    std::slice::from_ref(&lazy),
+                    &[wrong],
+                    &budget,
+                )
+                .test_value(label)?
+                .is_empty(),
+                "{label}",
+            );
+        }
         let mut conflict = origin.clone();
         conflict.origin.allocation_start = 501;
         assert_eq!(

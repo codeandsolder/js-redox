@@ -1944,6 +1944,12 @@ mod tests {
         assert_eq!(actionable_kind_count(&blobs, "opaque_blob"), 0);
         assert_eq!(blobs.actionable_signal_count, 0);
 
+        Ok(())
+    }
+
+    #[test]
+    fn actionability_distinguishes_cookie_helpers_from_table_decoders() -> Result<()> {
+        let options = options();
         let cookie = analyze_source(
             concat!(
                 "function getCookieValue(name) {\n",

@@ -1273,6 +1273,29 @@ fn artifact_at_sink(
     artifact_from_argument(argument, sink, evaluator, state)
 }
 
+fn call_to_sink(
+    call: &oxc_ast::ast::CallExpression<'_>,
+    sink: Sink,
+    evaluator: &Evaluator<'_, '_, '_>,
+    state: &mut EvalState,
+) -> Result<Option<RecoveredByteArtifact>, BudgetExceeded> {
+    if span_contains(call.callee.span(), sink.span) {
+        return expression_to_sink(&call.callee, sink, evaluator, state);
+    }
+    normal_expression(&call.callee, evaluator, state)?;
+    for argument in &call.arguments {
+        let Some(argument) = argument.as_expression() else {
+            state.invalidate_all_buffers("unsupported_binding_pattern");
+            continue;
+        };
+        if span_contains(argument.span(), sink.span) {
+            return expression_to_sink(argument, sink, evaluator, state);
+        }
+        normal_expression(argument, evaluator, state)?;
+    }
+    Ok(None)
+}
+
 fn expression_to_sink(
     expression: &Expression<'_>,
     sink: Sink,
@@ -1300,23 +1323,7 @@ fn expression_to_sink(
                 Ok(None)
             }
         }
-        Expression::CallExpression(call) => {
-            if span_contains(call.callee.span(), sink.span) {
-                return expression_to_sink(&call.callee, sink, evaluator, state);
-            }
-            normal_expression(&call.callee, evaluator, state)?;
-            for argument in &call.arguments {
-                let Some(argument) = argument.as_expression() else {
-                    state.invalidate_all_buffers("unsupported_binding_pattern");
-                    continue;
-                };
-                if span_contains(argument.span(), sink.span) {
-                    return expression_to_sink(argument, sink, evaluator, state);
-                }
-                normal_expression(argument, evaluator, state)?;
-            }
-            Ok(None)
-        }
+        Expression::CallExpression(call) => call_to_sink(call, sink, evaluator, state),
         Expression::StaticMemberExpression(member) => {
             expression_to_sink(&member.object, sink, evaluator, state)
         }

@@ -1892,7 +1892,7 @@ mod tests {
 
     #[test]
     fn module_memory_identity_fails_closed_on_conditional_init_or_reassignment() {
-        let conditional = r#"
+        let prefix = r"
             var m = window;
             function bA(A) {
                 if (Uint8Array.fromBase64) return [Uint8Array.fromBase64(A).buffer, false];
@@ -1900,7 +1900,8 @@ mod tests {
                 return [g.buffer, false];
             }
             var exports_binding;
-            function init(instance) { exports_binding = instance.exports; return exports_binding; }
+";
+        let module = r#"
             function tQ() {
                 var imports = {}; imports.wbg = {};
                 imports.wbg.__wbindgen_memory = function() { return exports_binding.memory; };
@@ -1908,96 +1909,16 @@ mod tests {
             }
             var N = "AGFzbQEAAAA=", G = bA(N)[0], imports = tQ();
             var instance = new m.WebAssembly.Instance(new m.WebAssembly.Module(G), imports);
-            if (enabled) init(instance);
-            instance.exports.copy(input);
-        "#;
-        assert_eq!(
-            proven_wasm_import_semantics(conditional)
-                .module_memory_identity_proofs
-                .len(),
-            0
-        );
-
-        let internally_conditional = r#"
-            var m = window;
-            function bA(A) {
-                if (Uint8Array.fromBase64) return [Uint8Array.fromBase64(A).buffer, false];
-                for (var Q = atob(A), g = new Uint8Array(Q.length), E = 0; E < Q.length; E++) g[E] = Q.charCodeAt(E);
-                return [g.buffer, false];
-            }
-            var exports_binding;
-            function init(instance) { if (enabled) exports_binding = instance.exports; return exports_binding; }
-            function tQ() {
-                var imports = {}; imports.wbg = {};
-                imports.wbg.__wbindgen_memory = function() { return exports_binding.memory; };
-                return imports;
-            }
-            var N = "AGFzbQEAAAA=", G = bA(N)[0], imports = tQ();
-            var instance = new m.WebAssembly.Instance(new m.WebAssembly.Module(G), imports);
-            init(instance);
-            instance.exports.copy(input);
-        "#;
-        assert_eq!(
-            proven_wasm_import_semantics(internally_conditional)
-                .module_memory_identity_proofs
-                .len(),
-            0
-        );
-
-        let reassigned = r#"
-            var m = window;
-            function bA(A) {
-                if (Uint8Array.fromBase64) return [Uint8Array.fromBase64(A).buffer, false];
-                for (var Q = atob(A), g = new Uint8Array(Q.length), E = 0; E < Q.length; E++) g[E] = Q.charCodeAt(E);
-                return [g.buffer, false];
-            }
-            var exports_binding;
-            function init(instance) { exports_binding = instance.exports; return exports_binding; }
-            function tQ() {
-                var imports = {}; imports.wbg = {};
-                imports.wbg.__wbindgen_memory = function() { return exports_binding.memory; };
-                return imports;
-            }
-            var N = "AGFzbQEAAAA=", G = bA(N)[0], imports = tQ();
-            var instance = new m.WebAssembly.Instance(new m.WebAssembly.Module(G), imports);
-            init(instance);
-            exports_binding = replacement;
-            instance.exports.copy(input);
-        "#;
-        assert_eq!(
-            proven_wasm_import_semantics(reassigned)
-                .module_memory_identity_proofs
-                .len(),
-            0
-        );
-
-        let escaped_instance = r#"
-            var m = window;
-            function bA(A) {
-                if (Uint8Array.fromBase64) return [Uint8Array.fromBase64(A).buffer, false];
-                for (var Q = atob(A), g = new Uint8Array(Q.length), E = 0; E < Q.length; E++) g[E] = Q.charCodeAt(E);
-                return [g.buffer, false];
-            }
-            var exports_binding;
-            function init(instance) { exports_binding = instance.exports; return exports_binding; }
-            function tQ() {
-                var imports = {}; imports.wbg = {};
-                imports.wbg.__wbindgen_memory = function() { return exports_binding.memory; };
-                return imports;
-            }
-            var N = "AGFzbQEAAAA=", G = bA(N)[0], imports = tQ();
-            var instance = new m.WebAssembly.Instance(new m.WebAssembly.Module(G), imports);
-            init(instance);
-            instance.exports.copy(input);
-            var alias = instance;
-            alias.exports.copy(input);
-        "#;
-        assert_eq!(
-            proven_wasm_import_semantics(escaped_instance)
-                .module_memory_identity_proofs
-                .len(),
-            0
-        );
+"#;
+        for (label, initializer, tail) in [
+            ("conditional", "function init(instance) { exports_binding = instance.exports; return exports_binding; }", "if (enabled) init(instance);\n            instance.exports.copy(input);"),
+            ("internally_conditional", "function init(instance) { if (enabled) exports_binding = instance.exports; return exports_binding; }", "init(instance);\n            instance.exports.copy(input);"),
+            ("reassigned", "function init(instance) { exports_binding = instance.exports; return exports_binding; }", "init(instance);\n            exports_binding = replacement;\n            instance.exports.copy(input);"),
+            ("escaped_instance", "function init(instance) { exports_binding = instance.exports; return exports_binding; }", "init(instance);\n            instance.exports.copy(input);\n            var alias = instance;\n            alias.exports.copy(input);"),
+        ] {
+            let source = format!("{prefix}{initializer}{module}{tail}");
+            assert!(proven_wasm_import_semantics(&source).module_memory_identity_proofs.is_empty(), "{label}");
+        }
     }
 
     #[test]
@@ -2035,7 +1956,10 @@ mod tests {
                 standard_webassembly_builtin_semantics_required: true,
             } if exports_binding == "exports_binding" && exact_grow_deltas == &[4]
         ));
+    }
 
+    #[test]
+    fn normalized_table_initializer_rejects_shadowing_and_effectful_operations() {
         let shadowed = r"
             var exports_binding;
             var imports = { wbg: {} };
