@@ -31,7 +31,8 @@ use oxc_syntax::{
     symbol::SymbolId,
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
+    rc::Rc,
     sync::LazyLock,
 };
 use work_budget::{BudgetExceeded, WorkBudget};
@@ -983,11 +984,14 @@ fn unparenthesized<'a>(mut expression: &'a Expression<'a>) -> &'a Expression<'a>
 }
 
 fn function_parameters_have_no_runtime_effects(function: &oxc_ast::ast::Function<'_>) -> bool {
-    function.params.items.iter().all(|parameter| {
+    formal_parameters_have_no_runtime_effects(&function.params)
+}
+
+fn formal_parameters_have_no_runtime_effects(params: &oxc_ast::ast::FormalParameters<'_>) -> bool {
+    params.items.iter().all(|parameter| {
         parameter.initializer.is_none()
             && matches!(parameter.pattern, BindingPattern::BindingIdentifier(_))
-    }) && function
-        .params
+    }) && params
         .rest
         .as_ref()
         .is_none_or(|rest| matches!(rest.rest.argument, BindingPattern::BindingIdentifier(_)))
@@ -1550,7 +1554,8 @@ enum DecoderTransform {
 
 #[derive(Debug, Clone)]
 pub struct Decoder {
-    values: Vec<Value>,
+    values: Rc<[Value]>,
+    proven_alias_reads: Option<Rc<HashSet<ReferenceId>>>,
     offset: i64,
     provider: SymbolId,
     provider_array_span: Span,
@@ -1586,6 +1591,12 @@ impl DecoderTransform {
 }
 
 impl Decoder {
+    fn permits_read(&self, reference: ReferenceId) -> bool {
+        self.proven_alias_reads
+            .as_ref()
+            .is_none_or(|reads| reads.contains(&reference))
+    }
+
     fn value_for_raw_rotated_with_key(
         &self,
         raw: i64,
@@ -1630,8 +1641,16 @@ pub fn decoder_call_rewrite(
     {
         return None;
     }
-    let symbol = facts.stable_callable_symbol(scoping, &call.callee)?;
+    let callee = call.callee.without_parentheses();
+    let Expression::Identifier(identifier) = callee else {
+        return None;
+    };
+    let reference = identifier.reference_id.get()?;
+    let symbol = facts.stable_callable_symbol(scoping, callee)?;
     let decoder = decoders.get(&symbol)?;
+    if !decoder.permits_read(reference) {
+        return None;
+    }
     let key = match call.arguments.get(1) {
         Some(Argument::StringLiteral(literal)) => Some(string_literal_value(literal)?),
         Some(_) => return None,
@@ -3144,7 +3163,8 @@ fn detect_fixed_rotated_direct_decoders(
             decoders.insert(
                 function.symbol,
                 Decoder {
-                    values,
+                    values: values.into(),
+                    proven_alias_reads: None,
                     offset,
                     provider: array.symbol,
                     provider_array_span: array.span,
@@ -3278,7 +3298,7 @@ fn prove_rotation_iife(
         .values_mut()
         .filter(|decoder| decoder.provider == iife.provider)
     {
-        decoder.values.rotate_left(amount);
+        Rc::make_mut(&mut decoder.values).rotate_left(amount);
     }
     true
 }
@@ -3323,7 +3343,7 @@ fn materializable_rotated_providers(
             None => {
                 materialized.insert(
                     decoder.provider,
-                    (decoder.provider_array_span, decoder.values.clone()),
+                    (decoder.provider_array_span, decoder.values.to_vec()),
                 );
             }
             Some((span, values))
@@ -3545,7 +3565,8 @@ fn inline_self_rewriting_direct_decoder(
     let provider_info = provider.provider.as_ref()?;
     let offset = parse_i64_literal(captures.name("offset")?.as_str())?;
     Some(Decoder {
-        values: provider_info.values.clone(),
+        values: provider_info.values.clone().into(),
+        proven_alias_reads: None,
         offset,
         provider: provider.symbol,
         provider_array_span: provider_info.span,
@@ -3575,7 +3596,8 @@ fn detect_decoder_candidate(
         }
         let provider_info = provider.provider.as_ref()?;
         return Some(Decoder {
-            values: provider_info.values.clone(),
+            values: provider_info.values.clone().into(),
+            proven_alias_reads: None,
             offset: shape.offset,
             provider: provider.symbol,
             provider_array_span: provider_info.span,
@@ -3669,7 +3691,8 @@ fn detect_decoder_candidate(
     });
 
     Some(Decoder {
-        values: provider_info.values.clone(),
+        values: provider_info.values.clone().into(),
+        proven_alias_reads: None,
         offset,
         provider: provider.symbol,
         provider_array_span: provider_info.span,
@@ -3677,41 +3700,71 @@ fn detect_decoder_candidate(
     })
 }
 
+struct DecoderBindingContext<'c> {
+    scoping: &'c Scoping,
+    facts: &'c BindingFacts,
+    reference_spans: &'c HashMap<ReferenceId, Span>,
+    budget: &'c WorkBudget,
+}
+
+/// Propagate only along proved capture edges. A read before an alias is
+/// initialized is not authorized, even when later reads are exact. The
+/// worklist visits each reachable alias and shares the provider table.
 fn propagate_decoder_aliases(
     decoders: &mut HashMap<SymbolId, Decoder>,
     program: &oxc_ast::ast::Program<'_>,
-    scoping: &Scoping,
-    reference_spans: &HashMap<ReferenceId, Span>,
-) {
-    let aliases = collect_symbol_aliases(program, scoping, reference_spans);
-    loop {
-        let mut changed = false;
-        for (alias_symbol, target_symbol) in &aliases {
-            if decoders.contains_key(alias_symbol) {
+    context: &DecoderBindingContext<'_>,
+) -> Result<(), BudgetExceeded> {
+    let mut collector = AliasCandidateCollector {
+        context,
+        by_target: HashMap::new(),
+    };
+    collector.visit_program(program);
+    let mut pending = decoders.keys().copied().collect::<VecDeque<_>>();
+    while let Some(target) = pending.pop_front() {
+        context.budget.checkpoint()?;
+        let Some(candidates) = collector.by_target.remove(&target) else {
+            continue;
+        };
+        let Some(decoder) = decoders.get(&target).cloned() else {
+            continue;
+        };
+        context
+            .budget
+            .consume(u64::try_from(candidates.len()).unwrap_or(u64::MAX))?;
+        for candidate in candidates {
+            if decoders.contains_key(&candidate.alias)
+                || !decoder.permits_read(candidate.target_reference)
+            {
                 continue;
             }
-            if let Some(decoder) = decoders.get(target_symbol).cloned() {
-                decoders.insert(*alias_symbol, decoder);
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
+            let Some(reads) = candidate.proven_reads(context)? else {
+                continue;
+            };
+            let mut alias = decoder.clone();
+            alias.proven_alias_reads = Some(Rc::new(reads));
+            decoders.insert(candidate.alias, alias);
+            pending.push_back(candidate.alias);
         }
     }
+    Ok(())
 }
 
 fn detect_decoders(
     source: &str,
     functions: &[FnInfo],
     program: &oxc_ast::ast::Program<'_>,
-    scoping: &Scoping,
-    facts: &BindingFacts,
-    reference_spans: &HashMap<ReferenceId, Span>,
+    context: &DecoderBindingContext<'_>,
     rotations: &[RotationIife],
-) -> DecoderDetection {
+) -> Result<DecoderDetection, BudgetExceeded> {
+    let DecoderBindingContext {
+        scoping,
+        facts,
+        reference_spans,
+        ..
+    } = *context;
     let Some(patterns) = decoder_patterns() else {
-        return (HashMap::new(), Vec::new(), Vec::new());
+        return Ok((HashMap::new(), Vec::new(), Vec::new()));
     };
     let name_counts = function_name_counts(functions);
     let providers = decoder_providers(functions);
@@ -3798,8 +3851,8 @@ fn detect_decoders(
     decoders.retain(|_, decoder| !invalid.contains(&decoder.provider));
     let (protected_spans, rotation_replacements) =
         apply_proven_decoder_rotations(source, &mut decoders, rotations);
-    propagate_decoder_aliases(&mut decoders, program, scoping, reference_spans);
-    (decoders, protected_spans, rotation_replacements)
+    propagate_decoder_aliases(&mut decoders, program, context)?;
+    Ok((decoders, protected_spans, rotation_replacements))
 }
 
 pub struct DecoderAnalysis {
@@ -3829,15 +3882,14 @@ pub fn analyze_decoders(
     let functions = all_function_declarations(program, scoping, facts);
 
     let rotations = collect_rotation_iifes(source, program, scoping, facts, reference_spans);
-    let (mut decoders, mut protected_spans, mut replacements) = detect_decoders(
-        source,
-        &functions,
-        program,
+    let context = DecoderBindingContext {
         scoping,
         facts,
         reference_spans,
-        &rotations,
-    );
+        budget,
+    };
+    let (mut decoders, mut protected_spans, mut replacements) =
+        detect_decoders(source, &functions, program, &context, &rotations)?;
     let (fixed_decoders, fixed_protected, fixed_replacements) =
         detect_fixed_rotated_direct_decoders(
             source,
@@ -3895,37 +3947,278 @@ pub fn analyze_decoders(
     })
 }
 
-#[derive(Debug, Clone, Copy)]
-struct DominatingForContext {
-    container_span: Span,
+#[derive(Clone, Copy)]
+struct LeadingAliasRegion {
+    owner: ScopeId,
+    container: Span,
+    initialized_after: u32,
 }
 
-#[derive(Default)]
-struct DirectForContextCollector {
-    contexts: HashMap<(u32, u32), DominatingForContext>,
-}
-
-impl DirectForContextCollector {
-    fn collect_statements(&mut self, statements: &[Statement<'_>], container_span: Span) {
-        let Some(Statement::ForStatement(for_statement)) = statements.first() else {
-            return;
-        };
-        self.contexts.insert(
-            (for_statement.span.start, for_statement.span.end),
-            DominatingForContext { container_span },
-        );
+impl LeadingAliasRegion {
+    fn contains(self, scoping: &Scoping, scope: ScopeId, span: Span) -> bool {
+        self.initialized_after <= span.start
+            && span.end <= self.container.end
+            && scoping
+                .scope_ancestors(scope)
+                .any(|ancestor| ancestor == self.owner)
     }
 }
 
-impl<'a> Visit<'a> for DirectForContextCollector {
+#[derive(Clone, Copy)]
+enum AliasOrigin {
+    Declaration(Option<LeadingAliasRegion>),
+    Assignment {
+        region: LeadingAliasRegion,
+        write: ReferenceId,
+        span: Span,
+    },
+}
+
+#[derive(Clone, Copy)]
+struct AliasCandidate {
+    alias: SymbolId,
+    target_reference: ReferenceId,
+    origin: AliasOrigin,
+}
+
+impl AliasCandidate {
+    fn proven_reads(
+        self,
+        context: &DecoderBindingContext<'_>,
+    ) -> Result<Option<HashSet<ReferenceId>>, BudgetExceeded> {
+        let DecoderBindingContext {
+            scoping,
+            facts,
+            reference_spans,
+            budget,
+        } = *context;
+        let symbol = self.alias;
+        if facts.is_eval_exposed(scoping, symbol)
+            || facts.is_mapped_arguments_exposed(scoping, symbol)
+            || !scoping.symbol_redeclarations(symbol).is_empty()
+        {
+            return Ok(None);
+        }
+        let (prefix, write) = match self.origin {
+            AliasOrigin::Declaration(prefix) => {
+                if !facts.binding_has_stable_value(scoping, symbol) {
+                    return Ok(None);
+                }
+                (prefix, None)
+            }
+            AliasOrigin::Assignment {
+                region,
+                write,
+                span,
+            } => {
+                let reference = scoping.get_reference(write);
+                let flags = scoping.symbol_flags(symbol);
+                // Assignment to a parameter or initialized writable local,
+                // not a TDZ, immutable, object-environment or outer binding.
+                if facts.fixed_assignment_reference(scoping, write) != Some(symbol)
+                    || flags.is_const_variable()
+                    || flags.is_import()
+                    || !facts.proves_initialized(scoping, symbol, reference.scope_id(), span)
+                {
+                    return Ok(None);
+                }
+                (Some(region), Some(write))
+            }
+        };
+        if prefix.is_some_and(|region| scoping.symbol_scope_id(symbol) != region.owner) {
+            return Ok(None);
+        }
+        let references = scoping.get_resolved_reference_ids(symbol);
+        budget.consume(u64::try_from(references.len()).unwrap_or(u64::MAX))?;
+        let mut proven = HashSet::new();
+        for &reference in references {
+            if write == Some(reference) {
+                continue;
+            }
+            let info = scoping.get_reference(reference);
+            // Writes invalidate the alias across all paths. Reads without
+            // exact initialization evidence remain in the rewritten code.
+            if !info.is_read() || info.is_write() || info.flags().is_member_write_target() {
+                return Ok(None);
+            }
+            if facts.resolved_symbol(scoping, reference) != Some(symbol) {
+                continue;
+            }
+            let Some(&span) = reference_spans.get(&reference) else {
+                continue;
+            };
+            if prefix.is_some_and(|prefix| prefix.contains(scoping, info.scope_id(), span))
+                || (write.is_none()
+                    && facts.proves_initialized_through_calls(
+                        scoping,
+                        symbol,
+                        info.scope_id(),
+                        span,
+                        budget,
+                    )?)
+            {
+                proven.insert(reference);
+            }
+        }
+        Ok((!proven.is_empty()).then_some(proven))
+    }
+}
+
+struct AliasCandidateCollector<'c, 'p> {
+    context: &'c DecoderBindingContext<'p>,
+    by_target: HashMap<SymbolId, Vec<AliasCandidate>>,
+}
+
+impl AliasCandidateCollector<'_, '_> {
+    fn add(&mut self, alias: SymbolId, target: &Expression<'_>, origin: AliasOrigin) {
+        let Expression::Identifier(target) = target.without_parentheses() else {
+            return;
+        };
+        let Some(reference) = target.reference_id.get() else {
+            return;
+        };
+        let DecoderBindingContext { scoping, facts, .. } = *self.context;
+        let Some(target_symbol) = facts.resolved_symbol(scoping, reference) else {
+            return;
+        };
+        if alias == target_symbol || !facts.binding_unmodified_by_eval(scoping, target_symbol) {
+            return;
+        }
+        self.by_target
+            .entry(target_symbol)
+            .or_default()
+            .push(AliasCandidate {
+                alias,
+                target_reference: reference,
+                origin,
+            });
+    }
+
+    fn declaration(
+        &mut self,
+        declarator: &oxc_ast::ast::VariableDeclarator<'_>,
+        prefix: Option<LeadingAliasRegion>,
+    ) {
+        let Some(alias) = declarator
+            .id
+            .get_binding_identifier()
+            .and_then(|id| id.symbol_id.get())
+        else {
+            return;
+        };
+        let Some(target) = &declarator.init else {
+            return;
+        };
+        self.add(alias, target, AliasOrigin::Declaration(prefix));
+    }
+
+    fn execution_prefix(
+        &mut self,
+        statements: &[Statement<'_>],
+        owner: Option<ScopeId>,
+        container: Span,
+    ) {
+        let Some(owner) = owner else {
+            return;
+        };
+        let Some(first) = statements.iter().find(|statement| {
+            !matches!(
+                statement,
+                Statement::FunctionDeclaration(_) | Statement::EmptyStatement(_)
+            )
+        }) else {
+            return;
+        };
+        match first {
+            Statement::VariableDeclaration(declaration)
+                if matches!(
+                    declaration.kind,
+                    VariableDeclarationKind::Const
+                        | VariableDeclarationKind::Let
+                        | VariableDeclarationKind::Var
+                ) =>
+            {
+                // Nothing with an initializer precedes the captured function
+                // value: earlier bare identifier declarations are inert.
+                if let Some(declarator) = declaration
+                    .declarations
+                    .iter()
+                    .find(|declarator| declarator.init.is_some())
+                {
+                    self.declaration(
+                        declarator,
+                        Some(LeadingAliasRegion {
+                            owner,
+                            container,
+                            initialized_after: declarator.span.end,
+                        }),
+                    );
+                }
+            }
+            Statement::ForStatement(statement) => {
+                let Some(initializer) = statement
+                    .init
+                    .as_ref()
+                    .and_then(|init| init.as_expression())
+                else {
+                    return;
+                };
+                let first = match initializer.without_parentheses() {
+                    Expression::SequenceExpression(sequence) => sequence.expressions.first(),
+                    expression => Some(expression),
+                };
+                let Some(expression) = first else {
+                    return;
+                };
+                let Some((alias, target)) = assignment_identifier(expression) else {
+                    return;
+                };
+                let Some(write) = alias.reference_id.get() else {
+                    return;
+                };
+                let DecoderBindingContext { scoping, facts, .. } = *self.context;
+                let Some(alias) = facts.fixed_assignment_reference(scoping, write) else {
+                    return;
+                };
+                self.add(
+                    alias,
+                    target,
+                    AliasOrigin::Assignment {
+                        region: LeadingAliasRegion {
+                            owner,
+                            container,
+                            initialized_after: expression.span().end,
+                        },
+                        write,
+                        span: expression.span(),
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+impl<'a> Visit<'a> for AliasCandidateCollector<'_, '_> {
+    fn visit_variable_declaration(&mut self, declaration: &oxc_ast::ast::VariableDeclaration<'a>) {
+        if declaration.kind == VariableDeclarationKind::Const {
+            for declarator in &declaration.declarations {
+                self.declaration(declarator, None);
+            }
+        }
+        walk::walk_variable_declaration(self, declaration);
+    }
+
     fn visit_program(&mut self, program: &oxc_ast::ast::Program<'a>) {
-        self.collect_statements(&program.body, program.span);
+        self.execution_prefix(&program.body, program.scope_id.get(), program.span);
         walk::walk_program(self, program);
     }
 
     fn visit_function(&mut self, function: &oxc_ast::ast::Function<'a>, flags: ScopeFlags) {
-        if let Some(body) = &function.body {
-            self.collect_statements(&body.statements, body.span);
+        if function_parameters_have_no_runtime_effects(function) {
+            if let Some(body) = &function.body {
+                self.execution_prefix(&body.statements, function.scope_id.get(), body.span);
+            }
         }
         walk::walk_function(self, function, flags);
     }
@@ -3934,261 +4227,16 @@ impl<'a> Visit<'a> for DirectForContextCollector {
         &mut self,
         function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
     ) {
+        match &function.body {
+            oxc_ast::ast::ArrowFunctionBody::FunctionBody(body)
+                if formal_parameters_have_no_runtime_effects(&function.params) =>
+            {
+                self.execution_prefix(&body.statements, function.scope_id.get(), body.span);
+            }
+            _ => {}
+        }
         walk::walk_arrow_function_expression(self, function);
     }
-}
-
-struct SymbolAliasCollector<'s, 'r> {
-    scoping: &'s Scoping,
-    reference_spans: &'r HashMap<ReferenceId, Span>,
-    for_contexts: &'r HashMap<(u32, u32), DominatingForContext>,
-    aliases: Vec<(SymbolId, SymbolId)>,
-}
-
-impl<'a> Visit<'a> for SymbolAliasCollector<'_, '_> {
-    fn visit_variable_declaration(&mut self, it: &oxc_ast::ast::VariableDeclaration<'a>) {
-        // Nested aliases stay const-only. Mutable aliases need an explicit
-        // execution-order proof and are handled separately at program scope.
-        if it.kind != VariableDeclarationKind::Const {
-            walk::walk_variable_declaration(self, it);
-            return;
-        }
-        for d in &it.declarations {
-            let BindingPattern::BindingIdentifier(alias) = &d.id else {
-                continue;
-            };
-            let Some(alias_symbol) = alias.symbol_id.get() else {
-                continue;
-            };
-            let Some(Expression::Identifier(target)) = &d.init else {
-                continue;
-            };
-            let Some(reference_id) = target.reference_id.get() else {
-                continue;
-            };
-            let Some(target_symbol) = statically_resolved_symbol(self.scoping, reference_id) else {
-                continue;
-            };
-            self.aliases.push((alias_symbol, target_symbol));
-        }
-        walk::walk_variable_declaration(self, it);
-    }
-
-    fn visit_for_statement(&mut self, it: &oxc_ast::ast::ForStatement<'a>) {
-        let Some(context) = self.for_contexts.get(&(it.span.start, it.span.end)) else {
-            walk::walk_for_statement(self, it);
-            return;
-        };
-        let assignments = match it.init.as_ref() {
-            Some(oxc_ast::ast::ForStatementInit::AssignmentExpression(assignment)) => {
-                vec![assignment.as_ref()]
-            }
-            Some(oxc_ast::ast::ForStatementInit::SequenceExpression(sequence)) => sequence
-                .expressions
-                .first()
-                .and_then(|expression| {
-                    let Expression::AssignmentExpression(assignment) = unparenthesized(expression)
-                    else {
-                        return None;
-                    };
-                    Some(vec![assignment.as_ref()])
-                })
-                .unwrap_or_default(),
-            _ => Vec::new(),
-        };
-
-        for assignment in assignments {
-            if assignment.operator.as_str() != "=" {
-                continue;
-            }
-            let oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(alias) =
-                &assignment.left
-            else {
-                continue;
-            };
-            let Some(alias_reference_id) = alias.reference_id.get() else {
-                continue;
-            };
-            let alias_reference = self.scoping.get_reference(alias_reference_id);
-            let Some(alias_symbol) = alias_reference.symbol_id() else {
-                continue;
-            };
-            if !alias_reference.is_write() {
-                continue;
-            }
-            let Expression::Identifier(target) = unparenthesized(&assignment.right) else {
-                continue;
-            };
-            let Some(target_reference_id) = target.reference_id.get() else {
-                continue;
-            };
-            let Some(target_symbol) = statically_resolved_symbol(self.scoping, target_reference_id)
-            else {
-                continue;
-            };
-            if alias_symbol == target_symbol
-                || !symbol_has_only_read_references(self.scoping, target_symbol)
-            {
-                continue;
-            }
-            let stable = self
-                .scoping
-                .get_resolved_reference_ids(alias_symbol)
-                .iter()
-                .all(|reference_id| {
-                    if *reference_id == alias_reference_id {
-                        return true;
-                    }
-                    let Some(span) = self.reference_spans.get(reference_id) else {
-                        return false;
-                    };
-                    context.container_span.start <= span.start
-                        && span.end <= context.container_span.end
-                        && span.start >= assignment.span.end
-                        && reference_is_statically_resolved_read(
-                            self.scoping,
-                            *reference_id,
-                            alias_symbol,
-                        )
-                });
-            if stable {
-                self.aliases.push((alias_symbol, target_symbol));
-            }
-        }
-
-        walk::walk_for_statement(self, it);
-    }
-}
-
-fn leading_mutable_aliases_in_statements(
-    statements: &[Statement<'_>],
-    scoping: &Scoping,
-    reference_spans: &HashMap<ReferenceId, Span>,
-) -> Vec<(SymbolId, SymbolId)> {
-    let first_executable = statements.iter().find(|statement| {
-        !matches!(
-            statement,
-            Statement::FunctionDeclaration(_) | Statement::EmptyStatement(_)
-        )
-    });
-    let Some(Statement::VariableDeclaration(declaration)) = first_executable else {
-        return Vec::new();
-    };
-    if declaration.kind == VariableDeclarationKind::Const {
-        return Vec::new();
-    }
-
-    let mut aliases = Vec::new();
-    let mut prior_initializer = false;
-    for declarator in &declaration.declarations {
-        let candidate = if prior_initializer {
-            None
-        } else {
-            let BindingPattern::BindingIdentifier(alias) = &declarator.id else {
-                prior_initializer |= declarator.init.is_some();
-                continue;
-            };
-            let Some(alias_symbol) = alias.symbol_id.get() else {
-                prior_initializer |= declarator.init.is_some();
-                continue;
-            };
-            let Some(Expression::Identifier(target)) = &declarator.init else {
-                prior_initializer |= declarator.init.is_some();
-                continue;
-            };
-            let Some(target_reference_id) = target.reference_id.get() else {
-                prior_initializer = true;
-                continue;
-            };
-            let Some(target_symbol) = statically_resolved_symbol(scoping, target_reference_id)
-            else {
-                prior_initializer = true;
-                continue;
-            };
-            if target_symbol == alias_symbol {
-                prior_initializer = true;
-                continue;
-            }
-            let stable =
-                scoping
-                    .get_resolved_reference_ids(alias_symbol)
-                    .iter()
-                    .all(|reference_id| {
-                        reference_spans.get(reference_id).is_some_and(|span| {
-                            span.start >= declarator.span.end
-                                && reference_is_statically_resolved_read(
-                                    scoping,
-                                    *reference_id,
-                                    alias_symbol,
-                                )
-                        })
-                    });
-            stable.then_some((alias_symbol, target_symbol))
-        };
-        if let Some(alias) = candidate {
-            aliases.push(alias);
-        }
-        prior_initializer |= declarator.init.is_some();
-    }
-    aliases
-}
-
-struct LeadingMutableAliasCollector<'s, 'r> {
-    scoping: &'s Scoping,
-    reference_spans: &'r HashMap<ReferenceId, Span>,
-    aliases: Vec<(SymbolId, SymbolId)>,
-}
-
-impl<'a> Visit<'a> for LeadingMutableAliasCollector<'_, '_> {
-    fn visit_program(&mut self, program: &oxc_ast::ast::Program<'a>) {
-        let mut dynamic_scope = RotationDynamicScopeProbe::default();
-        dynamic_scope.visit_program(program);
-        if !dynamic_scope.found {
-            self.aliases.extend(leading_mutable_aliases_in_statements(
-                &program.body,
-                self.scoping,
-                self.reference_spans,
-            ));
-        }
-        walk::walk_program(self, program);
-    }
-
-    fn visit_function(&mut self, function: &oxc_ast::ast::Function<'a>, flags: ScopeFlags) {
-        if !rotation_has_dynamic_scope(function) {
-            if let Some(body) = &function.body {
-                self.aliases.extend(leading_mutable_aliases_in_statements(
-                    &body.statements,
-                    self.scoping,
-                    self.reference_spans,
-                ));
-            }
-        }
-        walk::walk_function(self, function, flags);
-    }
-}
-
-fn collect_symbol_aliases(
-    program: &oxc_ast::ast::Program<'_>,
-    scoping: &Scoping,
-    reference_spans: &HashMap<ReferenceId, Span>,
-) -> Vec<(SymbolId, SymbolId)> {
-    let mut context_collector = DirectForContextCollector::default();
-    context_collector.visit_program(program);
-    let mut collector = SymbolAliasCollector {
-        scoping,
-        reference_spans,
-        for_contexts: &context_collector.contexts,
-        aliases: Vec::new(),
-    };
-    collector.visit_program(program);
-    let mut mutable_collector = LeadingMutableAliasCollector {
-        scoping,
-        reference_spans,
-        aliases: Vec::new(),
-    };
-    mutable_collector.visit_program(program);
-    collector.aliases.extend(mutable_collector.aliases);
-    collector.aliases
 }
 
 #[cfg(test)]
@@ -4250,7 +4298,9 @@ mod tests {
                 Value::String("11".into()),
                 Value::String("22".into()),
                 Value::String("33".into()),
-            ],
+            ]
+            .into(),
+            proven_alias_reads: None,
             offset: 0,
             provider,
             provider_array_span: Span::new(0, 1),
@@ -4288,11 +4338,13 @@ mod tests {
             matches!(decoders[&unrelated].value_for_call(0,None),Some(Value::String(value)) if value == "11")
         );
         let mut invalid = decoders.clone();
-        invalid
-            .get_mut(&second)
-            .unwrap_or_else(|| unreachable!())
-            .values
-            .rotate_left(1);
+        Rc::make_mut(
+            &mut invalid
+                .get_mut(&second)
+                .unwrap_or_else(|| unreachable!())
+                .values,
+        )
+        .rotate_left(1);
         assert!(!prove_rotation_iife(source, &iife, &mut invalid));
         assert!(
             matches!(invalid[&first].value_for_call(0,None),Some(Value::String(value)) if value == "22")
@@ -4308,7 +4360,9 @@ mod tests {
                 Value::String("b8khW4W9WQG=".into()),
                 Value::String("gmknW5i9WQm=".into()),
                 Value::String("xSov".into()),
-            ],
+            ]
+            .into(),
+            proven_alias_reads: None,
             offset: 0x10,
             provider: SymbolId::new(0),
             provider_array_span: Span::new(0, 0),

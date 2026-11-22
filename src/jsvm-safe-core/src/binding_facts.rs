@@ -10,6 +10,7 @@ use oxc_ast::ast::{
 };
 use oxc_ast::AstKind;
 use oxc_ast_visit::{walk, Visit};
+use oxc_ecmascript::IsSimpleParameterList;
 use oxc_semantic::{ReferenceId, Scoping};
 use oxc_span::{GetSpan, Span};
 use oxc_syntax::{
@@ -40,6 +41,9 @@ struct EvalSite {
 pub struct BindingFacts {
     hoisted_vars: HashSet<SymbolId>,
     parameters: HashSet<SymbolId>,
+    simple_parameter_functions: HashSet<ScopeId>,
+    arguments_references: Vec<ReferenceId>,
+    mapped_arguments_exposed: HashSet<ScopeId>,
     regions: HashMap<SymbolId, Vec<Span>>,
     node_spans: Vec<Span>,
     scope_entries: HashMap<ScopeId, u32>,
@@ -118,6 +122,9 @@ impl BindingFacts {
         let mut facts = Self {
             hoisted_vars: HashSet::new(),
             parameters: HashSet::new(),
+            simple_parameter_functions: HashSet::new(),
+            arguments_references: Vec::new(),
+            mapped_arguments_exposed: HashSet::new(),
             regions: HashMap::new(),
             node_spans: Vec::new(),
             scope_entries: HashMap::new(),
@@ -139,6 +146,40 @@ impl BindingFacts {
                 .into_iter()
                 .filter_map(|reference| scoping.get_reference(reference).symbol_id()),
         );
+        // A sloppy ordinary function with simple parameters can expose its
+        // parameter cells through the implicit arguments object. Arrow
+        // references share their nearest ordinary function's object.
+        let arguments_owner = |scope| {
+            scoping.scope_ancestors(scope).find(|&ancestor| {
+                let flags = scoping.scope_flags(ancestor);
+                flags.is_function() && !flags.is_arrow()
+            })
+        };
+        for reference in std::mem::take(&mut facts.arguments_references) {
+            let reference = scoping.get_reference(reference);
+            let Some(owner) = arguments_owner(reference.scope_id()) else {
+                continue;
+            };
+            if reference.symbol_id().is_none_or(|symbol| {
+                // var arguments shares the implicit binding, unlike a
+                // separately scoped lexical name.
+                scoping.symbol_scope_id(symbol) == owner
+                    && scoping
+                        .symbol_flags(symbol)
+                        .is_function_scoped_declaration()
+            }) {
+                facts.mapped_arguments_exposed.insert(owner);
+            }
+        }
+        for site in &facts.eval_sites {
+            if let Some(owner) = arguments_owner(site.scope) {
+                facts.mapped_arguments_exposed.insert(owner);
+            }
+        }
+        facts.mapped_arguments_exposed.retain(|scope| {
+            facts.simple_parameter_functions.contains(scope)
+                && !scoping.scope_flags(*scope).is_strict_mode()
+        });
         // Non-strict direct eval may create var bindings in its caller's
         // variable environment. These bindings can shadow outer variables
         // even when the static symbol itself is immutable. Do not confuse
@@ -407,6 +448,15 @@ impl BindingFacts {
         })
     }
 
+    /// A parameter cell may be indirectly written through mapped arguments.
+    /// This is a function-local property, including references in arrows.
+    pub(crate) fn is_mapped_arguments_exposed(&self, scoping: &Scoping, symbol: SymbolId) -> bool {
+        self.parameters.contains(&symbol)
+            && self
+                .mapped_arguments_exposed
+                .contains(&scoping.symbol_scope_id(symbol))
+    }
+
     /// Binding value cannot be reassigned by potential direct eval.
     /// This does not prove the absence of ordinary writes or mutation of
     /// objects stored in the binding.
@@ -421,6 +471,7 @@ impl BindingFacts {
     pub fn binding_has_stable_value(&self, scoping: &Scoping, symbol: SymbolId) -> bool {
         scoping.symbol_redeclarations(symbol).is_empty()
             && self.binding_unmodified_by_eval(scoping, symbol)
+            && !self.is_mapped_arguments_exposed(scoping, symbol)
             && scoping
                 .get_resolved_reference_ids(symbol)
                 .iter()
@@ -521,6 +572,13 @@ impl<'a> Visit<'a> for BindingFacts {
 
     fn leave_scope(&mut self) {
         self.scopes.pop();
+    }
+
+    fn visit_identifier_reference(&mut self, identifier: &oxc_ast::ast::IdentifierReference<'a>) {
+        if identifier.name == "arguments" {
+            self.arguments_references
+                .extend(identifier.reference_id.get());
+        }
     }
 
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
@@ -655,6 +713,13 @@ impl<'a> Visit<'a> for BindingFacts {
         }
         if let Some(scope) = node.scope_id.get() {
             self.parameter_regions.insert(scope, node.params.span);
+            if node.params.is_simple_parameter_list()
+                && !node.params.items.iter().any(|parameter| {
+                    matches!(&parameter.pattern, BindingPattern::BindingIdentifier(id) if id.name == "arguments")
+                })
+            {
+                self.simple_parameter_functions.insert(scope);
+            }
         }
         if node.r#type == FunctionType::FunctionExpression {
             if let Some(symbol) = node.id.as_ref().and_then(|id| id.symbol_id.get()) {

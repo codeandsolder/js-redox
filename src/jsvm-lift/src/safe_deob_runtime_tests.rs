@@ -758,6 +758,34 @@ fn depythonify_safe_deob_provider_runtime_equivalence() -> Result<()> {
     script_runtime_equivalence(&sources, "provider", false)
 }
 
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_decoder_alias_runtime_equivalence() -> Result<()> {
+    let sources = [
+        "function p(){var t=['a','b'];p=function(){return t;};return p();}function d(i,t,v){return i=i-16,t=p(),v=t[i],v;}const a=d;const b=a;const c=b;[c(16),c(17)];",
+        "function p(){var t=['a','b'];p=function(){return t;};return p();}function d(i,t,v){return i=i-16,t=p(),v=t[i],v;}try{a(16)}catch(e){events.push(e.name)}const a=d;a(16);",
+        "function p(){var t=['a','b'];p=function(){return t;};return p();}function d(i,t,v){return i=i-16,t=p(),v=t[i],v;}try{const b=a;b(16)}catch(e){events.push(e.name)}const a=d;a(16);",
+        "function p(){var t=['a','b'];p=function(){return t;};return p();}function d(i,t,v){return i=i-16,t=p(),v=t[i],v;}function g(){return a(16)}try{g()}catch(e){events.push(e.name)}const a=d;[g(),a(16)];",
+        "function p(){var t=['a','b'];p=function(){return t;};return p();}function d(i,t,v){return i=i-16,t=p(),v=t[i],v;}function outer(){function f(){return a(16)}const a=d;return f()}outer();",
+        "function p(){var t=['a','b'];p=function(){return t;};return p();}function d(i,t,v){return i=i-16,t=p(),v=t[i],v;}function outer(){function f(){return a(16)}try{f()}catch(e){events.push(e.name)}const a=d;return f()}outer();",
+        "function p(){var t=['a','b'];p=function(){return t;};return p();}function d(i,t,v){return i=i-16,t=p(),v=t[i],v;}function outer(){const a=d;return ()=>a(16)}outer()();",
+        "function p(){var t=['a','b'];p=function(){return t;};return p();}function d(i,t,v){return i=i-16,t=p(),v=t[i],v;}function outer(){const a=d;function f(){return a(16)}return f}outer()();",
+        "function p(){var t=['a','b'];p=function(){return t;};return p();}function d(i,t,v){return i=i-16,t=p(),v=t[i],v;}function outer(a){for(a=d;false;){}function f(){return a(16)}return f()}outer();",
+        "function p(){var t=['a','b'];p=function(){return t;};return p();}function d(i,t,v){return i=i-16,t=p(),v=t[i],v;}function outer(a){for(a=d;false;){}arguments[0]=()=>7;return a(16)}outer(null);",
+        "function p(){var t=['a','b'];p=function(){return t;};return p();}function d(i,t,v){return i=i-16,t=p(),v=t[i],v;}function outer(a){for(a=d;false;){}let mutate=()=>{arguments[0]=()=>7};mutate();return a(16)}outer(null);",
+        "function p(){var t=['a','b'];p=function(){return t;};return p();}function d(i,t,v){return i=i-16,t=p(),v=t[i],v;}function outer(a){for(a=d;false;){}var arguments;arguments[0]=()=>7;return a(16)}outer(null);",
+        "function p(){var t=['a','b'];p=function(){return t;};return p();}function d(i,t,v){return i=i-16,t=p(),v=t[i],v;}function outer(a){'use strict';for(a=d;false;){}arguments[0]=()=>7;return a(16)}outer(null);",
+        "function p(){var t=['a','b'];p=function(){return t;};return p();}function d(i,t,v){return i=i-16,t=p(),v=t[i],v;}function outer(a){function f(){return a(16)}for(a=d;false;){}return f()}outer();",
+        "function p(){var t=['a','b'];p=function(){return t;};return p();}function d(i,t,v){return i=i-16,t=p(),v=t[i],v;}function outer(a,v=a(16)){for(a=d;false;){}return [v,a(16)]}outer(()=>7);",
+        "function p(){var t=['a','b'];p=function(){return t;};return p();}function d(i,t,v){return i=i-16,t=p(),v=t[i],v;}function outer(){eval('var d=()=>7');const a=d;return a(16)}outer();",
+        "function p(){var t=['a','b'];p=function(){return t;};return p();}function d(i,t,v){return i=i-16,t=p(),v=t[i],v;}function outer(){const a=d;function other(a,d,p){eval('1')}return a(16)}outer();",
+        "function p(){var t=['a','b'];p=function(){return t;};return p();}function d(i,t,v){return i=i-16,t=p(),v=t[i],v;}function outer(){let a=d;a=()=>7;return a(16)}outer();",
+        "function p(){var t=['a','b'];p=function(){return t;};return p();}function d(i,t,v){return i=i-16,t=p(),v=t[i],v;}const a=d;const b=a;(b)(16);",
+        "function p(){var t=['a','b'];p=function(){return t;};return p();}function d(i,t,v){return i=i-16,t=p(),v=t[i],v;}const run=()=>{let a=d;return a(16)};run();",
+    ];
+    script_runtime_equivalence(&sources, "decoder-alias", false)
+}
+
 fn script_runtime_equivalence(sources: &[&str], suite: &str, browser_globals: bool) -> Result<()> {
     let scratch = TempDir::new()?;
     // Browser decoders assume standard atob. Node's isolated VM does not

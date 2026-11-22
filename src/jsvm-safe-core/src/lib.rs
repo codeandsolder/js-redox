@@ -8511,6 +8511,43 @@ use();
     }
 
     #[test]
+    fn decoder_alias_initialization_authorizes_only_proven_reference_sites() {
+        let functions = "function p(){var t=['a','b'];p=function(){return t;};return p();}function d(i,t,v){return i=i-16,t=p(),v=t[i],v;}";
+        for (body, expected) in [
+            ("const a=d;sink(a(16));",1),
+            ("const a=d;const b=a;const c=b;sink(c(16));",1),
+            ("try{a(16)}catch(e){}const a=d;sink(a(16));",1),
+            ("try{const b=a;sink(b(16))}catch(e){}const a=d;sink(a(16));",1),
+            ("function f(){return a(16)}try{f()}catch(e){}const a=d;sink(f(),a(16));",1),
+            ("function outer(){function f(){return a(16)}const a=d;return f()}sink(outer());",1),
+            ("function outer(){function f(){return a(16)}try{f()}catch(e){}const a=d;return f()}sink(outer());",0),
+            ("function outer(){const a=d;return ()=>a(16)}sink(outer()());",1),
+            ("function outer(){const a=d;function f(){return a(16)}return f}sink(outer()());",1),
+            ("function outer(){function f(){return a(16)}const a=d;return f}sink(outer()());",0),
+            ("function outer(a){for(a=d;false;){}function f(){return a(16)}return f()}sink(outer());",1),
+            ("function outer(a){for(a=d;false;){}arguments[0]=()=>7;return a(16)}sink(outer(null));",0),
+            ("function outer(a){for(a=d;false;){}let mutate=()=>{arguments[0]=()=>7};mutate();return a(16)}sink(outer(null));",0),
+            ("function outer(a){for(a=d;false;){}var arguments;arguments[0]=()=>7;return a(16)}sink(outer(null));",0),
+            ("function outer(a){'use strict';for(a=d;false;){}arguments[0]=()=>7;return a(16)}sink(outer(null));",1),
+            ("function outer(a){for(a=d;false;){}function sibling(){arguments[0]=()=>7}sibling(null);return a(16)}sink(outer(null));",1),
+            ("function outer(a){function f(){return a(16)}for(a=d;false;){}return f()}sink(outer());",0),
+            ("function outer(a,v=a(16)){for(a=d;false;){}return [v,a(16)]}sink(outer(()=>7));",0),
+            ("function outer(){eval('var d=()=>7');const a=d;return a(16)}sink(outer());",0),
+            ("function outer(){const a=d;function other(a,d,p){eval('1')}return a(16)}sink(outer());",1),
+            ("function outer(){let a=d;a=replacement;return a(16)}sink(outer());",0),
+            ("const a=d;eval('a.extra=1');sink(a(16));",0),
+            ("const a=d;const b=a;const c=b;sink((c)(16));",1),
+            ("const a=d;const b=a;const c=b;const e=c;const f=e;sink(f(16));",1),
+            ("const a=d;const b=a;sink(b(16),b(17));",2),
+            ("const run=()=>{let a=d;return a(16)};sink(run());",1),
+        ] {
+            let source = format!("{functions}{body}");
+            let result = recover_static_decoders(&source, 8).unwrap_or_else(|| unreachable!("{source}"));
+            assert_eq!(result.transforms.get("string_array_decode").copied().unwrap_or_default(), expected, "{source}: {}", result.source);
+        }
+    }
+
+    #[test]
     fn decoder_alias_first_statement_dominates_closure_reads() {
         let source = r"
 function provider(table) {
