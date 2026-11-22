@@ -610,10 +610,24 @@ impl Analyzer<'_> {
                 for item in &object.properties {
                     match item {
                         ObjectPropertyKind::SpreadProperty(spread) => {
-                            self.expression(&spread.argument, environment);
-                            environment.clear();
-                            data.define_unknown_key(true, None);
-                            inert = false;
+                            let value = self.expression(&spread.argument, environment);
+                            let copied = match value.fact.as_ref() {
+                                Some(fact) => match data.spread(environment, fact, self.budget) {
+                                    Ok(copied) => copied,
+                                    Err(failure) => {
+                                        self.failure = Some(failure);
+                                        return Self::barrier(environment);
+                                    }
+                                },
+                                None => false,
+                            };
+                            if copied {
+                                inert &= value.inert;
+                            } else {
+                                environment.clear();
+                                data.define_unknown_key(true, None);
+                                inert = false;
+                            }
                         }
                         ObjectPropertyKind::ObjectProperty(property) => {
                             let key = if property.computed {
@@ -1035,6 +1049,43 @@ mod tests {
             ("let p={x:7};let a={__proto__:p,y:unknown()};a.x;",vec![]),
             ("let a={__proto__:null};Object.setPrototypeOf(a,p);a.x;",vec![]),
             ("let a={__proto__:null};Object.defineProperty(a,'x',{value:7});a.x=9;a.x;",vec![]),
+        ] {
+            let expected = expected.into_iter().map(|(text,value)|(text.to_owned(),value.to_owned())).collect::<Vec<_>>();
+            assert_eq!(reads(source)?, expected, "{source}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn copy_data_properties_preserves_exact_enumerability_aliases_and_effects(
+    ) -> Result<(), BudgetExceeded> {
+        for (source, expected) in [
+            ("let a={x:7};let b={...a};b.x;",vec![("b.x","7")]),
+            ("let a={x:7};let b={...a};a.x=9;b.x;",vec![("b.x","7")]),
+            ("let a={x:{y:7}};let b={...a};b.x.y=9;a.x.y;b.x.y;",vec![("a.x.y","9"),("b.x.y","9")]),
+            ("let a={__proto__:{x:7}};let b={__proto__:null,...a};b.x;",vec![("b.x","void 0")]),
+            ("let a=[7,,9];let b={__proto__:null,...a};b[0];b[1];b[2];b.length;",vec![("b[0]","7"),("b[1]","void 0"),("b[2]","9"),("b.length","void 0")]),
+            ("let a=[7,8];a.length=1;let b={__proto__:null,...a};b[0];b[1];b.length;",vec![("b[0]","7"),("b[1]","void 0"),("b.length","void 0")]),
+            ("let b={x:2,...{x:7},x:9};b.x;",vec![("b.x","9")]),
+            ("let b={x:2,...{x:7}};b.x;",vec![("b.x","7")]),
+            ("let a={__proto__:null,x:7};let b={__proto__:null,...a};b.x;b.y;",vec![("b.x","7"),("b.y","void 0")]),
+            ("let a={__proto__:null,...null,...void 0,...7,...true};a.x;",vec![("a.x","void 0")]),
+            ("let a={__proto__:null,...'ab'};a[0];a[1];a[2];a.length;",vec![("a[0]",r#""a""#),("a[1]",r#""b""#),("a[2]","void 0"),("a.length","void 0")]),
+            ("let a={__proto__:null,...'é中'};a[0];a[1];a[2];",vec![("a[0]",r#""é""#),("a[1]",r#""中""#),("a[2]","void 0")]),
+            ("let a={__proto__:null,...'😀z'};a[0];a[1];a[2];a[3];",vec![("a[2]",r#""z""#),("a[3]","void 0")]),
+            ("let a={['__proto__']:7};let b={__proto__:null,...a};b.__proto__;b.x;",vec![("b.__proto__","7"),("b.x","void 0")]),
+            ("let a={x:7};let b={get x(){return 9},...a};b.x;",vec![("b.x","7")]),
+            ("function f(flag){let a=flag?{x:7}:{y:8};let b={__proto__:null,x:7,...a};b.x;}",vec![("b.x","7")]),
+            ("function f(flag){let a=flag?{x:7}:{y:8};let b={__proto__:null,...a};b.x;b.z;}",vec![("b.z","void 0")]),
+            ("function f(k){const a={__proto__:null,[k]:7};const b={__proto__:null,x:7,...a};b.x;}",vec![("b.x","7")]),
+            ("let a={x:7,...thing};let b={...a};b.x=9;b.x;",vec![("b.x","9")]),
+            ("let p={x:7};let b={...{get x(){p.x=9;return 7}}};p.x;",vec![]),
+            ("let a={get x(){return 7}};let b={...a};b.x;",vec![]),
+            ("function f(k){let a={get [k](){return 7}};let b={__proto__:null,...a};b.x;}",vec![]),
+            ("let a={x:7};let b={...a,y:side()};a.x;b.x;",vec![("b.x","7")]),
+            ("let a={x:7};let b={...a,y:(a.x=9)};a.x;b.x;",vec![("a.x","9"),("b.x","7")]),
+            ("let a={x:7};let b={...a,...(a.x=9,a)};a.x;b.x;",vec![("a.x","9"),("b.x","9")]),
+            ("let a={x:7};let b={...a,...(unknown(),a)};b.x;",vec![]),
         ] {
             let expected = expected.into_iter().map(|(text,value)|(text.to_owned(),value.to_owned())).collect::<Vec<_>>();
             assert_eq!(reads(source)?, expected, "{source}");

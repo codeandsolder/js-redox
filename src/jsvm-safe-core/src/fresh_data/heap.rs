@@ -6,10 +6,10 @@ use crate::value_eval::{canonical_array_index_key, same_value, Value};
 use oxc_syntax::symbol::SymbolId;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use work_budget::{BudgetExceeded, WorkBudget};
 
 pub(super) type AllocationId = usize;
 pub(super) type Locations = Rc<[AllocationId]>;
-type Properties = HashMap<String, Property>;
 
 #[derive(Clone)]
 pub(super) enum Fact {
@@ -107,6 +107,84 @@ impl Property {
     }
 }
 
+/// Enumerably copied properties are always writable own data on the
+/// fresh destination, regardless of the source's prototype. Reuse the
+/// same sparse descriptor lattice for source joins and destination overlays.
+#[derive(Clone)]
+struct Properties {
+    listed: HashMap<String, Property>,
+    unlisted: Property,
+}
+
+impl Default for Properties {
+    fn default() -> Self {
+        Self {
+            listed: HashMap::new(),
+            unlisted: Property::Absent,
+        }
+    }
+}
+
+impl Property {
+    fn copied_over(&self, previous: &Self) -> Self {
+        match self {
+            Self::Absent => previous.clone(),
+            Self::Data(value) => Self::Data(value.clone()),
+            Self::MaybeData(value) => previous.join(&Self::Data(value.clone())),
+            Self::Opaque => Self::Opaque,
+        }
+    }
+}
+
+impl Properties {
+    fn get(&self, key: &str) -> &Property {
+        self.listed.get(key).unwrap_or(&self.unlisted)
+    }
+
+    fn insert(&mut self, key: String, property: Property) {
+        self.listed.insert(key, property);
+    }
+
+    fn charge(&self, budget: &WorkBudget) -> Result<(), BudgetExceeded> {
+        budget.consume(u64::try_from(self.listed.len()).unwrap_or(u64::MAX))
+    }
+
+    fn data_only(&self) -> bool {
+        !matches!(self.unlisted, Property::Opaque)
+            && self
+                .listed
+                .values()
+                .all(|property| !matches!(property, Property::Opaque))
+    }
+
+    fn define_unknown(&mut self, definition: &Property) {
+        for property in self.listed.values_mut() {
+            *property = property.join(definition);
+        }
+        self.unlisted = self.unlisted.join(definition);
+    }
+
+    fn combine(&mut self, other: &Self, operation: impl Fn(&Property, &Property) -> Property) {
+        for (key, property) in &mut self.listed {
+            *property = operation(property, other.get(key));
+        }
+        for (key, property) in &other.listed {
+            self.listed
+                .entry(key.clone())
+                .or_insert_with(|| operation(&self.unlisted, property));
+        }
+        self.unlisted = operation(&self.unlisted, &other.unlisted);
+    }
+
+    fn join(&mut self, other: &Self) {
+        self.combine(other, Property::join);
+    }
+
+    fn copy_from(&mut self, other: &Self) {
+        self.combine(other, |previous, source| source.copied_over(previous));
+    }
+}
+
 /// Explicit prototypes of fresh allocations are known by identity. The
 /// ordinary intrinsic prototype is deliberately unknown: its properties
 /// may have been modified before a literal was even evaluated.
@@ -128,7 +206,6 @@ pub(super) struct OwnData {
     kind: AllocationKind,
     prototype: Prototype,
     properties: Properties,
-    unlisted: Property,
 }
 
 impl OwnData {
@@ -136,8 +213,7 @@ impl OwnData {
         Self {
             kind,
             prototype: Prototype::Unknown,
-            properties: HashMap::new(),
-            unlisted: Property::Absent,
+            properties: Properties::default(),
         }
     }
 
@@ -172,34 +248,52 @@ impl OwnData {
         } else {
             Property::Opaque
         };
-        for property in self.properties.values_mut() {
-            *property = property.join(&definition);
-        }
-        self.unlisted = self.unlisted.join(&definition);
+        self.properties.define_unknown(&definition);
     }
 
     /// Array spread cannot overwrite any of the already created prefix
     /// elements. Unknown later indices are data or absent, never accessors.
     pub(super) fn unknown_array_tail(&mut self) {
-        self.unlisted = Property::MaybeData(None);
+        self.properties.unlisted = Property::MaybeData(None);
     }
 
     fn property(&self, key: &str) -> &Property {
-        self.properties.get(key).unwrap_or(&self.unlisted)
+        self.properties.get(key)
     }
 
     fn join(&mut self, other: &Self) {
         // A single allocation's prototype cannot change on any modeled
         // path. Unknown prototype mutation invalidates the allocation.
-        for (key, property) in &mut self.properties {
-            *property = property.join(other.property(key));
+        self.properties.join(&other.properties);
+    }
+
+    fn enumerable_data(&self, budget: &WorkBudget) -> Result<Option<Properties>, BudgetExceeded> {
+        self.properties.charge(budget)?;
+        let mut properties = self.properties.clone();
+        if self.kind == AllocationKind::Array {
+            // All tracked ordinary literal properties are enumerable,
+            // except the intrinsic own Array length descriptor.
+            properties.insert("length".to_owned(), Property::Absent);
         }
-        for (key, property) in &other.properties {
-            self.properties
-                .entry(key.clone())
-                .or_insert_with(|| self.unlisted.join(property));
-        }
-        self.unlisted = self.unlisted.join(&other.unlisted);
+        Ok(properties.data_only().then_some(properties))
+    }
+
+    /// CopyDataProperties ignores inherited data, uses own enumerability,
+    /// and defines rather than sets the destination's property. We can
+    /// model it only if all possible source descriptors are data/absent.
+    pub(super) fn spread(
+        &mut self,
+        environment: &Environment,
+        source: &Fact,
+        budget: &WorkBudget,
+    ) -> Result<bool, BudgetExceeded> {
+        let Some(properties) = environment.enumerable_data(source, budget)? else {
+            return Ok(false);
+        };
+        self.properties.charge(budget)?;
+        properties.charge(budget)?;
+        self.properties.copy_from(&properties);
+        Ok(true)
     }
 
     fn is_length(&self, key: &str) -> bool {
@@ -228,7 +322,7 @@ impl OwnData {
             };
             // All indexed properties of a still-fresh Array literal are
             // configurable. ArraySetLength only removes indices >= length.
-            for (key, property) in &mut self.properties {
+            for (key, property) in &mut self.properties.listed {
                 if canonical_array_index_key(key).is_some_and(|index| index >= length) {
                     *property = Property::Absent;
                 }
@@ -323,6 +417,54 @@ impl Environment {
                 self.allocations
                     .entry(id)
                     .or_insert_with(|| Rc::clone(data));
+            }
+        }
+    }
+
+    fn enumerable_data(
+        &self,
+        source: &Fact,
+        budget: &WorkBudget,
+    ) -> Result<Option<Properties>, BudgetExceeded> {
+        match source {
+            Fact::Objects(locations) => {
+                let mut merged: Option<Properties> = None;
+                for id in locations.iter() {
+                    let Some(data) = self.allocations.get(id) else {
+                        return Ok(None);
+                    };
+                    let Some(properties) = data.enumerable_data(budget)? else {
+                        return Ok(None);
+                    };
+                    if let Some(merged) = &mut merged {
+                        merged.charge(budget)?;
+                        properties.charge(budget)?;
+                        merged.join(&properties);
+                    } else {
+                        merged = Some(properties);
+                    }
+                }
+                Ok(merged)
+            }
+            Fact::Primitive(value) => {
+                let mut properties = Properties::default();
+                // CopyDataProperties skips null/undefined, and primitive
+                // wrappers other than String have no enumerable own keys.
+                if let Value::String(value) = value {
+                    budget.consume(u64::try_from(value.len()).unwrap_or(u64::MAX))?;
+                    for (index, unit) in value.encode_utf16().enumerate() {
+                        if index % 256 == 0 {
+                            budget.checkpoint()?;
+                        }
+                        // A supplementary character is two indexed UTF-16
+                        // code units. Preserve unrepresentable surrogate
+                        // values as unknown data rather than replacing them.
+                        let fact = char::from_u32(u32::from(unit))
+                            .map(|character| Fact::Primitive(Value::String(character.to_string())));
+                        properties.insert(index.to_string(), Property::Data(fact));
+                    }
+                }
+                Ok(Some(properties))
             }
         }
     }
