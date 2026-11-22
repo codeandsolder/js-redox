@@ -5,6 +5,36 @@ use oxc_span::{GetSpan, SourceType, Span};
 use rolldown_redox::ecmascript::parse_program;
 use serde::Serialize;
 
+/// Common file I/O and serialization contract for generated IR reports.
+pub(crate) fn publish_report<S: serde::de::DeserializeOwned, V: Serialize>(
+    source_path: &std::path::Path,
+    scan_path: &std::path::Path,
+    output_path: &std::path::Path,
+    budget: &work_budget::WorkBudget,
+    schema: &'static str,
+    derive: impl FnOnce(&str, &S, &work_budget::WorkBudget) -> anyhow::Result<Vec<V>>,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+    #[derive(Serialize)]
+    struct Report<V> {
+        schema: &'static str,
+        source: String,
+        vms: Vec<V>,
+    }
+    budget.checkpoint()?;
+    let source = std::fs::read_to_string(source_path)
+        .with_context(|| format!("reading {}", source_path.display()))?;
+    let scan = crate::report_file::read_json(scan_path, "scan report")?;
+    budget.checkpoint()?;
+    let report = Report {
+        schema,
+        source: source_path.display().to_string(),
+        vms: derive(&source, &scan, budget)?,
+    };
+    budget.checkpoint()?;
+    crate::report_file::write_json(output_path, &report)
+}
+
 #[derive(Debug, Serialize)]
 pub struct IrOp {
     pub kind: String,

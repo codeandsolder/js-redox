@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{BindingPattern, Expression, Statement};
 use oxc_span::{GetSpan, SourceType};
@@ -6,7 +6,6 @@ use rolldown_redox::ecmascript::parse_program;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
-    fs,
     path::Path,
 };
 
@@ -115,13 +114,6 @@ struct TableVmIr {
     method_bindings: BTreeMap<String, String>,
     property_stats: BTreeMap<String, PropertyStats>,
     handlers: Vec<HandlerIr>,
-}
-
-#[derive(Debug, Serialize)]
-struct Output {
-    schema: &'static str,
-    source: String,
-    vms: Vec<TableVmIr>,
 }
 
 const fn is_ident_char(c: u8) -> bool {
@@ -728,21 +720,12 @@ pub fn materialize(
     output_path: &Path,
     budget: &WorkBudget,
 ) -> Result<()> {
-    budget.checkpoint()?;
-    let source = fs::read_to_string(source_path)
-        .with_context(|| format!("reading {}", source_path.display()))?;
-    let report: ScanReport = serde_json::from_str(
-        fs::read_to_string(scan_path)
-            .with_context(|| format!("reading {}", scan_path.display()))?
-            .trim(),
+    crate::semantic_ir::publish_report(
+        source_path,
+        scan_path,
+        output_path,
+        budget,
+        "jsvm-table-ir/v0",
+        lift_table_vms,
     )
-    .with_context(|| format!("parsing {}", scan_path.display()))?;
-    budget.checkpoint()?;
-    let output = Output {
-        schema: "jsvm-table-ir/v0",
-        source: source_path.display().to_string(),
-        vms: lift_table_vms(&source, &report, budget)?,
-    };
-    budget.checkpoint()?;
-    crate::report_file::write_json(output_path, &output)
 }
