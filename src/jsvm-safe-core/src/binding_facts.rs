@@ -43,6 +43,8 @@ pub struct BindingFacts {
     node_spans: Vec<Span>,
     scope_entries: HashMap<ScopeId, u32>,
     hoisted_functions: HashSet<ScopeId>,
+    hoisted_function_bindings: HashMap<ScopeId, SymbolId>,
+    direct_calls: HashMap<ReferenceId, Span>,
     scopes: Vec<Option<ScopeId>>,
     eval_sites: Vec<EvalSite>,
     parameter_regions: HashMap<ScopeId, Span>,
@@ -118,6 +120,8 @@ impl BindingFacts {
             node_spans: Vec::new(),
             scope_entries: HashMap::new(),
             hoisted_functions: HashSet::new(),
+            hoisted_function_bindings: HashMap::new(),
+            direct_calls: HashMap::new(),
             scopes: Vec::new(),
             eval_sites: Vec::new(),
             parameter_regions: HashMap::new(),
@@ -283,6 +287,82 @@ impl BindingFacts {
         })
     }
 
+    /// Discharge initialization at a specific use through a closed set of
+    /// direct calls to private hoisted functions. All incoming calls must
+    /// establish the same captured environment, not just one convenient
+    /// call site. A reference used as a value, an exported function, or an
+    /// ungrounded recursive cycle cannot provide this evidence.
+    pub(crate) fn proves_initialized_through_calls(
+        &self,
+        scoping: &Scoping,
+        symbol: SymbolId,
+        scope: ScopeId,
+        at: Span,
+        budget: &work_budget::WorkBudget,
+    ) -> Result<bool, work_budget::BudgetExceeded> {
+        if self.proves_value_initialized(scoping, symbol, scope, at) {
+            return Ok(true);
+        }
+        let owner = scoping.symbol_scope_id(symbol);
+        let mut pending = vec![(scope, at)];
+        let mut visited = HashSet::new();
+        let mut grounded = false;
+        while let Some((scope, at)) = pending.pop() {
+            budget.checkpoint()?;
+            if self.proves_value_initialized(scoping, symbol, scope, at) {
+                grounded = true;
+                continue;
+            }
+            let Some(function_scope) = scoping
+                .scope_ancestors(scope)
+                .take_while(|&ancestor| ancestor != owner)
+                .find(|&ancestor| scoping.scope_flags(ancestor).is_function())
+            else {
+                return Ok(false);
+            };
+            if !visited.insert(function_scope) {
+                continue;
+            }
+            let Some(&function) = self.hoisted_function_bindings.get(&function_scope) else {
+                return Ok(false);
+            };
+            if !self.is_private(scoping, function)
+                || !self.binding_has_stable_value(scoping, function)
+                || !scoping
+                    .scope_ancestors(scoping.symbol_scope_id(function))
+                    .any(|ancestor| ancestor == owner)
+            {
+                return Ok(false);
+            }
+            let references = scoping.get_resolved_reference_ids(function);
+            if references.is_empty() {
+                return Ok(false);
+            }
+            budget.consume(u64::try_from(references.len()).unwrap_or(u64::MAX))?;
+            for &reference in references {
+                let Some(&span) = self.direct_calls.get(&reference) else {
+                    return Ok(false);
+                };
+                if self.resolved_symbol(scoping, reference) != Some(function) {
+                    return Ok(false);
+                }
+                pending.push((scoping.get_reference(reference).scope_id(), span));
+            }
+        }
+        Ok(grounded)
+    }
+
+    /// Source-local table proofs do not extend to object-backed script
+    /// globals or exported mutable allocations accessed by external code.
+    pub(crate) fn source_local_data_binding(&self, scoping: &Scoping, symbol: SymbolId) -> bool {
+        !self.exported_bindings.contains(&symbol)
+            && !(self.ambient_root
+                && scoping.symbol_scope_id(symbol) == scoping.root_scope_id()
+                && !scoping.symbol_flags(symbol).is_block_scoped())
+            && !self.is_eval_exposed(scoping, symbol)
+            && self.binding_has_stable_value(scoping, symbol)
+    }
+
     /// Can this binding's value or properties be exposed to unmodeled code
     /// without an ordinary reference? A classic script's global environment
     /// and directly exported module allocations are not private. A potential
@@ -436,6 +516,13 @@ impl<'a> Visit<'a> for BindingFacts {
     }
 
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        if !call.optional {
+            if let Expression::Identifier(callee) = call.callee.without_parentheses() {
+                if let Some(reference) = callee.reference_id.get() {
+                    self.direct_calls.insert(reference, call.span);
+                }
+            }
+        }
         if crate::is_potential_direct_eval(call) {
             if let Some(Some(scope)) = self.scopes.last() {
                 self.eval_sites.push(EvalSite {
@@ -500,6 +587,9 @@ impl<'a> Visit<'a> for BindingFacts {
         if node.r#type == FunctionType::FunctionDeclaration {
             if let Some(scope) = node.scope_id.get() {
                 self.hoisted_functions.insert(scope);
+                if let Some(symbol) = node.id.as_ref().and_then(|id| id.symbol_id.get()) {
+                    self.hoisted_function_bindings.insert(scope, symbol);
+                }
             }
         }
         if let Some(scope) = node.scope_id.get() {

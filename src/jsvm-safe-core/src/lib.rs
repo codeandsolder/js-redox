@@ -1317,7 +1317,13 @@ impl Collector<'_, '_> {
     }
 
     fn try_decoder_rewrite(&mut self, call: &CallExpression<'_>) -> Option<CallRewriteTraversal> {
-        let rewrite = decoder_call_rewrite(self.source, self.scoping, self.decoders, call)?;
+        let rewrite = decoder_call_rewrite(
+            self.source,
+            self.scoping,
+            &self.constants.initialization,
+            self.decoders,
+            call,
+        )?;
         self.push(call.span, rewrite.text, "string_array_decode");
         Some(if rewrite.stop {
             CallRewriteTraversal::Stop
@@ -2090,7 +2096,8 @@ fn transform_once(
         scoping,
         &constants.initialization,
         &reference_spans,
-    );
+        budget,
+    )?;
     budget.checkpoint()?;
     let decoders = decoder_analysis.decoders;
     let mut protected_spans = decoder_analysis.protected_spans;
@@ -2238,7 +2245,7 @@ fn recover_static_decoders_with_mode(
         budget.checkpoint()?;
         let scoping = semantic_ret.semantic.scoping();
         let reference_spans = collect_reference_spans(&program);
-        let pass = static_decoder_pass(&current, &program, scoping, &reference_spans);
+        let pass = static_decoder_pass(&current, &program, scoping, &reference_spans, budget)?;
         budget.checkpoint()?;
         decoder_candidates = decoder_candidates.max(pass.decoder_count);
         if pass.replacements.is_empty() {
@@ -8469,6 +8476,35 @@ use();
         assert!(rejected.is_some());
         let rejected = rejected.unwrap_or_else(|| unreachable!());
         assert_eq!(rejected.transforms.get("string_array_decode"), None);
+    }
+
+    #[test]
+    fn direct_tables_require_exact_property_keys_own_slots_and_initialized_bindings() {
+        for (source, count) in [
+            ("const t=['YQ==','Yg=='];function d(i){return atob(t[i])}sink(d(0),d('1'),d(-0),d(1n),d(1-1),d('00'),d('0x0'),d(' 1'),d('-0'),d(true),d(2));",5),
+            ("const t=['YQ==',, 'Yg=='];function d(i){return atob(t[i])}sink(d(0),d(1),d(2));",2),
+            ("const t=['YQ==',value()];function d(i){return atob(t[i])}sink(d(0),d(1));",1),
+            ("sink(d(0));const t=['YQ=='];function d(i){return atob(t[i])}sink(d(0));",1),
+            ("sink(d(0));var t=['YQ=='];function d(i){return atob(t[i])}",0),
+            ("function f(){sink(d(0));const t=['YQ=='];function d(i){return atob(t[i])}sink(d(0))}f();",1),
+            ("function f(){const t=['YQ=='];function d(i){return atob(t[i])}function g(){return d(0)}sink(g())}f();",1),
+            ("function f(){sink(g());const t=['YQ=='];function d(i){return atob(t[i])}function g(){return d(0)}sink(g())}f();",0),
+            ("function f(){const t=['YQ=='];function d(i){return atob(t[i])}function g(){return h()}function h(){return d(0)}sink(g())}f();",1),
+            ("function f(){const t=['YQ=='];function d(i){return atob(t[i])}function g(){return d(0)}sink(g)}f();",0),
+            ("function f(){const t=['YQ=='];function d(i){return atob(t[i])}function g(){return d(0)}eval('g()');sink(g())}f();",0),
+            ("const t=['YQ=='];function d(i){return atob(t[i])}function f(){eval('var d=()=>7');sink(d(0))}f();",0),
+            ("const t=['YQ=='];function d(i){return atob(t[i])}eval('d=()=>7');sink(d(0));",0),
+            (r#"const t=['YQ=='];function d(i){return atob(t[i])}eval('t[0]="Yg=="');sink(d(0));"#,0),
+            ("function f(){const t=['YQ=='];function d(i){return atob(t[i])}function sibling(){eval('1')}sink(d(0))}f();",0),
+            ("function f(){const t=['YQ=='];function d(i){return atob(t[i])}function sibling(t,d){eval('1')}sink(d(0))}f();",1),
+            ("const t=['YQ=='];function d(i,i){return atob(t[i])}sink(d(0));",0),
+            ("const t=['YQ=='];function d(i){return d=t[i],atob(d)}sink(d(0));",0),
+            ("export const t=['YQ=='];function d(i){return atob(t[i])}sink(d(0));",0),
+            ("var t=['YQ=='];function d(i){return atob(t[i])}globalThis.t[0]='Yg==';sink(d(0));",0),
+        ] {
+            let recovered = recover_static_decoders(source, 4).unwrap_or_else(|| unreachable!("{source}"));
+            assert_eq!(recovered.transforms.get("string_array_decode").copied().unwrap_or_default(), count, "{source}: {}",recovered.source);
+        }
     }
 
     #[test]

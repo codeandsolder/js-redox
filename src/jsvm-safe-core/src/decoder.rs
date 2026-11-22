@@ -4,10 +4,11 @@ use crate::decoder_encoding::{
 };
 mod fixed_base64_proof;
 
-use crate::binding_facts::BindingFacts;
+use crate::binding_facts::{BindingFacts, ReferenceIdentity};
 use crate::rewrite::Replacement;
 use crate::value_eval::{
-    eval, js_to_uint32, literal_property_key, render_value_array, same_values, Value,
+    canonical_array_index_key, eval, exact_computed_property_key, js_to_uint32,
+    literal_property_key, render_value_array, same_values, Value,
 };
 use crate::{
     argument_integer, array_element, decoder_argument_integer, expression_integer, fragment,
@@ -33,6 +34,7 @@ use std::{
     collections::{HashMap, HashSet},
     sync::LazyLock,
 };
+use work_budget::{BudgetExceeded, WorkBudget};
 
 /// Convert an integer into the JavaScript Number domain. Precision loss above
 /// 2^53 is intentional here: JavaScript itself stores the value as IEEE-754 f64.
@@ -108,7 +110,6 @@ fn all_static_arrays(program: &oxc_ast::ast::Program<'_>) -> Vec<StaticArrayInfo
 #[derive(Debug, Clone)]
 struct PartialStaticArrayInfo {
     symbol: SymbolId,
-    name: String,
     values: Vec<Option<Value>>,
 }
 
@@ -137,17 +138,15 @@ impl<'a> Visit<'a> for PartialStaticArrayCollector {
                         valid = false;
                         break;
                     }
-                    oxc_ast::ast::ArrayExpressionElement::Elision(_) => Some(Value::Undefined),
+                    // A hole has no own descriptor and can inherit a value.
+                    oxc_ast::ast::ArrayExpressionElement::Elision(_) => None,
                     _ => array_element(element),
                 };
                 values.push(value);
             }
             if valid && !values.is_empty() && values.iter().any(Option::is_some) {
-                self.candidates.push(PartialStaticArrayInfo {
-                    symbol,
-                    name: id.name.to_string(),
-                    values,
-                });
+                self.candidates
+                    .push(PartialStaticArrayInfo { symbol, values });
             }
         }
         walk::walk_variable_declaration(self, it);
@@ -164,15 +163,6 @@ fn partial_decoder_arrays(
         .candidates
         .retain(|candidate| symbol_has_only_read_references(scoping, candidate.symbol));
     collector.candidates
-}
-
-fn decoder_static_arrays(
-    program: &oxc_ast::ast::Program<'_>,
-    scoping: &Scoping,
-) -> Vec<StaticArrayInfo> {
-    let mut candidates = all_static_arrays(program);
-    candidates.retain(|candidate| symbol_has_only_read_references(scoping, candidate.symbol));
-    candidates
 }
 
 fn fixed_decoder_loop_shape(statement: &Statement<'_>) -> bool {
@@ -1142,12 +1132,17 @@ fn standard_base64_table_for_function(
         return None;
     };
     let index_symbol = first_param.symbol_id.get()?;
+    let parameter_symbols = function
+        .params
+        .items
+        .iter()
+        .filter_map(|parameter| parameter.pattern.get_binding_identifier()?.symbol_id.get())
+        .collect::<HashSet<_>>();
 
     let local_assignment = |expression: &Expression<'_>| -> Option<(SymbolId, SymbolId)> {
         let (target, value) = assignment_identifier(expression)?;
         let target_symbol = statically_resolved_symbol(scoping, target.reference_id.get()?)?;
-        let declaration = scoping.symbol_span(target_symbol);
-        if declaration.start < function.span.start || declaration.end > function.span.end {
+        if !parameter_symbols.contains(&target_symbol) {
             return None;
         }
         Some((
@@ -1281,40 +1276,83 @@ struct DirectFnInfo {
 
 struct DirectFnInfoCollector<'c> {
     scoping: &'c Scoping,
+    facts: &'c BindingFacts,
     aliases: &'c HashMap<SymbolId, u32>,
     reference_spans: &'c HashMap<ReferenceId, Span>,
     out: Vec<DirectFnInfo>,
 }
 
+struct ExactBodyReferences<'c> {
+    scoping: &'c Scoping,
+    facts: &'c BindingFacts,
+    valid: bool,
+}
+
+impl<'a> Visit<'a> for ExactBodyReferences<'_> {
+    fn visit_identifier_reference(&mut self, identifier: &oxc_ast::ast::IdentifierReference<'a>) {
+        self.valid &= identifier.reference_id.get().is_some_and(|reference| {
+            self.facts.resolve_reference(self.scoping, reference) != ReferenceIdentity::Dynamic
+        });
+    }
+}
+
 impl<'a> Visit<'a> for DirectFnInfoCollector<'_> {
     fn visit_function(&mut self, f: &oxc_ast::ast::Function<'a>, flags: ScopeFlags) {
-        if let Some(id) = &f.id {
-            if let Some(symbol) = id.symbol_id.get() {
-                let fixed_base64_alphabet = fixed_alphabet_for_function(
-                    f,
-                    symbol,
-                    self.scoping,
-                    self.aliases,
-                    self.reference_spans,
-                );
-                let fixed_base64_algorithm_proven =
-                    fixed_base64_alphabet.as_deref().is_some_and(|alphabet| {
-                        fixed_base64_algorithm_proven(
-                            f,
-                            self.scoping,
-                            self.aliases,
-                            self.reference_spans,
-                            alphabet,
-                        )
-                    });
-                self.out.push(DirectFnInfo {
-                    symbol,
-                    span: f.span,
-                    indexed_table_symbols: indexed_table_symbols_for_function(f, self.scoping),
-                    standard_base64_table: standard_base64_table_for_function(f, self.scoping),
-                    fixed_base64_alphabet,
-                    fixed_base64_algorithm_proven,
-                });
+        if let Some(symbol) = f.id.as_ref().and_then(|id| id.symbol_id.get()) {
+            if self.facts.binding_has_stable_value(self.scoping, symbol)
+                && !f.r#async
+                && !f.generator
+                && function_parameters_have_no_runtime_effects(f)
+            {
+                let parameters = f
+                    .params
+                    .items
+                    .iter()
+                    .filter_map(|parameter| {
+                        parameter.pattern.get_binding_identifier()?.symbol_id.get()
+                    })
+                    .collect::<HashSet<_>>();
+                if parameters.len() == f.params.items.len() {
+                    let standard_base64_table = standard_base64_table_for_function(f, self.scoping);
+                    let fixed_base64_alphabet = fixed_alphabet_for_function(
+                        f,
+                        symbol,
+                        self.scoping,
+                        self.aliases,
+                        self.reference_spans,
+                    );
+                    let fixed_base64_algorithm_proven =
+                        fixed_base64_alphabet.as_deref().is_some_and(|alphabet| {
+                            fixed_base64_algorithm_proven(
+                                f,
+                                self.scoping,
+                                self.aliases,
+                                self.reference_spans,
+                                alphabet,
+                            )
+                        });
+                    if standard_base64_table.is_some() || fixed_base64_algorithm_proven {
+                        let mut probe = ExactBodyReferences {
+                            scoping: self.scoping,
+                            facts: self.facts,
+                            valid: true,
+                        };
+                        probe.visit_function(f, flags);
+                        if probe.valid {
+                            self.out.push(DirectFnInfo {
+                                symbol,
+                                span: f.span,
+                                indexed_table_symbols: indexed_table_symbols_for_function(
+                                    f,
+                                    self.scoping,
+                                ),
+                                standard_base64_table,
+                                fixed_base64_alphabet,
+                                fixed_base64_algorithm_proven,
+                            });
+                        }
+                    }
+                }
             }
         }
         walk::walk_function(self, f, flags);
@@ -1324,11 +1362,13 @@ impl<'a> Visit<'a> for DirectFnInfoCollector<'_> {
 fn all_functions(
     program: &oxc_ast::ast::Program<'_>,
     scoping: &Scoping,
+    facts: &BindingFacts,
     aliases: &HashMap<SymbolId, u32>,
     reference_spans: &HashMap<ReferenceId, Span>,
 ) -> Vec<DirectFnInfo> {
     let mut collector = DirectFnInfoCollector {
         scoping,
+        facts,
         aliases,
         reference_spans,
         out: Vec::new(),
@@ -1407,9 +1447,9 @@ pub struct Decoder {
     transform: DecoderTransform,
 }
 
-impl Decoder {
+impl DecoderTransform {
     fn transform_value(&self, value: Value, key: Option<&str>) -> Option<Value> {
-        match (&self.transform, value) {
+        match (self, value) {
             (DecoderTransform::LowerAlphabetBase64Uri, Value::String(encoded)) => {
                 decode_lower_alphabet_base64_uri(&encoded).map(Value::String)
             }
@@ -1433,14 +1473,16 @@ impl Decoder {
             }
         }
     }
+}
 
+impl Decoder {
     fn value_for_raw_rotated_with_key(
         &self,
         raw: i64,
         rotation: usize,
         key: Option<&str>,
     ) -> Option<Value> {
-        let index = raw - self.offset;
+        let index = raw.checked_sub(self.offset)?;
         if index < 0 || self.values.is_empty() {
             return None;
         }
@@ -1451,7 +1493,8 @@ impl Decoder {
             return None;
         }
         let index = index.checked_add(rotation)? % self.values.len();
-        self.transform_value(self.values.get(index)?.clone(), key)
+        self.transform
+            .transform_value(self.values.get(index)?.clone(), key)
     }
 
     pub(super) fn value_for_call(&self, raw: i64, key: Option<&str>) -> Option<Value> {
@@ -1467,6 +1510,7 @@ pub struct DecoderCallRewrite {
 pub fn decoder_call_rewrite(
     source: &str,
     scoping: &Scoping,
+    facts: &BindingFacts,
     decoders: &HashMap<SymbolId, Decoder>,
     call: &CallExpression<'_>,
 ) -> Option<DecoderCallRewrite> {
@@ -1476,7 +1520,7 @@ pub fn decoder_call_rewrite(
     {
         return None;
     }
-    let symbol = symbol_of(scoping, &call.callee)?;
+    let symbol = facts.stable_callable_symbol(scoping, &call.callee)?;
     let decoder = decoders.get(&symbol)?;
     let key = match call.arguments.get(1) {
         Some(Argument::StringLiteral(literal)) => Some(string_literal_value(literal)?),
@@ -1485,21 +1529,32 @@ pub fn decoder_call_rewrite(
     };
     let argument = call.arguments.first()?;
     if let Some(raw) = decoder_argument_integer(argument) {
-        let text = decoder
-            .value_for_call(raw, key.as_deref())
-            .and_then(|value| value.render_expression())?;
-        return Some(DecoderCallRewrite { text, stop: false });
+        return literal_decoder_rewrite(decoder.value_for_call(raw, key.as_deref())?);
     }
+    conditional_decoder_rewrite(source, argument, |expression| {
+        decoder.value_for_call(expression_integer(expression)?, key.as_deref())
+    })
+}
 
-    let Argument::ConditionalExpression(conditional) = argument else {
+fn literal_decoder_rewrite(value: Value) -> Option<DecoderCallRewrite> {
+    Some(DecoderCallRewrite {
+        text: value.render_expression()?,
+        stop: false,
+    })
+}
+
+fn conditional_decoder_rewrite(
+    source: &str,
+    argument: &Argument<'_>,
+    value: impl Fn(&Expression<'_>) -> Option<Value>,
+) -> Option<DecoderCallRewrite> {
+    let Expression::ConditionalExpression(conditional) =
+        argument.as_expression()?.without_parentheses()
+    else {
         return None;
     };
-    let consequent = expression_integer(&conditional.consequent)
-        .and_then(|raw| decoder.value_for_call(raw, key.as_deref()))
-        .and_then(|value| value.render())?;
-    let alternate = expression_integer(&conditional.alternate)
-        .and_then(|raw| decoder.value_for_call(raw, key.as_deref()))
-        .and_then(|value| value.render())?;
+    let consequent = value(&conditional.consequent)?.render()?;
+    let alternate = value(&conditional.alternate)?.render()?;
     let test = fragment(source, conditional.test.span());
     Some(DecoderCallRewrite {
         text: format!("(({test}) ? ({consequent}) : ({alternate}))"),
@@ -1510,6 +1565,7 @@ pub fn decoder_call_rewrite(
 struct DecoderOnlyCallCollector<'c> {
     source: &'c str,
     scoping: &'c Scoping,
+    facts: &'c BindingFacts,
     decoders: &'c HashMap<SymbolId, Decoder>,
     protected_spans: &'c [(usize, usize)],
     replacements: Vec<Replacement>,
@@ -1529,7 +1585,8 @@ impl DecoderOnlyCallCollector<'_> {
 
 impl<'a> Visit<'a> for DecoderOnlyCallCollector<'_> {
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
-        let Some(rewrite) = decoder_call_rewrite(self.source, self.scoping, self.decoders, call)
+        let Some(rewrite) =
+            decoder_call_rewrite(self.source, self.scoping, self.facts, self.decoders, call)
         else {
             walk::walk_call_expression(self, call);
             return;
@@ -1557,22 +1614,24 @@ pub fn static_decoder_pass(
     program: &oxc_ast::ast::Program<'_>,
     scoping: &Scoping,
     reference_spans: &HashMap<ReferenceId, Span>,
-) -> StaticDecoderPass {
+    budget: &WorkBudget,
+) -> Result<StaticDecoderPass, BudgetExceeded> {
     let facts = BindingFacts::analyze(program, scoping);
-    let analysis = analyze_decoders(source, program, scoping, &facts, reference_spans);
-    let decoder_count = analysis.decoders.len();
+    let analysis = analyze_decoders(source, program, scoping, &facts, reference_spans, budget)?;
+    let decoder_count = analysis.decoder_count;
     let mut collector = DecoderOnlyCallCollector {
         source,
         scoping,
+        facts: &facts,
         decoders: &analysis.decoders,
         protected_spans: &analysis.protected_spans,
         replacements: analysis.replacements,
     };
     collector.visit_program(program);
-    StaticDecoderPass {
+    Ok(StaticDecoderPass {
         replacements: collector.replacements,
         decoder_count,
-    }
+    })
 }
 
 fn compile_regex(pattern: &str) -> Option<regex::Regex> {
@@ -1656,69 +1715,48 @@ fn function_has_external_write(
     false
 }
 
-#[derive(Debug, Clone)]
-struct SparseDirectDecoder {
+#[derive(Debug)]
+struct DirectTableDecoder {
+    table: SymbolId,
+    table_read_initialized: bool,
     values: Vec<Option<Value>>,
     transform: DecoderTransform,
 }
 
-impl SparseDirectDecoder {
-    fn value_for_raw(&self, raw: i64) -> Option<Value> {
-        let index = usize::try_from(raw).ok()?;
-        let value = self.values.get(index)?.clone()?;
-        match (&self.transform, value) {
-            (DecoderTransform::StandardBase64, Value::String(encoded)) => {
-                decode_standard_base64_latin1(&encoded).map(Value::String)
-            }
-            (DecoderTransform::FixedBase64Alphabet(alphabet), Value::String(encoded)) => {
-                decode_fixed_base64_latin1(&encoded, alphabet).map(Value::String)
-            }
-            (DecoderTransform::FixedBase64Alphabet(_), value) => Some(value),
-            // Sparse direct decoding is intentionally limited to the two exact
-            // direct-decoder shapes proved here. Rotation/offset decoders stay
-            // on the complete-table path above.
-            _ => None,
+impl DirectTableDecoder {
+    fn value(&self, expression: &Expression<'_>) -> Option<Value> {
+        let key = exact_computed_property_key(expression, eval)?;
+        let index = usize::try_from(canonical_array_index_key(&key)?).ok()?;
+        self.transform
+            .transform_value(self.values.get(index)?.clone()?, None)
+    }
+
+    fn rewrite(&self, source: &str, call: &CallExpression<'_>) -> Option<DecoderCallRewrite> {
+        if call.optional
+            || !(1..=2).contains(&call.arguments.len())
+            || call.arguments.iter().any(Argument::is_spread)
+            || call
+                .arguments
+                .get(1)
+                .is_some_and(|argument| !matches!(argument, Argument::StringLiteral(_)))
+        {
+            return None;
         }
+        let argument = call.arguments.first()?;
+        if let Some(value) = self.value(argument.as_expression()?) {
+            return literal_decoder_rewrite(value);
+        }
+        conditional_decoder_rewrite(source, argument, |expression| self.value(expression))
     }
 }
 
-// Both complete and partially materialized tables need the same strict
-// binding and transform proof; only their candidate-selection rules differ.
-fn proven_direct_table_transform(
-    source: &str,
+fn direct_table_transform(
     function: &DirectFnInfo,
     table_symbol: SymbolId,
-    table_name: &str,
-    scoping: &Scoping,
-    reference_spans: &HashMap<ReferenceId, Span>,
 ) -> Option<DecoderTransform> {
-    // The table must have exactly one confined read, without aliases,
-    // reassignment, member mutation or an external mutating array call.
-    let [reference_id] = scoping.get_resolved_reference_ids(table_symbol) else {
-        return None;
-    };
-    let reference = scoping.get_reference(*reference_id);
-    if reference.is_write() || reference.flags().is_member_write_target() {
-        return None;
-    }
-    let span = reference_spans.get(reference_id)?;
-    if function.span.start > span.start || span.end > function.span.end {
-        return None;
-    }
-
-    let mutator = compile_regex(&format!(
-        r"\b{}\s*\.\s*(?:copyWithin|fill|pop|push|reverse|shift|sort|splice|unshift)\s*\(",
-        regex::escape(table_name)
-    ))?;
-    if mutator.is_match(source) {
-        return None;
-    }
-
     if function.standard_base64_table == Some(table_symbol) {
         Some(DecoderTransform::StandardBase64)
-    } else if function.fixed_base64_algorithm_proven
-        && !function_has_external_write(function.span, scoping, reference_spans)
-    {
+    } else if function.fixed_base64_algorithm_proven {
         Some(DecoderTransform::FixedBase64Alphabet(
             function.fixed_base64_alphabet.clone()?,
         ))
@@ -1727,217 +1765,130 @@ fn proven_direct_table_transform(
     }
 }
 
-fn detect_sparse_direct_table_decoders(
-    source: &str,
+fn detect_direct_table_decoders(
+    program: &oxc_ast::ast::Program<'_>,
     functions: &[DirectFnInfo],
-    arrays: &[PartialStaticArrayInfo],
-    complete_decoders: &HashMap<SymbolId, Decoder>,
+    existing: &HashMap<SymbolId, Decoder>,
     scoping: &Scoping,
+    facts: &BindingFacts,
     reference_spans: &HashMap<ReferenceId, Span>,
-) -> HashMap<SymbolId, SparseDirectDecoder> {
+) -> HashMap<SymbolId, DirectTableDecoder> {
+    let arrays = partial_decoder_arrays(program, scoping);
+    let arrays = arrays
+        .iter()
+        .map(|array| (array.symbol, array))
+        .collect::<HashMap<_, _>>();
     let mut out = HashMap::new();
     for function in functions {
-        if complete_decoders.contains_key(&function.symbol)
-            || scoping
-                .get_resolved_reference_ids(function.symbol)
-                .iter()
-                .any(|reference_id| scoping.get_reference(*reference_id).is_write())
+        if existing.contains_key(&function.symbol)
+            || function_has_external_write(function.span, scoping, reference_spans)
         {
             continue;
         }
-        let array = if let Some(symbol) = function.standard_base64_table {
-            let Some(array) = arrays.iter().find(|array| array.symbol == symbol) else {
-                continue;
+        let candidate_symbols = function.standard_base64_table.as_ref().map_or(
+            function.indexed_table_symbols.as_slice(),
+            std::slice::from_ref,
+        );
+        let mut candidates = candidate_symbols.iter().filter_map(|symbol| {
+            let array = arrays.get(symbol)?;
+            if !facts.source_local_data_binding(scoping, *symbol) {
+                return None;
+            }
+            let [reference] = scoping.get_resolved_reference_ids(*symbol) else {
+                return None;
             };
-            array
-        } else {
-            let mut matched = function
-                .indexed_table_symbols
-                .iter()
-                .filter_map(|symbol| arrays.iter().find(|array| array.symbol == *symbol))
-                .filter(|array| {
-                    let references = scoping.get_resolved_reference_ids(array.symbol);
-                    let [reference_id] = references else {
-                        return false;
-                    };
-                    reference_spans.get(reference_id).is_some_and(|span| {
-                        function.span.start <= span.start && span.end <= function.span.end
-                    })
-                })
-                .collect::<Vec<_>>();
-            matched.sort_by_key(|array| array.symbol);
-            matched.dedup_by_key(|array| array.symbol);
-            let [array] = matched.as_slice() else {
-                continue;
-            };
-            *array
-        };
-
-        // The table binding is immutable, and its only resolved read is the
-        // decoder lookup proved above. Dynamic elements are allowed at table
-        // construction time, but they can never be substituted by this path.
-        let Some(transform) = proven_direct_table_transform(
-            source,
-            function,
-            array.symbol,
-            &array.name,
-            scoping,
-            reference_spans,
-        ) else {
-            continue;
-        };
-
-        out.insert(
-            function.symbol,
-            SparseDirectDecoder {
+            let reference_flags = scoping.get_reference(*reference);
+            let span = reference_spans.get(reference)?;
+            if !reference_flags.is_read()
+                || reference_flags.is_write()
+                || reference_flags.flags().is_member_write_target()
+                || facts.resolved_symbol(scoping, *reference) != Some(*symbol)
+                || function.span.start > span.start
+                || span.end > function.span.end
+            {
+                return None;
+            }
+            let transform = direct_table_transform(function, *symbol)?;
+            Some(DirectTableDecoder {
+                table: *symbol,
+                table_read_initialized: facts.initialized_reference(scoping, *reference, *span)
+                    == Some(*symbol),
                 values: array.values.clone(),
                 transform,
-            },
-        );
+            })
+        });
+        let Some(candidate) = candidates.next() else {
+            continue;
+        };
+        if candidates.next().is_none() {
+            out.insert(function.symbol, candidate);
+        }
     }
     out
 }
 
-struct SparseDecoderCallCollector<'c> {
+struct DirectTableCallCollector<'c> {
+    source: &'c str,
     scoping: &'c Scoping,
-    decoders: &'c HashMap<SymbolId, SparseDirectDecoder>,
+    facts: &'c BindingFacts,
+    decoders: &'c HashMap<SymbolId, DirectTableDecoder>,
+    budget: &'c WorkBudget,
+    failure: Option<BudgetExceeded>,
     replacements: Vec<Replacement>,
 }
 
-impl<'a> Visit<'a> for SparseDecoderCallCollector<'_> {
-    fn visit_function(&mut self, function: &oxc_ast::ast::Function<'a>, flags: ScopeFlags) {
-        walk::walk_function(self, function, flags);
-    }
-
-    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
-        if call.optional || call.arguments.len() != 1 || call.arguments[0].is_spread() {
-            walk::walk_call_expression(self, call);
-            return;
-        }
-        let Some(symbol) = symbol_of(self.scoping, &call.callee) else {
-            walk::walk_call_expression(self, call);
-            return;
+impl DirectTableCallCollector<'_> {
+    fn rewrite(
+        &self,
+        call: &CallExpression<'_>,
+    ) -> Result<Option<DecoderCallRewrite>, BudgetExceeded> {
+        let Expression::Identifier(callee) = call.callee.without_parentheses() else {
+            return Ok(None);
+        };
+        let Some(reference) = callee.reference_id.get() else {
+            return Ok(None);
+        };
+        let Some(symbol) = self.facts.resolved_symbol(self.scoping, reference) else {
+            return Ok(None);
         };
         let Some(decoder) = self.decoders.get(&symbol) else {
-            walk::walk_call_expression(self, call);
-            return;
+            return Ok(None);
         };
-        let Some(raw) = decoder_argument_integer(&call.arguments[0]) else {
-            walk::walk_call_expression(self, call);
-            return;
+        let Some(rewrite) = decoder.rewrite(self.source, call) else {
+            return Ok(None);
         };
-        let Some(text) = decoder
-            .value_for_raw(raw)
-            .and_then(|value| value.render_expression())
-        else {
-            walk::walk_call_expression(self, call);
-            return;
-        };
-        self.replacements.push(Replacement {
-            start: call.span.start as usize,
-            end: call.span.end as usize,
-            text,
-            kind: "string_array_decode",
-            arithmetic_state_proof: None,
-        });
-        // The only argument is an exact literal, so replacing this whole call
-        // cannot hide nested evaluation effects.
-    }
-}
-
-fn sparse_direct_decoder_replacements(
-    source: &str,
-    program: &oxc_ast::ast::Program<'_>,
-    functions: &[DirectFnInfo],
-    complete_decoders: &HashMap<SymbolId, Decoder>,
-    scoping: &Scoping,
-    reference_spans: &HashMap<ReferenceId, Span>,
-) -> Vec<Replacement> {
-    let arrays = partial_decoder_arrays(program, scoping);
-    let decoders = detect_sparse_direct_table_decoders(
-        source,
-        functions,
-        &arrays,
-        complete_decoders,
-        scoping,
-        reference_spans,
-    );
-    if decoders.is_empty() {
-        return Vec::new();
-    }
-    let mut collector = SparseDecoderCallCollector {
-        scoping,
-        decoders: &decoders,
-        replacements: Vec::new(),
-    };
-    collector.visit_program(program);
-    collector.replacements
-}
-
-fn detect_direct_table_decoders(
-    source: &str,
-    functions: &[DirectFnInfo],
-    arrays: &[StaticArrayInfo],
-    scoping: &Scoping,
-    reference_spans: &HashMap<ReferenceId, Span>,
-) -> HashMap<SymbolId, Decoder> {
-    let mut out = HashMap::new();
-    for function in functions {
-        if scoping
-            .get_resolved_reference_ids(function.symbol)
-            .iter()
-            .any(|reference_id| scoping.get_reference(*reference_id).is_write())
+        if !decoder.table_read_initialized
+            && !self.facts.proves_initialized_through_calls(
+                self.scoping,
+                decoder.table,
+                self.scoping.get_reference(reference).scope_id(),
+                call.span,
+                self.budget,
+            )?
         {
-            continue;
+            return Ok(None);
         }
-        let array = if let Some(symbol) = function.standard_base64_table {
-            let Some(array) = arrays.iter().find(|array| array.symbol == symbol) else {
-                continue;
-            };
-            array
-        } else {
-            let mut matched = function
-                .indexed_table_symbols
-                .iter()
-                .filter_map(|symbol| arrays.iter().find(|array| array.symbol == *symbol))
-                .collect::<Vec<_>>();
-            matched.sort_by_key(|array| array.symbol);
-            matched.dedup_by_key(|array| array.symbol);
-            let [array] = matched.as_slice() else {
-                continue;
-            };
-            *array
-        };
-
-        // A direct literal-table decoder should have exactly one resolved
-        // use of the table binding: the indexed load proved above. Requiring a
-        // single confined read fails closed on aliases/escapes both outside
-        // and *inside* the decoder (an internal alias can otherwise mutate the
-        // array before the returned lookup without writing the original
-        // binding itself).
-        let Some(transform) = proven_direct_table_transform(
-            source,
-            function,
-            array.symbol,
-            &array.name,
-            scoping,
-            reference_spans,
-        ) else {
-            continue;
-        };
-
-        out.insert(
-            function.symbol,
-            Decoder {
-                values: array.values.clone(),
-                offset: 0,
-                provider: array.name.clone(),
-                provider_array_span: array.span,
-                transform,
-            },
-        );
+        Ok(Some(rewrite))
     }
-    out
+}
+
+impl<'a> Visit<'a> for DirectTableCallCollector<'_> {
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        if self.failure.is_some() {
+            return;
+        }
+        match self.rewrite(call) {
+            Ok(Some(rewrite)) => self.replacements.push(Replacement {
+                start: call.span.start as usize,
+                end: call.span.end as usize,
+                text: rewrite.text,
+                kind: "string_array_decode",
+                arithmetic_state_proof: None,
+            }),
+            Ok(None) => walk::walk_call_expression(self, call),
+            Err(failure) => self.failure = Some(failure),
+        }
+    }
 }
 
 fn parse_i64_literal(text: &str) -> Option<i64> {
@@ -3688,6 +3639,7 @@ pub struct DecoderAnalysis {
     pub(super) protected_spans: Vec<(usize, usize)>,
     pub(super) replacements: Vec<Replacement>,
     pub(super) removable_helpers: HashMap<SymbolId, Span>,
+    decoder_count: usize,
 }
 
 pub fn analyze_decoders(
@@ -3696,20 +3648,20 @@ pub fn analyze_decoders(
     scoping: &Scoping,
     facts: &BindingFacts,
     reference_spans: &HashMap<ReferenceId, Span>,
-) -> DecoderAnalysis {
-    let arrays = decoder_static_arrays(program, scoping);
+    budget: &WorkBudget,
+) -> Result<DecoderAnalysis, BudgetExceeded> {
     let from_char_code_aliases = crate::collect_from_char_code_aliases(program, scoping, facts);
-    let direct_functions =
-        all_functions(program, scoping, &from_char_code_aliases, reference_spans);
+    let direct_functions = all_functions(
+        program,
+        scoping,
+        facts,
+        &from_char_code_aliases,
+        reference_spans,
+    );
     let functions = all_function_declarations(program, scoping);
 
     let (mut decoders, mut protected_spans, mut replacements) =
         detect_decoders(source, &functions, program, scoping, reference_spans);
-    for (symbol, decoder) in
-        detect_direct_table_decoders(source, &direct_functions, &arrays, scoping, reference_spans)
-    {
-        decoders.entry(symbol).or_insert(decoder);
-    }
     let (fixed_decoders, fixed_protected, fixed_replacements) =
         detect_fixed_rotated_direct_decoders(source, program, scoping, reference_spans);
     for (symbol, decoder) in fixed_decoders {
@@ -3717,27 +3669,47 @@ pub fn analyze_decoders(
     }
     protected_spans.extend(fixed_protected);
     replacements.extend(fixed_replacements);
-    replacements.extend(sparse_direct_decoder_replacements(
-        source,
+    let direct = detect_direct_table_decoders(
         program,
         &direct_functions,
         &decoders,
         scoping,
+        facts,
         reference_spans,
-    ));
+    );
+    let mut collector = DirectTableCallCollector {
+        source,
+        scoping,
+        facts,
+        decoders: &direct,
+        budget,
+        failure: None,
+        replacements: Vec::new(),
+    };
+    if !direct.is_empty() {
+        collector.visit_program(program);
+    }
+    if let Some(failure) = collector.failure {
+        return Err(failure);
+    }
+    replacements.extend(collector.replacements);
+    let decoder_count = decoders.len() + direct.len();
 
     let removable_helpers = functions
         .iter()
-        .filter(|function| decoders.contains_key(&function.symbol))
+        .filter(|function| {
+            decoders.contains_key(&function.symbol) || direct.contains_key(&function.symbol)
+        })
         .map(|function| (function.symbol, function.span))
         .collect();
 
-    DecoderAnalysis {
+    Ok(DecoderAnalysis {
         decoders,
         protected_spans,
         replacements,
         removable_helpers,
-    }
+        decoder_count,
+    })
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -715,6 +715,21 @@ fn depythonify_safe_deob_script_completion_runtime_equivalence() -> Result<()> {
         "Array.prototype[Symbol.iterator]=function*(){yield 99;};let a=[7,8];let b={...a};b[0];",
         "let a=[7,8];let b={...a};[b[0],b[1],b.length];",
         "let a={__proto__:null,[Symbol('a')]:7};let b={...a};Reflect.ownKeys(b).length;",
+        "const t=['YQ==','Yg=='];function d(i){return atob(t[i])}Array.prototype['00']='Yw==';Array.prototype['0x0']='ZA==';[d(0),d('1'),d(-0),d(1n),d('00'),d('0x0')];",
+        "const t=['YQ==',,'Yg=='];function d(i){return atob(t[i])}Array.prototype[1]='Yw==';[d(0),d(1),d(2)];",
+        "const t=['YQ==',(()=>{events.push('init');return 'Yg=='})()];function d(i){return atob(t[i])}[d(0),d(1)];",
+        "function f(){try{d(0)}catch(e){events.push(e.name)}const t=['YQ=='];function d(i){return atob(t[i])}return d(0)}f();",
+        "function f(){const t=['YQ=='];function d(i){return atob(t[i])}function g(){return d(0)}return g()}f();",
+        "function f(){try{g()}catch(e){events.push(e.name)}const t=['YQ=='];function d(i){return atob(t[i])}function g(){return d(0)}return g()}f();",
+        "function f(){const t=['YQ=='];function d(i){return atob(t[i])}function g(){return h()}function h(){return d(0)}return g()}f();",
+        "function f(){const t=['YQ=='];function d(i){return atob(t[i])}function g(){return d(0)}return g}f()();",
+        "const t=['YQ=='];function d(i){return atob(t[i])}function f(){eval('var d=()=>7');return d(0)}f();",
+        "const t=['YQ=='];function d(i){return atob(t[i])}eval('d=()=>7');d(0);",
+        "const t=['YQ=='];function d(i){return atob(t[i])}eval(\"t[0]='Yg=='\");d(0);",
+        "function f(){const t=['YQ=='];function d(i){return atob(t[i])}function sibling(t,d){eval('1')}return d(0)}f();",
+        "const t=['YQ=='];function d(i,i){return atob(t[i])}try{d(0)}catch(e){e.name;}",
+        "const t=['YQ=='];function d(i){return d=t[i],atob(d)}[d(0),typeof d];",
+        "var t=['YQ=='];function d(i){return atob(t[i])}globalThis.t[0]='Yg==';d(0);",
     ];
     for (index, source) in sources.iter().enumerate() {
         let label = format!("script-completion-{index}");
