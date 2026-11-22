@@ -8062,6 +8062,33 @@ mod tests {
     }
 
     #[test]
+    fn self_installing_providers_require_the_complete_structural_effect_proof() {
+        let decoder = "function d(i, t, v) { return i = i - 0x10, t = p(), v = t[i], v; }";
+        for (provider, expected) in [
+            ("function p() { var t=['a','b']; p=function(){return t;}; return p(); }", 1),
+            ("function p() { const t=['a','b']; return (p=function(){return t;})(); }", 1),
+            ("function p() { let t=['a','b']; return p=function(){return t;},p(); }", 1),
+            ("function p() { var /*comment*/ t=['a','b']; p = (function(){return (t);}); return (p)(); }", 1),
+            ("function p(t) { return t='a!b'.split('!'),p=function(){return t;},p(); }", 1),
+            ("function p() { var t=['a','b']; side(); p=function(){return t;}; return p(); }", 0),
+            ("function p() { var t=['a','b']; p=function(){side();return t;}; return p(); }", 0),
+            ("function p() { var t=['a','b']; p=function(){return t;}; side(); return p(); }", 0),
+            ("function p() { var t=['a','b']; p=function named(){return named;}; return p(); }", 0),
+            ("function p() { var t=['a','b']; p=async function(){return t;}; return p(); }", 0),
+            ("function p() { var t=['a','b']; p=function*(){return t;}; return p(); }", 0),
+            ("function p() { var t=['a','b']; p=function(t){return t;}; return p(); }", 0),
+            ("function p() { var t=['a','b'], additional=side(); p=function(){return t;}; return p(); }", 0),
+            ("function p(t=side()) { return t='a!b'.split('!'),p=function(){return t;},p(); }", 0),
+            ("function p() { var t=['a','b']; p=function(){return t;}; return p(); } p=replacement;", 0),
+            ("function p() { var t=['a','b']; p=function(){return t;}; return p(); } eval('p=replacement');", 0),
+        ] {
+            let source = format!("{provider} {decoder} sink(d(16));");
+            let result = recover_static_decoders(&source, 4).unwrap_or_else(|| unreachable!("{source}"));
+            assert_eq!(result.transforms.get("string_array_decode").copied().unwrap_or_default(), expected, "{source}: {}", result.source);
+        }
+    }
+
+    #[test]
     fn decoder_only_recovery_proves_inline_self_rewriting_plain_decoder() {
         let source = r#"
 function provider() {

@@ -357,8 +357,8 @@ struct FnInfo {
     scope: ScopeId,
     params: Vec<String>,
     span: Span,
-    static_arrays: HashMap<String, LocalStaticArrayInfo>,
-    split_provider: Option<LocalStaticArrayInfo>,
+    provider: Option<LocalStaticArrayInfo>,
+    parameters_proven: bool,
     sequence_decoder: Option<SequenceDecoderShape>,
 }
 
@@ -415,50 +415,43 @@ fn assignment_identifier<'a>(
     Some((target, &assignment.right))
 }
 
-fn self_rewriting_split_provider(
-    function: &oxc_ast::ast::Function<'_>,
+/// Ordinary, argument-free calls used by a self-installing provider.
+fn zero_argument_call<'a>(expression: &'a Expression<'a>) -> Option<&'a Expression<'a>> {
+    let Expression::CallExpression(call) = unparenthesized(expression) else {
+        return None;
+    };
+    (!call.optional && call.arguments.is_empty()).then_some(&call.callee)
+}
+
+fn exact_identifier(
+    expression: &Expression<'_>,
     scoping: &Scoping,
-) -> Option<LocalStaticArrayInfo> {
-    if function.r#async || function.generator || function.params.rest.is_some() {
-        return None;
-    }
-    let [param] = function.params.items.as_slice() else {
+    facts: &BindingFacts,
+) -> Option<SymbolId> {
+    let Expression::Identifier(identifier) = unparenthesized(expression) else {
         return None;
     };
-    let BindingPattern::BindingIdentifier(param) = &param.pattern else {
-        return None;
-    };
-    let param_symbol = param.symbol_id.get()?;
-    let provider_id = function.id.as_ref()?;
-    let provider_symbol = provider_id.symbol_id.get()?;
-    let body = function.body.as_ref()?;
-    if !body.directives.is_empty() || body.statements.len() != 1 {
-        return None;
-    }
-    let Statement::ReturnStatement(ret) = &body.statements[0] else {
-        return None;
-    };
-    let Expression::SequenceExpression(sequence) = unparenthesized(ret.argument.as_ref()?) else {
-        return None;
-    };
-    let [table_assignment, rewrite_assignment, tail_call] = sequence.expressions.as_slice() else {
-        return None;
-    };
+    facts.resolved_symbol(scoping, identifier.reference_id.get()?)
+}
 
-    let (table_target, table_value) = assignment_identifier(table_assignment)?;
-    if statically_resolved_symbol(scoping, table_target.reference_id.get()?) != Some(param_symbol) {
-        return None;
-    }
-    let table = static_string_split(table_value)?;
-
-    let (rewrite_target, rewrite_value) = assignment_identifier(rewrite_assignment)?;
-    let rewrite_reference_id = rewrite_target.reference_id.get()?;
-    if statically_resolved_symbol(scoping, rewrite_reference_id) != Some(provider_symbol)
-        || !scoping.get_reference(rewrite_reference_id).is_write()
+/// Prove the sole permitted write: installing a zero-argument function
+/// that returns the exact newly created table, rather than a similarly
+/// spelled or dynamically resolved name.
+fn provider_installation(
+    expression: &Expression<'_>,
+    provider: SymbolId,
+    table: SymbolId,
+    scoping: &Scoping,
+    facts: &BindingFacts,
+) -> Option<ReferenceId> {
+    let (target, value) = assignment_identifier(expression)?;
+    let reference = target.reference_id.get()?;
+    if facts.resolved_symbol(scoping, reference) != Some(provider)
+        || !scoping.get_reference(reference).is_write()
     {
         return None;
     }
-    let Expression::FunctionExpression(replacement) = unparenthesized(rewrite_value) else {
+    let Expression::FunctionExpression(replacement) = unparenthesized(value) else {
         return None;
     };
     if replacement.r#async
@@ -468,44 +461,176 @@ fn self_rewriting_split_provider(
     {
         return None;
     }
-    let replacement_body = replacement.body.as_ref()?;
-    if !replacement_body.directives.is_empty() || replacement_body.statements.len() != 1 {
-        return None;
-    }
-    let Statement::ReturnStatement(replacement_return) = &replacement_body.statements[0] else {
+    let body = replacement.body.as_ref()?;
+    let [Statement::ReturnStatement(returned)] = body.statements.as_slice() else {
         return None;
     };
-    let Expression::Identifier(returned) = unparenthesized(replacement_return.argument.as_ref()?)
-    else {
-        return None;
-    };
-    if statically_resolved_symbol(scoping, returned.reference_id.get()?) != Some(param_symbol) {
+    if !body.directives.is_empty()
+        || exact_identifier(returned.argument.as_ref()?, scoping, facts) != Some(table)
+    {
         return None;
     }
+    Some(reference)
+}
 
-    let Expression::CallExpression(call) = unparenthesized(tail_call) else {
-        return None;
-    };
-    if call.optional || !call.arguments.is_empty() {
-        return None;
-    }
-    let Expression::Identifier(callee) = unparenthesized(&call.callee) else {
-        return None;
-    };
-    if statically_resolved_symbol(scoping, callee.reference_id.get()?) != Some(provider_symbol) {
-        return None;
-    }
-
-    let stable_provider = scoping
-        .get_resolved_reference_ids(provider_symbol)
-        .iter()
-        .all(|reference_id| {
-            if *reference_id == rewrite_reference_id {
-                return true;
+/// An installation and tail invocation can be separate statements, a return
+/// sequence, or an immediately invoked assignment. These have the same
+/// table/provider binding roles and no additional work.
+fn provider_tail(
+    statements: &[Statement<'_>],
+    provider: SymbolId,
+    table: SymbolId,
+    scoping: &Scoping,
+    facts: &BindingFacts,
+) -> Option<ReferenceId> {
+    let installation = match statements {
+        [Statement::ExpressionStatement(install), Statement::ReturnStatement(ret)] => {
+            if exact_identifier(zero_argument_call(ret.argument.as_ref()?)?, scoping, facts)
+                != Some(provider)
+            {
+                return None;
             }
-            reference_is_statically_resolved_read(scoping, *reference_id, provider_symbol)
-        });
-    stable_provider.then_some(table)
+            &install.expression
+        }
+        [Statement::ReturnStatement(ret)] => {
+            let argument = unparenthesized(ret.argument.as_ref()?);
+            if let Expression::SequenceExpression(sequence) = argument {
+                let [install, tail] = sequence.expressions.as_slice() else {
+                    return None;
+                };
+                if exact_identifier(zero_argument_call(tail)?, scoping, facts) != Some(provider) {
+                    return None;
+                }
+                install
+            } else {
+                zero_argument_call(argument)?
+            }
+        }
+        _ => return None,
+    };
+    provider_installation(installation, provider, table, scoping, facts)
+}
+
+fn self_rewriting_provider(
+    function: &oxc_ast::ast::Function<'_>,
+    scoping: &Scoping,
+    facts: &BindingFacts,
+) -> Option<LocalStaticArrayInfo> {
+    if function.r#async
+        || function.generator
+        || function.params.rest.is_some()
+        || !function_parameters_have_no_runtime_effects(function)
+    {
+        return None;
+    }
+    let provider = function.id.as_ref()?.symbol_id.get()?;
+    if !facts.binding_unmodified_by_eval(scoping, provider)
+        || !scoping.symbol_redeclarations(provider).is_empty()
+    {
+        return None;
+    }
+    let body = function.body.as_ref()?;
+    if !body.directives.is_empty() {
+        return None;
+    }
+    let (table, values, installation) = match function.params.items.as_slice() {
+        [] => {
+            let (first, tail) = body.statements.split_first()?;
+            let Statement::VariableDeclaration(declaration) = first else {
+                return None;
+            };
+            let [declarator] = declaration.declarations.as_slice() else {
+                return None;
+            };
+            let table = declarator.id.get_binding_identifier()?.symbol_id.get()?;
+            let Expression::ArrayExpression(array) = unparenthesized(declarator.init.as_ref()?)
+            else {
+                return None;
+            };
+            let values = array
+                .elements
+                .iter()
+                .map(array_element)
+                .collect::<Option<Vec<_>>>()?;
+            if values.is_empty() || !facts.binding_has_stable_value(scoping, table) {
+                return None;
+            }
+            let installation = provider_tail(tail, provider, table, scoping, facts)?;
+            (
+                table,
+                LocalStaticArrayInfo {
+                    values,
+                    span: array.span,
+                },
+                installation,
+            )
+        }
+        [parameter] => {
+            let table = parameter
+                .pattern
+                .get_binding_identifier()?
+                .symbol_id
+                .get()?;
+            let [Statement::ReturnStatement(ret)] = body.statements.as_slice() else {
+                return None;
+            };
+            let Expression::SequenceExpression(sequence) = unparenthesized(ret.argument.as_ref()?)
+            else {
+                return None;
+            };
+            let [assign, install, tail] = sequence.expressions.as_slice() else {
+                return None;
+            };
+            let (target, value) = assignment_identifier(assign)?;
+            let reference = target.reference_id.get()?;
+            if facts.resolved_symbol(scoping, reference) != Some(table)
+                || !scoping.get_reference(reference).is_write()
+                || exact_identifier(zero_argument_call(tail)?, scoping, facts) != Some(provider)
+                || !scoping
+                    .get_resolved_reference_ids(table)
+                    .iter()
+                    .all(|&candidate| {
+                        candidate == reference
+                            || (scoping.get_reference(candidate).is_read()
+                                && !scoping.get_reference(candidate).is_write()
+                                && !scoping
+                                    .get_reference(candidate)
+                                    .flags()
+                                    .is_member_write_target()
+                                && facts.resolved_symbol(scoping, candidate) == Some(table))
+                    })
+            {
+                return None;
+            }
+            let values = static_string_split(value)?;
+            (
+                table,
+                values,
+                provider_installation(install, provider, table, scoping, facts)?,
+            )
+        }
+        _ => return None,
+    };
+    if table == provider
+        || facts.is_eval_exposed(scoping, table)
+        || !scoping.symbol_redeclarations(table).is_empty()
+    {
+        return None;
+    }
+    scoping
+        .get_resolved_reference_ids(provider)
+        .iter()
+        .all(|&reference| {
+            reference == installation
+                || (facts.resolved_symbol(scoping, reference) == Some(provider)
+                    && scoping.get_reference(reference).is_read()
+                    && !scoping.get_reference(reference).is_write()
+                    && !scoping
+                        .get_reference(reference)
+                        .flags()
+                        .is_member_write_target())
+        })
+        .then_some(values)
 }
 
 /// Only the public positional parameter may be adjusted by a fixed
@@ -632,55 +757,32 @@ fn sequence_decoder_shape(
     })
 }
 
-fn function_info(f: &oxc_ast::ast::Function<'_>, scoping: &Scoping) -> Option<FnInfo> {
+fn function_info(
+    f: &oxc_ast::ast::Function<'_>,
+    scoping: &Scoping,
+    facts: &BindingFacts,
+) -> Option<FnInfo> {
     if f.r#type != oxc_ast::ast::FunctionType::FunctionDeclaration {
         return None;
     }
     let id = f.id.as_ref()?;
     let symbol = id.symbol_id.get()?;
-    let params = f
+    let params: Vec<_> = f
         .params
         .items
         .iter()
-        .filter_map(|p| match &p.pattern {
-            BindingPattern::BindingIdentifier(id) => Some(id.name.to_string()),
-            _ => None,
+        .filter_map(|parameter| {
+            parameter
+                .pattern
+                .get_binding_identifier()
+                .map(|id| id.name.to_string())
         })
         .collect();
-
-    let mut static_arrays = HashMap::new();
-    if let Some(body) = &f.body {
-        for stmt in &body.statements {
-            let Statement::VariableDeclaration(decl) = stmt else {
-                continue;
-            };
-            for d in &decl.declarations {
-                let BindingPattern::BindingIdentifier(array_id) = &d.id else {
-                    continue;
-                };
-                let Some(Expression::ArrayExpression(array)) = &d.init else {
-                    continue;
-                };
-                let Some(values) = array
-                    .elements
-                    .iter()
-                    .map(array_element)
-                    .collect::<Option<Vec<_>>>()
-                else {
-                    continue;
-                };
-                if !values.is_empty() {
-                    static_arrays.insert(
-                        array_id.name.to_string(),
-                        LocalStaticArrayInfo {
-                            values,
-                            span: array.span,
-                        },
-                    );
-                }
-            }
-        }
-    }
+    let parameters_proven = !f.r#async
+        && !f.generator
+        && f.params.rest.is_none()
+        && function_parameters_have_no_runtime_effects(f)
+        && params.iter().collect::<HashSet<_>>().len() == f.params.items.len();
 
     Some(FnInfo {
         name: id.name.to_string(),
@@ -688,14 +790,17 @@ fn function_info(f: &oxc_ast::ast::Function<'_>, scoping: &Scoping) -> Option<Fn
         scope: scoping.symbol_scope_id(symbol),
         params,
         span: f.span,
-        static_arrays,
-        split_provider: self_rewriting_split_provider(f, scoping),
-        sequence_decoder: sequence_decoder_shape(f, scoping),
+        provider: self_rewriting_provider(f, scoping, facts),
+        parameters_proven,
+        sequence_decoder: parameters_proven
+            .then(|| sequence_decoder_shape(f, scoping))
+            .flatten(),
     })
 }
 
 struct FunctionDeclarationCollector<'s> {
     scoping: &'s Scoping,
+    facts: &'s BindingFacts,
     out: Vec<FnInfo>,
 }
 
@@ -705,7 +810,7 @@ impl<'a> Visit<'a> for FunctionDeclarationCollector<'_> {
         it: &oxc_ast::ast::Function<'a>,
         flags: oxc_syntax::scope::ScopeFlags,
     ) {
-        if let Some(info) = function_info(it, self.scoping) {
+        if let Some(info) = function_info(it, self.scoping, self.facts) {
             self.out.push(info);
         }
         walk::walk_function(self, it, flags);
@@ -715,9 +820,11 @@ impl<'a> Visit<'a> for FunctionDeclarationCollector<'_> {
 fn all_function_declarations(
     program: &oxc_ast::ast::Program<'_>,
     scoping: &Scoping,
+    facts: &BindingFacts,
 ) -> Vec<FnInfo> {
     let mut collector = FunctionDeclarationCollector {
         scoping,
+        facts,
         out: Vec::new(),
     };
     collector.visit_program(program);
@@ -3269,95 +3376,16 @@ fn function_name_counts(functions: &[FnInfo]) -> HashMap<String, usize> {
     counts
 }
 
-fn compact_whitespace(source: &str) -> String {
-    source.chars().filter(|ch| !ch.is_whitespace()).collect()
-}
-
-fn inline_self_rewriting_provider_matches(
-    source: &str,
-    function: &FnInfo,
-    array_name: &str,
-    values: &LocalStaticArrayInfo,
-) -> bool {
-    let Ok(function_start) = usize::try_from(function.span.start) else {
-        return false;
-    };
-    let Ok(function_end) = usize::try_from(function.span.end) else {
-        return false;
-    };
-    let Ok(array_start) = usize::try_from(values.span.start) else {
-        return false;
-    };
-    let Ok(array_end) = usize::try_from(values.span.end) else {
-        return false;
-    };
-    if function_start > array_start || array_start > array_end || array_end > function_end {
-        return false;
-    }
-    let Some(prefix) = source.get(function_start..array_start) else {
-        return false;
-    };
-    let Some(suffix) = source.get(array_end..function_end) else {
-        return false;
-    };
-
-    // The old proof compiled the complete array literal into a regex. On large
-    // hostile bundles that can mean building a multi-megabyte Thompson NFA for
-    // source bytes whose exact span we already know. Compare the two small
-    // surrounding fragments instead; the array itself remains proven by its AST
-    // span and static-value analysis.
-    let prefix = compact_whitespace(prefix);
-    let prefix_matches = ["const", "let", "var"]
-        .into_iter()
-        .any(|kind| prefix == format!("function{}(){{{}{}=", function.name, kind, array_name));
-    if !prefix_matches {
-        return false;
-    }
-
-    let suffix = compact_whitespace(suffix);
-    [false, true].into_iter().any(|inner_semicolon| {
-        [false, true].into_iter().any(|outer_semicolon| {
-            let inner = if inner_semicolon { ";" } else { "" };
-            let outer = if outer_semicolon { ";" } else { "" };
-            suffix
-                == format!(
-                    ";return({}=function(){{return{}{inner}}})(){outer}}}",
-                    function.name, array_name
-                )
+fn decoder_providers(functions: &[FnInfo]) -> HashMap<(ScopeId, String), LocalStaticArrayInfo> {
+    functions
+        .iter()
+        .filter_map(|function| {
+            Some((
+                (function.scope, function.name.clone()),
+                function.provider.clone()?,
+            ))
         })
-    })
-}
-
-fn decoder_providers(
-    source: &str,
-    functions: &[FnInfo],
-) -> HashMap<(ScopeId, String), LocalStaticArrayInfo> {
-    let mut providers = HashMap::new();
-    for function in functions {
-        if let Some(values) = &function.split_provider {
-            providers.insert((function.scope, function.name.clone()), values.clone());
-            continue;
-        }
-        if !function.params.is_empty() {
-            continue;
-        }
-        let body = fragment(source, function.span);
-        if !contains_function_reassignment(body, &function.name) {
-            continue;
-        }
-        let classic_self_rewrite = body.contains(&format!("return {}();", function.name));
-        for (array_name, values) in &function.static_arrays {
-            let inline_self_rewrite =
-                inline_self_rewriting_provider_matches(source, function, array_name, values);
-            if (classic_self_rewrite && body.contains(&format!("return {array_name};")))
-                || inline_self_rewrite
-            {
-                providers.insert((function.scope, function.name.clone()), values.clone());
-                break;
-            }
-        }
-    }
-    providers
+        .collect()
 }
 
 fn decoder_transform(body: &str, keyed_decode_call: bool) -> Option<DecoderTransform> {
@@ -3460,7 +3488,7 @@ fn detect_decoder_candidate(
     name_counts: &HashMap<String, usize>,
     providers: &HashMap<(ScopeId, String), LocalStaticArrayInfo>,
 ) -> Option<Decoder> {
-    if function.params.is_empty() {
+    if !function.parameters_proven || function.params.is_empty() {
         return None;
     }
     if let Some(shape) = &function.sequence_decoder {
@@ -3601,18 +3629,55 @@ fn detect_decoders(
     functions: &[FnInfo],
     program: &oxc_ast::ast::Program<'_>,
     scoping: &Scoping,
+    facts: &BindingFacts,
     reference_spans: &HashMap<ReferenceId, Span>,
 ) -> DecoderDetection {
     let Some(patterns) = decoder_patterns() else {
         return (HashMap::new(), Vec::new(), Vec::new());
     };
     let name_counts = function_name_counts(functions);
-    let providers = decoder_providers(source, functions);
+    let providers = decoder_providers(functions);
     let mut by_name = functions
         .iter()
         .filter_map(|function| {
-            detect_decoder_candidate(source, function, patterns, &name_counts, &providers)
-                .map(|decoder| (function.name.clone(), decoder))
+            if !facts.binding_unmodified_by_eval(scoping, function.symbol)
+                || !scoping.symbol_redeclarations(function.symbol).is_empty()
+                || !scoping
+                    .get_resolved_reference_ids(function.symbol)
+                    .iter()
+                    .all(|&reference| {
+                        facts.resolved_symbol(scoping, reference) == Some(function.symbol)
+                            && ((!scoping.get_reference(reference).is_write()
+                                && !scoping
+                                    .get_reference(reference)
+                                    .flags()
+                                    .is_member_write_target())
+                                || reference_spans
+                                    .get(&reference)
+                                    .is_some_and(|span| span_contains(function.span, *span)))
+                    })
+            {
+                return None;
+            }
+            let decoder =
+                detect_decoder_candidate(source, function, patterns, &name_counts, &providers)?;
+            let provider = functions.iter().find(|candidate| {
+                candidate.scope == function.scope
+                    && candidate.name == decoder.provider
+                    && candidate.provider.is_some()
+            })?;
+            // Verify the provider referenced by the matched body, not only a
+            // name that happens to be declared in its enclosing scope.
+            scoping
+                .get_resolved_reference_ids(provider.symbol)
+                .iter()
+                .any(|&reference| {
+                    facts.resolved_symbol(scoping, reference) == Some(provider.symbol)
+                        && reference_spans
+                            .get(&reference)
+                            .is_some_and(|span| span_contains(function.span, *span))
+                })
+                .then_some((function.name.clone(), decoder))
         })
         .collect::<HashMap<_, _>>();
 
@@ -3658,10 +3723,10 @@ pub fn analyze_decoders(
         &from_char_code_aliases,
         reference_spans,
     );
-    let functions = all_function_declarations(program, scoping);
+    let functions = all_function_declarations(program, scoping, facts);
 
     let (mut decoders, mut protected_spans, mut replacements) =
-        detect_decoders(source, &functions, program, scoping, reference_spans);
+        detect_decoders(source, &functions, program, scoping, facts, reference_spans);
     let (fixed_decoders, fixed_protected, fixed_replacements) =
         detect_fixed_rotated_direct_decoders(source, program, scoping, reference_spans);
     for (symbol, decoder) in fixed_decoders {
