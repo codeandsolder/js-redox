@@ -8312,6 +8312,128 @@ sink(decode(0x10), decode(0x11));
     }
 
     #[test]
+    fn fixed_decoder_rotation_proves_countdown_and_exact_table_reader() {
+        let prefix = "const table=['a','b','c'];";
+        let rotation = "(function(a,n){const rotate=function(k){while(--k){a.push(a.shift());}};rotate(++n);})(table,4);";
+        let decoder = "const decode=function(i,_unused){i=i-0;let value=table[i];return value;};sink(decode(0));";
+        for (rotation, decoder, expected) in [
+            (rotation.to_string(), decoder.to_string(), 1),
+            (
+                rotation.replace("a.push(a.shift())", "a['push'](a['shift']())"),
+                decoder.to_string(),
+                1,
+            ),
+            (
+                rotation.replace(
+                    "while(--k){a.push(a.shift());}",
+                    "while((--k))a.push(a.shift());",
+                ),
+                decoder.to_string(),
+                1,
+            ),
+            (
+                rotation.to_string(),
+                decoder.replace("table[i]", "(table)[(i)]"),
+                1,
+            ),
+            (
+                rotation.to_string(),
+                decoder.replace("i=i-0;", "i=(i)-(0);"),
+                1,
+            ),
+            (
+                rotation.replace("(table,4)", "(table,0)"),
+                decoder.to_string(),
+                1,
+            ),
+            (
+                rotation.replace("(table,4)", "(table,-1)"),
+                decoder.to_string(),
+                0,
+            ),
+            (
+                rotation.replace("(table,4)", "(table,9007199254740992)"),
+                decoder.to_string(),
+                0,
+            ),
+            (
+                rotation.replace("while(--k)", "while(k--)"),
+                decoder.to_string(),
+                0,
+            ),
+            (
+                rotation.replace("rotate(++n)", "rotate(n++)"),
+                decoder.to_string(),
+                0,
+            ),
+            (
+                rotation.replace("a.push(a.shift());", "a.push(a.shift());events.push(k);"),
+                decoder.to_string(),
+                0,
+            ),
+            (
+                rotation.replace("function(k)", "async function(k)"),
+                decoder.to_string(),
+                0,
+            ),
+            (
+                rotation.replace("function(k)", "function(k,k)"),
+                decoder.to_string(),
+                0,
+            ),
+            (
+                rotation.replace("a.push(a.shift());", "a.push(a.shift());a.push(a.shift());"),
+                decoder.to_string(),
+                0,
+            ),
+            (
+                rotation.to_string(),
+                decoder.replace("function(i,_unused)", "function(i,i)"),
+                0,
+            ),
+            (
+                rotation.to_string(),
+                decoder.replace("let value", "using value"),
+                0,
+            ),
+            (
+                rotation.to_string(),
+                decoder.replace("return value;", "events.push(value);return value;"),
+                0,
+            ),
+            (
+                rotation.to_string(),
+                decoder.replace("sink(decode(0))", "sink(table,decode(0))"),
+                0,
+            ),
+        ] {
+            let source = format!("{prefix}{rotation}{decoder}");
+            let result =
+                recover_static_decoders(&source, 8).unwrap_or_else(|| unreachable!("{source}"));
+            assert_eq!(
+                result
+                    .transforms
+                    .get("remove_fixed_decoder_rotation_iife")
+                    .copied()
+                    .unwrap_or_default(),
+                expected,
+                "{source}: {}",
+                result.source
+            );
+            assert_eq!(
+                result
+                    .transforms
+                    .get("string_array_decode")
+                    .copied()
+                    .unwrap_or_default(),
+                expected,
+                "{source}: {}",
+                result.source
+            );
+        }
+    }
+
+    #[test]
     fn decoder_rotation_requires_complete_structural_effect_proof() {
         let prefix = "function p(){var t=['11','22','33'];p=function(){return t;};return p();}function d(i,t,v){return i=i-0,t=p(),v=t[i],v;}";
         let setup = "var alias=d,table=provider();";
