@@ -5,6 +5,7 @@
 //! original lexical symbol identity. Forwarded parameters are traced only
 //! when the referring binding is not written; other expressions are retained
 //! as unknown/dynamic, not guessed as constant values.
+use crate::source_text::clip_chars;
 use anyhow::{ensure, Result};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
@@ -928,8 +929,7 @@ fn format_view(view: &CallerView, original: &str) -> String {
             let raw = original
                 .get(span[0] as usize..span[1] as usize)
                 .unwrap_or("");
-            let excerpt = raw.chars().take(1600).collect::<String>();
-            let clipped = raw.chars().count() > 1600;
+            let (excerpt, clipped) = clip_chars(raw, 1600);
             // Embedded source may contain Markdown fences inside JS strings
             // or comments. Always choose a fence longer than any original
             // backtick run, keeping the browsing view structurally intact.

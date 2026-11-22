@@ -4,6 +4,7 @@ use crate::{
         annotate_bitfield_selectors, complete_selector_masks, derive_candidates, link_candidates,
         observed_opcodes, BuilderSite, DecoderCandidate, IndexedAccess,
     },
+    source_text::{collapsed_whitespace, collect_byte_prefix},
     state_flatten::DecoderControlInfo,
 };
 use oxc_ast::{ast::Expression, AstKind};
@@ -63,10 +64,7 @@ impl<'a> Visit<'a> for EvidenceVisitor<'_> {
                 let start = member.span.start as usize;
                 let end = (member.span.end as usize).min(self.source.len());
                 if let Some(raw) = self.source.get(start..end) {
-                    let mut preview = raw.split_whitespace().collect::<Vec<_>>().join(" ");
-                    if preview.len() > 160 {
-                        preview.truncate(160);
-                    }
+                    let preview = collect_byte_prefix(collapsed_whitespace(raw), 160);
                     self.evidence.computed_previews.insert(preview);
                 }
             }
@@ -368,6 +366,28 @@ impl FunctionState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn computed_member_preview_clips_without_panicking_at_utf8_boundaries() -> anyhow::Result<()> {
+        let prefix = format!("arr[\"{}", "a".repeat(153));
+        let source = format!("{prefix}💡\"]; ");
+        let allocator = oxc_allocator::Allocator::default();
+        let parsed = rolldown_redox::ecmascript::parse_program(
+            &allocator,
+            &source,
+            oxc_span::SourceType::cjs(),
+        );
+        assert!(parsed.is_clean());
+        let Some(oxc_ast::ast::Statement::ExpressionStatement(statement)) =
+            parsed.program.body.first()
+        else {
+            anyhow::bail!("expected fixture expression")
+        };
+        let evidence = expression_evidence(&source, &statement.expression);
+        assert_eq!(evidence.computed_members, 1);
+        assert_eq!(evidence.computed_previews, BTreeSet::from([prefix]));
+        Ok(())
+    }
 
     #[test]
     fn follows_expression_evidence_through_variables() {

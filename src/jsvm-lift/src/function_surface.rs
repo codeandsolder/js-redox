@@ -2,6 +2,7 @@
 //!
 //! Every event retains exact source offsets. Nested closures have a separate
 //! lexical depth: their bodies are not treated as executed parent code.
+use crate::source_text::clip_chars;
 use oxc_ast::{ast::Expression, AstKind};
 use oxc_semantic::{Reference, Semantic};
 use oxc_span::{GetSpan, Span};
@@ -43,15 +44,9 @@ const fn range(span: Span) -> [u32; 2] {
 
 fn preview(source: &str, span: Span) -> Option<String> {
     let raw = source.get(span.start as usize..span.end as usize)?;
-    let mut chars = raw.chars();
-    let mut out = String::new();
-    for _ in 0..160 {
-        match chars.next() {
-            Some(c) => out.push(c),
-            None => return Some(out),
-        }
-    }
-    if chars.next().is_some() {
+    let (prefix, clipped) = clip_chars(raw, 160);
+    let mut out = prefix.to_owned();
+    if clipped {
         out.push('…');
     }
     Some(out)

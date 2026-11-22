@@ -9,7 +9,7 @@ use crate::{
         retain_agreed, script_id_text, session_name, ScriptIdentityIndex, ScriptOriginContext,
     },
     sha256_hex,
-    source_text::js_line_ranges,
+    source_text::{clip_chars, js_line_ranges},
 };
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
@@ -25,10 +25,10 @@ fn fence(value: &str, language: &str) -> String {
 fn display_json(value: &Value) -> Result<String> {
     let raw = serde_json::to_string_pretty(value)?;
     let limit = 16_000;
-    if raw.chars().count() <= limit {
-        return Ok(fence(&raw, "json"));
+    let (shortened, clipped) = clip_chars(&raw, limit);
+    if !clipped {
+        return Ok(fence(shortened, "json"));
     }
-    let shortened = raw.chars().take(limit).collect::<String>();
     Ok(fence(&format!("{shortened}\n... truncated in this view; complete values remain in analysis/selective-trace.json"), "text"))
 }
 
@@ -60,9 +60,8 @@ fn source_excerpt(raw: &str, line: u64, first_line: Option<u64>) -> String {
         .skip(begin)
     {
         found |= index == local_line;
-        let mut chars = text.chars();
-        let shown = chars.by_ref().take(260).collect::<String>();
-        let cropped = if chars.next().is_some() { " …" } else { "" };
+        let (shown, clipped) = clip_chars(text, 260);
+        let cropped = if clipped { " …" } else { "" };
         let _ = writeln!(
             excerpt,
             "{} {:>6} | {shown}{cropped}",

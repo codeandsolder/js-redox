@@ -1,7 +1,7 @@
 use crate::{
     browser_decode::{decode_script, ScriptDecodeContext},
     numeric::exact_u64,
-    source_text::SourceLineIndex,
+    source_text::{clip_chars, SourceLineIndex},
 };
 use anyhow::{ensure, Context, Result};
 use base64::{engine::general_purpose, Engine as _};
@@ -1007,7 +1007,8 @@ fn compact_snippet(source: &str, start: usize, end: usize) -> String {
     let fragment = source.get(start..end).unwrap_or_default();
     let mut out = String::new();
     let mut previous_space = false;
-    for ch in fragment.chars().take(280) {
+    let (fragment, clipped) = clip_chars(fragment, 280);
+    for ch in fragment.chars() {
         if ch.is_whitespace() {
             if !previous_space {
                 out.push(' ');
@@ -1018,7 +1019,7 @@ fn compact_snippet(source: &str, start: usize, end: usize) -> String {
             previous_space = false;
         }
     }
-    if fragment.chars().count() > 280 {
+    if clipped {
         out.push('…');
     }
     out

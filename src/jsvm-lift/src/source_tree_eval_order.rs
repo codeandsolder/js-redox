@@ -11,7 +11,10 @@ use oxc_syntax::operator::AssignmentOperator;
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
-use crate::{source_text::SourceLineIndex, source_tree_navigation::long_assignment_roots};
+use crate::{
+    source_text::{collapsed_whitespace, SourceLineIndex},
+    source_tree_navigation::long_assignment_roots,
+};
 
 struct Phase {
     span: Span,
@@ -45,12 +48,12 @@ impl<'s> Plan<'s> {
             .source
             .get(span.start as usize..span.end as usize)
             .unwrap_or("");
-        let single = text.split_whitespace().collect::<Vec<_>>().join(" ");
-        if single.chars().count() > 64 {
-            format!("{}…", single.chars().take(64).collect::<String>())
-        } else {
-            single
+        let mut chars = collapsed_whitespace(text);
+        let mut single = chars.by_ref().take(64).collect::<String>();
+        if chars.next().is_some() {
+            single.push('…');
         }
+        single
     }
     fn opaque(&mut self, span: Span, kind: &str) {
         let snippet = self.snippet(span);
