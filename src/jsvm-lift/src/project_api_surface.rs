@@ -1,5 +1,8 @@
 use crate::{
-    analysis_artifacts::{load_artifact, write_artifact, API_SURFACE, DEOBFUSCATION, SOURCE_INDEX},
+    analysis_artifacts::{
+        load_artifact, load_optional_artifact, write_artifact, API_SURFACE, DEOBFUSCATION,
+        SOURCE_INDEX,
+    },
     analysis_budget::{recoverable_unit_error, AnalysisBudgets, AnalysisOperation},
     api_surface::analyze_api_surface,
 };
@@ -68,9 +71,9 @@ fn attach_source_identity(
 pub fn analyze_project_api_surface(project: &Path, budgets: &AnalysisBudgets) -> Result<Value> {
     let stage_budget = budgets.scope(format!("api-surface-project:{}", project.display()));
     stage_budget.checkpoint()?;
-    let source_index = load_artifact(project, SOURCE_INDEX, false)?
+    let source_index = load_artifact(project, SOURCE_INDEX)
         .context("source index is required for API-surface analysis")?;
-    let deobfuscation = load_artifact(project, DEOBFUSCATION, true)?;
+    let deobfuscation = load_optional_artifact(project, DEOBFUSCATION)?;
 
     let mut deob_by_raw = BTreeMap::<String, Value>::new();
     if let Some(rows) = deobfuscation
@@ -233,7 +236,7 @@ pub fn analyze_project_api_surface(project: &Path, budgets: &AnalysisBudgets) ->
 mod tests {
     use super::analyze_project_api_surface;
     use crate::analysis_artifacts::{
-        read_artifact, write_artifact, API_SURFACE, DEOBFUSCATION, SOURCE_INDEX,
+        load_artifact, write_artifact, API_SURFACE, DEOBFUSCATION, SOURCE_INDEX,
     };
     use crate::analysis_budget::AnalysisBudgets;
     use anyhow::Context;
@@ -278,7 +281,7 @@ mod tests {
             }),
         )?;
         let summary = analyze_project_api_surface(project, &AnalysisBudgets::standard(label))?;
-        let document = read_artifact(&project.join(API_SURFACE.relative_path), API_SURFACE)?;
+        let document = load_artifact(project, API_SURFACE)?;
         Ok((summary, document))
     }
 
@@ -458,7 +461,7 @@ navigator.sendBeacon("https://api.example.test/events", payload);
         assert_eq!(summary["callsites"], 1);
         assert_eq!(summary["failures"], 1);
         assert_eq!(summary["absolute_network_urls"], 1);
-        let artifact = read_artifact(&project.join(API_SURFACE.relative_path), API_SURFACE)?;
+        let artifact = load_artifact(&project, API_SURFACE)?;
         let call = &artifact["callsites"][0];
         assert_eq!(call["resource_id"], 11);
         assert_eq!(call["source_index_ordinal"], 1);
@@ -591,7 +594,7 @@ function shadow(fetch) { fetch("https://fake.invalid/"); }
         assert_eq!(summary["static_methods"], 6);
         assert_eq!(summary["invalid_methods"], 1);
 
-        let artifact = read_artifact(&project.join(API_SURFACE.relative_path), API_SURFACE)?;
+        let artifact = load_artifact(&project, API_SURFACE)?;
         let callsites = artifact["callsites"]
             .as_array()
             .context("api-surface callsites must be an array")?;
@@ -632,10 +635,7 @@ function shadow(fetch) { fetch("https://fake.invalid/"); }
             &AnalysisBudgets::standard("api-source-graph-test"),
         )?;
         assert!(graph_summary.nodes >= 8);
-        let graph = read_artifact(
-            &project.join(crate::analysis_artifacts::SOURCE_GRAPH.relative_path),
-            crate::analysis_artifacts::SOURCE_GRAPH,
-        )?;
+        let graph = load_artifact(&project, crate::analysis_artifacts::SOURCE_GRAPH)?;
         let api_nodes = graph["nodes"]
             .as_array()
             .context("source graph nodes must be an array")?

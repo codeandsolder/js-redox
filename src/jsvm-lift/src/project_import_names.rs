@@ -3,7 +3,7 @@
 //! This only rewrites local bindings in `src/_readable/` and never changes
 //! import specifiers, public ESM export names, or exact deobfuscated sources.
 use crate::{
-    analysis_artifacts::{load_artifact, DEOBFUSCATION, JS_REFERENCES, SOURCE_INDEX},
+    analysis_artifacts::{load_optional_artifact, DEOBFUSCATION, JS_REFERENCES, SOURCE_INDEX},
     readable_names::{recover_readable_names_with_imports, ImportedNames},
     report_markdown::{code_span, link_destination},
     source_text::SourceLineIndex,
@@ -498,13 +498,13 @@ Names come from readable source and statically resolved captured ESM exports. Th
 /// Fails if existing project artifacts cannot be loaded, an indexed readable module cannot be
 /// read, or renamed output and related artifacts cannot be persisted.
 pub fn propagate_imported_names(project: &Path) -> Result<usize> {
-    let Some(refs) = load_artifact(project, JS_REFERENCES, true)? else {
+    let Some(refs) = load_optional_artifact(project, JS_REFERENCES)? else {
         return Ok(0);
     };
-    let Some(deob) = load_artifact(project, DEOBFUSCATION, true)? else {
+    let Some(deob) = load_optional_artifact(project, DEOBFUSCATION)? else {
         return Ok(0);
     };
-    let Some(source_index) = load_artifact(project, SOURCE_INDEX, true)? else {
+    let Some(source_index) = load_optional_artifact(project, SOURCE_INDEX)? else {
         return Ok(0);
     };
     let mut urls = BTreeMap::<String, Option<String>>::new();

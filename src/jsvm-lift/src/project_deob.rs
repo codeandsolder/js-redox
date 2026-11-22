@@ -328,7 +328,7 @@ pub fn materialize_project_deobfuscation(
         .budgets
         .scope(format!("project-deob:{}", project.display()));
     stage_budget.checkpoint()?;
-    let source_index = load_artifact(project, SOURCE_INDEX, false)?
+    let source_index = load_artifact(project, SOURCE_INDEX)
         .context("source index is required for project deobfuscation")?;
     let source_units = source_index
         .get("units")
@@ -758,7 +758,7 @@ export {v as t, r as decode, c as panel};
         )?;
         assert_eq!(summary.javascript_units, 1);
         assert_eq!(summary.failed_units, 0);
-        let artifact = load_artifact(project, DEOBFUSCATION, false)?.context("missing deob")?;
+        let artifact = load_artifact(project, DEOBFUSCATION).context("missing deob")?;
         let row = artifact["units"]
             .as_array()
             .and_then(|rows| rows.first())
@@ -824,8 +824,7 @@ export {v as t, r as decode, c as panel};
         assert_eq!(summary.unique_raw_inputs, 2);
         assert_eq!(summary.unique_pre_deob_inputs, 2);
 
-        let artifact =
-            load_artifact(&project, DEOBFUSCATION, false)?.context("missing deob artifact")?;
+        let artifact = load_artifact(&project, DEOBFUSCATION).context("missing deob artifact")?;
         assert_eq!(
             artifact
                 .get("mode_sensitive_deduplication")
@@ -850,7 +849,7 @@ export {v as t, r as decode, c as panel};
         assert_eq!(commonjs["pre_deob_sha256"], commonjs["input_sha256"]);
 
         let strings =
-            load_artifact(&project, STRING_RECOVERY, false)?.context("missing string artifact")?;
+            load_artifact(&project, STRING_RECOVERY).context("missing string artifact")?;
         let rows = strings["units"].as_array().context("string rows")?;
         let modes = rows
             .iter()

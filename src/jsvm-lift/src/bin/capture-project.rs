@@ -2,9 +2,10 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use jsvm_lift::{
     analysis_artifacts::{
-        load_artifact, ArtifactSpec, API_SURFACE, BUNDLES, DEOBFUSCATION, GENERATED_RECOVERY,
-        JSVM_INDEX, JS_REFERENCES, OBSERVED_SOURCE, RUNTIME_SCRIPTS, SOURCEMAPS, SOURCE_GRAPH,
-        SOURCE_INDEX, WASM_INDEX, WASM_JS_BOUNDARY, WASM_RESOURCE_PROVENANCE,
+        load_artifact, load_optional_artifact, ArtifactSpec, API_SURFACE, BUNDLES, DEOBFUSCATION,
+        GENERATED_RECOVERY, JSVM_INDEX, JS_REFERENCES, OBSERVED_SOURCE, RUNTIME_SCRIPTS,
+        SOURCEMAPS, SOURCE_GRAPH, SOURCE_INDEX, WASM_INDEX, WASM_JS_BOUNDARY,
+        WASM_RESOURCE_PROVENANCE,
     },
     analysis_budget::AnalysisBudgets,
     capture_pipeline::{recover_capture_project, CapturePipelineOptions},
@@ -48,12 +49,8 @@ struct Args {
     http_max_resource_mib: usize,
 }
 
-fn required_artifact(project: &Path, spec: ArtifactSpec) -> Result<Value> {
-    load_artifact(project, spec, false)?.with_context(|| format!("missing {}", spec.name))
-}
-
 fn optional_artifact(project: &Path, spec: ArtifactSpec) -> Result<Value> {
-    Ok(load_artifact(project, spec, true)?.unwrap_or(Value::Null))
+    Ok(load_optional_artifact(project, spec)?.unwrap_or(Value::Null))
 }
 
 fn summary_u64(document: &Value, field: &str) -> u64 {
@@ -90,11 +87,11 @@ fn print_summary(
     vm_scan: bool,
 ) -> Result<()> {
     let manifest = read_manifest(&project.join(MANIFEST_NAME))?;
-    let source_index = required_artifact(project, SOURCE_INDEX)?;
-    let sourcemaps = required_artifact(project, SOURCEMAPS)?;
-    let references = required_artifact(project, JS_REFERENCES)?;
-    let api = required_artifact(project, API_SURFACE)?;
-    let graph = required_artifact(project, SOURCE_GRAPH)?;
+    let source_index = load_artifact(project, SOURCE_INDEX)?;
+    let sourcemaps = load_artifact(project, SOURCEMAPS)?;
+    let references = load_artifact(project, JS_REFERENCES)?;
+    let api = load_artifact(project, API_SURFACE)?;
+    let graph = load_artifact(project, SOURCE_GRAPH)?;
     let runtime = optional_artifact(project, RUNTIME_SCRIPTS)?;
     let observed = optional_artifact(project, OBSERVED_SOURCE)?;
 

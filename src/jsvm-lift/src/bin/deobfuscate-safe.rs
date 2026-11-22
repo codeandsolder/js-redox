@@ -1862,7 +1862,7 @@ fn run_project_names(args: &ProjectNamesArgs) -> Result<()> {
     // Unlike the optional post-pass in the full capture pipeline, a direct
     // request to relink names must reject missing or invalid graph artifacts.
     for artifact in [SOURCE_INDEX, DEOBFUSCATION, JS_REFERENCES] {
-        let _ = load_artifact(&project, artifact, false)?;
+        let _ = load_artifact(&project, artifact)?;
     }
     let renamed = propagate_imported_names(&project)?;
     println!(

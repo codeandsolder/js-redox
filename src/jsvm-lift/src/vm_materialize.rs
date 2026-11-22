@@ -1,4 +1,4 @@
-use crate::analysis_artifacts::{load_artifact, write_artifact, JSVM_INDEX};
+use crate::analysis_artifacts::{load_optional_artifact, write_artifact, JSVM_INDEX};
 use crate::analysis_budget::{AnalysisBudgets, AnalysisOperation};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -628,7 +628,7 @@ pub fn materialize_project(
         project.display().to_string(),
     );
     stage_budget.checkpoint()?;
-    let Some(mut index) = load_artifact(project, JSVM_INDEX, true)? else {
+    let Some(mut index) = load_optional_artifact(project, JSVM_INDEX)? else {
         return Ok(MaterializeSummary {
             devirtualized_units: 0,
             switch_vms: 0,
@@ -703,7 +703,7 @@ pub fn materialize_project(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analysis_artifacts::{write_artifact, JSVM_INDEX};
+    use crate::analysis_artifacts::{load_artifact, write_artifact, JSVM_INDEX};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn test_project() -> Result<PathBuf> {
@@ -810,8 +810,8 @@ mod tests {
             )?;
             assert!(pseudo.contains("opcode       3  add  [fallthrough]"));
 
-            let updated = load_artifact(&project, JSVM_INDEX, false)?
-                .context("updated JS VM index missing")?;
+            let updated =
+                load_artifact(&project, JSVM_INDEX).context("updated JS VM index missing")?;
             assert_eq!(
                 updated
                     .get("devirtualized_units")

@@ -278,7 +278,7 @@ mod tests {
     }
 
     fn artifact(project: &Path, spec: crate::analysis_artifacts::ArtifactSpec) -> Result<Value> {
-        load_artifact(project, spec, false)?.context("missing pipeline artifact")
+        load_artifact(project, spec).context("missing pipeline artifact")
     }
 
     fn edge_count(graph: &Value, kind: &str) -> u64 {

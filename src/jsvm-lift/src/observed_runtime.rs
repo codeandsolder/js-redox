@@ -2,7 +2,7 @@
 //! Parsed, absent, or zero-count scripts are not proof of non-execution.
 use crate::{
     analysis_artifacts::{
-        load_artifact, write_artifact, DEOBFUSCATION, EXECUTION_COVERAGE, OBSERVED_SOURCE,
+        load_optional_artifact, write_artifact, DEOBFUSCATION, EXECUTION_COVERAGE, OBSERVED_SOURCE,
         RUNTIME_SCRIPTS,
     },
     analysis_budget::{AnalysisBudgets, AnalysisOperation},
@@ -77,14 +77,14 @@ pub fn materialize_observed_runtime_sources(
 ) -> Result<ObservedSourceSummary> {
     let manifest = read_manifest(&project.join("capture-manifest.json"))?;
     if manifest.source.kind != "recorder"
-        || load_artifact(project, EXECUTION_COVERAGE, true)?.is_none()
+        || load_optional_artifact(project, EXECUTION_COVERAGE)?.is_none()
     {
         return Ok(ObservedSourceSummary::default());
     }
-    let Some(mut index) = load_artifact(project, RUNTIME_SCRIPTS, true)? else {
+    let Some(mut index) = load_optional_artifact(project, RUNTIME_SCRIPTS)? else {
         return Ok(ObservedSourceSummary::default());
     };
-    let deob = load_artifact(project, DEOBFUSCATION, true)?;
+    let deob = load_optional_artifact(project, DEOBFUSCATION)?;
     let safe_views = deob
         .as_ref()
         .and_then(|report| report.get("units"))
@@ -106,7 +106,7 @@ pub fn materialize_observed_runtime_sources(
         "positive runtime coverage witnesses",
     );
     let coverage = RuntimeCoverageIndex::build(&index, &coverage_budget)?;
-    let previous = load_artifact(project, OBSERVED_SOURCE, true)?;
+    let previous = load_optional_artifact(project, OBSERVED_SOURCE)?;
     let mut stale_paths = previous
         .as_ref()
         .and_then(|artifact| artifact.get("sources"))
@@ -305,6 +305,7 @@ pub fn materialize_observed_runtime_sources(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis_artifacts::load_artifact;
     use crate::capture_project::{write_manifest, CaptureManifest, CaptureSource};
     use serde_json::Map;
     use std::collections::BTreeMap;
@@ -392,7 +393,7 @@ mod tests {
         assert!(readme.contains(&digest[..12]));
         assert!(project.join(format!("src/_observed/{digest}.js")).is_file());
         assert_eq!(fs::read_to_string(capture.join(rel))?, script);
-        let mut runtime = load_artifact(&project, RUNTIME_SCRIPTS, false)?.context("index")?;
+        let mut runtime = load_artifact(&project, RUNTIME_SCRIPTS).context("index")?;
         assert_eq!(
             runtime["sources"][0]["observed_source_path"],
             json!(format!("src/_observed/{digest}.js"))
@@ -405,11 +406,11 @@ mod tests {
         )?;
         assert_eq!(again.witnessed_sources, 0);
         assert!(!project.join(format!("src/_observed/{digest}.js")).is_file());
-        let runtime = load_artifact(&project, RUNTIME_SCRIPTS, false)?.context("index")?;
-        assert_eq!(runtime["sources"][0]["observed_executed"], false);
+        let runtime = load_artifact(&project, RUNTIME_SCRIPTS).context("index")?;
+        assert_eq!(runtime["sources"][0]["observed_executed"]);
         assert!(runtime["sources"][0].get("observed_source_path").is_none());
         assert!(
-            load_artifact(&project, OBSERVED_SOURCE, false)?.context("observed report")?["sources"]
+            load_artifact(&project, OBSERVED_SOURCE).context("observed report")?["sources"]
                 .as_array()
                 .is_some_and(Vec::is_empty)
         );

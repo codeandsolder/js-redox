@@ -2614,9 +2614,9 @@ pub fn correlate_project(
         format!("boundary:{}", project.display()),
     );
     stage_budget.checkpoint()?;
-    let wasm_index = load_artifact(project, WASM_INDEX, false)?
+    let wasm_index = load_artifact(project, WASM_INDEX)
         .context("WASM index is required for WASM/JS boundary correlation")?;
-    let deob = load_artifact(project, DEOBFUSCATION, false)?
+    let deob = load_artifact(project, DEOBFUSCATION)
         .context("deobfuscation artifact is required for WASM/JS boundary correlation")?;
     let deob_by_raw = array_field(&deob, "units")
         .iter()

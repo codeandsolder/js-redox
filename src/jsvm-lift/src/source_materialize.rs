@@ -371,58 +371,57 @@ pub fn materialize_capture_source(
     // Materialize them as separate code units, retaining the recorder's exact
     // content-addressed bytes and their independent source-graph provenance.
     if manifest.source.kind == "recorder" {
-        if let Some(runtime) = load_artifact(project, RUNTIME_SCRIPTS, false)? {
-            let sources = runtime
-                .get("sources")
-                .and_then(Value::as_array)
-                .context("recorder runtime source index missing sources[]")?;
-            let capture = Path::new(&manifest.source.input);
-            for source in sources {
-                stage_budget.checkpoint()?;
-                if source.get("classification").and_then(Value::as_str)
-                    == Some("capture_instrumentation")
-                {
-                    continue;
-                }
-                let digest = source
-                    .get("sha256")
-                    .and_then(Value::as_str)
-                    .context("runtime source missing sha256")?;
-                if !crate::content_dedup::is_canonical_sha256(digest) {
-                    bail!("invalid runtime script SHA-256");
-                }
-                let capture_path = format!("runtime-scripts/{digest}.js");
-                if source.get("path").and_then(Value::as_str) != Some(capture_path.as_str()) {
-                    bail!("runtime script path is not content-addressed");
-                }
-                let raw_path = format!("resources/{capture_path}");
-                if !seen.insert(raw_path.clone()) {
-                    bail!("duplicate runtime script input path");
-                }
-                let bytes = fs::read(capture.join(&capture_path))
-                    .with_context(|| format!("reading captured runtime script {digest}"))?;
-                if sha256_hex(&bytes) != digest {
-                    bail!("runtime script digest mismatch {digest}");
-                }
-                let output = project.join(&raw_path);
-                crate::report_file::write_bytes(&output, &bytes)?;
-                units.push(Unit {
-                    kind: "javascript".into(),
-                    captured_kind: "javascript".into(),
-                    transport_kind: "cdp_runtime_script".into(),
-                    origin: "runtime_script",
-                    ordinal: None,
-                    raw_path,
-                    resource_id: None,
-                    url: source
-                        .get("urls")
-                        .and_then(Value::as_array)
-                        .and_then(|urls| urls.iter().find_map(Value::as_str))
-                        .unwrap_or("")
-                        .to_owned(),
-                    resource: None,
-                });
+        let runtime = load_artifact(project, RUNTIME_SCRIPTS)?;
+        let sources = runtime
+            .get("sources")
+            .and_then(Value::as_array)
+            .context("recorder runtime source index missing sources[]")?;
+        let capture = Path::new(&manifest.source.input);
+        for source in sources {
+            stage_budget.checkpoint()?;
+            if source.get("classification").and_then(Value::as_str)
+                == Some("capture_instrumentation")
+            {
+                continue;
             }
+            let digest = source
+                .get("sha256")
+                .and_then(Value::as_str)
+                .context("runtime source missing sha256")?;
+            if !crate::content_dedup::is_canonical_sha256(digest) {
+                bail!("invalid runtime script SHA-256");
+            }
+            let capture_path = format!("runtime-scripts/{digest}.js");
+            if source.get("path").and_then(Value::as_str) != Some(capture_path.as_str()) {
+                bail!("runtime script path is not content-addressed");
+            }
+            let raw_path = format!("resources/{capture_path}");
+            if !seen.insert(raw_path.clone()) {
+                bail!("duplicate runtime script input path");
+            }
+            let bytes = fs::read(capture.join(&capture_path))
+                .with_context(|| format!("reading captured runtime script {digest}"))?;
+            if sha256_hex(&bytes) != digest {
+                bail!("runtime script digest mismatch {digest}");
+            }
+            let output = project.join(&raw_path);
+            crate::report_file::write_bytes(&output, &bytes)?;
+            units.push(Unit {
+                kind: "javascript".into(),
+                captured_kind: "javascript".into(),
+                transport_kind: "cdp_runtime_script".into(),
+                origin: "runtime_script",
+                ordinal: None,
+                raw_path,
+                resource_id: None,
+                url: source
+                    .get("urls")
+                    .and_then(Value::as_array)
+                    .and_then(|urls| urls.iter().find_map(Value::as_str))
+                    .unwrap_or("")
+                    .to_owned(),
+                resource: None,
+            });
         }
     }
 
@@ -679,7 +678,7 @@ mod tests {
             let raw_path = format!("resources/runtime-scripts/{digest}.js");
             let copied = fs::read(project.join(&raw_path))?;
             assert_eq!(copied, body);
-            let index = crate::analysis_artifacts::load_artifact(&project, SOURCE_INDEX, false)?
+            let index = crate::analysis_artifacts::load_artifact(&project, SOURCE_INDEX)
                 .context("source index")?;
             assert_eq!(index["summary"]["runtime_javascript_units"], 1);
             let runtime = index["units"]

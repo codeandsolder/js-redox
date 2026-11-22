@@ -1,7 +1,7 @@
 use crate::{
     analysis_artifacts::{
-        load_artifact, write_artifact, BUNDLES, DEOBFUSCATION, GENERATED_RECOVERY, JSVM_INDEX,
-        SOURCE_INDEX,
+        load_artifact, load_optional_artifact, write_artifact, BUNDLES, DEOBFUSCATION,
+        GENERATED_RECOVERY, JSVM_INDEX, SOURCE_INDEX,
     },
     analysis_budget::{recoverable_unit_error, AnalysisBudgets, AnalysisOperation},
     content_dedup::{link_or_copy, sha256_path},
@@ -447,9 +447,10 @@ pub fn scan_project(project: &Path, options: &ProjectScanOptions) -> Result<Proj
         .budgets
         .scope(format!("project-scan:{}", project.display()));
     stage_budget.checkpoint()?;
-    let source_index = load_artifact(project, SOURCE_INDEX, false)?
+    let source_index = load_artifact(project, SOURCE_INDEX)
         .context("source index is required for VM project scanning")?;
-    let deob = load_artifact(project, DEOBFUSCATION, true)?.unwrap_or_else(|| json!({"units": []}));
+    let deob =
+        load_optional_artifact(project, DEOBFUSCATION)?.unwrap_or_else(|| json!({"units": []}));
     let deob_by_raw = deob
         .get("units")
         .and_then(Value::as_array)
@@ -467,7 +468,7 @@ pub fn scan_project(project: &Path, options: &ProjectScanOptions) -> Result<Proj
         .collect::<BTreeMap<_, _>>();
 
     let mut bundle_spans_by_parent = BTreeMap::<String, BTreeSet<(i64, i64)>>::new();
-    if let Some(bundles) = load_artifact(project, BUNDLES, true)? {
+    if let Some(bundles) = load_optional_artifact(project, BUNDLES)? {
         for bundle in bundles
             .get("bundles")
             .and_then(Value::as_array)
