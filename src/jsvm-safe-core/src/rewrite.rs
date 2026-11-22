@@ -184,6 +184,9 @@ fn lexically_safe_texts(source: &str, selected: &[Replacement]) -> Option<Vec<St
 /// previously implicit semicolon, even though the new program still parses.
 #[derive(Default)]
 struct StatementBoundaries {
+    // Repair queries only the original starts of proposed edits. Protection
+    // changes replacement text and can remove edits, but cannot move them.
+    edit_starts: HashSet<usize>,
     prologue_ends: HashSet<usize>,
     // An implicit directive terminator and the empty statement that prevents
     // another directive are independent boundaries. A single semicolon can
@@ -209,13 +212,18 @@ impl StatementBoundaries {
             return;
         };
         let start = first.span().start as usize;
-        self.prologue_ends.insert(start);
+        let targeted = self.edit_starts.contains(&start);
+        if targeted {
+            self.prologue_ends.insert(start);
+        }
         if directives.last().is_some_and(|last| {
             !crate::fragment(source, last.span())
                 .trim_end()
                 .ends_with(';')
         }) {
-            self.implicit_directive_left.insert(start);
+            if targeted {
+                self.implicit_directive_left.insert(start);
+            }
             return;
         }
         if !matches!(first, Statement::EmptyStatement(_)) {
@@ -227,8 +235,10 @@ impl StatementBoundaries {
             let span = statement.span();
             prefix_end = span.end as usize;
             if matches!(statement, Statement::EmptyStatement(_)) {
-                self.leading_empty_statements
-                    .insert((span.start as usize, prefix_end));
+                if self.edit_starts.contains(&(span.start as usize)) {
+                    self.leading_empty_statements
+                        .insert((span.start as usize, prefix_end));
+                }
                 continue;
             }
             // A bare string literal expression would become a directive.
@@ -241,8 +251,10 @@ impl StatementBoundaries {
             }
             break;
         }
-        self.releasable_prologues
-            .insert(start, (body_start, prefix_end));
+        if targeted {
+            self.releasable_prologues
+                .insert(start, (body_start, prefix_end));
+        }
     }
 
     fn removes_leading_empty(&self, edit: &Replacement) -> bool {
@@ -372,15 +384,17 @@ impl<'a> Visit<'a> for BoundaryCollector<'a> {
         let mut previous = None;
         for statement in statements {
             let span = statement.span();
-            if previous
-                .is_some_and(|span| !crate::fragment(self.source, span).trim_end().ends_with(';'))
-            {
-                self.boundaries.implicit_left.insert(span.start as usize);
-            }
-            if !matches!(statement, Statement::EmptyStatement(_)) {
-                self.boundaries
-                    .nonempty_statements
-                    .insert((span.start as usize, span.end as usize));
+            if self.boundaries.edit_starts.contains(&(span.start as usize)) {
+                if previous.is_some_and(|span| {
+                    !crate::fragment(self.source, span).trim_end().ends_with(';')
+                }) {
+                    self.boundaries.implicit_left.insert(span.start as usize);
+                }
+                if !matches!(statement, Statement::EmptyStatement(_)) {
+                    self.boundaries
+                        .nonempty_statements
+                        .insert((span.start as usize, span.end as usize));
+                }
             }
             previous = Some(span);
             self.visit_statement(statement);
@@ -397,9 +411,15 @@ pub fn apply(
     budget: &WorkBudget,
 ) -> Result<Option<String>, BudgetExceeded> {
     budget.checkpoint()?;
+    if replacements.is_empty() {
+        return Ok(Some(program.source_text.to_owned()));
+    }
     let mut collector = BoundaryCollector {
         source: program.source_text,
-        boundaries: StatementBoundaries::default(),
+        boundaries: StatementBoundaries {
+            edit_starts: replacements.iter().map(|edit| edit.start).collect(),
+            ..StatementBoundaries::default()
+        },
         directives: DirectiveInventory::default(),
     };
     collector.visit_program(program);
@@ -547,6 +567,74 @@ mod tests {
         )
         .unwrap_or_else(|_| unreachable!())
         .unwrap_or_else(|| unreachable!())
+    }
+
+    #[test]
+    fn sparse_boundaries_match_full_index_for_competing_nested_edits() {
+        let source =
+            ";;function outer(){;;function inner(){'other'\n{}\nwork();}\nwork();}\nother();";
+        let allocator = oxc_allocator::Allocator::default();
+        let program = crate::parse_as(&allocator, source, oxc_span::SourceType::cjs())
+            .unwrap_or_else(|| unreachable!());
+        let find = |text: &str| source.find(text).unwrap_or_else(|| unreachable!("{text}"));
+        let outer = find(";;function inner");
+        let inner = find("{}");
+        let first_work = find("work();");
+        let final_call = find("other();");
+        let choices = [
+            replacement(0, 1, ""),
+            replacement(1, 2, ""),
+            replacement(outer, outer + 1, ""),
+            replacement(outer + 1, outer + 2, ""),
+            replacement(inner, inner + 2, ""),
+            replacement(first_work, first_work + 7, "'use strict';"),
+            replacement(final_call, final_call, "/* insert */"),
+            replacement(outer, final_call, "void 0;"),
+        ];
+
+        let mut full = BoundaryCollector {
+            source,
+            boundaries: StatementBoundaries {
+                edit_starts: (0..source.len()).collect(),
+                ..StatementBoundaries::default()
+            },
+            directives: DirectiveInventory::default(),
+        };
+        full.visit_program(&program);
+        for subset in 0..(1 << choices.len()) {
+            let edits = choices
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| subset & (1 << index) != 0)
+                .map(|(_, edit)| edit.clone())
+                .collect::<Vec<_>>();
+            let mut sparse = BoundaryCollector {
+                source,
+                boundaries: StatementBoundaries {
+                    edit_starts: edits.iter().map(|edit| edit.start).collect(),
+                    ..StatementBoundaries::default()
+                },
+                directives: DirectiveInventory::default(),
+            };
+            sparse.visit_program(&program);
+            assert!(sparse.boundaries.implicit_left.len() <= edits.len());
+            assert!(sparse.boundaries.prologue_ends.len() <= edits.len());
+            let mut expected = edits.clone();
+            let mut actual = edits;
+            full.boundaries.protect(source, &mut expected);
+            sparse.boundaries.protect(source, &mut actual);
+            assert_eq!(
+                expected
+                    .iter()
+                    .map(|edit| (edit.start, edit.end, &edit.text))
+                    .collect::<Vec<_>>(),
+                actual
+                    .iter()
+                    .map(|edit| (edit.start, edit.end, &edit.text))
+                    .collect::<Vec<_>>(),
+                "subset {subset}"
+            );
+        }
     }
 
     #[test]
