@@ -60,37 +60,48 @@ pub fn default_jobs(cap: usize) -> usize {
         .clamp(1, cap.max(1))
 }
 
-/// Materialize a source file using a hard link when possible, otherwise copy it.
-///
+/// Materialize a regular source file by hardlink if possible, otherwise copy.
+/// The old destination remains intact until its replacement is complete.
 /// # Errors
-///
-/// Fails when destination parent directories cannot be created, an existing destination cannot be inspected or removed, or the fallback file copy fails.
+/// Fails when either endpoint is invalid, staging fails, or the completed file
+/// cannot be published.
 pub fn link_or_copy(source: &Path, dest: &Path) -> Result<Materialization> {
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    anyhow::ensure!(
+        fs::symlink_metadata(source)
+            .with_context(|| format!("inspecting {}", source.display()))?
+            .is_file(),
+        "materialization source is not a regular file: {}",
+        source.display()
+    );
+    let (parent, _) = crate::report_file::prepare_destination(dest)?;
+    // Private same-filesystem staging directory permits both hardlink and
+    // copy without creating a window where dest is absent. Its RAII cleanup
+    // also handles rename's same-inode no-op (including source == dest).
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".materialize-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(fs::Permissions::from_mode(0o700));
     }
-    match fs::symlink_metadata(dest) {
-        Ok(_) => {
-            fs::remove_file(dest).with_context(|| format!("removing {}", dest.display()))?;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(error).with_context(|| format!("inspecting {}", dest.display()));
-        }
-    }
-    match fs::hard_link(source, dest) {
-        Ok(()) => Ok(Materialization::HardLink),
-        Err(_) => {
-            fs::copy(source, dest)
-                .with_context(|| format!("copying {} to {}", source.display(), dest.display()))?;
-            Ok(Materialization::Copy)
-        }
-    }
+    let pending = builder
+        .tempdir_in(parent)
+        .with_context(|| format!("staging {}", dest.display()))?;
+    let file = pending.path().join("content");
+    let materialization = if fs::hard_link(source, &file).is_ok() {
+        Materialization::HardLink
+    } else {
+        fs::copy(source, &file)
+            .with_context(|| format!("copying {} to stage {}", source.display(), dest.display()))?;
+        Materialization::Copy
+    };
+    fs::rename(&file, dest).with_context(|| format!("publishing {}", dest.display()))?;
+    Ok(materialization)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{default_jobs, is_canonical_sha256, sha256_hex, sha256_path};
+    use super::{default_jobs, is_canonical_sha256, link_or_copy, sha256_hex, sha256_path};
     use anyhow::Result;
     use std::fs;
 
@@ -124,6 +135,47 @@ mod tests {
         ] {
             assert!(!is_canonical_sha256(&invalid), "accepted {invalid:?}");
         }
+    }
+
+    #[test]
+    fn materialization_preserves_destination_on_failure_and_same_inode() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let source = dir.path().join("source");
+        let dest = dir.path().join("destination");
+        let snapshot = dir.path().join("previous");
+        fs::write(&source, "next")?;
+        fs::write(&dest, "previous")?;
+        fs::hard_link(&dest, &snapshot)?;
+        assert!(link_or_copy(&dir.path().join("missing"), &dest).is_err());
+        assert!(link_or_copy(dir.path(), &dest).is_err());
+        assert_eq!(fs::read_to_string(&dest)?, "previous");
+        link_or_copy(&source, &dest)?;
+        assert_eq!(fs::read_to_string(&dest)?, "next");
+        assert_eq!(fs::read_to_string(&snapshot)?, "previous");
+        link_or_copy(&source, &dest)?;
+        link_or_copy(&source, &source)?;
+        assert_eq!(fs::read_to_string(&source)?, "next");
+        assert_eq!(fs::read_dir(dir.path())?.count(), 3);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialization_rejects_symlinks_without_mutating_targets() -> Result<()> {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir()?;
+        let source = dir.path().join("source");
+        let dest = dir.path().join("destination");
+        let alias = dir.path().join("alias");
+        fs::write(&source, "source")?;
+        fs::write(&dest, "destination")?;
+        symlink(&source, &alias)?;
+        assert!(link_or_copy(&alias, &dest).is_err());
+        assert!(link_or_copy(&dest, &alias).is_err());
+        assert_eq!(fs::read_to_string(&dest)?, "destination");
+        assert_eq!(fs::read_to_string(&source)?, "source");
+        assert!(fs::symlink_metadata(alias)?.is_symlink());
+        Ok(())
     }
 
     #[test]

@@ -22,10 +22,8 @@ impl StagedReport {
     }
 }
 
-fn stage(
-    path: &Path,
-    write: impl FnOnce(&mut BufWriter<&mut File>) -> Result<()>,
-) -> Result<StagedReport> {
+/// Prepare a regular-file destination without removing or modifying it.
+pub(crate) fn prepare_destination(path: &Path) -> Result<(&Path, Option<fs::Permissions>)> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -35,7 +33,7 @@ fn stage(
         Ok(metadata) => {
             ensure!(
                 metadata.is_file(),
-                "report destination is not a regular file: {}",
+                "publication destination is not a regular file: {}",
                 path.display()
             );
             Some(metadata.permissions())
@@ -43,9 +41,17 @@ fn stage(
         Err(error) if error.kind() == ErrorKind::NotFound => None,
         Err(error) => return Err(error).with_context(|| format!("checking {}", path.display())),
     };
+    Ok((parent, permissions))
+}
+
+fn stage(
+    path: &Path,
+    write: impl FnOnce(&mut BufWriter<&mut File>) -> Result<()>,
+) -> Result<StagedReport> {
+    let (parent, permissions) = prepare_destination(path)?;
     let mut builder = tempfile::Builder::new();
     builder.prefix(".report-");
-    // Match the permissions of a newly created regular report (subject to umask).
+    // Match the permissions of a newly created regular file (subject to umask).
     #[cfg(unix)]
     if permissions.is_none() {
         use std::os::unix::fs::PermissionsExt;
@@ -83,11 +89,19 @@ pub(crate) fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
     stage_json(path, value)?.publish()
 }
 
-pub(crate) fn stage_text(path: &Path, value: &str) -> Result<StagedReport> {
+fn stage_bytes(path: &Path, value: &[u8]) -> Result<StagedReport> {
     stage(path, |writer| {
-        writer.write_all(value.as_bytes())?;
+        writer.write_all(value)?;
         Ok(())
     })
+}
+
+pub(crate) fn write_bytes(path: &Path, value: &[u8]) -> Result<()> {
+    stage_bytes(path, value)?.publish()
+}
+
+pub(crate) fn stage_text(path: &Path, value: &str) -> Result<StagedReport> {
+    stage_bytes(path, value.as_bytes())
 }
 
 pub(crate) fn write_text(path: &Path, value: &str) -> Result<()> {
