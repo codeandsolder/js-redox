@@ -8,73 +8,48 @@
 use crate::binding_facts::BindingFacts;
 use crate::value_eval::{
     eval, eval_binary, eval_logical_left, eval_unary_value, is_prototype_setter,
-    literal_property_key, same_value, LogicalStep, Value,
+    literal_property_key, LogicalStep, Value,
 };
 use oxc_ast::ast::{
-    Argument, ArrayExpressionElement, AssignmentTarget, BindingPattern, Declaration, Expression,
-    IdentifierReference, ObjectPropertyKind, Program, PropertyKind, Statement, VariableDeclaration,
-    VariableDeclarationKind,
+    Argument, ArrayExpressionElement, BindingPattern, Declaration, Expression, IdentifierReference,
+    ObjectPropertyKind, Program, PropertyKind, SimpleAssignmentTarget, Statement,
+    VariableDeclaration, VariableDeclarationKind,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::Scoping;
 use oxc_span::{GetSpan, Span};
-use oxc_syntax::symbol::SymbolId;
+use oxc_syntax::{operator::AssignmentOperator, symbol::SymbolId};
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
 use work_budget::{BudgetExceeded, WorkBudget};
 
-type OwnData = HashMap<String, Option<Value>>;
-type Environment = HashMap<SymbolId, Fact>;
+mod heap;
+use heap::{AllocationId, AllocationKind, Environment, Fact, Locations, OwnData};
 
-#[derive(Clone)]
-enum Fact {
-    Primitive(Value),
-    Data(Rc<OwnData>),
+enum Reference {
+    Binding(SymbolId),
+    Member { locations: Locations, key: String },
 }
 
-impl Fact {
-    fn join(&self, other: &Self) -> Option<Self> {
-        match (self, other) {
-            (Self::Primitive(a), Self::Primitive(b)) => same_primitive(a, b).then(|| self.clone()),
-            (Self::Data(a), Self::Data(b)) if Rc::ptr_eq(a, b) => Some(self.clone()),
-            (Self::Data(a), Self::Data(b)) => {
-                // Neither identity nor non-shared properties are proven at
-                // the join. Retain only own data guaranteed on both paths.
-                // A differing value is still a non-effectful own-data read.
-                let (smaller, larger) = if a.len() <= b.len() { (a, b) } else { (b, a) };
-                let common = smaller
-                    .iter()
-                    .filter_map(|(key, left)| {
-                        let right = larger.get(key)?;
-                        let value = left
-                            .as_ref()
-                            .filter(|value| {
-                                right
-                                    .as_ref()
-                                    .is_some_and(|other| same_primitive(value, other))
-                            })
-                            .cloned();
-                        Some((key.clone(), value))
-                    })
-                    .collect();
-                Some(Self::Data(Rc::new(common)))
-            }
-            _ => None,
-        }
-    }
-
-    fn truthy(&self) -> bool {
+impl Reference {
+    fn read(&self, environment: &Environment) -> Option<Option<Fact>> {
         match self {
-            Self::Primitive(value) => value.truthy(),
-            Self::Data(_) => true,
+            Self::Binding(symbol) => Some(environment.get(symbol).cloned()),
+            Self::Member { locations, key } => environment.read(locations, key),
         }
     }
-}
 
-fn same_primitive(left: &Value, right: &Value) -> bool {
-    match (left, right) {
-        (Value::Number(a), Value::Number(b)) => a.to_bits() == b.to_bits(),
-        _ => same_value(left, right),
+    fn write(&self, environment: &mut Environment, value: Option<Fact>) -> bool {
+        match self {
+            Self::Binding(symbol) => {
+                if let Some(value) = value {
+                    environment.insert(*symbol, value);
+                } else {
+                    environment.remove(symbol);
+                }
+                true
+            }
+            Self::Member { locations, key } => environment.write(locations, key, value),
+        }
     }
 }
 
@@ -92,18 +67,8 @@ impl Evaluation {
         }
     }
 
-    fn data(data: OwnData, inert: bool) -> Self {
-        Self {
-            fact: Some(Fact::Data(Rc::new(data))),
-            inert,
-        }
-    }
-
     fn primitive_value(&self) -> Option<&Value> {
-        match &self.fact {
-            Some(Fact::Primitive(value)) => Some(value),
-            _ => None,
-        }
+        self.fact.as_ref()?.primitive()
     }
 
     fn unknown_inert() -> Self {
@@ -112,16 +77,6 @@ impl Evaluation {
             inert: true,
         }
     }
-}
-
-fn intersect(left: &mut Environment, right: &Environment) {
-    left.retain(|symbol, fact| {
-        let Some(joined) = right.get(symbol).and_then(|other| fact.join(other)) else {
-            return false;
-        };
-        *fact = joined;
-        true
-    });
 }
 
 #[derive(Default)]
@@ -144,6 +99,7 @@ impl FreshDataReads {
             visited_lists: HashSet::new(),
             budget,
             failure: None,
+            next_allocation: 0,
         };
         analyzer.visit_program(program);
         analyzer.failure.map_or(Ok(analyzer.reads), Err)
@@ -162,6 +118,7 @@ struct Analyzer<'c> {
     visited_lists: HashSet<(u32, u32)>,
     budget: &'c WorkBudget,
     failure: Option<BudgetExceeded>,
+    next_allocation: AllocationId,
 }
 
 impl Analyzer<'_> {
@@ -211,7 +168,11 @@ impl Analyzer<'_> {
         let Some(reference) = identifier.reference_id.get() else {
             return Self::barrier(environment);
         };
-        if !crate::reference_is_statically_resolved_read(self.scoping, reference, symbol) {
+        let reference_flags = self.scoping.get_reference(reference);
+        // This is an AST value-position read, including the receiver of a
+        // property write. MemberWriteTarget marks the containing operation,
+        // not a write to the receiver binding itself.
+        if !reference_flags.is_read() || reference_flags.is_write() {
             return Self::barrier(environment);
         }
         if let Some(fact) = environment.get(&symbol) {
@@ -237,6 +198,27 @@ impl Analyzer<'_> {
         }
     }
 
+    fn allocate(
+        &mut self,
+        environment: &mut Environment,
+        data: OwnData,
+        inert: bool,
+    ) -> Evaluation {
+        let id = self.next_allocation;
+        self.next_allocation += 1;
+        Evaluation {
+            fact: Some(environment.allocate(id, data)),
+            inert,
+        }
+    }
+
+    fn key(&mut self, expression: &Expression<'_>, environment: &mut Environment) -> Evaluation {
+        if let Expression::BigIntLiteral(literal) = expression.without_parentheses() {
+            return Evaluation::primitive(Value::String(literal.value.to_string()), true);
+        }
+        self.expression(expression, environment)
+    }
+
     fn member(
         &mut self,
         span: Span,
@@ -244,32 +226,202 @@ impl Analyzer<'_> {
         key: Evaluation,
         environment: &mut Environment,
     ) -> Evaluation {
-        // If ToPropertyKey or evaluation of the key can execute user code,
-        // even a previously obtained receiver may have changed in the meantime.
-        if !key.inert {
-            return Self::barrier(environment);
-        }
         let Some(name) = key.primitive_value().and_then(Value::js_string) else {
             return Self::barrier(environment);
         };
-        let Some(Fact::Data(data)) = object.fact else {
+        let Some(Fact::Objects(locations)) = object.fact else {
             return Self::barrier(environment);
         };
-        let Some(value) = data.get(&name) else {
+        // The receiver was evaluated before the key, but its contents must
+        // be read *after* key evaluation, including any effects on aliases.
+        let Some(fact) = environment.read(&locations, &name) else {
             return Self::barrier(environment);
         };
-        if let Some(value) = value {
-            if object.inert {
+        let inert = object.inert && key.inert;
+        if let Some(Fact::Primitive(value)) = &fact {
+            if inert {
                 self.reads
                     .values
                     .insert((span.start, span.end), value.clone());
             }
-            Evaluation::primitive(value.clone(), object.inert)
-        } else {
-            Evaluation {
-                fact: None,
-                inert: object.inert,
+        }
+        Evaluation { fact, inert }
+    }
+
+    fn member_reference(object: Evaluation, key: Evaluation) -> Option<Reference> {
+        let key = key.primitive_value()?.js_string()?;
+        let Fact::Objects(locations) = object.fact? else {
+            return None;
+        };
+        Some(Reference::Member { locations, key })
+    }
+
+    fn reference(
+        &mut self,
+        target: &SimpleAssignmentTarget<'_>,
+        environment: &mut Environment,
+    ) -> Option<Reference> {
+        match target {
+            SimpleAssignmentTarget::AssignmentTargetIdentifier(identifier) => {
+                let symbol = self.lexical_reference(identifier)?;
+                let flags = self.scoping.symbol_flags(symbol);
+                (flags.is_block_scoped() && !flags.is_const_variable())
+                    .then_some(Reference::Binding(symbol))
             }
+            SimpleAssignmentTarget::StaticMemberExpression(member) if !member.optional => {
+                let object = self.expression(&member.object, environment);
+                let key =
+                    Evaluation::primitive(Value::String(member.property.name.to_string()), true);
+                Self::member_reference(object, key)
+            }
+            SimpleAssignmentTarget::ComputedMemberExpression(member) if !member.optional => {
+                let object = self.expression(&member.object, environment);
+                let key = self.key(&member.expression, environment);
+                Self::member_reference(object, key)
+            }
+            _ => None,
+        }
+    }
+
+    fn logical_decision(operator: &str, fact: &Fact) -> Option<bool> {
+        match fact {
+            Fact::Primitive(value) => eval_logical_left(operator, value.clone())
+                .map(|step| matches!(step, LogicalStep::EvaluateRight)),
+            Fact::Objects(_) => Some(operator == "&&"),
+        }
+    }
+
+    fn assignment(
+        &mut self,
+        assignment: &oxc_ast::ast::AssignmentExpression<'_>,
+        environment: &mut Environment,
+    ) -> Evaluation {
+        let Some(reference) = assignment
+            .left
+            .as_simple_assignment_target()
+            .and_then(|target| self.reference(target, environment))
+        else {
+            return Self::barrier(environment);
+        };
+        let operator = assignment.operator;
+        if operator == AssignmentOperator::Assign {
+            let value = self.expression(&assignment.right, environment);
+            if !reference.write(environment, value.fact.clone()) {
+                environment.clear();
+            }
+            return Evaluation {
+                fact: value.fact,
+                inert: false,
+            };
+        }
+
+        let Some(previous) = reference.read(environment) else {
+            return Self::barrier(environment);
+        };
+        if let Some(logical) = operator.to_logical_operator() {
+            let decision = previous
+                .as_ref()
+                .and_then(|fact| Self::logical_decision(logical.as_str(), fact));
+            if decision == Some(false) {
+                return Evaluation {
+                    fact: previous,
+                    inert: false,
+                };
+            }
+            let skipped = (decision.is_none()).then(|| (environment.clone(), self.next_allocation));
+            let value = self.expression(&assignment.right, environment);
+            if !reference.write(environment, value.fact.clone()) {
+                environment.clear();
+            }
+            if let Some((skipped, first_new)) = skipped {
+                environment.join(&skipped, first_new);
+                return Evaluation {
+                    fact: None,
+                    inert: false,
+                };
+            }
+            return Evaluation {
+                fact: value.fact,
+                inert: false,
+            };
+        }
+
+        let right = self.expression(&assignment.right, environment);
+        let value = operator.to_binary_operator().and_then(|binary| {
+            eval_binary(
+                binary.as_str(),
+                previous.as_ref()?.primitive()?,
+                right.primitive_value()?,
+            )
+        });
+        let Some(value) = value else {
+            return Self::barrier(environment);
+        };
+        let fact = Fact::Primitive(value);
+        if !reference.write(environment, Some(fact.clone())) {
+            environment.clear();
+        }
+        Evaluation {
+            fact: Some(fact),
+            inert: false,
+        }
+    }
+
+    fn update_expression(
+        &mut self,
+        update: &oxc_ast::ast::UpdateExpression<'_>,
+        environment: &mut Environment,
+    ) -> Evaluation {
+        let Some(reference) = self.reference(&update.argument, environment) else {
+            return Self::barrier(environment);
+        };
+        let Some(previous) = reference
+            .read(environment)
+            .flatten()
+            .and_then(|fact| fact.primitive()?.number())
+        else {
+            return Self::barrier(environment);
+        };
+        let next = if update.operator.as_str() == "++" {
+            previous + 1.0
+        } else {
+            previous - 1.0
+        };
+        if !reference.write(environment, Some(Fact::Primitive(Value::Number(next)))) {
+            environment.clear();
+        }
+        Evaluation::primitive(
+            Value::Number(if update.prefix { next } else { previous }),
+            false,
+        )
+    }
+
+    fn delete_expression(
+        &mut self,
+        argument: &Expression<'_>,
+        environment: &mut Environment,
+    ) -> Evaluation {
+        let reference = match argument.without_parentheses() {
+            Expression::StaticMemberExpression(member) if !member.optional => {
+                let object = self.expression(&member.object, environment);
+                let key =
+                    Evaluation::primitive(Value::String(member.property.name.to_string()), true);
+                Self::member_reference(object, key)
+            }
+            Expression::ComputedMemberExpression(member) if !member.optional => {
+                let object = self.expression(&member.object, environment);
+                let key = self.key(&member.expression, environment);
+                Self::member_reference(object, key)
+            }
+            _ => None,
+        };
+        let Some(Reference::Member { locations, key }) = reference else {
+            return Self::barrier(environment);
+        };
+        if environment.delete(&locations, &key) {
+            Evaluation::primitive(Value::Bool(true), false)
+        } else {
+            Self::barrier(environment)
         }
     }
 
@@ -294,7 +446,7 @@ impl Analyzer<'_> {
             }
             Expression::ComputedMemberExpression(member) if !member.optional => {
                 let object = self.expression(&member.object, environment);
-                let key = self.expression(&member.expression, environment);
+                let key = self.key(&member.expression, environment);
                 self.member(member.span, object, key, environment)
             }
             Expression::SequenceExpression(sequence) => {
@@ -309,7 +461,7 @@ impl Analyzer<'_> {
             Expression::UnaryExpression(unary) => {
                 let operator = unary.operator.as_str();
                 if operator == "delete" {
-                    return Self::barrier(environment);
+                    return self.delete_expression(&unary.argument, environment);
                 }
                 let argument = self.expression(&unary.argument, environment);
                 let value = argument
@@ -327,6 +479,9 @@ impl Analyzer<'_> {
                         |value| Evaluation::primitive(Value::Bool(!value.truthy()), argument.inert),
                     ),
                     "void" => Evaluation::primitive(Value::Undefined, argument.inert),
+                    "typeof" if matches!(argument.fact, Some(Fact::Objects(_))) => {
+                        Evaluation::primitive(Value::String("object".into()), argument.inert)
+                    }
                     "typeof" => Evaluation {
                         fact: None,
                         inert: argument.inert,
@@ -346,8 +501,15 @@ impl Analyzer<'_> {
                     }
                 }
                 if matches!(operator, "===" | "!==") {
+                    let equal = left
+                        .fact
+                        .as_ref()
+                        .zip(right.fact.as_ref())
+                        .and_then(|(left, right)| left.strict_equal(right));
                     Evaluation {
-                        fact: None,
+                        fact: equal.map(|equal| {
+                            Fact::Primitive(Value::Bool(equal == (operator == "===")))
+                        }),
                         inert: left.inert && right.inert,
                     }
                 } else {
@@ -356,14 +518,10 @@ impl Analyzer<'_> {
             }
             Expression::LogicalExpression(logical) => {
                 let left = self.expression(&logical.left, environment);
-                let decision = match &left.fact {
-                    Some(Fact::Primitive(value)) => {
-                        eval_logical_left(logical.operator.as_str(), value.clone())
-                            .map(|step| matches!(step, LogicalStep::EvaluateRight))
-                    }
-                    Some(Fact::Data(_)) => Some(logical.operator.as_str() == "&&"),
-                    None => None,
-                };
+                let decision = left
+                    .fact
+                    .as_ref()
+                    .and_then(|fact| Self::logical_decision(logical.operator.as_str(), fact));
                 match decision {
                     Some(false) => left,
                     Some(true) => {
@@ -373,8 +531,9 @@ impl Analyzer<'_> {
                     }
                     None => {
                         let skip = environment.clone();
+                        let first_new = self.next_allocation;
                         let right = self.expression(&logical.right, environment);
-                        intersect(environment, &skip);
+                        environment.join(&skip, first_new);
                         Evaluation {
                             fact: None,
                             inert: left.inert && right.inert,
@@ -395,9 +554,10 @@ impl Analyzer<'_> {
                     return result;
                 }
                 let mut other = environment.clone();
+                let first_new = self.next_allocation;
                 let left = self.expression(&conditional.consequent, environment);
                 let right = self.expression(&conditional.alternate, &mut other);
-                intersect(environment, &other);
+                environment.join(&other, first_new);
                 Evaluation {
                     fact: left
                         .fact
@@ -408,7 +568,7 @@ impl Analyzer<'_> {
                 }
             }
             Expression::ArrayExpression(array) => {
-                let mut data = OwnData::new();
+                let mut data = OwnData::new(AllocationKind::Array);
                 let mut inert = true;
                 let mut known_index = true;
                 for (index, element) in array.elements.iter().enumerate() {
@@ -427,20 +587,20 @@ impl Analyzer<'_> {
                             let result = self.expression(value, environment);
                             inert &= result.inert;
                             if known_index {
-                                data.insert(index.to_string(), result.primitive_value().cloned());
+                                data.insert(index.to_string(), result.fact);
                             }
                         }
                     }
                 }
-                if known_index {
-                    if let Ok(length) = u32::try_from(array.elements.len()) {
-                        data.insert("length".into(), Some(Value::Number(f64::from(length))));
-                    }
-                }
-                Evaluation::data(data, inert)
+                let length = known_index
+                    .then(|| u32::try_from(array.elements.len()).ok())
+                    .flatten()
+                    .map(|length| Fact::Primitive(Value::Number(f64::from(length))));
+                data.insert("length".into(), length);
+                self.allocate(environment, data, inert)
             }
             Expression::ObjectExpression(object) => {
-                let mut data = OwnData::new();
+                let mut data = OwnData::new(AllocationKind::Ordinary);
                 let mut inert = true;
                 for item in &object.properties {
                     match item {
@@ -455,7 +615,7 @@ impl Analyzer<'_> {
                                 let result = property
                                     .key
                                     .as_expression()
-                                    .map(|key| self.expression(key, environment))
+                                    .map(|key| self.key(key, environment))
                                     .unwrap_or_default();
                                 inert &= result.inert;
                                 let key = result.primitive_value().and_then(Value::js_string);
@@ -477,14 +637,14 @@ impl Analyzer<'_> {
                                 continue;
                             }
                             if property.kind == PropertyKind::Init {
-                                data.insert(key, value.primitive_value().cloned());
+                                data.insert(key, value.fact);
                             } else {
                                 data.remove(&key);
                             }
                         }
                     }
                 }
-                Evaluation::data(data, inert)
+                self.allocate(environment, data, inert)
             }
             Expression::CallExpression(call) => {
                 // Callee lookup precedes argument evaluation. An unknown
@@ -498,27 +658,10 @@ impl Analyzer<'_> {
                 self.arguments(&call.arguments, environment);
                 Self::barrier(environment)
             }
-            Expression::AssignmentExpression(assignment) if assignment.operator.as_str() == "=" => {
-                let AssignmentTarget::AssignmentTargetIdentifier(identifier) = &assignment.left
-                else {
-                    return Self::barrier(environment);
-                };
-                let Some(symbol) = self.lexical_reference(identifier) else {
-                    return Self::barrier(environment);
-                };
-                let flags = self.scoping.symbol_flags(symbol);
-                if !flags.is_block_scoped() || flags.is_const_variable() {
-                    return Self::barrier(environment);
-                }
-                let mut value = self.expression(&assignment.right, environment);
-                if let Some(fact) = &value.fact {
-                    environment.insert(symbol, fact.clone());
-                } else {
-                    environment.remove(&symbol);
-                }
-                value.inert = false;
-                value
+            Expression::AssignmentExpression(assignment) => {
+                self.assignment(assignment, environment)
             }
+            Expression::UpdateExpression(update) => self.update_expression(update, environment),
             Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_) => {
                 Evaluation::unknown_inert()
             }
@@ -631,13 +774,14 @@ impl Analyzer<'_> {
                     };
                 }
                 let mut other = environment.clone();
+                let first_new = self.next_allocation;
                 let left = self.statement(&branch.consequent, environment);
                 let right = branch
                     .alternate
                     .as_ref()
                     .is_none_or(|alternate| self.statement(alternate, &mut other));
                 match (left, right) {
-                    (true, true) => intersect(environment, &other),
+                    (true, true) => environment.join(&other, first_new),
                     (false, true) => *environment = other,
                     (true, false) => {}
                     (false, false) => return false,
@@ -798,6 +942,50 @@ mod tests {
     }
 
     #[test]
+    fn heap_facts_follow_alias_writes_and_nested_references() -> Result<(), BudgetExceeded> {
+        for (source, expected) in [
+            ("const a=[7];a[0]=9;a[0];", vec![("a[0]","9")]),
+            ("let a={x:7,y:8};let b=a;b.x=9;a.x;a.y;",vec![("a.x","9"),("a.y","8")]),
+            ("let a={x:{y:7}};let b=a.x;b.y=9;a.x.y;",vec![("a.x.y","9")]),
+            ("let a={x:7};let b={a};a.x=9;b.a.x;",vec![("b.a.x","9")]),
+            ("let a={x:7};let b={a};b.a.x+=2;a.x;",vec![("a.x","9")]),
+            ("let a={x:7};let b={a};const p=b.a.x++;const q=++b.a.x;a.x;({p,q}).p;({p,q}).q;",vec![("a.x","9"),("({p,q}).p","7"),("({p,q}).q","9")]),
+            ("let a={x:0,y:8};a.x ||= 9;a.x &&= 7;a.x ??= side();a.x;a.y;",vec![("a.x","7"),("a.y","8")]),
+            ("let a={x:null};a.x ??= {y:7};a.x.y;",vec![("a.x.y","7")]),
+            ("let a={x:7};let b=a;a.x=(a={x:8},9);a.x;b.x;",vec![("a.x","8"),("b.x","9")]),
+            ("let a={x:7};let b=a;a[(a={x:8},'x')]=9;a.x;b.x;",vec![("a.x","8"),("b.x","9")]),
+            ("let a=[7,8,9];let b=a;b.length=2;a.length;a[1];",vec![("a.length","2"),("a[1]","8")]),
+            ("let a=[7,8,9];a.length='1';a[0];a.length;",vec![("a[0]","7"),("a.length","1")]),
+            ("let a=[7,8,9];delete a[1];a[0];a[2];a.length;",vec![("a[0]","7"),("a[2]","9"),("a.length","3")]),
+            ("let a={x:null};a.x=a;a.x.x.x===a;a.x.x.x.x.x.x.x.x;",vec![]),
+            ("let a={x:7};let b={x:9};let c=true?a:b;c.x=8;a.x;b.x;",vec![("a.x","8"),("b.x","9")]),
+            ("function f(flag){let a={x:7};let b={x:8};let c=flag?a:b;c.x=9;a.x;b.x;}",vec![]),
+            ("function f(flag){let a={x:7,y:8};let b={x:7,y:9};let c=flag?a:b;c.x=9;c.y;a.y;b.y;}",vec![("a.y","8"),("b.y","9")]),
+            ("function f(flag){let a={x:7};if(flag)a.x=9;else a.x=9;return a.x;}",vec![("a.x","9")]),
+            ("function f(flag){let a={x:7};if(flag)a.x=9;return a.x;}",vec![]),
+            ("function f(flag,v){let a={x:v,y:7};a.x ||= 9;return a.y;}",vec![("a.y","7")]),
+            ("function f(v){let a={x:7,y:8};a.x=v;return a.y;}",vec![("a.y","8")]),
+            ("let a={x:7};let b={p:a};let c={q:b};c.q.p.x=9;c.q.p.x;",vec![("c.q.p.x","9")]),
+            ("let a={x:7};let b={p:a,y:side()};b.p.x;",vec![]),
+            ("let a={x:7};let b={p:a,y:(a.x=9)};b.p.x;",vec![("b.p.x","9")]),
+            ("let a={x:7};a[(a.x=9,'x')];a.x;",vec![("a.x","9")]),
+            ("let a={x:7};let b={p:a};unknown();b.p.x;",vec![]),
+            ("function f(flag){let a={x:7};let b=flag?{p:a}:{p:a};b.p.x;}",vec![("b.p.x","7")]),
+            ("const a=[7,...iter];a.length=1;a[0];a.length;",vec![("a[0]","7"),("a.length","1")]),
+            ("let a={x:7};a[0n]=8;a.x;",vec![]),
+            ("const a={16:7};a[0x10n]=9;a[16n];",vec![("a[16n]","9")]),
+            ("let a={x:7};let b=a;if(a===b)a.x=9;a.x;", vec![("a.x","9")]),
+            ("let a={x:7};let b={x:8};if(a!==b)a.x=9;a.x;", vec![("a.x","9")]),
+            ("let a={x:7};if(typeof a==='object')a.x=9;a.x;", vec![("a.x","9")]),
+            ("function f(flag){let a={x:7};let b={x:8};let c=flag?a:b;if(c===a)a.x=9;a.x;}",vec![]),
+        ] {
+            let expected = expected.into_iter().map(|(text,value)|(text.to_owned(),value.to_owned())).collect::<Vec<_>>();
+            assert_eq!(reads(source)?, expected, "{source}");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn no_facts_cross_unknown_effects_or_deferred_execution() -> Result<(), BudgetExceeded> {
         for source in [
             "const a=[7];unknown(a[0]);",
@@ -806,7 +994,6 @@ mod tests {
             "const a=[7];a[(mutate(a),0)];",
             "const a=[7];a[8];a[0];",
             "const a=[7];delete a[0];a[0];",
-            "const a=[7];a[0]=9;a[0];",
             "const a=[7];function f(){return a[0];}",
             "const a=[7];while(flag){a[0];mutate(a);}",
             "let a=[7];try{mutate(a);}catch(e){}a[0];",
