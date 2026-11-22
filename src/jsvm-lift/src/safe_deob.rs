@@ -1,4 +1,4 @@
-use crate::{forwarding_alias, js_format::format_source, sha256_hex};
+use crate::{forwarding_alias, js_format::format_source_as, sha256_hex};
 use anyhow::{anyhow, Result};
 use jsvm_safe_core::{SafeSourceMode, SafeSourceRecovery, SafeSourceRejection};
 use oxc_span::SourceType;
@@ -222,7 +222,10 @@ pub fn deobfuscate_source(
 
     let mut transforms = result.transforms;
     let source = if format_output {
-        let formatted = format_source(&result.source, budget)?;
+        let source_type = result
+            .resolved_source_type
+            .ok_or_else(|| anyhow!("cannot format source without a validated parser mode"))?;
+        let formatted = format_source_as(&result.source, source_type, budget)?;
         if formatted != result.source {
             *transforms.entry("presentation_codegen".into()).or_default() += 1;
         }
@@ -323,6 +326,34 @@ mod tests {
         assert_eq!(outcome.source, source);
         assert!(outcome.report.structure.is_none());
         assert!(!outcome.report.analysis_complete);
+        Ok(())
+    }
+
+    #[test]
+    fn formatting_uses_the_core_validated_script_mode() -> Result<()> {
+        let budget = WorkBudget::unlimited("format-script-mode");
+        let source = "var await=1; sink(await);";
+        let plain = deobfuscate_source(
+            source,
+            "fixture.cjs",
+            SourceMode::CommonJs,
+            8,
+            false,
+            &budget,
+        )?;
+        let formatted = deobfuscate_source(
+            source,
+            "fixture.cjs",
+            SourceMode::CommonJs,
+            8,
+            true,
+            &budget,
+        )?;
+        assert_eq!(formatted.report.structure, plain.report.structure);
+        assert_eq!(
+            formatted.source,
+            format_source_as(&plain.source, SourceType::cjs(), &budget)?
+        );
         Ok(())
     }
 
