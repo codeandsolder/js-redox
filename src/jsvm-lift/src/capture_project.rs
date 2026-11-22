@@ -163,10 +163,7 @@ pub fn validate_manifest_value(document: &Value, label: &str) -> Result<CaptureM
 ///
 /// Fails on filesystem reads, malformed JSON or invalid capture-manifest invariants.
 pub fn read_manifest(path: &Path) -> Result<CaptureManifest> {
-    let text = fs::read_to_string(path)
-        .with_context(|| format!("failed to read capture manifest {}", path.display()))?;
-    let manifest: CaptureManifest = serde_json::from_str(&text)
-        .with_context(|| format!("failed to parse capture manifest {}", path.display()))?;
+    let manifest = crate::report_file::read_json(path, "capture manifest")?;
     validate_manifest(&manifest, &path.display().to_string())?;
     Ok(manifest)
 }

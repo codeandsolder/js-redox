@@ -1,9 +1,9 @@
 //! Publish complete generated reports without truncating the previous snapshot.
 use anyhow::{ensure, Context, Result};
-use serde::Serialize;
+use serde::{de::DeserializeOwned, Serialize};
 use std::{
     fs::{self, File},
-    io::{BufWriter, ErrorKind, Write},
+    io::{BufWriter, ErrorKind, Read, Write},
     path::{Path, PathBuf},
 };
 
@@ -20,6 +20,48 @@ impl StagedReport {
             .persist(&self.destination)
             .with_context(|| format!("publishing {}", self.destination.display()))
     }
+}
+
+/// Open an existing regular file without following a final-component symlink.
+fn open_regular(path: &Path) -> Result<File> {
+    ensure!(
+        fs::symlink_metadata(path)?.is_file(),
+        "not a regular file: {}",
+        path.display()
+    );
+    // Native nonblocking, no-follow open closes the gap between checking
+    // the path and opening it on the supported Unix platforms.
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    let file = File::from(
+        rustix::fs::open(
+            path,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::NONBLOCK,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(std::io::Error::from)?,
+    );
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    let file = File::open(path)?;
+    ensure!(
+        file.metadata()?.is_file(),
+        "not a regular file: {}",
+        path.display()
+    );
+    Ok(file)
+}
+
+/// Decode project-owned JSON, retaining IO errors independently of parse failures.
+pub(crate) fn read_json<T: DeserializeOwned>(path: &Path, label: &str) -> Result<T> {
+    let mut file =
+        open_regular(path).with_context(|| format!("failed to read {label} {}", path.display()))?;
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .with_context(|| format!("failed to read {label} {}", path.display()))?;
+    serde_json::from_str(&text)
+        .with_context(|| format!("failed to parse {label} {}", path.display()))
 }
 
 /// Prepare a regular-file destination without removing or modifying it.

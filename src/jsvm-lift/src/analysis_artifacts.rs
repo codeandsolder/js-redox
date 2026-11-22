@@ -1,9 +1,6 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use serde_json::Value;
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArtifactSpec {
@@ -258,10 +255,7 @@ pub fn build_artifact(
 ///
 /// Fails on file-read errors, invalid JSON, a mismatched schema or missing/incorrect required fields.
 pub fn read_artifact(path: &Path, spec: ArtifactSpec) -> Result<Value> {
-    let text = fs::read_to_string(path)
-        .with_context(|| format!("failed to read {} {}", spec.name, path.display()))?;
-    let document: Value = serde_json::from_str(&text)
-        .with_context(|| format!("failed to parse {} {}", spec.name, path.display()))?;
+    let document = crate::report_file::read_json(path, spec.name)?;
     validate_artifact(&document, spec, &path.display().to_string())?;
     Ok(document)
 }
@@ -308,7 +302,32 @@ pub fn write_artifact(project: &Path, spec: ArtifactSpec, document: &Value) -> R
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::collections::BTreeSet;
+    use std::{collections::BTreeSet, fs};
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_links_and_nonregular_files_are_not_optional_absence() -> Result<()> {
+        use std::os::unix::{fs::symlink, net::UnixListener};
+        let root = tempfile::tempdir()?;
+        let project = root.path();
+        let path = artifact_path(project, SOURCE_INDEX);
+        fs::create_dir_all(project.join("analysis"))?;
+        let target = project.join("manifest.json");
+        symlink(&target, &path)?;
+        assert!(load_artifact(project, SOURCE_INDEX, true).is_err());
+        let valid = json!({"schema":SOURCE_INDEX.schema,"units":[],"summary":{}});
+        fs::write(&target, serde_json::to_vec(&valid)?)?;
+        assert!(load_artifact(project, SOURCE_INDEX, true).is_err());
+        fs::remove_file(&path)?;
+        let socket = UnixListener::bind(&path)?;
+        assert!(load_artifact(project, SOURCE_INDEX, true).is_err());
+        drop(socket);
+        fs::remove_file(&path)?;
+        assert!(load_artifact(project, SOURCE_INDEX, true)?.is_none());
+        write_artifact(project, SOURCE_INDEX, &valid)?;
+        assert_eq!(load_artifact(project, SOURCE_INDEX, true)?, Some(valid));
+        Ok(())
+    }
 
     #[test]
     fn optional_artifact_ignores_missing_file_not_other_read_failures() -> Result<()> {
