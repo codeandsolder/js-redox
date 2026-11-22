@@ -14,7 +14,7 @@ struct Comparison {
     rewritten: String,
 }
 
-const RUNNER: &str = r#"
+const RUNNER: &str = r"
 const vm = require('node:vm');
 function encode(value) {
     const type = typeof value;
@@ -53,7 +53,7 @@ for (const row of comparisons) {
     }
 }
 console.log(comparisons.length);
-"#;
+";
 
 /// Execute a batch of independently parsed scripts in one Node process rather
 /// than launching two processes for every tiny fixture.
