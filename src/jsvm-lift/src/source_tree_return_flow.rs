@@ -158,7 +158,7 @@ struct ReturnFlow<'s> {
 }
 
 impl ReturnFlow<'_> {
-    /// Keep NamedEvaluation in its original assignment context. Naming an
+    /// Keep `NamedEvaluation` in its original assignment context. Naming an
     /// anonymous class explicitly would introduce a new lexical name binding
     /// and may change what its static initializers observe.
     fn terminal_value(&self, assignment: &AssignmentExpression<'_>) -> Option<&str> {
