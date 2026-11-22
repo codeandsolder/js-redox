@@ -60,7 +60,7 @@ url = "2"
 reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "cookies", "rustls", "gzip", "brotli", "deflate"] }
 wasmparser = "0.263.0"
 wasmprinter = "0.263.0"
-waffle = { git = "https://github.com/codeandsolder/waffle.git", rev = "682bfdb45653246f981a93978d3990bdcae70ce9" }
+waffle = { git = "https://github.com/codeandsolder/waffle.git", rev = "554a237a02d0c93768f9cfbde91843899f73a4b2" }
 work-budget = { path = "src/work-budget" }
 
 # Temporary release-compatible backports of oxc-project/oxc#28542 and #29927.

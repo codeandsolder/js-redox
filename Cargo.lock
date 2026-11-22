@@ -2672,8 +2672,8 @@ checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
 
 [[package]]
 name = "waffle"
-version = "0.3.2"
-source = "git+https://github.com/codeandsolder/waffle.git?rev=682bfdb45653246f981a93978d3990bdcae70ce9#682bfdb45653246f981a93978d3990bdcae70ce9"
+version = "0.4.0"
+source = "git+https://github.com/codeandsolder/waffle.git?rev=554a237a02d0c93768f9cfbde91843899f73a4b2#554a237a02d0c93768f9cfbde91843899f73a4b2"
 dependencies = [
  "anyhow",
  "fxhash",

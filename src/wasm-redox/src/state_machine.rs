@@ -1254,8 +1254,8 @@ mod tests {
             .first()
             .map(|report| report.expression.as_str())
             .context("return expression")?;
-        assert!(expression.contains("phi(0x00000014, 0x00000015)"));
-        assert!(expression.contains("phi(0x00000028, 0x00000029)"));
+        assert!(expression.contains("phi_if($arg0, 0x00000015, 0x00000014)"));
+        assert!(expression.contains("phi_if($arg0, 0x00000029, 0x00000028)"));
         Ok(())
     }
 
