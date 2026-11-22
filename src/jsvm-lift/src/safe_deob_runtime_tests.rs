@@ -1119,6 +1119,29 @@ console.log(JSON.stringify([results,example3(),example4(),example5(),example8(),
 }
 
 #[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_nested_standalone_blocks_runtime_equivalence() -> Result<()> {
+    let deep = format!(
+        "function f(x){{{}x+=1;{}return x;}}f(3);",
+        "{ /*open*/".repeat(32),
+        "/*close*/ }".repeat(32),
+    );
+    let sources = [
+        deep.as_str(),
+        "function f(x){ { {x+=1;} {x*=2;} } return x;} f(3);",
+        "function f(){let x=1; { { {let x=2;events.push(x);} {events.push(x);} } } return x;} f();",
+        "function f(){ { {'use strict';return this===undefined;} } } f();",
+        "function f(){ { {var x=3;} } return x;} f();",
+        "function f(){function a(){events.push('a');return ()=>events.push('bad');}function b(){events.push('b');} { {a() } {(b)()} } } f();",
+        "function f(){let x=0;outer:for(let i=0;i<3;i++){ { {if(i===1)continue outer;x+=i;if(i===2)break outer;} } }return x;} f();",
+        "function f(){ { {function inner(){return 3;}events.push(inner());} {events.push(typeof inner);} } } f();",
+        "function f(){try{ { {events.push('try');throw Error('x');} } }catch(e){ { {events.push(e.message);} } }finally{ { {events.push('finally');} } }} f();",
+        "function f(){{ // open\n {events.push('inner') // close\n } } return 7}f();",
+    ];
+    script_runtime_equivalence(&sources, "nested-standalone-blocks", false)
+}
+
+#[test]
 #[ignore = "requires Node; run the focused test explicitly"]
 fn nested_member_target_reassociation_runtime_equivalence() -> Result<()> {
     let source = r"

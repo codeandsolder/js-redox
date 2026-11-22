@@ -178,53 +178,77 @@ fn empty_statement(stmt: &Statement<'_>) -> bool {
     }
 }
 
-/// Lift a standalone, nonempty lexical block into its parent statement list
-/// only when its own scope has no block-local declarations. Var belongs to the
-/// containing function and does not create a block-local lexical binding.
+/// A maximal connected region of flattenable standalone blocks. The
+/// outermost edit replaces the whole region; nested spans must not be
+/// rendered a second time by the subsequent AST traversal.
+pub struct FlattenedBlock {
+    pub text: String,
+    pub nested: Vec<Span>,
+}
+
+fn block_is_flattenable(block: &BlockStatement<'_>, scoping: &Scoping) -> bool {
+    // The semantic scope catches contextual Annex-B/function declarations
+    // as well as direct lexical declarations. Strings cannot be lifted into
+    // a containing directive prologue.
+    block
+        .scope_id
+        .get()
+        .is_some_and(|scope| scoping.get_bindings(scope).is_empty())
+        && !block.body.is_empty()
+        && block.body.iter().all(|statement| match statement {
+            Statement::VariableDeclaration(declaration) => {
+                declaration.kind == VariableDeclarationKind::Var
+            }
+            Statement::FunctionDeclaration(_) | Statement::ClassDeclaration(_) => false,
+            Statement::ExpressionStatement(expression) => {
+                !matches!(&expression.expression, Expression::StringLiteral(_))
+            }
+            _ => true,
+        })
+}
+
+/// Lift standalone lexical blocks into their parent statement list.
+/// Descend only into direct standalone child blocks whose individual
+/// scopes satisfy the same proof. Never cross a lexical, directive, or
+/// control-body boundary. Preserve original source and comments between
+/// braces, replacing each delimiter in source order.
 ///
-/// Preserve nested control-flow syntax (if/loop/switch/label/try) unchanged:
-/// the caller invokes this only on direct children of a function body or
-/// another `BlockStatement`, never on a branch or labeled statement body.
-/// String expression statements are retained inside braces because lifting
-/// them to the beginning of a function can create a new strict directive.
-/// Comments and formatting inside the braces are preserved byte-for-byte.
+/// Rendering a maximal region once avoids repeatedly copying inner blocks
+/// and reparsing the entire program for each layer.
 pub fn flatten_standalone_block(
     block: &BlockStatement<'_>,
     source: &str,
     scoping: &Scoping,
-) -> Option<String> {
-    // The actual semantic scope must not introduce any binding. This catches
-    // contextual Annex-B/function bindings and declarations beyond direct
-    // statement forms before removing the scope, not just syntactic let/const.
-    if !scoping.get_bindings(block.scope_id.get()?).is_empty() {
+) -> Option<FlattenedBlock> {
+    if !block_is_flattenable(block, scoping) {
         return None;
     }
-    if block.body.is_empty()
-        || block.body.iter().any(|statement| match statement {
-            Statement::VariableDeclaration(declaration) => {
-                declaration.kind != VariableDeclarationKind::Var
+    let mut cursor = block.span.start as usize;
+    let mut text = String::with_capacity((block.span.end - block.span.start) as usize);
+    let mut nested = Vec::new();
+    let mut pending = vec![(block, false)];
+    while let Some((current, closing)) = pending.pop() {
+        let (offset, delimiter) = if closing {
+            (current.span.end as usize - 1, "\n;\n")
+        } else {
+            pending.push((current, true));
+            for statement in current.body.iter().rev() {
+                if let Statement::BlockStatement(child) = statement {
+                    if block_is_flattenable(child, scoping) {
+                        nested.push(child.span);
+                        pending.push((child, false));
+                    }
+                }
             }
-            Statement::FunctionDeclaration(_) | Statement::ClassDeclaration(_) => true,
-            _ => false,
-        })
-    {
-        return None;
+            (current.span.start as usize, "\n;")
+        };
+        text.push_str(source.get(cursor..offset)?);
+        // Both original braces separate statements, even without explicit
+        // semicolons. Keep those boundaries during simultaneous flattening.
+        text.push_str(delimiter);
+        cursor = offset + 1;
     }
-    // A string-literal statement can become a directive at a new position
-    // in its parent statement list. Preserve that scope boundary instead.
-    if block.body.iter().any(|statement| match statement {
-        Statement::ExpressionStatement(expression) => {
-            matches!(&expression.expression, Expression::StringLiteral(_))
-        }
-        _ => false,
-    }) {
-        return None;
-    }
-    let inner = source.get(block.span.start as usize + 1..block.span.end as usize - 1)?;
-    // Both original braces separated statements even where no semicolon
-    // was present. Preserve that boundary when an adjacent `(`, `[`,
-    // template or other continuation token would otherwise change the parse.
-    Some(format!("\n;{inner}\n;\n"))
+    Some(FlattenedBlock { text, nested })
 }
 
 /// Turn empty `if` branches into ordinary, readable control flow while still
