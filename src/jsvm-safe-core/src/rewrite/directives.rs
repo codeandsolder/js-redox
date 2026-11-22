@@ -9,17 +9,20 @@ use oxc_ast_visit::{walk, Visit};
 use std::collections::BTreeMap;
 
 #[derive(Debug, PartialEq, Eq)]
-struct DirectiveIdentity {
-    raw: String,
-    cooked: Vec<u16>,
+struct DirectiveIdentity<'a> {
+    raw: &'a str,
+    // Oxc's canonical WTF-8 representation preserves every JavaScript
+    // UTF-16 code unit, including lone surrogates. Comparing these arena
+    // slices requires neither a lossy UTF-8 conversion nor a UTF-16 copy.
+    cooked: &'a [u8],
 }
 
-fn identities(directives: &[Directive<'_>]) -> Vec<DirectiveIdentity> {
+fn identities<'a>(directives: &[Directive<'a>]) -> Vec<DirectiveIdentity<'a>> {
     directives
         .iter()
         .map(|directive| DirectiveIdentity {
-            raw: directive.directive.to_string(),
-            cooked: directive.expression.value.encode_utf16().collect(),
+            raw: directive.directive.as_str(),
+            cooked: directive.expression.value.as_bytes(),
         })
         .collect()
 }
@@ -28,17 +31,17 @@ fn identities(directives: &[Directive<'_>]) -> Vec<DirectiveIdentity> {
 /// Expression-bodied arrows have synthesized FunctionBody nodes without
 /// brace anchors and cannot contain directive prologues.
 #[derive(Default)]
-pub(super) struct DirectiveInventory {
-    root: Vec<DirectiveIdentity>,
-    bodies: BTreeMap<(usize, usize), Vec<DirectiveIdentity>>,
+pub(super) struct DirectiveInventory<'a> {
+    root: Vec<DirectiveIdentity<'a>>,
+    bodies: BTreeMap<(usize, usize), Vec<DirectiveIdentity<'a>>>,
 }
 
-impl DirectiveInventory {
-    pub(super) fn record_program(&mut self, program: &Program<'_>) {
+impl<'a> DirectiveInventory<'a> {
+    pub(super) fn record_program(&mut self, program: &Program<'a>) {
         self.root = identities(&program.directives);
     }
 
-    pub(super) fn record_body(&mut self, body: &FunctionBody<'_>, source: &str) {
+    pub(super) fn record_body(&mut self, body: &FunctionBody<'a>, source: &str) {
         let start = body.span.start as usize;
         let Some(end) = (body.span.end as usize).checked_sub(1) else {
             return;
@@ -72,7 +75,7 @@ impl DirectiveInventory {
         };
         let mut visitor = InventoryVisitor {
             source: candidate,
-            inventory: Self::default(),
+            inventory: DirectiveInventory::default(),
         };
         visitor.visit_program(&program);
         let actual = visitor.inventory;
@@ -92,12 +95,12 @@ impl DirectiveInventory {
     }
 }
 
-struct InventoryVisitor<'s> {
-    source: &'s str,
-    inventory: DirectiveInventory,
+struct InventoryVisitor<'a> {
+    source: &'a str,
+    inventory: DirectiveInventory<'a>,
 }
 
-impl<'a> Visit<'a> for InventoryVisitor<'_> {
+impl<'a> Visit<'a> for InventoryVisitor<'a> {
     fn visit_program(&mut self, program: &Program<'a>) {
         self.inventory.record_program(program);
         walk::walk_program(self, program);
@@ -186,6 +189,30 @@ mod tests {
             "'other';work(1);",
             &[edit(13, 13, "1")]
         ));
+    }
+
+    #[test]
+    fn directive_identity_preserves_lone_surrogates_and_raw_escape_spelling() {
+        for original in [
+            r"'\ud800';work();",
+            r"'\udfff';work();",
+            r"'\ud83d\ude00';work();",
+            "'😀';work();",
+            r"'use\x20strict';work();",
+        ] {
+            assert!(accepts(original, original, &[]));
+        }
+
+        let original = r"'\ud800';work();";
+        let changed = r"'\udfff';work();";
+        assert!(!accepts(original, changed, &[edit(0, 8, r"'\udfff'")]));
+
+        let original = r"'use\x20strict';work();";
+        let changed = "'use strict';work();";
+        let Some(end) = original.find(';') else {
+            unreachable!();
+        };
+        assert!(!accepts(original, changed, &[edit(0, end, "'use strict'")]));
     }
 
     #[test]

@@ -342,10 +342,10 @@ impl StatementBoundaries {
 struct BoundaryCollector<'s> {
     source: &'s str,
     boundaries: StatementBoundaries,
-    directives: DirectiveInventory,
+    directives: DirectiveInventory<'s>,
 }
 
-impl<'a> Visit<'a> for BoundaryCollector<'_> {
+impl<'a> Visit<'a> for BoundaryCollector<'a> {
     fn visit_program(&mut self, program: &Program<'a>) {
         self.directives.record_program(program);
         self.boundaries.record_prologue_end(
