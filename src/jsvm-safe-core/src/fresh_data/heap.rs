@@ -944,67 +944,94 @@ impl Environment {
         }
     }
 
-    /// Resolve ordinary [[Get]] from every possible receiver and prototype.
-    /// Every successful path must reach either known ordinary writable data
-    /// or a null prototype, without an opaque descriptor or unknown object.
-    /// This is also sufficient to establish ordinary [[Set]] eligibility.
-    pub(super) fn read(
+    /// Prove ordinary property resolution on every possible receiver.
+    /// The caller chooses whether to materialize data values or merely
+    /// establish that no opaque descriptor can intercept the operation.
+    fn visit_resolved_data(
         &self,
         locations: &Locations,
         key: &str,
         budget: &WorkBudget,
-    ) -> Result<Option<Option<Fact>>, BudgetExceeded> {
+        mut visit: impl FnMut(Option<&Fact>) -> Result<(), BudgetExceeded>,
+    ) -> Result<bool, BudgetExceeded> {
         if let [id] = locations.as_ref() {
             charge(budget, key.len())?;
             let Some(data) = self.allocations.get(id) else {
-                return Ok(None);
+                return Ok(false);
             };
             if let Property::Data(value) = data.property(key) {
-                if let Some(value) = value {
-                    charge(budget, value.clone_weight())?;
-                }
-                return Ok(Some(value.clone()));
+                visit(value.as_ref())?;
+                return Ok(true);
             }
         }
         charge(budget, locations.len())?;
         let mut pending = locations.to_vec();
         let mut visited = HashSet::new();
-        let mut result = None;
+        let undefined = Fact::Primitive(Value::Undefined);
+        let mut found = false;
         while let Some(id) = pending.pop() {
             charge(budget, 1)?;
             if !visited.insert(id) {
                 continue;
             }
             let Some(data) = self.allocations.get(&id) else {
-                return Ok(None);
+                return Ok(false);
             };
-            let property = data.property(key);
-            charge(budget, key.len().saturating_add(property.clone_weight()))?;
-            match property {
+            charge(budget, key.len())?;
+            match data.property(key) {
                 Property::Data(value) => {
-                    join_lookup(&mut result, value.clone(), budget)?;
+                    visit(value.as_ref())?;
+                    found = true;
                     continue;
                 }
-                Property::MaybeData(value) => join_lookup(&mut result, value.clone(), budget)?,
+                Property::MaybeData(value) => {
+                    visit(value.as_ref())?;
+                    found = true;
+                }
                 Property::Absent => {}
-                Property::Opaque => return Ok(None),
+                Property::Opaque => return Ok(false),
             }
             match &data.prototype {
-                Prototype::Unknown => return Ok(None),
+                Prototype::Unknown => return Ok(false),
                 Prototype::Null => {
-                    join_lookup(&mut result, Some(Fact::Primitive(Value::Undefined)), budget)?;
+                    visit(Some(&undefined))?;
+                    found = true;
                 }
                 Prototype::Objects(prototypes) => {
                     charge(budget, prototypes.len())?;
                     if prototypes.is_empty() || prototypes.iter().any(|&prototype| prototype >= id)
                     {
-                        return Ok(None);
+                        return Ok(false);
                     }
                     pending.extend(prototypes.iter().copied());
                 }
             }
         }
-        Ok(result)
+        Ok(found)
+    }
+
+    pub(super) fn read(
+        &self,
+        locations: &Locations,
+        key: &str,
+        budget: &WorkBudget,
+    ) -> Result<Option<Option<Fact>>, BudgetExceeded> {
+        let mut result = None;
+        if self.visit_resolved_data(locations, key, budget, |value| {
+            // Once the value is unknown, the remaining paths only need
+            // descriptor proof. They cannot restore a precise value.
+            if matches!(result, Some(None)) {
+                return Ok(());
+            }
+            if let Some(value) = value {
+                charge(budget, value.clone_weight())?;
+            }
+            join_lookup(&mut result, value.cloned(), budget)
+        })? {
+            Ok(result)
+        } else {
+            Ok(None)
+        }
     }
 
     fn update(
@@ -1040,7 +1067,7 @@ impl Environment {
         value: Option<Fact>,
         budget: &WorkBudget,
     ) -> Result<bool, BudgetExceeded> {
-        if self.read(locations, key, budget)?.is_none() {
+        if !self.visit_resolved_data(locations, key, budget, |_| Ok(()))? {
             return Ok(false);
         }
         charge(budget, locations.len())?;
@@ -1112,6 +1139,48 @@ mod tests {
             ),
             Property::Opaque => (3, None),
         }
+    }
+
+    #[test]
+    fn descriptor_proof_does_not_materialize_unused_inherited_values() -> Result<(), BudgetExceeded>
+    {
+        let unlimited = WorkBudget::unlimited("lookup-setup");
+        let mut heap = Environment::new();
+        for id in 0..2 {
+            let mut data = OwnData::new(AllocationKind::Ordinary);
+            data.define_data(
+                "x".into(),
+                Some(Fact::Primitive(Value::String("a".repeat(8192)))),
+            );
+            let parent = heap.allocate(id * 2, data, &unlimited)?;
+            let mut child = OwnData::new(AllocationKind::Ordinary);
+            child.set_literal_prototype(Some(parent));
+            heap.allocate(id * 2 + 1, child, &unlimited)?;
+        }
+        let locations = Rc::from([1, 3]);
+        let bounded = WorkBudget::new(
+            "write-with-large-inherited-value",
+            work_budget::BudgetLimits::work(128),
+        );
+        assert!(heap.write(
+            &locations,
+            "x",
+            Some(Fact::Primitive(Value::Number(9.0))),
+            &bounded
+        )?);
+        assert!(matches!(
+            heap.read(&locations, "x", &unlimited)?,
+            Some(None)
+        ));
+        // An opaque path must still reject a write, even when earlier
+        // paths have already established unknown ordinary data.
+        let mut opaque = OwnData::new(AllocationKind::Ordinary);
+        opaque.define_accessor("x".into());
+        heap.allocate(4, opaque, &unlimited)?;
+        assert!(!heap.write(&Rc::from([1, 3, 4]), "x", None, &unlimited)?);
+        let bounded = WorkBudget::new("read-large-value", work_budget::BudgetLimits::work(128));
+        assert!(heap.read(&Rc::from([0]), "x", &bounded).is_err());
+        Ok(())
     }
 
     #[test]
