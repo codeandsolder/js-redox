@@ -292,3 +292,86 @@ fn reference_sources() -> Result<Vec<String>> {
 fn depythonify_safe_deob_reference_value_matrix() -> Result<()> {
     compare_sources("reference-value-matrix", reference_sources()?)
 }
+
+// Include every ECMAScript line terminator, block and line comments that
+// contain them, and escaped directive spellings that must not activate strict
+// mode. Partition by separator to keep each parsed program reasonably sized.
+fn unicode_boundary_sources() -> Result<Vec<String>> {
+    let separators = [
+        "\n",
+        "\r",
+        "\r\n",
+        "\u{2028}",
+        "\u{2029}",
+        "/*\n*/",
+        "/*\u{2028}*/",
+        "//line\r",
+        "//line\u{2029}",
+    ];
+    let leading = [
+        "'other'",
+        "'other';",
+        "'use strict'",
+        "'use strict';",
+        r"'use\x20strict'",
+        r"'use\x20strict';",
+        "",
+    ];
+    let prefixes = [
+        "",
+        ";",
+        ";;",
+        "{}",
+        "{;}",
+        "0;",
+        r#"if(false){record("unreachable");}"#,
+        "/*π*/{}",
+    ];
+    let following = [
+        "'use strict';",
+        "('use strict');",
+        "'use '+'strict';",
+        r"'use\x20strict';",
+        "'other';'use strict';",
+        r#"record("seen");"#,
+        r#"(record)("seen");"#,
+        "[1].forEach(record);",
+    ];
+
+    let mut sources = Vec::with_capacity(separators.len());
+    let mut total = 0;
+    for separator in separators {
+        let mut source = String::from("let seen=[];function record(x){seen.push(x)}\n");
+        let mut invocations = String::from("const results=[];\n");
+        for first in leading {
+            for prefix in prefixes {
+                for next in following {
+                    let body = [
+                        first,
+                        prefix,
+                        next,
+                        "return [this===undefined,this===globalThis];",
+                    ]
+                    .join(separator);
+                    writeln!(source, "function fixture_{total}(){{{body}}}")?;
+                    writeln!(
+                        invocations,
+                        "seen=[];try{{results.push([fixture_{total}(),seen]);}}catch(error){{results.push([error.name,seen]);}}"
+                    )?;
+                    total += 1;
+                }
+            }
+        }
+        source.push_str(&invocations);
+        source.push_str("results;");
+        sources.push(source);
+    }
+    assert_eq!(total, 4032);
+    Ok(sources)
+}
+
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_unicode_boundary_matrix() -> Result<()> {
+    compare_sources("unicode-boundary-matrix", unicode_boundary_sources()?)
+}
