@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 #[derive(Debug, PartialEq, Eq)]
 struct DirectiveIdentity {
     raw: String,
-    cooked: String,
+    cooked: Vec<u16>,
 }
 
 fn identities(directives: &[Directive<'_>]) -> Vec<DirectiveIdentity> {
@@ -19,7 +19,7 @@ fn identities(directives: &[Directive<'_>]) -> Vec<DirectiveIdentity> {
         .iter()
         .map(|directive| DirectiveIdentity {
             raw: directive.directive.to_string(),
-            cooked: directive.expression.value.to_string(),
+            cooked: directive.expression.value.encode_utf16().collect(),
         })
         .collect()
 }
