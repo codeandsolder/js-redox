@@ -7471,17 +7471,18 @@ mod tests {
 
     #[test]
     fn distinguishes_empty_function_and_nested_block_statements() {
-        // The first empty statement terminates the directive prologue. Only
-        // the second empty statement is ordinary removable function-body syntax.
+        // The leading run is redundant because the next statement is an if.
+        // A competing edit within that prefix may delay release to a later pass.
         let input = "function f(flag){ ; ; if(flag){ ; work(); } return 3; }";
-        let output = deobfuscate(input, 1);
+        let output = deobfuscate(input, 8);
         assert!(output.is_some(), "source is valid JavaScript");
         let Some(output) = output else {
             unreachable!();
         };
+        assert!(output.analysis_complete);
         assert_eq!(
             output.transforms.get("remove_empty_function_statement"),
-            Some(&1),
+            Some(&2),
             "{:?}",
             output.transforms
         );
@@ -7497,7 +7498,7 @@ mod tests {
             .filter(|ch| !ch.is_whitespace())
             .collect();
         assert!(
-            compact.starts_with("functionf(flag){;if"),
+            compact.starts_with("functionf(flag){if"),
             "{}",
             output.source
         );
