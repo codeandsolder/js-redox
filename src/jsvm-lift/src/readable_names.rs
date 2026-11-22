@@ -340,12 +340,11 @@ impl<'a> Visit<'a> for NameCandidates {
 
     fn visit_binding_property(&mut self, property: &BindingProperty<'a>) {
         if !property.shorthand {
-            if let Some(name) = property
-                .key
-                .static_name()
-                .and_then(oxc_ast::StaticPropertyName::into_cow_str)
-            {
-                let name = name.into_owned();
+            if let Some(name) = jsvm_safe_core::exact_property_key(
+                &property.key,
+                property.computed,
+                eval_static_primitive,
+            ) {
                 if meaningful_property_name(&name) {
                     let binding = match &property.value {
                         BindingPattern::BindingIdentifier(id) => Some(id.as_ref()),

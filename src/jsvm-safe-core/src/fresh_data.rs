@@ -7,8 +7,8 @@
 //! bodies and unsupported control regions are analyzed from an empty state.
 use crate::binding_facts::BindingFacts;
 use crate::value_eval::{
-    eval, eval_binary, eval_logical_left, eval_unary_value, literal_property_key, same_value,
-    LogicalStep, Value,
+    eval, eval_binary, eval_logical_left, eval_unary_value, is_prototype_setter,
+    literal_property_key, same_value, LogicalStep, Value,
 };
 use oxc_ast::ast::{
     Argument, ArrayExpressionElement, AssignmentTarget, BindingPattern, Declaration, Expression,
@@ -467,12 +467,7 @@ impl Analyzer<'_> {
                                 data.clear();
                                 continue;
                             };
-                            if key == "__proto__"
-                                && property.kind == PropertyKind::Init
-                                && !property.computed
-                                && !property.method
-                                && !property.shorthand
-                            {
+                            if is_prototype_setter(property, &key) {
                                 continue;
                             }
                             if property.kind == PropertyKind::Init {

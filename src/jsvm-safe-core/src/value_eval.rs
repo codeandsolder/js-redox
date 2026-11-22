@@ -47,6 +47,49 @@ pub(crate) fn literal_property_key(key: &PropertyKey<'_>) -> Option<String> {
     }
 }
 
+/// Evaluate a computed property key only when its complete primitive
+/// evaluation is proven. BigInt literals are exact even though BigInt
+/// arithmetic is not in the shared primitive evaluator's domain.
+#[must_use]
+pub fn exact_computed_property_key(
+    expression: &Expression<'_>,
+    primitive: impl FnOnce(&Expression<'_>) -> Option<Value>,
+) -> Option<String> {
+    let expression = expression.without_parentheses();
+    if let Expression::BigIntLiteral(literal) = expression {
+        return Some(literal.value.to_string());
+    }
+    primitive(expression)?.js_string()
+}
+
+/// Canonical ECMAScript property identity, with an explicit computed-key
+/// evaluator. In particular, never treat a computed RegExp or object literal
+/// as a statically known name: ToPrimitive can invoke user code.
+#[must_use]
+pub fn exact_property_key(
+    key: &PropertyKey<'_>,
+    computed: bool,
+    primitive: impl FnOnce(&Expression<'_>) -> Option<Value>,
+) -> Option<String> {
+    if computed {
+        exact_computed_property_key(key.as_expression()?, primitive)
+    } else {
+        literal_property_key(key)
+    }
+}
+
+/// The special object initializer colon-form is a prototype setter, not an
+/// own property. Computed, shorthand, method and accessor forms are ordinary
+/// definitions, even if the key has the same text.
+#[must_use]
+pub fn is_prototype_setter(property: &oxc_ast::ast::ObjectProperty<'_>, name: &str) -> bool {
+    name == "__proto__"
+        && property.kind == oxc_ast::ast::PropertyKind::Init
+        && !property.computed
+        && !property.method
+        && !property.shorthand
+}
+
 /// Recover a template quasi with the original AST's cooked/raw semantics.
 ///
 /// Prefer cooked text, falling back to raw spelling when cooked is absent.
@@ -475,6 +518,64 @@ where
 #[cfg(test)]
 mod tests {
     use super::{eval_binary, Value};
+
+    #[test]
+    fn exact_property_keys_do_not_confuse_literal_names_and_computed_coercion() {
+        use oxc_allocator::Allocator;
+        use oxc_ast::ast::{Expression, ObjectPropertyKind, Statement};
+        use oxc_span::SourceType;
+        let source = r#"({
+            1e21:1, 1e-7:2, 0x10n:3, [(-0)]:4, [(0x10n)]:5,
+            ["a"+"b"]:6, [true]:7, [null]:8, [void 0]:9,
+            [/x/]:10, [{}]:11, ["\uD800"]:12, __proto__:13,
+            ["__proto__"]:14, __proto__(){}, get __proto__(){}
+        });"#;
+        let allocator = Allocator::default();
+        let program = crate::parse_as(&allocator, source, SourceType::cjs())
+            .unwrap_or_else(|| unreachable!("literal property fixture"));
+        let [Statement::ExpressionStatement(statement)] = program.body.as_slice() else {
+            unreachable!("one expression");
+        };
+        let Expression::ObjectExpression(object) = statement.expression.without_parentheses()
+        else {
+            unreachable!("object literal");
+        };
+        let names = object
+            .properties
+            .iter()
+            .map(|item| {
+                let ObjectPropertyKind::ObjectProperty(property) = item else {
+                    unreachable!("ordinary property");
+                };
+                let name = super::exact_property_key(&property.key, property.computed, super::eval);
+                let prototype = name
+                    .as_deref()
+                    .is_some_and(|name| super::is_prototype_setter(property, name));
+                (name, prototype)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                (Some("1e+21".into()), false),
+                (Some("1e-7".into()), false),
+                (Some("16".into()), false),
+                (Some("0".into()), false),
+                (Some("16".into()), false),
+                (Some("ab".into()), false),
+                (Some("true".into()), false),
+                (Some("null".into()), false),
+                (Some("undefined".into()), false),
+                (None, false),
+                (None, false),
+                (None, false),
+                (Some("__proto__".into()), true),
+                (Some("__proto__".into()), false),
+                (Some("__proto__".into()), false),
+                (Some("__proto__".into()), false),
+            ]
+        );
+    }
 
     #[test]
     fn relational_string_comparison_uses_utf16_code_units() {

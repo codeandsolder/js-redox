@@ -1140,16 +1140,9 @@ impl BindingCollector<'_, '_> {
                     return;
                 };
                 for property in &object.properties {
-                    let key = property
-                        .key
-                        .static_name()
-                        .and_then(|name| name.into_cow_str().map(|key| key.into_owned()))
-                        .or_else(|| {
-                            property
-                                .key
-                                .as_expression()
-                                .and_then(|expr| static_string(expr, self.scoping, self.constants))
-                        });
+                    let key = exact_property_key(&property.key, property.computed, |expr| {
+                        self.constants.exact_primitive(expr, self.scoping)
+                    });
                     let Some(key) = key else {
                         continue;
                     };

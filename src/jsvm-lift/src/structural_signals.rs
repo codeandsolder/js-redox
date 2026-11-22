@@ -475,11 +475,15 @@ fn detect_operator_proxy_table(object: &ObjectExpression<'_>) -> Option<Structur
         {
             continue;
         }
-        let Some(key) = property.key.static_name() else {
+        let Some(key) = jsvm_safe_core::exact_property_key(
+            &property.key,
+            property.computed,
+            jsvm_safe_core::eval_static_primitive,
+        ) else {
             continue;
         };
         static_properties += 1;
-        if key.as_str().is_some_and(looks_generated_proxy_key) {
+        if looks_generated_proxy_key(&key) {
             generated_keys += 1;
         }
         if is_tiny_proxy_function(&property.value) {
