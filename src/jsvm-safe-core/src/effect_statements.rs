@@ -6,7 +6,11 @@
 //! directive prologue (and to preserve dangling-else grammar). Atomically
 //! retained expressions remain wrapped so object/function literals are valid
 //! statement syntax. Dynamic branches are evaluated exactly once.
-use crate::{binding_facts::BindingFacts, fragment, value_eval::eval};
+use crate::{
+    binding_facts::BindingFacts,
+    fragment,
+    value_eval::{eval, inert_literal_value, known_bool},
+};
 use oxc_ast::ast::{
     AssignmentExpression, AssignmentTarget, Expression, ExpressionStatement, IfStatement,
     SequenceExpression,
@@ -38,6 +42,10 @@ fn name_inference_hazard(expr: &Expression<'_>) -> bool {
     }
 }
 
+fn inert_evaluation(expression: &Expression<'_>) -> bool {
+    inert_literal_value(expression) || eval(expression).is_some()
+}
+
 #[derive(Default)]
 struct Lowered {
     statements: Vec<String>,
@@ -46,7 +54,7 @@ struct Lowered {
 
 impl Lowered {
     fn push_expression(&mut self, expression: &Expression<'_>, source: &str) {
-        if eval(expression).is_none() {
+        if !inert_evaluation(expression) {
             self.statements
                 .push(format!("({});", fragment(source, expression.span())));
         }
@@ -64,13 +72,13 @@ impl Lowered {
     ) -> Option<()> {
         self.structured = true;
         let and = logical.operator.as_str() == "&&";
-        if let Some(value) = eval(&logical.left) {
-            if value.truthy() == and {
+        if let Some(truthy) = known_bool(&logical.left) {
+            if truthy == and {
                 self.emit(&logical.right, source, scoping, bindings, depth + 1)?;
             }
             return Some(());
         }
-        if eval(&logical.right).is_some() {
+        if inert_evaluation(&logical.right) {
             // The result is discarded; this RHS is pure, so only
             // the LHS's evaluation may have effects or throw.
             return self.emit(&logical.left, source, scoping, bindings, depth + 1);
@@ -102,9 +110,9 @@ impl Lowered {
         depth: usize,
     ) -> Option<()> {
         self.structured = true;
-        if let Some(value) = eval(&conditional.test) {
+        if let Some(truthy) = known_bool(&conditional.test) {
             return self.emit(
-                if value.truthy() {
+                if truthy {
                     &conditional.consequent
                 } else {
                     &conditional.alternate
@@ -655,7 +663,7 @@ pub fn lower_if_test(statement: &IfStatement<'_>, source: &str) -> Option<String
         let original = fragment(source, expression.span());
         // An inert known primitive cannot have observable effects. Keep
         // comments within such an operand rather than deleting annotations.
-        if eval(expression).is_none() || original.contains("/*") || original.contains("//") {
+        if !inert_evaluation(expression) || original.contains("/*") || original.contains("//") {
             writeln!(&mut text, "({original});").ok()?;
         }
     }
@@ -726,6 +734,28 @@ mod tests {
         assert!(output.contains("if ("), "{output}");
         assert!(output.contains("u=U"), "{output}");
         assert!(!output.contains("false;"), "{output}");
+        Ok(())
+    }
+
+    #[test]
+    fn discards_inert_values_without_evaluating_implementation_dependent_results(
+    ) -> Result<(), BudgetExceeded> {
+        let source = "function f(x, log){return (2 ** 1.5, [1,2], log('kept'), x+1);}";
+        let output = rewritten(source)?;
+        assert!(!output.contains("**"), "{output}");
+        assert!(output.contains("log('kept')"), "{output}");
+        assert!(output.contains("x+1"), "{output}");
+
+        let source = "function f(o, log){(o.value ? 2 ** 1.5 : 3 ** 2.5, log('end'));}";
+        let output = rewritten(source)?;
+        assert!(!output.contains("**"), "{output}");
+        assert!(output.contains("o.value"), "{output}");
+        assert!(output.contains("log('end')"), "{output}");
+
+        let source = "function f(log){return (1n / 0n, log('never'));}";
+        let output = rewritten(source)?;
+        assert!(output.contains("1n / 0n"), "{output}");
+        assert!(output.contains("log('never')"), "{output}");
         Ok(())
     }
 

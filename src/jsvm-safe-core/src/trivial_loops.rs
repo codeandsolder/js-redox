@@ -150,7 +150,7 @@ pub fn prune_inert_sequence_values(expr: &SequenceExpression<'_>, source: &str) 
     let mut retained = Vec::new();
     let mut removed = 0usize;
     for candidate in preceding {
-        if inert_literal_statement(candidate) || matches!(candidate, Expression::StringLiteral(_)) {
+        if inert_literal_value(candidate) {
             removed += 1;
         } else {
             retained.push(fragment(source, candidate.span()));

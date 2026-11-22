@@ -394,3 +394,21 @@ fn depythonify_safe_deob_literal_type_facts_runtime_equivalence() -> Result<()> 
         ].into_iter().map(str::to_owned).collect(),
     )
 }
+
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_discarded_literal_effects_runtime_equivalence() -> Result<()> {
+    compare_sources(
+        "discarded-literal-effects",
+        [
+            "function f(x){return (2 ** 1.5, [], events.push('kept'), x+1);} f(7);",
+            "function f(o){(o.value ? 2 ** 1.5 : 3 ** 2.5, events.push('end'));} f({get value(){events.push('getter');return true}});",
+            "function f(o){(o.value && 2 ** 1.5, o.value || [3 ** 2.5], events.push('end'));} f({get value(){events.push('getter');return false}});",
+            "function f(){return (1n / 0n, events.push('never'));} try{f()}catch(e){events.push(e.name)}",
+            "const o={m(){'use strict';return this===undefined}}; (2 ** 1.5, o.m)();",
+            "const x=(2 ** 1.5, function(){}); x.name;",
+            "function f(){return (2 ** 1.5, (0,eval)('typeof privateName'));} f();",
+            "function f(){([2 ** 1.5] ? events.push('yes') : events.push('no'), events.push('end'));} f();",
+        ].into_iter().map(str::to_owned).collect(),
+    )
+}
