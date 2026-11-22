@@ -744,10 +744,5 @@ pub fn materialize(
         vms: lift_table_vms(&source, &report, budget)?,
     };
     budget.checkpoint()?;
-    fs::write(
-        output_path,
-        format!("{}\n", serde_json::to_string_pretty(&output)?),
-    )
-    .with_context(|| format!("writing {}", output_path.display()))?;
-    Ok(())
+    crate::report_file::write_json(output_path, &output)
 }

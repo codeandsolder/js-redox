@@ -397,13 +397,10 @@ fn render_table_pseudocode(vm: &TableVm, provenance: &Map<String, Value>) -> Str
 }
 
 fn write_js_module(path: &Path, header: &str, pseudo_name: &str, payload: &Value) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    }
     let encoded = serde_json::to_string_pretty(payload)?;
-    fs::write(
+    crate::report_file::write_text(
         path,
-        format!(
+        &format!(
             "// {header}\n// Provenance-preserving analyst output; not an executable replacement.\n// Human-first listing: {pseudo_name}\nexport default {encoded};\n"
         ),
     )
@@ -513,7 +510,7 @@ fn materialize_switch_vms(
             pseudo_name,
             &payload,
         )?;
-        fs::write(&pseudo_out, render_switch_pseudocode(vm, &provenance))
+        crate::report_file::write_text(&pseudo_out, &render_switch_pseudocode(vm, &provenance))
             .with_context(|| format!("writing {}", pseudo_out.display()))?;
 
         units.push(json!({
@@ -592,7 +589,7 @@ fn materialize_table_vms(
             pseudo_name,
             &payload,
         )?;
-        fs::write(&pseudo_out, render_table_pseudocode(vm, &provenance))
+        crate::report_file::write_text(&pseudo_out, &render_table_pseudocode(vm, &provenance))
             .with_context(|| format!("writing {}", pseudo_out.display()))?;
 
         units.push(json!({

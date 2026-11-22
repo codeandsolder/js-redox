@@ -64,7 +64,7 @@ fn write_recovered_binary(root: &Path, digest: &str, bytes: &[u8]) -> Result<Pat
             );
         }
     } else {
-        fs::write(&path, bytes).with_context(|| format!("writing {}", path.display()))?;
+        crate::report_file::write_bytes(&path, bytes)?;
     }
     Ok(path)
 }
@@ -94,15 +94,14 @@ fn analyze_module(
     budget.checkpoint()?;
 
     fs::create_dir_all(output_dir).with_context(|| format!("creating {}", output_dir.display()))?;
-    fs::write(
-        output_dir.join("module.report.json"),
-        serde_json::to_vec_pretty(&report)?,
-    )?;
-    fs::write(output_dir.join("module.readable.wat"), wat)?;
-    fs::write(
-        output_dir.join("module.deep.json"),
-        serde_json::to_vec_pretty(&deep)?,
-    )?;
+    let reports = [
+        crate::report_file::stage_json(&output_dir.join("module.report.json"), &report)?,
+        crate::report_file::stage_text(&output_dir.join("module.readable.wat"), &wat)?,
+        crate::report_file::stage_json(&output_dir.join("module.deep.json"), &deep)?,
+    ];
+    for report in reports {
+        report.publish()?;
+    }
     let wax_output = output_dir.join("module.readable.wax");
     if let Some(wax) = wax {
         budget.checkpoint()?;

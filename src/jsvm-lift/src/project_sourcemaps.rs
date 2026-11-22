@@ -749,7 +749,7 @@ fn materialize_sources(
             text.push('\n');
             text
         };
-        fs::write(&destination, encoded.as_bytes())?;
+        crate::report_file::write_text(&destination, &encoded)?;
         let source_path = destination
             .strip_prefix(project)
             .with_context(|| {
@@ -862,7 +862,7 @@ pub fn recover_project_sourcemaps(
             let map_destination = composed_root.join(format!("{resource_id:04}-{digest}.map"));
             let mut encoded = serde_json::to_string(&composed)?;
             encoded.push('\n');
-            fs::write(&map_destination, encoded)?;
+            crate::report_file::write_text(&map_destination, &encoded)?;
             composed_map_path = Value::String(
                 map_destination
                     .strip_prefix(&project)?
@@ -975,6 +975,36 @@ pub fn recover_project_sourcemaps(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn republishing_a_materialized_file_preserves_existing_hardlink_snapshot() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let project = temp.path();
+        let root = project.join("src/recovered");
+        let budget = WorkBudget::unlimited("publication fixture");
+        let first = materialize_sources(
+            &json!({"sources":["fixture.txt"],"sourcesContent":["previous"]}),
+            &root,
+            project,
+            &budget,
+        )?;
+        let relative = first[0]["source_path"]
+            .as_str()
+            .context("fixture output path")?;
+        let path = project.join(relative);
+        let snapshot = project.join("snapshot.txt");
+        fs::hard_link(&path, &snapshot)?;
+        let next = materialize_sources(
+            &json!({"sources":["fixture.txt"],"sourcesContent":["replacement"]}),
+            &root,
+            project,
+            &budget,
+        )?;
+        assert_eq!(next[0]["source_path"], relative);
+        assert_eq!(fs::read_to_string(&path)?, "replacement");
+        assert_eq!(fs::read_to_string(&snapshot)?, "previous");
+        Ok(())
+    }
 
     fn shared_map_fixture(project: &Path, second: &str, root_map: &str) -> Result<()> {
         use crate::capture_project::{write_manifest, CaptureManifest, CaptureSource, SCHEMA};

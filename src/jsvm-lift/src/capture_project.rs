@@ -228,6 +228,14 @@ pub fn read_manifest(path: &Path) -> Result<CaptureManifest> {
     Ok(manifest)
 }
 
+/// Persist the common generated editor configuration.
+pub(crate) fn write_editor_settings(project: &Path) -> Result<()> {
+    crate::report_file::write_json(
+        &project.join(".vscode/settings.json"),
+        &serde_json::json!({"editor.maxTokenizationLineLength": 200000}),
+    )
+}
+
 /// Validate and serialize the capture manifest to its destination.
 ///
 /// # Errors

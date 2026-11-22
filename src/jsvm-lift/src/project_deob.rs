@@ -155,7 +155,7 @@ fn run_string_recovery(
             });
         }
     };
-    fs::write(&recovered, outcome.source.as_bytes())
+    crate::report_file::write_text(&recovered, &outcome.source)
         .with_context(|| format!("writing {}", recovered.display()))?;
     write_json(&report, &outcome.report)?;
     let recovered_sha = sha256_hex(outcome.source.as_bytes());
@@ -233,7 +233,7 @@ fn run_safe_deob(
             let cache = work.join("deob").join(mode.as_str()).join(selected_sha);
             fs::create_dir_all(&cache).with_context(|| format!("creating {}", cache.display()))?;
             let output_path = cache.join(format!("safe{}", mode.suffix()));
-            fs::write(&output_path, outcome.source.as_bytes())
+            crate::report_file::write_text(&output_path, &outcome.source)
                 .with_context(|| format!("writing {}", output_path.display()))?;
             Ok(DeobResult {
                 mode: *mode,
@@ -300,7 +300,8 @@ fn format_output(
     let cache = work.join("readable").join(mode.as_str()).join(output_sha);
     fs::create_dir_all(&cache).with_context(|| format!("creating {}", cache.display()))?;
     let path = cache.join("readable.js");
-    fs::write(&path, source.as_bytes()).with_context(|| format!("writing {}", path.display()))?;
+    crate::report_file::write_text(&path, &source)
+        .with_context(|| format!("writing {}", path.display()))?;
     Ok(ReadableResult {
         path,
         formatted,

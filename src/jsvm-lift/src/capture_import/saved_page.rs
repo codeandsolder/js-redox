@@ -785,11 +785,7 @@ pub(super) fn import_saved_page(
     budget.checkpoint()?;
     write_manifest(&output.join(MANIFEST_NAME), &manifest)?;
     budget.checkpoint()?;
-    fs::create_dir_all(output.join(".vscode"))?;
-    fs::write(
-        output.join(".vscode/settings.json"),
-        "{\n  \"editor.maxTokenizationLineLength\": 200000\n}\n",
-    )?;
+    crate::capture_project::write_editor_settings(output)?;
 
     budget.checkpoint()?;
     staged.publish()?;
