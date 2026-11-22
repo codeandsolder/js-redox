@@ -524,21 +524,82 @@ impl OwnData {
     }
 }
 
-/// Outer None means no proved normal lookup yet; inner None is an
-/// effect-free data lookup whose value is unknown.
-fn join_lookup(
-    result: &mut Option<Option<Fact>>,
-    value: Option<Fact>,
-    budget: &WorkBudget,
-) -> Result<(), BudgetExceeded> {
-    if let (Some(Some(previous)), Some(next)) = (result.as_ref(), value.as_ref()) {
-        previous.charge_merge(next, budget)?;
+/// Merge an arbitrary number of possible property values without
+/// repeatedly allocating growing sorted location unions. Preserve the
+/// original shared fact until a genuinely different location set arrives.
+#[derive(Default)]
+enum LookupValues {
+    #[default]
+    Unseen,
+    Unknown,
+    Single(Fact),
+    Union(HashSet<AllocationId>),
+}
+
+impl LookupValues {
+    fn add(&mut self, value: Option<&Fact>, budget: &WorkBudget) -> Result<(), BudgetExceeded> {
+        if matches!(self, Self::Unknown) {
+            return Ok(());
+        }
+        let Some(value) = value else {
+            *self = Self::Unknown;
+            return Ok(());
+        };
+        match self {
+            Self::Unseen => {
+                charge(budget, value.clone_weight())?;
+                *self = Self::Single(value.clone());
+            }
+            Self::Single(previous) => {
+                if let (Fact::Objects(left), Fact::Objects(right)) = (&*previous, value) {
+                    if Rc::ptr_eq(left, right) {
+                        return Ok(());
+                    }
+                    charge(budget, left.len().saturating_add(right.len()))?;
+                    if left != right {
+                        let mut union = HashSet::new();
+                        union.extend(left.iter().copied());
+                        union.extend(right.iter().copied());
+                        *self = Self::Union(union);
+                    }
+                } else if previous.join(value, budget)?.is_none() {
+                    *self = Self::Unknown;
+                }
+            }
+            Self::Union(union) => {
+                if let Fact::Objects(locations) = value {
+                    charge(budget, locations.len())?;
+                    union.extend(locations.iter().copied());
+                } else {
+                    *self = Self::Unknown;
+                }
+            }
+            Self::Unknown => {}
+        }
+        Ok(())
     }
-    *result = Some(match result.take() {
-        Some(previous) => join_value(&previous, &value),
-        None => value,
-    });
-    Ok(())
+
+    fn finish(self, budget: &WorkBudget) -> Result<Option<Fact>, BudgetExceeded> {
+        match self {
+            Self::Unseen | Self::Unknown => Ok(None),
+            Self::Single(value) => Ok(Some(value)),
+            Self::Union(union) => {
+                charge(
+                    budget,
+                    union.capacity().saturating_add(
+                        union.len().saturating_mul(
+                            usize::try_from(union.len().max(1).ilog2())
+                                .unwrap_or(usize::MAX)
+                                .saturating_add(1),
+                        ),
+                    ),
+                )?;
+                let mut locations = union.into_iter().collect::<Vec<_>>();
+                locations.sort_unstable();
+                Ok(Some(Fact::Objects(locations.into())))
+            }
+        }
+    }
 }
 
 /// Bound dead allocation retention without tracing the entire live heap
@@ -1016,19 +1077,9 @@ impl Environment {
         key: &str,
         budget: &WorkBudget,
     ) -> Result<Option<Option<Fact>>, BudgetExceeded> {
-        let mut result = None;
-        if self.visit_resolved_data(locations, key, budget, |value| {
-            // Once the value is unknown, the remaining paths only need
-            // descriptor proof. They cannot restore a precise value.
-            if matches!(result, Some(None)) {
-                return Ok(());
-            }
-            if let Some(value) = value {
-                charge(budget, value.clone_weight())?;
-            }
-            join_lookup(&mut result, value.cloned(), budget)
-        })? {
-            Ok(result)
+        let mut values = LookupValues::default();
+        if self.visit_resolved_data(locations, key, budget, |value| values.add(value, budget))? {
+            Ok(Some(values.finish(budget)?))
         } else {
             Ok(None)
         }
@@ -1139,6 +1190,42 @@ mod tests {
             ),
             Property::Opaque => (3, None),
         }
+    }
+
+    #[test]
+    fn lookup_accumulates_many_object_values_in_one_set() -> Result<(), BudgetExceeded> {
+        let unlimited = WorkBudget::unlimited("lookup-setup");
+        let mut heap = Environment::new();
+        let mut receivers = Vec::new();
+        let count = 1024;
+        for index in 0..count {
+            let target = heap.allocate(
+                index * 2,
+                OwnData::new(AllocationKind::Ordinary),
+                &unlimited,
+            )?;
+            let mut receiver = OwnData::new(AllocationKind::Ordinary);
+            receiver.define_data("x".into(), Some(target));
+            heap.allocate(index * 2 + 1, receiver, &unlimited)?;
+            receivers.push(index * 2 + 1);
+        }
+        let receivers = Rc::from(receivers);
+        // A sequential union would traverse more than 500,000 IDs.
+        let bounded = WorkBudget::new("lookup-many-values", work_budget::BudgetLimits::work(32768));
+        let Some(Some(Fact::Objects(result))) = heap.read(&receivers, "x", &bounded)? else {
+            unreachable!()
+        };
+        assert_eq!(result.len(), count);
+        assert!(result.iter().copied().eq((0..count).map(|index| index * 2)));
+        let mut values = LookupValues::default();
+        let fact = Fact::Objects(Rc::clone(&result));
+        values.add(Some(&fact), &unlimited)?;
+        values.add(Some(&fact), &unlimited)?;
+        let Some(Fact::Objects(shared)) = values.finish(&unlimited)? else {
+            unreachable!()
+        };
+        assert!(Rc::ptr_eq(&shared, &result));
+        Ok(())
     }
 
     #[test]
