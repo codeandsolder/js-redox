@@ -867,24 +867,28 @@ fn replacement_decoder_shape(
     facts: &BindingFacts,
 ) -> Option<PlainDecoderShape> {
     let symbol = function.id.as_ref()?.symbol_id.get()?;
-    let [declaration, Statement::ReturnStatement(result)] =
-        function.body.as_ref()?.statements.as_slice()
-    else {
-        return None;
-    };
+    let (declaration, tail) = function.body.as_ref()?.statements.split_first()?;
     let (table, initializer) = local_initializer(declaration, scoping, parameters)?;
     let provider_symbol = provider_initializer(initializer, scoping, facts)?;
-    let returned = unparenthesized(result.argument.as_ref()?);
-    let (installation, invocation) = if let Expression::SequenceExpression(sequence) = returned {
-        let [installation, invocation] = sequence.expressions.as_slice() else {
-            return None;
-        };
-        (installation, invocation)
-    } else {
-        let Expression::CallExpression(call) = returned else {
-            return None;
-        };
-        (&call.callee, returned)
+    let (installation, invocation, named_tail) = match tail {
+        [Statement::ExpressionStatement(install), Statement::ReturnStatement(result)] => {
+            (&install.expression, result.argument.as_ref()?, true)
+        }
+        [Statement::ReturnStatement(result)] => {
+            let returned = unparenthesized(result.argument.as_ref()?);
+            if let Expression::SequenceExpression(sequence) = returned {
+                let [installation, invocation] = sequence.expressions.as_slice() else {
+                    return None;
+                };
+                (installation, invocation, true)
+            } else {
+                let Expression::CallExpression(call) = returned else {
+                    return None;
+                };
+                (&call.callee, returned, false)
+            }
+        }
+        _ => return None,
     };
     let (target, value) = assignment_identifier(installation)?;
     let reference = target.reference_id.get()?;
@@ -907,9 +911,7 @@ fn replacement_decoder_shape(
     {
         return None;
     }
-    if matches!(returned, Expression::SequenceExpression(_))
-        && exact_identifier(&call.callee, scoping, facts) != Some(symbol)
-    {
+    if named_tail && exact_identifier(&call.callee, scoping, facts) != Some(symbol) {
         return None;
     }
     if !call

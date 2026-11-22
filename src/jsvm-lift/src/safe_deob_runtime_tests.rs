@@ -952,6 +952,8 @@ fn depythonify_safe_deob_plain_decoder_runtime_equivalence() -> Result<()> {
         "function d(i){i=(i)-(16);const /*table*/ t=(p)();return (t)[(i)];}",
         "function d(i){const t=p();return (d=function(x){return t[x-=16]})(i)}",
         "function d(i){const t=p();return d=function(x){x-=16;return t[x]},d(i)}",
+        "function d(i){const t=p();d=function(x){x-=16;return t[x]};return d(i)}",
+        "function d(i){const t=p();d=function(x){x-=16;return t[x]};events.push(i);return d(i)}",
         "function d(i){const t=p();return d=function(x){x=x-16;const v=t[x];return v},d(i)}",
         "function d(i){const t=p();return (d=function named(x){return t[x-=16]})(i)}",
         "function d(i){i=i-16;const t=p();let v=t[i];events.push(v);return v;}",
