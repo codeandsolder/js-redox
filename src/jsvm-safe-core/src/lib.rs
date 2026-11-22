@@ -657,6 +657,7 @@ struct Collector<'s, 'c> {
     function_context: FunctionContext,
     active_labels: Vec<(Span, String)>,
     allow_effect_statements: bool,
+    flattened_blocks: HashSet<Span>,
     replacements: Vec<Replacement>,
 }
 
@@ -812,10 +813,16 @@ impl Collector<'_, '_> {
                     self.push(block.span, String::new(), "remove_empty_block_statement");
                 }
                 Statement::BlockStatement(block) => {
+                    if self.flattened_blocks.contains(&block.span)
+                        || self.is_protected(block.span.start as usize, block.span.end as usize)
+                    {
+                        continue;
+                    }
                     if let Some(flattened) =
                         trivial_loops::flatten_standalone_block(block, self.source, self.scoping)
                     {
-                        self.push(block.span, flattened, "flatten_redundant_block");
+                        self.flattened_blocks.extend(flattened.nested);
+                        self.push(block.span, flattened.text, "flatten_redundant_block");
                     }
                 }
                 _ => {}
@@ -2141,6 +2148,7 @@ fn transform_once(
         function_context: FunctionContext::default(),
         active_labels: Vec::new(),
         allow_effect_statements: false,
+        flattened_blocks: HashSet::new(),
         replacements: Vec::new(),
     };
     // All facts above are immutable and indexed to this source/AST. A
@@ -2151,6 +2159,7 @@ fn transform_once(
     for allow_effect_statements in [false, true] {
         budget.checkpoint()?;
         collector.allow_effect_statements = allow_effect_statements;
+        collector.flattened_blocks.clear();
         collector.replacements = if allow_effect_statements {
             std::mem::take(&mut initial_replacements)
         } else {
@@ -7539,7 +7548,23 @@ mod tests {
         assert!(!output.source.contains("{ {"), "{}", output.source);
         assert!(output.source.contains("x+=1"), "{}", output.source);
         assert!(output.source.contains("x*=2"), "{}", output.source);
-        assert_eq!(output.transforms.get("flatten_redundant_block"), Some(&2));
+        assert_eq!(output.transforms.get("flatten_redundant_block"), Some(&1));
+    }
+
+    #[test]
+    fn flattens_deep_standalone_regions_without_per_layer_reparsing() {
+        let input = format!(
+            "function f(x){{{}x+=1;{}return x;}}",
+            "{/*open*/".repeat(32),
+            "/*close*/}".repeat(32),
+        );
+        let output = deobfuscate(&input, 8).unwrap_or_else(|| unreachable!());
+        assert!(output.analysis_complete, "{}", output.source);
+        assert!(output.iterations <= 2, "{}", output.iterations);
+        assert_eq!(output.transforms.get("flatten_redundant_block"), Some(&1));
+        assert_eq!(output.source.matches("/*open*/").count(), 32);
+        assert_eq!(output.source.matches("/*close*/").count(), 32);
+        assert_eq!(output.source.matches('{').count(), 1);
     }
 
     #[test]
