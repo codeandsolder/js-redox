@@ -8,6 +8,7 @@ use crate::{
     analysis_budget::{AnalysisBudgets, AnalysisOperation},
     capture_project::read_manifest,
     js_format::format_source,
+    report_markdown::literal_text,
     runtime_coverage::RuntimeCoverageIndex,
     sha256_hex,
 };
@@ -251,7 +252,8 @@ pub fn materialize_observed_runtime_sources(
             .entry(classification_heading(&category))
             .or_default()
             .push(format!(
-                "- [{origin} · {}](./{digest}.js) — {status}; {instances} witnessed script instance(s), {functions} positive functions, {ranges} positive ranges{readable_link}{}",
+                "- [{} · {}](./{digest}.js) — {status}; {instances} witnessed script instance(s), {functions} positive functions, {ranges} positive ranges{readable_link}{}",
+                literal_text(&origin),
                 &digest[..12],
                 if was_formatted { "" } else { "; unformatted fallback" },
             ));
