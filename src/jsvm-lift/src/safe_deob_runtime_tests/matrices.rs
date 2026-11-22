@@ -412,3 +412,19 @@ fn depythonify_safe_deob_discarded_literal_effects_runtime_equivalence() -> Resu
         ].into_iter().map(str::to_owned).collect(),
     )
 }
+
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_literal_path_facts_runtime_equivalence() -> Result<()> {
+    compare_sources(
+        "literal-path-facts",
+        [
+            "function effect(){events.push('called');return 7} events.push(typeof ([] && 2 ** 1.5), typeof([] || effect()), typeof(false && effect()), typeof(2 ** 1.5 ?? effect()));",
+            "function effect(){events.push('called');return 7} events.push(typeof(0n && effect()),typeof(1n || effect()),typeof(false ? effect():[]),typeof(void 0 ?? 2 ** 1.5));",
+            "events.push([] && 7,0n || 7,0x1n && 7,!(2 ** 1.5 ? null:0n),!(''||/x/),!('\\ud800'&&null));",
+            "function effect(){events.push('called');return 7} events.push(typeof(null ?? effect()),typeof(1n && effect()),typeof(2 ** 1.5 && effect()));",
+            "try{typeof(true && (1n/0n))}catch(e){events.push(e.name)} try{typeof(0n || missing)}catch(e){events.push(e.name)}",
+            "function effect(){events.push('called');return 7} events.push(typeof([effect()] || 1),typeof((2 ** 1.5 ? null:1) ?? effect()));",
+        ].into_iter().map(str::to_owned).collect(),
+    )
+}
