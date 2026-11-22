@@ -412,10 +412,9 @@ pub fn eval_binary(op: &str, left: &Value, right: &Value) -> Option<Value> {
         "*" => Some(Value::Number(left.number() * right.number())),
         "/" => Some(Value::Number(left.number() / right.number())),
         "%" => Some(Value::Number(left.number() % right.number())),
-        "**" => Some(Value::Number(crate::numeric::js_number_exponentiate(
-            left.number(),
-            right.number(),
-        ))),
+        "**" => {
+            crate::numeric::js_number_exponentiate(left.number(), right.number()).map(Value::Number)
+        }
         "<<" => {
             let shift = js_to_uint32(right.number()) & 31;
             Some(Value::Number(f64::from(
