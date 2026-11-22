@@ -205,7 +205,7 @@ pub fn strict_primitive_equal(a: &Value, b: &Value) -> bool {
 
 /// Compare two proof facts without conflating opposite signed zeros or
 /// distinct floating-point encodings. This is intentionally stricter than
-/// ECMAScript SameValue, which treats all NaNs as equal.
+/// ECMAScript `SameValue`, which treats all NaNs as equal.
 #[must_use = "Only merge primitive facts when their represented values are identical"]
 pub fn identical_primitive_value(left: &Value, right: &Value) -> bool {
     match (left, right) {
@@ -642,7 +642,10 @@ mod primitive_equality_tests {
             &[positive_zero],
             &[negative_zero]
         ));
-        assert!(identical_primitive_values(&[nan.clone()], &[nan]));
+        assert!(identical_primitive_values(
+            std::slice::from_ref(&nan),
+            std::slice::from_ref(&nan)
+        ));
         assert!(!identical_primitive_values(&[other_nan], &[]));
         assert!(identical_primitive_value(
             &Value::String("a".into()),
