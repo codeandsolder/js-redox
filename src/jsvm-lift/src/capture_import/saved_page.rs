@@ -1,14 +1,12 @@
 use crate::{
     browser_decode::{decode_html, DecodedHtml},
     browser_script_types::{inline_script_extension, is_executable_script, script_type_essence},
-    capture_project::{
-        prepare_project_output, write_manifest, CaptureManifest, CaptureSource, MANIFEST_NAME,
-        SCHEMA,
-    },
+    capture_project::{write_manifest, CaptureManifest, CaptureSource, MANIFEST_NAME, SCHEMA},
     har_project::{
         html::{extract_script_tags, find_tag_end, parse_attrs},
         resource::resource_kind,
     },
+    project_output::ProjectOutput,
     sha256_hex,
     source_directive::source_directives,
 };
@@ -721,13 +719,6 @@ pub(super) fn import_saved_page(
     if !page.is_file() {
         bail!("saved page HTML does not exist: {}", page.display());
     }
-    let output = if output.is_absolute() {
-        output.to_owned()
-    } else {
-        std::env::current_dir()?.join(output)
-    };
-    prepare_project_output(&output, options.overwrite)?;
-
     let page_bytes = fs::read(&page)?;
     let decoded = decode_html(&page_bytes, None, None);
     budget.checkpoint()?;
@@ -753,9 +744,13 @@ pub(super) fn import_saved_page(
         })?;
     }
 
+    let mut inputs = vec![page.as_path()];
+    inputs.extend(assets.as_deref());
+    let staged = ProjectOutput::new(output, options.overwrite, &inputs)?;
+    let output = staged.path();
     let (page_rel, files) = collect_saved_page_files(&page, assets.as_deref(), budget)?;
     let (mut resources, rel_to_id) =
-        materialize_saved_resources(&page, &output, &files, &decoded, budget)?;
+        materialize_saved_resources(&page, output, &files, &decoded, budget)?;
     let page_id = *rel_to_id
         .get(&page_rel)
         .context("saved page resource disappeared")?;
@@ -773,7 +768,7 @@ pub(super) fn import_saved_page(
     reconcile_saved_reference_roles(&mut resources, &page_refs, budget)?;
     collect_saved_resource_references(&mut resources, budget)?;
     let inline_scripts = materialize_saved_inline_scripts(
-        page_text, &page_rel, &page_url, page_id, &decoded, &output, budget,
+        page_text, &page_rel, &page_url, page_id, &decoded, output, budget,
     )?;
     let manifest = saved_page_manifest(
         &page,
@@ -791,6 +786,9 @@ pub(super) fn import_saved_page(
         output.join(".vscode/settings.json"),
         "{\n  \"editor.maxTokenizationLineLength\": 200000\n}\n",
     )?;
+
+    budget.checkpoint()?;
+    staged.publish()?;
 
     Ok(SavedPageSummary {
         resources: manifest.resources.len(),

@@ -1,4 +1,3 @@
-use crate::capture_project::prepare_project_output;
 use anyhow::Result;
 use std::path::PathBuf;
 use work_budget::WorkBudget;
@@ -16,7 +15,6 @@ use parse::read_har;
 pub struct HarProjectOptions {
     pub har: PathBuf,
     pub output: PathBuf,
-    pub overwrite: bool,
 }
 
 /// Small import result for callers that need counts without decoding the manifest again.
@@ -26,13 +24,12 @@ pub struct HarProjectSummary {
     pub(crate) script_records: usize,
 }
 
-/// Materialize a HAR capture as a canonical capture project.
+/// Materialize a HAR capture into an isolated, empty project staging directory.
 pub fn import_har_project(
     args: &HarProjectOptions,
     budget: &WorkBudget,
 ) -> Result<HarProjectSummary> {
     budget.checkpoint()?;
-    prepare_project_output(&args.output, args.overwrite)?;
     let (har, salvaged, parse_error, parse_warnings) = read_har(&args.har, budget)?;
     budget.checkpoint()?;
     materialize_project(args, har, salvaged, parse_error, parse_warnings, budget)
