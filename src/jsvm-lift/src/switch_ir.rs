@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{Expression, Statement};
 use oxc_span::{GetSpan, SourceType};
@@ -7,7 +7,6 @@ use rolldown_redox::ecmascript::parse_program;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    fs,
     path::Path,
 };
 
@@ -93,13 +92,6 @@ struct SwitchVmIr {
     role_bindings: BTreeMap<String, String>,
     helper_bindings: BTreeMap<String, String>,
     handlers: Vec<SwitchHandlerIr>,
-}
-
-#[derive(Debug, Serialize)]
-struct Output {
-    schema: &'static str,
-    source: String,
-    vms: Vec<SwitchVmIr>,
 }
 
 const fn is_ident_char(c: char) -> bool {
@@ -888,26 +880,12 @@ pub fn materialize(
     output_path: &Path,
     budget: &WorkBudget,
 ) -> Result<()> {
-    budget.checkpoint()?;
-    let source = fs::read_to_string(source_path)
-        .with_context(|| format!("reading {}", source_path.display()))?;
-    let report: ScanReport = serde_json::from_str(
-        fs::read_to_string(scan_path)
-            .with_context(|| format!("reading {}", scan_path.display()))?
-            .trim(),
-    )
-    .with_context(|| format!("parsing {}", scan_path.display()))?;
-    budget.checkpoint()?;
-    let output = Output {
-        schema: "jsvm-switch-ir/v0",
-        source: source_path.display().to_string(),
-        vms: lift_switch_vms(&source, &report, budget)?,
-    };
-    budget.checkpoint()?;
-    fs::write(
+    crate::semantic_ir::publish_report(
+        source_path,
+        scan_path,
         output_path,
-        format!("{}\n", serde_json::to_string_pretty(&output)?),
+        budget,
+        "jsvm-switch-ir/v0",
+        lift_switch_vms,
     )
-    .with_context(|| format!("writing {}", output_path.display()))?;
-    Ok(())
 }

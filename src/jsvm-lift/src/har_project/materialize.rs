@@ -15,7 +15,7 @@ use crate::{
 use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::{Map, Value};
-use std::{collections::BTreeMap, fmt::Write as _, fs, path::Path};
+use std::{collections::BTreeMap, fmt::Write as _, path::Path};
 use url::Url;
 
 use work_budget::WorkBudget;
@@ -428,11 +428,7 @@ fn build_manifest(
 
 fn write_project_metadata(args: &HarProjectOptions, manifest: &CaptureManifest) -> Result<()> {
     write_manifest(&args.output.join(MANIFEST_NAME), manifest)?;
-    fs::create_dir_all(args.output.join(".vscode"))?;
-    fs::write(
-        args.output.join(".vscode/settings.json"),
-        "{\n  \"editor.maxTokenizationLineLength\": 200000\n}\n",
-    )?;
+    crate::capture_project::write_editor_settings(&args.output)?;
     let mut summary = String::new();
     for (kind, count) in &manifest.counts {
         let _ = writeln!(summary, "- {kind}: {count}");
