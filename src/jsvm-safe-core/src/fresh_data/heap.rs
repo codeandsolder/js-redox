@@ -234,6 +234,19 @@ impl Properties {
         self.listed.insert(key, property);
     }
 
+    fn replace(
+        &mut self,
+        key: &str,
+        next: Property,
+        strength: Strength,
+        budget: &WorkBudget,
+    ) -> Result<(), BudgetExceeded> {
+        charge(budget, key.len().saturating_add(next.clone_weight()))?;
+        let replacement = strength.replace(self.get(key), next, budget)?;
+        self.insert(key.to_owned(), replacement);
+        Ok(())
+    }
+
     fn charge_clone(&self, budget: &WorkBudget) -> Result<(), BudgetExceeded> {
         charge(budget, self.listed.capacity())?;
         for (key, property) in &self.listed {
@@ -307,6 +320,30 @@ impl Properties {
     }
 }
 
+/// A possible receiver retains both the old and new descriptor states.
+#[derive(Clone, Copy)]
+enum Strength {
+    Strong,
+    Weak,
+}
+
+impl Strength {
+    fn replace(
+        self,
+        previous: &Property,
+        next: Property,
+        budget: &WorkBudget,
+    ) -> Result<Property, BudgetExceeded> {
+        match self {
+            Self::Strong => Ok(next),
+            Self::Weak => {
+                previous.charge_pair(&next, budget)?;
+                Ok(previous.join(&next))
+            }
+        }
+    }
+}
+
 /// Explicit prototypes of fresh allocations are known by identity. The
 /// ordinary intrinsic prototype is deliberately unknown: its properties
 /// may have been modified before a literal was even evaluated.
@@ -357,8 +394,14 @@ impl OwnData {
         }
     }
 
-    fn delete_own(&mut self, key: &str) {
-        self.properties.insert(key.to_owned(), Property::Absent);
+    fn delete_own(
+        &mut self,
+        key: &str,
+        strength: Strength,
+        budget: &WorkBudget,
+    ) -> Result<(), BudgetExceeded> {
+        self.properties
+            .replace(key, Property::Absent, strength, budget)
     }
 
     /// An unknown computed definition can overwrite any one own key,
@@ -440,32 +483,43 @@ impl OwnData {
         !self.is_length(key) || Self::length_value(value).is_some()
     }
 
-    fn write(&mut self, key: &str, value: Option<Fact>) {
+    fn write(
+        &mut self,
+        key: &str,
+        value: Option<Fact>,
+        strength: Strength,
+        budget: &WorkBudget,
+    ) -> Result<(), BudgetExceeded> {
         if self.is_length(key) {
             let Some(length) = Self::length_value(&value) else {
-                return;
+                return Ok(());
             };
-            // All indexed properties of a still-fresh Array literal are
-            // configurable. ArraySetLength only removes indices >= length.
+            // Truncation changes only the removed indices and length.
+            charge(budget, self.properties.listed.capacity())?;
             for (key, property) in &mut self.properties.listed {
+                charge(budget, key.len())?;
                 if canonical_array_index_key(key).is_some_and(|index| index >= length) {
-                    *property = Property::Absent;
+                    *property = strength.replace(property, Property::Absent, budget)?;
                 }
             }
-            self.define_data(
-                key.to_owned(),
-                Some(Fact::Primitive(Value::Number(f64::from(length)))),
-            );
+            self.properties.replace(
+                key,
+                Property::Data(Some(Fact::Primitive(Value::Number(f64::from(length))))),
+                strength,
+                budget,
+            )
         } else {
             if self.kind == AllocationKind::Array {
                 if let Some(index) = canonical_array_index_key(key) {
                     let length = self.exact_length().map(|length| {
                         Fact::Primitive(Value::Number(f64::from(length.max(index + 1))))
                     });
-                    self.define_data("length".to_owned(), length);
+                    self.properties
+                        .replace("length", Property::Data(length), strength, budget)?;
                 }
             }
-            self.define_data(key.to_owned(), value);
+            self.properties
+                .replace(key, Property::Data(value), strength, budget)
         }
     }
 }
@@ -956,50 +1010,25 @@ impl Environment {
     fn update(
         &mut self,
         locations: &Locations,
-        key: &str,
-        value: Option<&Fact>,
         budget: &WorkBudget,
-        apply: impl Fn(&mut OwnData),
+        apply: impl Fn(&mut OwnData, Strength) -> Result<(), BudgetExceeded>,
     ) -> Result<bool, BudgetExceeded> {
         charge(budget, locations.len())?;
-        let weak = locations.len() != 1;
-        // Charge receiver enumeration and descriptor copies before writes.
-        // The caller has already checked ordinary mutation eligibility.
-        if locations.is_empty() {
-            return Ok(false);
-        }
+        let strength = match locations.as_ref() {
+            [] => return Ok(false),
+            [_] => Strength::Strong,
+            _ => Strength::Weak,
+        };
         self.charge_allocation_copy(budget)?;
-        for id in locations.iter() {
-            let Some(data) = self.allocations.get(id) else {
-                return Ok(false);
-            };
-            charge(
-                budget,
-                key.len()
-                    .saturating_add(value.map_or(1, Fact::clone_weight)),
-            )?;
-            if weak || Rc::strong_count(data) > 1 || Rc::strong_count(&self.allocations) > 1 {
-                data.properties.charge_clone(budget)?;
-            }
-            if data.is_length(key) {
-                charge(budget, data.properties.listed.capacity())?;
-            }
-        }
         let allocations = Rc::make_mut(&mut self.allocations);
         for id in locations.iter() {
             let Some(data) = allocations.get_mut(id) else {
                 return Ok(false);
             };
-            if weak {
-                let mut updated = data.as_ref().clone();
-                apply(&mut updated);
-                if Rc::strong_count(data) > 1 {
-                    data.properties.charge_clone(budget)?;
-                }
-                Rc::make_mut(data).join(&updated, budget)?;
-            } else {
-                apply(Rc::make_mut(data));
+            if Rc::strong_count(data) > 1 {
+                data.properties.charge_clone(budget)?;
             }
+            apply(Rc::make_mut(data), strength)?;
         }
         Ok(true)
     }
@@ -1030,8 +1059,11 @@ impl Environment {
         }) {
             return Ok(false);
         }
-        self.update(locations, key, value.as_ref(), budget, |data| {
-            data.write(key, value.clone())
+        self.update(locations, budget, |data, strength| {
+            if let Some(value) = &value {
+                charge(budget, value.clone_weight())?;
+            }
+            data.write(key, value.clone(), strength, budget)
         })
     }
 
@@ -1051,13 +1083,94 @@ impl Environment {
         }) {
             return Ok(false);
         }
-        self.update(locations, key, None, budget, |data| data.delete_own(key))
+        self.update(locations, budget, |data, strength| {
+            data.delete_own(key, strength, budget)
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn descriptor_shape(property: &Property) -> (u8, Option<String>) {
+        match property {
+            Property::Absent => (0, None),
+            Property::Data(value) => (
+                1,
+                value
+                    .as_ref()
+                    .and_then(Fact::primitive)
+                    .and_then(Value::render),
+            ),
+            Property::MaybeData(value) => (
+                2,
+                value
+                    .as_ref()
+                    .and_then(Fact::primitive)
+                    .and_then(Value::render),
+            ),
+            Property::Opaque => (3, None),
+        }
+    }
+
+    #[test]
+    fn local_weak_mutations_match_full_object_join() -> Result<(), BudgetExceeded> {
+        let budget = WorkBudget::unlimited("weak-update-oracle");
+        for kind in [AllocationKind::Ordinary, AllocationKind::Array] {
+            for unknown_tail in [false, true] {
+                let mut original = OwnData::new(kind);
+                for key in ["0", "1", "3", "x"] {
+                    original.define_data(key.into(), Some(Fact::Primitive(Value::Number(7.0))));
+                }
+                original.define_data("length".into(), Some(Fact::Primitive(Value::Number(4.0))));
+                original.define_accessor("getter".into());
+                if unknown_tail {
+                    original.unknown_array_tail();
+                }
+                for (key, value) in [
+                    ("0", Some(Fact::Primitive(Value::Number(8.0)))),
+                    ("3", None),
+                    ("9", Some(Fact::Primitive(Value::Number(8.0)))),
+                    ("length", Some(Fact::Primitive(Value::Number(1.0)))),
+                    ("x", None),
+                    ("new", None),
+                ] {
+                    let mut changed = original.clone();
+                    changed.write(key, value.clone(), Strength::Strong, &budget)?;
+                    let mut expected = original.clone();
+                    expected.join(&changed, &budget)?;
+                    let mut actual = original.clone();
+                    actual.write(key, value, Strength::Weak, &budget)?;
+                    for key in [
+                        "0", "1", "3", "9", "length", "x", "new", "getter", "unlisted",
+                    ] {
+                        assert_eq!(
+                            descriptor_shape(actual.property(key)),
+                            descriptor_shape(expected.property(key)),
+                            "{key}"
+                        );
+                    }
+                }
+                for key in ["0", "3", "x", "getter", "new"] {
+                    let mut changed = original.clone();
+                    changed.delete_own(key, Strength::Strong, &budget)?;
+                    let mut expected = original.clone();
+                    expected.join(&changed, &budget)?;
+                    let mut actual = original.clone();
+                    actual.delete_own(key, Strength::Weak, &budget)?;
+                    for key in ["0", "1", "3", "length", "x", "new", "getter", "unlisted"] {
+                        assert_eq!(
+                            descriptor_shape(actual.property(key)),
+                            descriptor_shape(expected.property(key)),
+                            "{key}"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn budget_accounts_for_prototype_edges_and_weak_descriptor_updates(
@@ -1092,7 +1205,8 @@ mod tests {
         heap.allocate(128, data.clone(), &unlimited)?;
         heap.allocate(129, data, &unlimited)?;
         let locations = Rc::from([128, 129]);
-        let bounded = WorkBudget::new("weak-write", work_budget::BudgetLimits::work(32));
+        let shared = heap.clone();
+        let bounded = WorkBudget::new("weak-write-copy", work_budget::BudgetLimits::work(32));
         assert!(heap
             .write(
                 &locations,
@@ -1105,11 +1219,13 @@ mod tests {
             heap.read(&locations, "key0", &unlimited)?,
             Some(Some(Fact::Primitive(Value::Number(7.0))))
         ));
+        drop(shared);
+        let bounded = WorkBudget::new("weak-write-local", work_budget::BudgetLimits::work(128));
         assert!(heap.write(
             &locations,
             "key0",
             Some(Fact::Primitive(Value::Number(9.0))),
-            &unlimited
+            &bounded
         )?);
         assert!(matches!(
             heap.read(&locations, "key0", &unlimited)?,
