@@ -132,7 +132,10 @@ mod tests {
         ] {
             assert_eq!(index.cdp_byte_offset(source, row, col, 0, 0), expected);
             if let Some(offset) = expected {
-                assert_eq!(index.byte_line_column(offset).0, row as usize + 1);
+                assert_eq!(
+                    u64::try_from(index.byte_line_column(offset).0).ok(),
+                    Some(row + 1)
+                );
             }
         }
         assert_eq!(index.character_line_column(source, 4), Some((1, 2)));
