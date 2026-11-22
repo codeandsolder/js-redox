@@ -3,7 +3,7 @@
 
 use crate::{
     fragment,
-    value_eval::{eval, same_value},
+    value_eval::{eval, identical_primitive_value, strict_primitive_equal},
 };
 use oxc_ast::ast::{Expression, Statement, SwitchStatement};
 use oxc_ast_visit::{walk, Visit};
@@ -64,7 +64,7 @@ pub fn select_constant_switch(node: &SwitchStatement<'_>, source: &str) -> Optio
             // Case expressions after a match are never evaluated, so don't
             // demand they be analyzable (or side-effect free).
             let test = eval(test)?;
-            if same_value(&discriminant, &test) {
+            if strict_primitive_equal(&discriminant, &test) {
                 matched = Some(index);
                 break;
             }
@@ -233,13 +233,7 @@ fn value_after_evaluation(expr: &Expression<'_>) -> Option<crate::value_eval::Va
         Expression::ConditionalExpression(conditional) => {
             let yes = value_after_evaluation(&conditional.consequent)?;
             let no = value_after_evaluation(&conditional.alternate)?;
-            // JS strict equality equates +0 and -0, but arithmetic does not.
-            // A proof carried into enclosing expressions must preserve the sign.
-            let equivalent = match (&yes, &no) {
-                (Value::Number(left), Value::Number(right)) => left.to_bits() == right.to_bits(),
-                _ => same_value(&yes, &no),
-            };
-            if equivalent {
+            if identical_primitive_value(&yes, &no) {
                 Some(yes)
             } else {
                 None

@@ -11,7 +11,7 @@ use crate::{
     trivial_loops::LoopBodyControl,
     value_eval::{
         canonical_array_index, eval, eval_with_resolver, inert_literal_value,
-        known_bool_with_resolver, same_value, Value,
+        known_bool_with_resolver, strict_primitive_equal, Value,
     },
     Collector,
 };
@@ -492,7 +492,7 @@ impl Collector<'_, '_> {
                 for (index, case) in switch.cases.iter().enumerate() {
                     self.budget.checkpoint().ok()?;
                     if let Some(test) = &case.test {
-                        if same_value(value, &environment.value(test)?) {
+                        if strict_primitive_equal(value, &environment.value(test)?) {
                             matched = Some(index);
                             break;
                         }

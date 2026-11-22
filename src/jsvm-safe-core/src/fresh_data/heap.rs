@@ -2,7 +2,9 @@
 //! allocation identities, never snapshots of object contents. Consequently an
 //! effect or a write through an alias also affects previously captured refs.
 use crate::numeric::exact_u32;
-use crate::value_eval::{canonical_array_index_key, same_value, Value};
+use crate::value_eval::{
+    canonical_array_index_key, identical_primitive_value, strict_primitive_equal, Value,
+};
 use oxc_syntax::symbol::SymbolId;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -66,7 +68,7 @@ impl Fact {
     fn join_proven(&self, other: &Self) -> Option<Self> {
         match (self, other) {
             (Self::Primitive(a), Self::Primitive(b)) => {
-                same_primitive_fact(a, b).then(|| self.clone())
+                identical_primitive_value(a, b).then(|| self.clone())
             }
             (Self::Objects(a), Self::Objects(b)) => {
                 if Rc::ptr_eq(a, b) || a == b {
@@ -108,7 +110,7 @@ impl Fact {
     ) -> Result<Option<bool>, BudgetExceeded> {
         self.charge_merge(other, budget)?;
         Ok(match (self, other) {
-            (Self::Primitive(a), Self::Primitive(b)) => Some(same_value(a, b)),
+            (Self::Primitive(a), Self::Primitive(b)) => Some(strict_primitive_equal(a, b)),
             (Self::Objects(a), Self::Objects(b)) => {
                 if a.len() == 1 && b.len() == 1 {
                     return Ok(Some(a == b));
@@ -140,15 +142,6 @@ impl Fact {
             Self::Primitive(value) => Some(value),
             Self::Objects(_) => None,
         }
-    }
-}
-
-/// Heap facts must retain signed zero even though strict equality does
-/// not distinguish it. Keep this predicate separate from JS equality.
-fn same_primitive_fact(left: &Value, right: &Value) -> bool {
-    match (left, right) {
-        (Value::Number(left), Value::Number(right)) => left.to_bits() == right.to_bits(),
-        _ => same_value(left, right),
     }
 }
 
@@ -595,7 +588,7 @@ impl LookupValues {
                         budget,
                         value_weight(left).saturating_add(value_weight(right)),
                     )?;
-                    if !same_primitive_fact(left, right) {
+                    if !identical_primitive_value(left, right) {
                         *self = Self::Unknown;
                     }
                 } else {
