@@ -1269,7 +1269,10 @@ console.log(JSON.stringify(output));
             position(&phases, "| Call | second;"),
             position(&phases, "| ToNumeric | unary -;"),
             position(&phases, "| Call | third;"),
-            position(&phases, "| ToNumeric | unary ~;"),
+            position(
+                &phases,
+                &format!("| ToNumeric | {};", literal_text("unary ~")),
+            ),
         ];
         assert!(ordered.windows(2).all(|pair| pair[0] < pair[1]), "{phases}");
         assert!(
