@@ -1,3 +1,5 @@
+#[path = "safe_deob_runtime_tests/literal_proofs.rs"]
+mod literal_proofs;
 #[path = "safe_deob_runtime_tests/matrices.rs"]
 mod matrices;
 #[path = "safe_deob_runtime_tests/script_observations.rs"]
