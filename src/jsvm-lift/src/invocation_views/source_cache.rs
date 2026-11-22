@@ -66,7 +66,7 @@ impl<'a> VerifiedSources<'a> {
     pub(super) fn load(&mut self, sha: &str) -> Result<Rc<VerifiedSource>> {
         self.budget.consume(1)?;
         ensure!(
-            sha.len() == 64 && sha.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            crate::content_dedup::is_canonical_sha256(sha),
             "invalid original runtime source digest"
         );
         if let Some(source) = self.entries.get(sha) {
@@ -149,6 +149,11 @@ mod tests {
         let mut fresh = VerifiedSources::new(root, &budget, SOURCE_CACHE_BYTES);
         assert!(fresh.load(&sha).is_err());
         assert!(fresh.load("../invalid").is_err());
+        let error = fresh
+            .load(&sha.to_uppercase())
+            .err()
+            .context("uppercase digest accepted")?;
+        assert_eq!(error.to_string(), "invalid original runtime source digest");
         Ok(())
     }
 
