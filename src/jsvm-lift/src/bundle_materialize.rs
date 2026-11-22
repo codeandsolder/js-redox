@@ -342,7 +342,7 @@ fn write_module_readme(module_root: &Path, bundles: &[Value], modules: &[Value])
         }
         lines.push(String::new());
     }
-    fs::write(module_root.join("README.md"), lines.join("\n"))
+    crate::report_file::write_text(&module_root.join("README.md"), &lines.join("\n"))
         .with_context(|| format!("writing {}/README.md", module_root.display()))
 }
 

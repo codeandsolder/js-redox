@@ -6,13 +6,9 @@ use crate::{
     capture_project::validate_project_relative_path,
     report_markdown::{code_span, link_destination},
 };
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde_json::Value;
-use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
-    fs,
-    path::Path,
-};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use work_budget::WorkBudget;
 
 fn fields<'a>(value: &'a Value, key: &str) -> &'a [Value] {
@@ -119,18 +115,22 @@ impl<'a> NavigationIndex<'a> {
     }
 }
 
-/// Materializes a complete navigator of HTML-declared scripts and their
+pub(crate) struct EntrypointIndex {
+    pub(crate) markdown: String,
+    pub(crate) declared_scripts: usize,
+}
+
+/// Renders a complete navigator of HTML-declared scripts and their
 /// statically resolved transitive JavaScript imports. Returns the number of
 /// distinct declared script entries; an empty index is still useful for
 /// explaining why there is no HTML-root code path in a capture.
-pub(crate) fn write_entrypoint_index(
-    project: &Path,
+pub(crate) fn render_entrypoint_index(
     manifest: &Value,
     source_index: &Value,
     deob: &Value,
     references: &Value,
     budget: &WorkBudget,
-) -> Result<usize> {
+) -> Result<EntrypointIndex> {
     budget.consume(u64::try_from(fields(source_index, "units").len())?)?;
     budget.consume(u64::try_from(fields(deob, "units").len())?)?;
     budget.consume(u64::try_from(fields(references, "code_units").len())?)?;
@@ -286,11 +286,10 @@ pub(crate) fn write_entrypoint_index(
         lines.push(String::new());
     }
     budget.checkpoint()?;
-    let output = project.join("src/ENTRYPOINTS.md");
-    fs::create_dir_all(output.parent().context("entrypoint index has no parent")?)?;
-    fs::write(&output, lines.join("\n"))
-        .with_context(|| format!("writing {}", output.display()))?;
-    Ok(roots)
+    Ok(EntrypointIndex {
+        markdown: lines.join("\n"),
+        declared_scripts: roots,
+    })
 }
 
 #[cfg(test)]
@@ -325,8 +324,6 @@ mod tests {
 
     #[test]
     fn entrypoint_index_escapes_all_labels_and_deduplicates_dense_traversal() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let project = directory.path();
         let manifest = json!({
             "resources":[{"id":0,"url":"https://fixture.invalid/[doc]`\n# not a heading"}],
             "inline_scripts":[{"parent_resource_id":0,"ordinal":1,"script_type":"module","resolved_src":"entry"}]
@@ -342,19 +339,15 @@ mod tests {
             {"raw_path":"resources/c.js","references":[{"kind":"import_static","specifier":"cycle","resolved_url":"entry"}]}
         ]});
         let deob = json!({"units":[]});
-        assert_eq!(
-            write_entrypoint_index(
-                project,
-                &manifest,
-                &units,
-                &deob,
-                &references,
-                &WorkBudget::unlimited("fixture")
-            )?,
-            1
-        );
-        let output = project.join("src/ENTRYPOINTS.md");
-        let original = fs::read_to_string(&output)?;
+        let report = render_entrypoint_index(
+            &manifest,
+            &units,
+            &deob,
+            &references,
+            &WorkBudget::unlimited("fixture"),
+        )?;
+        assert_eq!(report.declared_scripts, 1);
+        let original = report.markdown;
         assert!(original.contains("`` pkg`\\n# fake ``"), "{original}");
         for body in ["a.js", "b.js", "c.js"] {
             assert_eq!(
@@ -368,11 +361,7 @@ mod tests {
         }
         assert!(!original.contains("\n# not a heading\n"));
         let budget = WorkBudget::new("exhausted fixture", BudgetLimits::work(12));
-        assert!(
-            write_entrypoint_index(project, &manifest, &units, &deob, &references, &budget)
-                .is_err()
-        );
-        assert_eq!(fs::read_to_string(output)?, original);
+        assert!(render_entrypoint_index(&manifest, &units, &deob, &references, &budget).is_err());
         Ok(())
     }
 }

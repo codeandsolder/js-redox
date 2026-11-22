@@ -208,10 +208,7 @@ pub fn materialize_observed_runtime_sources(
         };
         let target = format!("src/_observed/{digest}.js");
         let absolute = project.join(&target);
-        if let Some(parent) = absolute.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&absolute, text)?;
+        crate::report_file::write_text(&absolute, &text)?;
         stale_paths.remove(&target);
         summary.witnessed_sources += 1;
         if was_formatted {
@@ -288,7 +285,7 @@ pub fn materialize_observed_runtime_sources(
             }
             readme.push('\n');
         }
-        fs::write(project.join("src/_observed/README.md"), readme)?;
+        crate::report_file::write_text(&project.join("src/_observed/README.md"), &readme)?;
     }
     let doc = json!({
         "schema":OBSERVED_SOURCE.schema,
