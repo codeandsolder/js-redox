@@ -2177,7 +2177,9 @@ fn transform_once(
             counts,
             arithmetic_state_proofs,
             iteration,
-        ) else {
+            budget,
+        )?
+        else {
             return Ok(None);
         };
         if next != source {
@@ -2243,7 +2245,9 @@ fn recover_static_decoders_with_mode(
             &mut counts,
             &mut Vec::new(),
             iteration,
-        ) else {
+            budget,
+        )?
+        else {
             return Ok(None);
         };
         if next == current {
