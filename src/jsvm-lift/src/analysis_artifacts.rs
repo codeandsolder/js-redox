@@ -273,7 +273,11 @@ pub fn read_artifact(path: &Path, spec: ArtifactSpec) -> Result<Value> {
 /// Propagates read, parse and validation failures; a missing optional artifact returns `Ok(None)`.
 pub fn load_artifact(project: &Path, spec: ArtifactSpec, optional: bool) -> Result<Option<Value>> {
     let path = artifact_path(project, spec);
-    if optional && !path.exists() {
+    if optional
+        && !path
+            .try_exists()
+            .with_context(|| format!("checking {}", path.display()))?
+    {
         return Ok(None);
     }
     read_artifact(&path, spec).map(Some)

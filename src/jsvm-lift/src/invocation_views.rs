@@ -16,7 +16,12 @@ use crate::{
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::fmt::Write as _;
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{
+    collections::BTreeMap,
+    fs,
+    io::{ErrorKind, Read},
+    path::Path,
+};
 
 fn display_json(value: &Value) -> Result<String> {
     let raw = serde_json::to_string_pretty(value)?;
@@ -368,6 +373,66 @@ fn build_observed_path_view(
     Ok(page)
 }
 
+fn has_path_steps(hit: &Value) -> bool {
+    hit.get("steps")
+        .and_then(Value::as_array)
+        .is_some_and(|steps| !steps.is_empty())
+}
+
+/// Identify only the exact names emitted by the renderer, including ordinals
+/// larger than four digits. Other Markdown files are not owned by this pass.
+fn generated_page(file: &str) -> Option<(usize, bool)> {
+    let (number, path) = file
+        .strip_suffix("-path.md")
+        .map(|number| (number, true))
+        .or_else(|| file.strip_suffix(".md").map(|number| (number, false)))?;
+    let ordinal = number.parse::<usize>().ok()?;
+    (number == format!("{ordinal:04}")).then_some((ordinal, path))
+}
+
+fn remove_obsolete_pages(output: &Path, hits: Option<&[Value]>) -> Result<()> {
+    let entries = match fs::read_dir(output) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let heading = if let Some((ordinal, path)) = generated_page(name) {
+            if hits
+                .and_then(|hits| hits.get(ordinal))
+                .is_some_and(|hit| !path || has_path_steps(hit))
+            {
+                continue;
+            }
+            if path {
+                format!("# Observed execution path {ordinal:04}\n")
+            } else {
+                format!("# Observed invocation {ordinal:04}\n")
+            }
+        } else if name == "README.md" && hits.is_none() {
+            "# Concrete observed invocations\n".to_owned()
+        } else {
+            continue;
+        };
+        // A canonical filename alone is not proof that a file was generated.
+        // Read only the heading-sized prefix, not arbitrary user content.
+        let mut prefix = vec![0; heading.len()];
+        match fs::File::open(entry.path())?.read_exact(&mut prefix) {
+            Ok(()) if prefix == heading.as_bytes() => fs::remove_file(entry.path())?,
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::UnexpectedEof => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
 /// Render every recorded invocation, including unresolved frames, without treating
 /// source offsets from transformed code as original CDP locations.
 ///
@@ -379,7 +444,9 @@ fn build_observed_path_view(
 /// absent, when a referenced source identity or file cannot be verified, on output
 /// filesystem/serialization errors, or when the analysis budget is exhausted.
 pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -> Result<usize> {
+    let output = project.join("src/_observed/invocations");
     let Some(mut trace) = load_artifact(project, SELECTIVE_TRACE, true)? else {
+        remove_obsolete_pages(&output, None)?;
         return Ok(0);
     };
     let runtime = load_artifact(project, RUNTIME_SCRIPTS, false)?
@@ -390,7 +457,6 @@ pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -
     );
     let identities = runtime_identity_index(&runtime, &budget)?;
     let mut sources = VerifiedSources::new(project, &budget, SOURCE_CACHE_BYTES);
-    let output = project.join("src/_observed/invocations");
     fs::create_dir_all(&output)?;
     let hits = trace
         .get_mut("hits")
@@ -405,6 +471,17 @@ pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -
 
     for (ordinal, hit) in hits.iter_mut().enumerate() {
         budget.checkpoint()?;
+        let fields = hit
+            .as_object_mut()
+            .context("selective trace hit must be an object")?;
+        // These fields describe this rendering pass, never a previous one.
+        for key in [
+            "readable_view_path",
+            "path_view_path",
+            "observed_guard_witnesses",
+        ] {
+            fields.remove(key);
+        }
         let name = format!("{ordinal:04}.md");
         let destination = format!("src/_observed/invocations/{name}");
         let session = session_name(hit.get("cdpSession")).map(ToOwned::to_owned);
@@ -510,11 +587,7 @@ pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -
             session.as_deref(),
             hit,
         )?;
-        if hit
-            .get("steps")
-            .and_then(Value::as_array)
-            .is_some_and(|steps| !steps.is_empty())
-        {
+        if has_path_steps(hit) {
             let path_name = format!("{ordinal:04}-path.md");
             let path_destination = format!("src/_observed/invocations/{path_name}");
             let guards = observed_guards::observe(
@@ -560,38 +633,8 @@ pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -
         );
     }
 
-    // Remove only our own obsolete numbered outputs, never user files.
     let keep = hits.len();
-    for item in fs::read_dir(&output)? {
-        let item = item?;
-        let file = item.file_name();
-        let Some(file) = file.to_str() else { continue };
-        let page_ordinal = file
-            .strip_suffix("-path.md")
-            .and_then(|value| value.parse::<usize>().ok())
-            .or_else(|| {
-                file.strip_suffix(".md")
-                    .and_then(|value| value.parse::<usize>().ok())
-            });
-        if let Some(number) = page_ordinal {
-            if number >= keep && number.to_string().len() <= 4 {
-                fs::remove_file(item.path())?;
-            }
-        }
-        if let Some(number) = file
-            .strip_suffix("-path.md")
-            .and_then(|value| value.parse::<usize>().ok())
-        {
-            if number < keep
-                && !hits[number]
-                    .get("steps")
-                    .and_then(Value::as_array)
-                    .is_some_and(|steps| !steps.is_empty())
-            {
-                fs::remove_file(item.path())?;
-            }
-        }
-    }
+    remove_obsolete_pages(&output, Some(hits))?;
     fs::write(output.join("README.md"), index)?;
     write_artifact(project, SELECTIVE_TRACE, &trace)?;
     Ok(keep)
@@ -768,6 +811,59 @@ mod tests {
         let path = fs::read_to_string(project.join("src/_observed/invocations/0000-path.md"))?;
         assert!(path.contains("Step 0: dispatch"));
         assert!(!path.contains("return handler(opcode)"));
+
+        // Re-running after a capture loses its path must discard both the
+        // previous page and its derived artifact fields.
+        let mut trace = load_artifact(project, SELECTIVE_TRACE, false)?.context("trace")?;
+        trace["hits"][0]["steps"] = json!([]);
+        trace["hits"][0]["observed_guard_witnesses"] = json!([{"kind":"stale"}]);
+        write_artifact(project, SELECTIVE_TRACE, &trace)?;
+        materialize_invocation_views(project, &AnalysisBudgets::standard("path removed"))?;
+        let trace = load_artifact(project, SELECTIVE_TRACE, false)?.context("trace")?;
+        let hit = &trace["hits"][0];
+        assert!(hit.get("path_view_path").is_none());
+        assert!(hit.get("observed_guard_witnesses").is_none());
+        assert!(!project
+            .join("src/_observed/invocations/0000-path.md")
+            .exists());
+        assert!(project.join("src/_observed/invocations/0000.md").is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_keeps_user_files_and_removes_generated_pages_above_four_digits() -> Result<()> {
+        let temp = TempDir::new()?;
+        let output = temp.path().join("src/_observed/invocations");
+        fs::create_dir_all(&output)?;
+        let obsolete = [
+            ("0000.md", "# Observed invocation 0000\n"),
+            ("0000-path.md", "# Observed execution path 0000\n"),
+            ("10000.md", "# Observed invocation 10000\n"),
+            ("10000-path.md", "# Observed execution path 10000\n"),
+            ("README.md", "# Concrete observed invocations\n"),
+        ];
+        let retained = [
+            ("1.md", "# Observed invocation 0001\n"),
+            ("00000.md", "# Observed invocation 0000\n"),
+            ("0001.md", "User notes about invocation 1"),
+            ("0001-path.md", ""),
+            ("notes.md", "# Notes\n"),
+        ];
+        for (name, contents) in obsolete.iter().chain(&retained) {
+            fs::write(output.join(name), contents)?;
+        }
+        fs::create_dir(output.join("0002.md"))?;
+        assert_eq!(
+            materialize_invocation_views(temp.path(), &AnalysisBudgets::standard("removed trace"))?,
+            0
+        );
+        for (name, _) in obsolete {
+            assert!(!output.join(name).exists(), "{name}");
+        }
+        for (name, contents) in retained {
+            assert_eq!(fs::read_to_string(output.join(name))?, contents, "{name}");
+        }
+        assert!(output.join("0002.md").is_dir());
         Ok(())
     }
 }
