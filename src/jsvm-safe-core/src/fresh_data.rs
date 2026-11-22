@@ -31,24 +31,33 @@ enum Reference {
 }
 
 impl Reference {
-    fn read(&self, environment: &Environment) -> Option<Option<Fact>> {
+    fn read(
+        &self,
+        environment: &Environment,
+        budget: &WorkBudget,
+    ) -> Result<Option<Option<Fact>>, BudgetExceeded> {
         match self {
-            Self::Binding(symbol) => Some(environment.get(symbol).cloned()),
-            Self::Member { locations, key } => environment.read(locations, key),
+            Self::Binding(symbol) => Ok(Some(environment.get(symbol).cloned())),
+            Self::Member { locations, key } => environment.read(locations, key, budget),
         }
     }
 
-    fn write(&self, environment: &mut Environment, value: Option<Fact>) -> bool {
+    fn write(
+        &self,
+        environment: &mut Environment,
+        value: Option<Fact>,
+        budget: &WorkBudget,
+    ) -> Result<bool, BudgetExceeded> {
         match self {
             Self::Binding(symbol) => {
                 if let Some(value) = value {
-                    environment.insert(*symbol, value);
+                    environment.insert(*symbol, value, budget)?;
                 } else {
-                    environment.remove(symbol);
+                    environment.remove(symbol, budget)?;
                 }
-                true
+                Ok(true)
             }
-            Self::Member { locations, key } => environment.write(locations, key, value),
+            Self::Member { locations, key } => environment.write(locations, key, value, budget),
         }
     }
 }
@@ -134,6 +143,28 @@ impl Analyzer<'_> {
         }
     }
 
+    fn heap_result<T>(&mut self, result: Result<T, BudgetExceeded>) -> Option<T> {
+        match result {
+            Ok(value) => Some(value),
+            Err(failure) => {
+                if self.failure.is_none() {
+                    self.failure = Some(failure);
+                }
+                None
+            }
+        }
+    }
+
+    fn join_heap(
+        &mut self,
+        environment: &mut Environment,
+        other: &Environment,
+        first_new: AllocationId,
+    ) -> bool {
+        self.heap_result(environment.join(other, first_new, self.budget))
+            .is_some()
+    }
+
     fn barrier(environment: &mut Environment) -> Evaluation {
         environment.clear();
         Evaluation::default()
@@ -206,8 +237,11 @@ impl Analyzer<'_> {
     ) -> Evaluation {
         let id = self.next_allocation;
         self.next_allocation += 1;
+        let Some(fact) = self.heap_result(environment.allocate(id, data, self.budget)) else {
+            return Self::barrier(environment);
+        };
         Evaluation {
-            fact: Some(environment.allocate(id, data)),
+            fact: Some(fact),
             inert,
         }
     }
@@ -234,7 +268,10 @@ impl Analyzer<'_> {
         };
         // The receiver was evaluated before the key, but its contents must
         // be read *after* key evaluation, including any effects on aliases.
-        let Some(fact) = environment.read(&locations, &name) else {
+        let Some(fact) = self
+            .heap_result(environment.read(&locations, &name, self.budget))
+            .flatten()
+        else {
             return Self::barrier(environment);
         };
         let inert = object.inert && key.inert;
@@ -322,7 +359,10 @@ impl Analyzer<'_> {
         let operator = assignment.operator;
         if operator == AssignmentOperator::Assign {
             let value = self.expression(&assignment.right, environment);
-            if !reference.write(environment, value.fact.clone()) {
+            if !self
+                .heap_result(reference.write(environment, value.fact.clone(), self.budget))
+                .unwrap_or(false)
+            {
                 environment.clear();
             }
             return Evaluation {
@@ -331,7 +371,10 @@ impl Analyzer<'_> {
             };
         }
 
-        let Some(previous) = reference.read(environment) else {
+        let Some(previous) = self
+            .heap_result(reference.read(environment, self.budget))
+            .flatten()
+        else {
             return Self::barrier(environment);
         };
         if let Some(logical) = operator.to_logical_operator() {
@@ -346,11 +389,16 @@ impl Analyzer<'_> {
             }
             let skipped = (decision.is_none()).then(|| (environment.clone(), self.next_allocation));
             let value = self.expression(&assignment.right, environment);
-            if !reference.write(environment, value.fact.clone()) {
+            if !self
+                .heap_result(reference.write(environment, value.fact.clone(), self.budget))
+                .unwrap_or(false)
+            {
                 environment.clear();
             }
             if let Some((skipped, first_new)) = skipped {
-                environment.join(&skipped, first_new);
+                if !self.join_heap(environment, &skipped, first_new) {
+                    return Self::barrier(environment);
+                }
                 return Evaluation {
                     fact: None,
                     inert: false,
@@ -374,7 +422,10 @@ impl Analyzer<'_> {
             return Self::barrier(environment);
         };
         let fact = Fact::Primitive(value);
-        if !reference.write(environment, Some(fact.clone())) {
+        if !self
+            .heap_result(reference.write(environment, Some(fact.clone()), self.budget))
+            .unwrap_or(false)
+        {
             environment.clear();
         }
         Evaluation {
@@ -391,8 +442,9 @@ impl Analyzer<'_> {
         let Some(reference) = self.reference(&update.argument, environment) else {
             return Self::barrier(environment);
         };
-        let Some(previous) = reference
-            .read(environment)
+        let Some(previous) = self
+            .heap_result(reference.read(environment, self.budget))
+            .flatten()
             .flatten()
             .and_then(|fact| fact.primitive()?.number())
         else {
@@ -403,7 +455,14 @@ impl Analyzer<'_> {
         } else {
             previous - 1.0
         };
-        if !reference.write(environment, Some(Fact::Primitive(Value::Number(next)))) {
+        if !self
+            .heap_result(reference.write(
+                environment,
+                Some(Fact::Primitive(Value::Number(next))),
+                self.budget,
+            ))
+            .unwrap_or(false)
+        {
             environment.clear();
         }
         Evaluation::primitive(
@@ -424,7 +483,10 @@ impl Analyzer<'_> {
         let Some(Reference::Member { locations, key }) = reference else {
             return Self::barrier(environment);
         };
-        if environment.delete(&locations, &key) {
+        if self
+            .heap_result(environment.delete(&locations, &key, self.budget))
+            .unwrap_or(false)
+        {
             Evaluation::primitive(Value::Bool(true), false)
         } else {
             Self::barrier(environment)
@@ -505,11 +567,14 @@ impl Analyzer<'_> {
                     }
                 }
                 if matches!(operator, "===" | "!==") {
-                    let equal = left
-                        .fact
-                        .as_ref()
-                        .zip(right.fact.as_ref())
-                        .and_then(|(left, right)| left.strict_equal(right));
+                    let equal = if let (Some(left), Some(right)) =
+                        (left.fact.as_ref(), right.fact.as_ref())
+                    {
+                        self.heap_result(left.strict_equal(right, self.budget))
+                            .flatten()
+                    } else {
+                        None
+                    };
                     Evaluation {
                         fact: equal.map(|equal| {
                             Fact::Primitive(Value::Bool(equal == (operator == "===")))
@@ -537,7 +602,9 @@ impl Analyzer<'_> {
                         let skip = environment.clone();
                         let first_new = self.next_allocation;
                         let right = self.expression(&logical.right, environment);
-                        environment.join(&skip, first_new);
+                        if !self.join_heap(environment, &skip, first_new) {
+                            return Self::barrier(environment);
+                        }
                         Evaluation {
                             fact: None,
                             inert: left.inert && right.inert,
@@ -561,13 +628,17 @@ impl Analyzer<'_> {
                 let first_new = self.next_allocation;
                 let left = self.expression(&conditional.consequent, environment);
                 let right = self.expression(&conditional.alternate, &mut other);
-                environment.join(&other, first_new);
+                if !self.join_heap(environment, &other, first_new) {
+                    return Self::barrier(environment);
+                }
+                let fact =
+                    if let (Some(left), Some(right)) = (left.fact.as_ref(), right.fact.as_ref()) {
+                        self.heap_result(left.join(right, self.budget)).flatten()
+                    } else {
+                        None
+                    };
                 Evaluation {
-                    fact: left
-                        .fact
-                        .as_ref()
-                        .zip(right.fact.as_ref())
-                        .and_then(|(left, right)| left.join(right)),
+                    fact,
                     inert: test.inert && left.inert && right.inert,
                 }
             }
@@ -625,7 +696,12 @@ impl Analyzer<'_> {
                                 inert &= value.inert;
                             } else {
                                 environment.clear();
-                                data.define_unknown_key(true, None);
+                                if self
+                                    .heap_result(data.define_unknown_key(true, None, self.budget))
+                                    .is_none()
+                                {
+                                    return Self::barrier(environment);
+                                }
                                 inert = false;
                             }
                         }
@@ -650,7 +726,16 @@ impl Analyzer<'_> {
                             inert &= value.inert;
                             let is_data = property.kind == PropertyKind::Init;
                             let Some(key) = key else {
-                                data.define_unknown_key(is_data, value.fact);
+                                if self
+                                    .heap_result(data.define_unknown_key(
+                                        is_data,
+                                        value.fact,
+                                        self.budget,
+                                    ))
+                                    .is_none()
+                                {
+                                    return Self::barrier(environment);
+                                }
                                 continue;
                             };
                             if is_prototype_setter(property, &key) {
@@ -740,9 +825,19 @@ impl Analyzer<'_> {
                 continue;
             }
             if let Some(fact) = value.fact {
-                environment.insert(symbol, fact);
+                if self
+                    .heap_result(environment.insert(symbol, fact, self.budget))
+                    .is_none()
+                {
+                    break;
+                }
             } else {
-                environment.remove(&symbol);
+                if self
+                    .heap_result(environment.remove(&symbol, self.budget))
+                    .is_none()
+                {
+                    break;
+                }
             }
         }
     }
@@ -827,7 +922,11 @@ impl Analyzer<'_> {
                 environment.protect_before(previous_floor);
                 other.protect_before(previous_floor);
                 match (left, right) {
-                    (true, true) => environment.join(&other, first_new),
+                    (true, true) => {
+                        if !self.join_heap(environment, &other, first_new) {
+                            return false;
+                        }
+                    }
                     (false, true) => *environment = other,
                     (true, false) => {}
                     (false, false) => return false,
@@ -904,6 +1003,33 @@ mod tests {
                 ))
             })
             .collect())
+    }
+
+    #[test]
+    fn exhausted_heap_budget_does_not_publish_partial_reaching_facts() -> Result<(), BudgetExceeded>
+    {
+        let mut source = "let p0={x:7};".to_owned();
+        for index in 1..128 {
+            use std::fmt::Write;
+            let _ = write!(source, "let p{index}={{__proto__:p{}}};", index - 1);
+        }
+        source.push_str("p0.x;p127.x;");
+        let allocator = Allocator::default();
+        let program = crate::parse_as(&allocator, &source, SourceType::cjs())
+            .unwrap_or_else(|| unreachable!());
+        let semantic = SemanticBuilder::new()
+            .with_check_syntax_error(true)
+            .build(&program);
+        assert!(semantic.diagnostics.is_empty());
+        let scoping = semantic.semantic.scoping();
+        let bindings = BindingFacts::analyze(&program, scoping);
+        let budget = WorkBudget::new("bounded-heap-analysis", work_budget::BudgetLimits::work(16));
+        assert!(FreshDataReads::analyze(&program, scoping, &bindings, &budget).is_err());
+        assert_eq!(
+            reads(&source)?,
+            vec![("p0.x".into(), "7".into()), ("p127.x".into(), "7".into())]
+        );
+        Ok(())
     }
 
     #[test]
