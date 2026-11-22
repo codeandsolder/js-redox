@@ -582,6 +582,7 @@ impl Analyzer<'_> {
                             self.expression(&spread.argument, environment);
                             environment.clear();
                             known_index = false;
+                            data.unknown_array_tail();
                             inert = false;
                         }
                         _ => {
@@ -591,7 +592,7 @@ impl Analyzer<'_> {
                             let result = self.expression(value, environment);
                             inert &= result.inert;
                             if known_index {
-                                data.insert(index.to_string(), result.fact);
+                                data.define_data(index.to_string(), result.fact);
                             }
                         }
                     }
@@ -600,7 +601,7 @@ impl Analyzer<'_> {
                     .then(|| u32::try_from(array.elements.len()).ok())
                     .flatten()
                     .map(|length| Fact::Primitive(Value::Number(f64::from(length))));
-                data.insert("length".into(), length);
+                data.define_data("length".into(), length);
                 self.allocate(environment, data, inert)
             }
             Expression::ObjectExpression(object) => {
@@ -611,7 +612,7 @@ impl Analyzer<'_> {
                         ObjectPropertyKind::SpreadProperty(spread) => {
                             self.expression(&spread.argument, environment);
                             environment.clear();
-                            data.clear();
+                            data.define_unknown_key(true, None);
                             inert = false;
                         }
                         ObjectPropertyKind::ObjectProperty(property) => {
@@ -633,17 +634,17 @@ impl Analyzer<'_> {
                             };
                             let value = self.expression(&property.value, environment);
                             inert &= value.inert;
+                            let is_data = property.kind == PropertyKind::Init;
                             let Some(key) = key else {
-                                data.clear();
+                                data.define_unknown_key(is_data, value.fact);
                                 continue;
                             };
                             if is_prototype_setter(property, &key) {
-                                continue;
-                            }
-                            if property.kind == PropertyKind::Init {
-                                data.insert(key, value.fact);
+                                data.set_literal_prototype(value.fact);
+                            } else if is_data {
+                                data.define_data(key, value.fact);
                             } else {
-                                data.remove(&key);
+                                data.define_accessor(key);
                             }
                         }
                     }
@@ -982,6 +983,58 @@ mod tests {
             ("let a={x:7};let b={x:8};if(a!==b)a.x=9;a.x;", vec![("a.x","9")]),
             ("let a={x:7};if(typeof a==='object')a.x=9;a.x;", vec![("a.x","9")]),
             ("function f(flag){let a={x:7};let b={x:8};let c=flag?a:b;if(c===a)a.x=9;a.x;}",vec![]),
+        ] {
+            let expected = expected.into_iter().map(|(text,value)|(text.to_owned(),value.to_owned())).collect::<Vec<_>>();
+            assert_eq!(reads(source)?, expected, "{source}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn prototype_and_descriptor_facts_support_inheritance_and_new_properties(
+    ) -> Result<(), BudgetExceeded> {
+        for (source, expected) in [
+            ("let a={__proto__:null};a.missing;a.x=7;a.x;delete a.x;a.x;",vec![("a.missing","void 0"),("a.x","7"),("a.x","void 0")]),
+            ("let p={x:7};let a={__proto__:p};a.x;p.x=9;a.x;",vec![("a.x","7"),("a.x","9")]),
+            ("let p={x:7};let a={__proto__:p};a.x=9;a.x;p.x;delete a.x;a.x;",vec![("a.x","9"),("p.x","7"),("a.x","7")]),
+            ("let p={__proto__:null,x:7};let a={__proto__:p};a.y=9;a.y;p.y;delete a.y;a.y;",vec![("a.y","9"),("p.y","void 0"),("a.y","void 0")]),
+            ("let p={__proto__:null,x:{y:7}};let a={__proto__:p};a.x.y=9;p.x.y;a.x.y;",vec![("p.x.y","9"),("a.x.y","9")]),
+            ("let p={x:7};let a={__proto__:{__proto__:p}};a.x;p.x=9;a.x;",vec![("a.x","7"),("a.x","9")]),
+            ("let a={__proto__:{x:7},x:8};delete a.x;a.x;",vec![("a.x","7")]),
+            ("let a={__proto__:null};a.__proto__=9;a.__proto__;",vec![("a.__proto__","9")]),
+            ("let a={['__proto__']:7};a.__proto__;",vec![("a.__proto__","7")]),
+            ("let a={__proto__:null};a.x??=7;a.x;",vec![("a.x","7")]),
+            ("let p={x:7};let a={__proto__:p};a.x+=2;a.x;p.x;",vec![("a.x","9"),("p.x","7")]),
+            ("let p={x:7};let a={__proto__:p};let y=a.x++;a.x;p.x;({y}).y;",vec![("a.x","8"),("p.x","7"),("({y}).y","7")]),
+            ("function f(flag){let a={__proto__:null};if(flag)a.x=7;a.x=9;a.x;}",vec![("a.x","9")]),
+            ("function f(flag){let a={__proto__:null,x:7};if(flag)delete a.x;a.x=9;a.x;}",vec![("a.x","9")]),
+            ("function f(flag){let p={x:7};let a={__proto__:p};if(flag)a.x=7;a.x;}",vec![("a.x","7")]),
+            ("function f(flag){let p={x:7};let a={__proto__:p,x:7};if(flag)delete a.x;a.x;}",vec![("a.x","7")]),
+            ("function f(flag){let p=flag?{x:7}:{x:7};let a={__proto__:p};a.x;}",vec![("a.x","7")]),
+            ("function f(flag){let p=flag?{x:7}:{x:9};let a={__proto__:p};a.x;}",vec![]),
+            ("function f(flag){let a={__proto__:null};let b={__proto__:null};let c=flag?a:b;c.x=7;c.x=9;}",vec![]),
+            ("function f(k){let a={x:7,[k]:9};a.x=8;a.x;}",vec![("a.x","8")]),
+            ("function f(k){let a={__proto__:null,[k]:9};a.x=8;a.x;}",vec![("a.x","8")]),
+            ("let a={__proto__:null,x:7,...thing};a.x=9;a.x;",vec![("a.x","9")]),
+            ("let a={__proto__:null,...thing};a.x=9;a.x;",vec![("a.x","9")]),
+            ("let a={x:7,...thing};a.x=9;a.x;",vec![("a.x","9")]),
+            ("let a={__proto__:null,get x(){return 7;}};delete a.x;a.x=9;a.x;",vec![("a.x","9")]),
+            ("let p=[7,8];let a={__proto__:p};a.length;a[0];p.length=1;a.length;",vec![("a.length","2"),("a[0]","7"),("a.length","1")]),
+            ("let p=[7];let a={__proto__:p};a.length=9;a.length;p.length;",vec![("a.length","9"),("p.length","1")]),
+            // Unproven prototypes/accessors remain effect barriers, even
+            // when the receiver itself is definitely an ordinary object.
+            ("let a={__proto__:3};a.missing;",vec![]),
+            ("let a={};a.missing;",vec![]),
+            ("let a={};a.x=9;a.x;",vec![]),
+            ("let p={get x(){return 7;}};let a={__proto__:p};a.x;",vec![]),
+            ("let p={set x(v){side(v)}};let a={__proto__:p};a.x=9;a.x;",vec![]),
+            ("let a={__proto__:null,get x(){return 7;}};a.x;",vec![]),
+            ("function f(k){let a={__proto__:null,x:7,get [k](){return 9;}};a.x;}",vec![]),
+            ("function f(k){let a={__proto__:null,x:7,get [k](){return 9;}};a.x=8;a.x;}",vec![]),
+            ("let p={x:7};let a={__proto__:p};unknown();a.x;",vec![]),
+            ("let p={x:7};let a={__proto__:p,y:unknown()};a.x;",vec![]),
+            ("let a={__proto__:null};Object.setPrototypeOf(a,p);a.x;",vec![]),
+            ("let a={__proto__:null};Object.defineProperty(a,'x',{value:7});a.x=9;a.x;",vec![]),
         ] {
             let expected = expected.into_iter().map(|(text,value)|(text.to_owned(),value.to_owned())).collect::<Vec<_>>();
             assert_eq!(reads(source)?, expected, "{source}");
