@@ -4,6 +4,7 @@ use crate::{
         annotate_bitfield_selectors, complete_selector_masks, derive_candidates, link_candidates,
         observed_opcodes, BuilderSite, DecoderCandidate, IndexedAccess,
     },
+    source_text::{collapsed_whitespace, collect_byte_prefix},
     state_flatten::DecoderControlInfo,
 };
 use oxc_ast::{ast::Expression, AstKind};
@@ -63,10 +64,7 @@ impl<'a> Visit<'a> for EvidenceVisitor<'_> {
                 let start = member.span.start as usize;
                 let end = (member.span.end as usize).min(self.source.len());
                 if let Some(raw) = self.source.get(start..end) {
-                    let mut preview = raw.split_whitespace().collect::<Vec<_>>().join(" ");
-                    if preview.len() > 160 {
-                        preview.truncate(160);
-                    }
+                    let preview = collect_byte_prefix(collapsed_whitespace(raw), 160);
                     self.evidence.computed_previews.insert(preview);
                 }
             }

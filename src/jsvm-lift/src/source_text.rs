@@ -3,12 +3,54 @@ pub fn preview(source: &str, start: u32, end: u32, cap: usize) -> String {
     let start = start as usize;
     let end = (end as usize).min(source.len());
     let raw = source.get(start..end).unwrap_or_default();
-    let mut out = String::with_capacity(cap.min(raw.len()));
-    for c in raw.chars() {
-        if out.len() >= cap {
+    collect_byte_prefix(
+        raw.chars()
+            .map(|ch| if ch.is_whitespace() { ' ' } else { ch }),
+        cap,
+    )
+}
+
+/// Return a borrowed prefix of at most cap Unicode scalar values and
+/// whether content was omitted. Do not count or allocate the remaining text.
+pub(crate) fn clip_chars(text: &str, cap: usize) -> (&str, bool) {
+    if text.len() <= cap {
+        return (text, false);
+    }
+    match text.char_indices().nth(cap) {
+        Some((end, _)) => (&text[..end], true),
+        None => (text, false),
+    }
+}
+
+/// A lazy equivalent of joining split_whitespace() with single spaces.
+/// Leading/trailing whitespace is omitted; inner runs become one ASCII space.
+pub(crate) fn collapsed_whitespace(text: &str) -> impl Iterator<Item = char> + '_ {
+    let mut chars = text.trim_start().chars().peekable();
+    std::iter::from_fn(move || {
+        let ch = chars.next()?;
+        if !ch.is_whitespace() {
+            return Some(ch);
+        }
+        while chars.next_if(|ch| ch.is_whitespace()).is_some() {}
+        chars.peek().map(|_| ' ')
+    })
+}
+
+/// Collect only complete scalar values fitting a UTF-8 byte cap. The prefix
+/// remains valid even when the next scalar spans the limit.
+pub(crate) fn collect_byte_prefix(chars: impl Iterator<Item = char>, cap: usize) -> String {
+    let mut out = String::with_capacity(chars.size_hint().0.min(cap));
+    if cap == 0 {
+        return out;
+    }
+    for ch in chars {
+        if ch.len_utf8() > cap - out.len() {
             break;
         }
-        out.push(if c.is_whitespace() { ' ' } else { c });
+        out.push(ch);
+        if out.len() == cap {
+            break;
+        }
     }
     out
 }
@@ -106,6 +148,43 @@ pub(crate) fn utf16_byte_offset(text: &str, offset: usize) -> anyhow::Result<usi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn previews_respect_byte_and_character_limits_without_splitting_scalars() {
+        let source = "x💡é\u{2028}z";
+        let end = u32::try_from(source.len()).unwrap_or_default();
+        for (cap, expected) in [
+            (0, ""),
+            (1, "x"),
+            (4, "x"),
+            (5, "x💡"),
+            (6, "x💡"),
+            (7, "x💡é"),
+            (8, "x💡é "),
+            (9, "x💡é z"),
+        ] {
+            let result = preview(source, 0, end, cap);
+            assert_eq!(result, expected);
+            assert!(result.len() <= cap);
+        }
+        assert_eq!(clip_chars(source, 2), ("x💡", true));
+        assert_eq!(clip_chars(source, 5), (source, false));
+        assert_eq!(clip_chars("", 0), ("", false));
+        assert_eq!(clip_chars("💡", 0), ("", true));
+        assert_eq!(preview(source, 2, end, 99), "");
+    }
+
+    #[test]
+    fn lazy_whitespace_collapse_matches_full_normalization() {
+        for raw in ["", "   ", "  x  y  ", "💡\u{2028}\t\rñ\n", "one two three"] {
+            let expected = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert_eq!(collapsed_whitespace(raw).collect::<String>(), expected);
+            for cap in 0..=expected.len() + 1 {
+                let prefix = &expected[..expected.floor_char_boundary(cap.min(expected.len()))];
+                assert_eq!(collect_byte_prefix(collapsed_whitespace(raw), cap), prefix);
+            }
+        }
+    }
 
     #[test]
     fn javascript_line_positions_agree_across_byte_and_utf16_coordinates() {
