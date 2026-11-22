@@ -6,6 +6,9 @@ use serde::Serialize;
 use std::{collections::BTreeMap, path::Path};
 use work_budget::WorkBudget;
 
+mod source_structure;
+pub use source_structure::{SourceStructure, SourceStructureComparison};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SourceMode {
     Auto,
@@ -99,6 +102,9 @@ pub struct SafeDeobReport {
     pub changed: bool,
     pub iterations: usize,
     pub transforms: BTreeMap<String, usize>,
+    /// Syntax inventory under the exact same validated parser mode, before
+    /// optional presentation code generation. Null for browser-legacy recovery.
+    pub structure: Option<SourceStructureComparison>,
     pub arithmetic_state_proofs: Vec<ArithmeticStateProofReport>,
     pub analysis_source_sha256: String,
     pub static_alias_installer_calls: Vec<StaticAliasInstallerCallReport>,
@@ -185,6 +191,10 @@ pub fn deobfuscate_source(
         .map(IterationCycleReport::from);
     let source_recovery = result.source_recovery.map(SafeSourceRecovery::as_str);
     let analysis_source_sha256 = sha256_hex(result.source.as_bytes());
+    let structure = result
+        .resolved_source_type
+        .map(|source_type| source_structure::compare(original, &result.source, source_type, budget))
+        .transpose()?;
     let static_alias_installer_calls =
         forwarding_alias::static_alias_installer_calls(&result.source, budget)?
             .into_iter()
@@ -222,7 +232,7 @@ pub fn deobfuscate_source(
     };
 
     let report = SafeDeobReport {
-        schema: "js-safe-deobfuscate/v2",
+        schema: "js-safe-deobfuscate/v3",
         source_mode: source_mode.as_str(),
         input: input_label.into(),
         input_sha256: sha256_hex(original.as_bytes()),
@@ -230,6 +240,7 @@ pub fn deobfuscate_source(
         changed: source != original,
         iterations,
         transforms,
+        structure,
         arithmetic_state_proofs,
         analysis_source_sha256,
         static_alias_installer_calls,
@@ -272,6 +283,46 @@ mod tests {
         assert!(!capped.report.analysis_complete);
         assert!(complete.report.analysis_complete);
         assert_eq!(capped.source, complete.source);
+        assert!(capped.report.structure.is_some());
+        assert_eq!(capped.report.structure, complete.report.structure);
+        Ok(())
+    }
+
+    #[test]
+    fn report_structure_uses_analysis_source_not_optional_formatting() -> Result<()> {
+        let source = "function f(x){ { {x+=1;} } return x;}";
+        let budget = WorkBudget::unlimited("structure-report");
+        let plain =
+            deobfuscate_source(source, "fixture.mjs", SourceMode::Module, 8, false, &budget)?;
+        let formatted =
+            deobfuscate_source(source, "fixture.mjs", SourceMode::Module, 8, true, &budget)?;
+        assert_eq!(plain.report.structure, formatted.report.structure);
+        let structure = plain
+            .report
+            .structure
+            .ok_or_else(|| anyhow!("missing structure"))?;
+        assert_eq!(structure.resolved_source_mode, "module");
+        assert_eq!(structure.original.block_statements, 2);
+        assert_eq!(structure.analysis.block_statements, 0);
+        assert_eq!(structure.original.functions, structure.analysis.functions);
+        Ok(())
+    }
+
+    #[test]
+    fn report_does_not_invent_structure_for_unparseable_legacy_source() -> Result<()> {
+        let source = "function target() {} target() = 1;";
+        let budget = WorkBudget::unlimited("structure-legacy");
+        let outcome = deobfuscate_source(
+            source,
+            "fixture.cjs",
+            SourceMode::CommonJs,
+            8,
+            false,
+            &budget,
+        )?;
+        assert_eq!(outcome.source, source);
+        assert!(outcome.report.structure.is_none());
+        assert!(!outcome.report.analysis_complete);
         Ok(())
     }
 

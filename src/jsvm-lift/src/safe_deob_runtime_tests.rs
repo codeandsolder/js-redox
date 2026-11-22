@@ -109,7 +109,7 @@ fn count(report: &SafeDeobReport, kind: &str) -> usize {
 }
 
 fn assert_invariants(label: &str, outcome: &SafeDeobOutcome) {
-    assert_eq!(outcome.report.schema, "js-safe-deobfuscate/v2", "{label}");
+    assert_eq!(outcome.report.schema, "js-safe-deobfuscate/v3", "{label}");
     assert!(outcome.report.safe_static_only, "{label}");
     assert!(!outcome.report.presentation_formatted, "{label}");
     assert!(
