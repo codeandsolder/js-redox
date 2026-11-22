@@ -14,7 +14,7 @@ use oxc_parser::Parser;
 use oxc_span::SourceType;
 use std::fmt::Write as _;
 
-const ATOMS: [&str; 41] = [
+const ATOMS: [&str; 44] = [
     "0",
     "1",
     "-0",
@@ -56,6 +56,9 @@ const ATOMS: [&str; 41] = [
     "class {static [{}]=1}",
     "class {static {throw 1}}",
     "class {static value=({'x':1})}",
+    "class extends (2 ** 1.5 ? function(){} : null) {}",
+    "class extends (2 ** 1.5 ? function(){} : (()=>{})) {}",
+    "class extends ([], class {}) {}",
 ];
 
 const ENVIRONMENT: &str = r"

@@ -26,13 +26,9 @@ pub(super) fn inert_class_definition(class: &Class<'_>) -> bool {
 /// an independently safe prototype read. Fresh ordinary functions and
 /// proven inert class expressions have an own data prototype.
 fn inert_heritage(expression: &Expression<'_>) -> bool {
-    match expression.without_parentheses() {
-        Expression::FunctionExpression(function) => {
-            !function.generator && !function.r#async && !function.declare
-        }
-        Expression::ClassExpression(class) => inert_class_definition(class),
-        _ => matches!(eval(expression), Some(Value::Null)),
-    }
+    let permitted = LiteralTypes::NULL.union(LiteralTypes::FRESH_CONSTRUCTOR);
+    inert_literal_facts(expression).is_some_and(|facts| facts.types.subset_of(permitted))
+        || matches!(eval(expression), Some(Value::Null))
 }
 
 /// A computed name performs `ToPropertyKey` at definition time. A static
@@ -107,6 +103,16 @@ mod tests {
             ("class extends (false ? effect() : null) {}", true),
             ("class extends function(){effect()} {}", true),
             ("class extends (class {}) {}", true),
+            ("class extends (2 ** 1.5 ? function(){} : null) {}", true),
+            ("class extends (true ? function(){} : (()=>{})) {}", true),
+            ("class extends ([], class {}) {}", true),
+            ("class extends (null ?? class {}) {}", true),
+            ("class extends (2 ** 1.5 ? null : null) {}", true),
+            (
+                "class extends (2 ** 1.5 ? function(){} : (()=>{})) {}",
+                false,
+            ),
+            ("class extends ([] || class {}) {}", false),
             ("class { static x = 2 ** 1.5 }", true),
             ("class { static [2 ** 1.5] = 1 }", true),
             ("class { static ['name'] = 1 }", true),
