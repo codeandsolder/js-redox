@@ -1,4 +1,5 @@
 //! Publish complete generated reports without truncating the previous snapshot.
+use crate::content_dedup::{digest_stream, FileDigest};
 use anyhow::{ensure, Context, Result};
 use serde::{de::DeserializeOwned, Serialize};
 use std::{
@@ -6,6 +7,7 @@ use std::{
     io::{BufWriter, ErrorKind, Read, Write},
     path::{Path, PathBuf},
 };
+use work_budget::WorkBudget;
 
 /// A completely encoded report whose final name is still untouched.
 /// Dropping it abandons the staging file, including on a later render failure.
@@ -95,10 +97,10 @@ pub(crate) fn prepare_destination(path: &Path) -> Result<(&Path, Option<fs::Perm
     Ok((parent, permissions))
 }
 
-fn stage(
+fn stage<T>(
     path: &Path,
-    write: impl FnOnce(&mut BufWriter<&mut File>) -> Result<()>,
-) -> Result<StagedReport> {
+    write: impl FnOnce(&mut BufWriter<&mut File>) -> Result<T>,
+) -> Result<(StagedReport, T)> {
     let (parent, permissions) = prepare_destination(path)?;
     let mut builder = tempfile::Builder::new();
     builder.prefix(".report-");
@@ -111,29 +113,34 @@ fn stage(
     let mut pending = builder
         .tempfile_in(parent)
         .with_context(|| format!("staging {}", path.display()))?;
-    {
+    let value = {
         let mut writer = BufWriter::new(pending.as_file_mut());
-        write(&mut writer).with_context(|| format!("encoding {}", path.display()))?;
+        let value = write(&mut writer).with_context(|| format!("encoding {}", path.display()))?;
         writer
             .flush()
             .with_context(|| format!("flushing {}", path.display()))?;
-    }
+        value
+    };
     if let Some(permissions) = permissions {
         pending.as_file().set_permissions(permissions)?;
     }
-    Ok(StagedReport {
-        pending: pending.into_temp_path(),
-        destination: path.to_owned(),
-    })
+    Ok((
+        StagedReport {
+            pending: pending.into_temp_path(),
+            destination: path.to_owned(),
+        },
+        value,
+    ))
 }
 
 /// Serialize directly into a buffered staging file.
 pub(crate) fn stage_json(path: &Path, value: &impl Serialize) -> Result<StagedReport> {
-    stage(path, |writer| {
+    let (report, ()) = stage(path, |writer| {
         serde_json::to_writer_pretty(&mut *writer, value)?;
         writer.write_all(b"\n")?;
         Ok(())
-    })
+    })?;
+    Ok(report)
 }
 
 pub(crate) fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
@@ -141,10 +148,36 @@ pub(crate) fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
 }
 
 fn stage_bytes(path: &Path, value: &[u8]) -> Result<StagedReport> {
-    stage(path, |writer| {
+    let (report, ()) = stage(path, |writer| {
         writer.write_all(value)?;
         Ok(())
-    })
+    })?;
+    Ok(report)
+}
+
+/// Copy a regular input into a complete independent file while computing
+/// the exact archived length and digest, with bounded streaming storage.
+pub(crate) fn copy_snapshot(
+    source: &Path,
+    destination: &Path,
+    budget: &WorkBudget,
+) -> Result<FileDigest> {
+    let reader = open_regular(source).with_context(|| format!("opening {}", source.display()))?;
+    let mut charged = reader.metadata()?.len().div_ceil(1024);
+    budget.consume(charged)?;
+    let (report, identity) = stage(destination, |writer| {
+        digest_stream(reader, |chunk, total| {
+            // Account for growth without charging differently for short reads.
+            let units = total.div_ceil(1024);
+            budget.consume(units.saturating_sub(charged))?;
+            charged = charged.max(units);
+            writer.write_all(chunk)?;
+            Ok(())
+        })
+    })?;
+    budget.checkpoint()?;
+    report.publish()?;
+    Ok(identity)
 }
 
 pub(crate) fn write_bytes(path: &Path, value: &[u8]) -> Result<()> {
@@ -175,6 +208,31 @@ mod tests {
             sequence.serialize_element(&"x".repeat(16_384))?;
             Err(S::Error::custom("fixture serialization failure"))
         }
+    }
+
+    #[test]
+    fn streamed_snapshot_is_independent_and_budget_failure_preserves_previous_output() -> Result<()>
+    {
+        let root = tempfile::tempdir()?;
+        let source = root.path().join("source.bin");
+        let destination = root.path().join("snapshot.bin");
+        let bytes = vec![0x5a; 2 * 1024 * 1024 + 37];
+        fs::write(&source, &bytes)?;
+        fs::write(&destination, "previous")?;
+        let exhausted = WorkBudget::new("copy limit", work_budget::BudgetLimits::work(2048));
+        assert!(copy_snapshot(&source, &destination, &exhausted).is_err());
+        assert_eq!(fs::read(&destination)?, b"previous");
+        let identity = copy_snapshot(
+            &source,
+            &destination,
+            &WorkBudget::unlimited("copy fixture"),
+        )?;
+        assert_eq!(identity.bytes, u64::try_from(bytes.len())?);
+        assert_eq!(identity.sha256, crate::sha256_hex(&bytes));
+        fs::write(&source, "changed")?;
+        assert_eq!(fs::read(&destination)?, bytes);
+        assert_eq!(fs::read_dir(root.path())?.count(), 2);
+        Ok(())
     }
 
     #[test]
