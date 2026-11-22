@@ -415,7 +415,7 @@ impl LiteralFacts {
         let types = self.types.without(excluded);
         (types.0 != 0).then_some(Self {
             types,
-            truthiness: truthiness.or(types.truthiness()),
+            truthiness: truthiness.or_else(|| types.truthiness()),
         })
     }
 
