@@ -181,6 +181,10 @@ fn lexically_safe_texts(source: &str, selected: &[Replacement]) -> Option<Vec<St
 #[derive(Default)]
 struct StatementBoundaries {
     prologue_ends: HashSet<usize>,
+    // An implicit directive terminator and the empty statement that prevents
+    // another directive are independent boundaries. A single semicolon can
+    // terminate the directive without terminating its prologue.
+    implicit_directive_left: HashSet<usize>,
     implicit_left: HashSet<usize>,
     nonempty_statements: HashSet<(usize, usize)>,
     // A leading empty run may be redundant if its first nonempty statement
@@ -207,7 +211,7 @@ impl StatementBoundaries {
                 .trim_end()
                 .ends_with(';')
         }) {
-            self.implicit_left.insert(start);
+            self.implicit_directive_left.insert(start);
             return;
         }
         if !matches!(first, Statement::EmptyStatement(_)) {
@@ -302,13 +306,20 @@ impl StatementBoundaries {
             let prologue_risk = self.prologue_ends.contains(&replacement.start)
                 && !releases_empty_prologue
                 && Self::possible_directive(&replacement.text);
-            let left_risk = self.implicit_left.contains(&replacement.start)
-                && !replacement.text.is_empty()
-                && !replacement.text.trim_start().starts_with(';');
-            if prologue_risk || left_risk {
-                // The new first token may join the preceding expression, or
-                // create/destroy a directive. Source spans establish the
-                // insertion is before an actual direct-list statement.
+            if prologue_risk {
+                // An empty statement prevents a newly exposed string from
+                // joining the original directive prologue.
+                replacement.text.insert_str(0, ";\n");
+            }
+            let left_risk = self.implicit_directive_left.contains(&replacement.start)
+                || (self.implicit_left.contains(&replacement.start)
+                    && !replacement.text.is_empty()
+                    && !replacement.text.trim_start().starts_with(';'));
+            if left_risk {
+                // An existing directive without an explicit semicolon must
+                // receive its own terminator, even if the replacement now
+                // begins with an empty statement. Otherwise ASI absorbs that
+                // empty statement and exposes a new directive.
                 replacement.text.insert_str(0, ";\n");
             }
         }
@@ -492,6 +503,35 @@ mod tests {
                 .map(|index| replacement(index, index + 1, ""))
                 .collect();
             assert_eq!(rewrite_script(source, edits), expected);
+        }
+    }
+
+    #[test]
+    fn implicit_directive_termination_is_independent_of_prologue_barrier() {
+        for (source, old, text) in [
+            ("'other'\n{}\n'use strict';", "{}", ""),
+            ("'other'\n0;\n'use strict';", "0;", ""),
+            (
+                "'other'\n'use ' + 'strict';",
+                "'use ' + 'strict'",
+                "\"use strict\"",
+            ),
+            ("'other'\n{}\n'use strict';", "{}", ";"),
+        ] {
+            let Some(start) = source.find(old) else {
+                unreachable!();
+            };
+            let rewritten =
+                rewrite_script(source, vec![replacement(start, start + old.len(), text)]);
+            let allocator = oxc_allocator::Allocator::default();
+            let program = crate::parse_as(&allocator, &rewritten, oxc_span::SourceType::cjs())
+                .unwrap_or_else(|| unreachable!());
+            assert_eq!(program.directives.len(), 1, "{rewritten}");
+            assert_eq!(program.directives[0].directive, "other");
+            assert!(
+                matches!(program.body.first(), Some(Statement::EmptyStatement(_))),
+                "{rewritten}"
+            );
         }
     }
 

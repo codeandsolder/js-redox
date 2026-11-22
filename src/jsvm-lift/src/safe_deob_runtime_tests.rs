@@ -1124,6 +1124,68 @@ console.log(JSON.stringify([results,example3(),example4(),example5(),example8(),
 
 #[test]
 #[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_directive_boundary_matrix_runtime_equivalence() -> Result<()> {
+    use std::fmt::Write as _;
+    let leading = [
+        "",
+        "'other';\n",
+        "'other'\n",
+        "'use strict';\n",
+        "'use strict'\n",
+    ];
+    let prefixes = [
+        "",
+        ";",
+        ";;",
+        "/* before */;/* after */;",
+        "{}",
+        "{;}",
+        "{{}}",
+        "{}\n;",
+        "0;",
+        r#"if(false){ record("unreachable"); }"#,
+        "if(true) { 0; }",
+        "; // separator\n;",
+        ";\r\n{}\r\n;",
+    ];
+    let following = [
+        "'use strict';",
+        "('use strict');",
+        "'use ' + 'strict';",
+        r#""other"; "use strict";"#,
+        "'other'\n'use strict';",
+        "`use strict`;",
+        r#"record("seen");"#,
+        r#"if(true) record("seen");"#,
+        "var local=3; record(local);",
+        "record(\"left\")\n{}\n(record)(\"right\");",
+        "record(\"left\")\n{ 0; }\n(record)(\"right\");",
+        "record(\"left\")\n{}\n[1].forEach(record);",
+        "record(\"left\")\n{}\n`template`;",
+        "record(\"left\");\n{}\n/regex/.test(\"regex\");",
+        r#"if(true) { "use strict"; }"#,
+        "",
+    ];
+    let mut source = String::from("let seen=[];function record(x){seen.push(x);}");
+    let mut invocations = String::from("const results=[];");
+    let mut index = 0;
+    for directive in leading {
+        for prefix in prefixes {
+            for statement in following {
+                writeln!(source, "function fixture_{index}(){{\n{directive}{prefix}\n{statement}\nreturn [this===undefined,this===globalThis,typeof local];\n}}")?;
+                writeln!(invocations, "seen=[];try{{results.push([fixture_{index}(),seen]);}}catch(error){{results.push([error.name,seen]);}}")?;
+                index += 1;
+            }
+        }
+    }
+    assert_eq!(index, 1040);
+    source.push_str(&invocations);
+    source.push_str("JSON.stringify(results);");
+    script_runtime_equivalence(&[source.as_str()], "directive-boundary-matrix", false)
+}
+
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
 fn depythonify_safe_deob_nested_standalone_blocks_runtime_equivalence() -> Result<()> {
     let deep = format!(
         "function f(x){{{}x+=1;{}return x;}}f(3);",
