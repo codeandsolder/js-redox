@@ -391,7 +391,7 @@ pub fn materialize_capture_source(
                     .get("sha256")
                     .and_then(Value::as_str)
                     .context("runtime source missing sha256")?;
-                if digest.len() != 64 || !digest.bytes().all(|ch| ch.is_ascii_hexdigit()) {
+                if !crate::content_dedup::is_canonical_sha256(digest) {
                     bail!("invalid runtime script SHA-256");
                 }
                 let capture_path = format!("runtime-scripts/{digest}.js");

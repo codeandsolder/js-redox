@@ -115,7 +115,7 @@ pub fn materialize_observed_runtime_sources(
         .flatten()
         .filter_map(|row| {
             let digest = row.get("sha256")?.as_str()?;
-            if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+            if !crate::content_dedup::is_canonical_sha256(digest) {
                 return None;
             }
             let path = format!("src/_observed/{digest}.js");
@@ -161,7 +161,7 @@ pub fn materialize_observed_runtime_sources(
             }
             continue;
         }
-        if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if !crate::content_dedup::is_canonical_sha256(&digest) {
             bail!("invalid runtime source digest: {digest}");
         }
         let rel = format!("runtime-scripts/{digest}.js");
