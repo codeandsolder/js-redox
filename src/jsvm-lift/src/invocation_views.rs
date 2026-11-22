@@ -5,7 +5,9 @@ mod observed_guards;
 use crate::{
     analysis_artifacts::{load_artifact, write_artifact, RUNTIME_SCRIPTS, SELECTIVE_TRACE},
     analysis_budget::{AnalysisBudgets, AnalysisOperation},
-    runtime_identity::{script_id_text, session_name, ScriptIdentityIndex},
+    runtime_identity::{
+        retain_agreed, script_id_text, session_name, ScriptIdentityIndex, ScriptOriginContext,
+    },
     sha256_hex,
 };
 use anyhow::{bail, Context, Result};
@@ -35,6 +37,26 @@ fn verified_sha(value: &Value) -> Option<&str> {
         .filter(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
+/// ECMAScript lines include CR, LF, CRLF and Unicode line/paragraph separators.
+/// Retain an empty final line so a coordinate at EOF is representable.
+fn js_source_lines(source: &str) -> impl Iterator<Item = &str> {
+    let mut remaining = Some(source);
+    std::iter::from_fn(move || {
+        let text = remaining.take()?;
+        let Some(end) = text.find(['\r', '\n', '\u{2028}', '\u{2029}']) else {
+            return Some(text);
+        };
+        let (line, terminator) = text.split_at(end);
+        let width = if terminator.starts_with("\r\n") {
+            2
+        } else {
+            terminator.chars().next()?.len_utf8()
+        };
+        remaining = terminator.get(width..);
+        Some(line)
+    })
+}
+
 fn source_excerpt(raw: &str, line: u64, first_line: Option<u64>) -> String {
     let Some(start) = first_line else {
         return "CDP script start offset was not recorded; raw source link is authoritative.\n"
@@ -46,27 +68,25 @@ fn source_excerpt(raw: &str, line: u64, first_line: Option<u64>) -> String {
     else {
         return "Paused location precedes the script start offset; no excerpt claimed.\n".into();
     };
-    let lines = raw.lines().collect::<Vec<_>>();
-    if local_line >= lines.len() {
-        return "Paused location is outside the captured raw source lines; no excerpt claimed.\n"
-            .into();
-    }
     let begin = local_line.saturating_sub(2);
-    let end = (local_line + 3).min(lines.len());
+    let end = local_line.saturating_add(3);
     let mut excerpt = String::new();
-    for (index, text) in lines.iter().enumerate().take(end).skip(begin) {
-        let shown = text.chars().take(260).collect::<String>();
-        let cropped = if text.chars().count() > 260 {
-            " …"
-        } else {
-            ""
-        };
+    let mut found = false;
+    for (index, text) in js_source_lines(raw).enumerate().take(end).skip(begin) {
+        found |= index == local_line;
+        let mut chars = text.chars();
+        let shown = chars.by_ref().take(260).collect::<String>();
+        let cropped = if chars.next().is_some() { " …" } else { "" };
         let _ = writeln!(
             excerpt,
             "{} {:>6} | {shown}{cropped}",
             if index == local_line { ">" } else { " " },
-            index + 1 + usize::try_from(start).unwrap_or(0),
+            u128::from(start) + index as u128 + 1,
         );
+    }
+    if !found {
+        return "Paused location is outside the captured raw source lines; no excerpt claimed.\n"
+            .into();
     }
     fence(excerpt.trim_end(), "js")
 }
@@ -76,7 +96,8 @@ struct RuntimeSourceIdentity {
     sha256: String,
     start_line: Option<u64>,
     start_column: Option<u64>,
-    capture_instrumentation: bool,
+    capture_instrumentation: Option<bool>,
+    origin: ScriptOriginContext,
 }
 
 type RuntimeIdentityIndex = ScriptIdentityIndex<RuntimeSourceIdentity>;
@@ -85,16 +106,37 @@ fn runtime_identity_index(
     runtime: &Value,
     budget: &work_budget::WorkBudget,
 ) -> Result<RuntimeIdentityIndex> {
-    ScriptIdentityIndex::from_runtime_report(runtime, budget, |sha, source, instance| {
-        verified_sha(source.get("sha256")?)?;
-        Some(RuntimeSourceIdentity {
-            sha256: sha.to_owned(),
-            start_line: instance.get("start_line").and_then(Value::as_u64),
-            start_column: instance.get("start_column").and_then(Value::as_u64),
-            capture_instrumentation: source.get("classification").and_then(Value::as_str)
-                == Some("capture_instrumentation"),
-        })
-    })
+    ScriptIdentityIndex::from_runtime_report_with(
+        runtime,
+        budget,
+        |sha, source, instance| {
+            // Keep malformed claims in the index to invalidate conflicting rows;
+            // verification at each consumer still requires a valid 64-digit SHA.
+            RuntimeSourceIdentity {
+                sha256: sha.to_owned(),
+                start_line: instance.get("start_line").and_then(Value::as_u64),
+                start_column: instance.get("start_column").and_then(Value::as_u64),
+                capture_instrumentation: source
+                    .get("classification")
+                    .and_then(Value::as_str)
+                    .map(|classification| classification == "capture_instrumentation"),
+                origin: ScriptOriginContext::from_instance(instance),
+            }
+        },
+        |previous, next| {
+            if previous.sha256 != next.sha256 {
+                return false;
+            }
+            retain_agreed(&mut previous.start_line, next.start_line);
+            retain_agreed(&mut previous.start_column, next.start_column);
+            retain_agreed(
+                &mut previous.capture_instrumentation,
+                next.capture_instrumentation,
+            );
+            previous.origin.retain_agreed(next.origin);
+            true
+        },
+    )
 }
 
 /// Group source definitions by exact script and original coordinate, not by
@@ -306,7 +348,7 @@ fn build_observed_path_view(
         if exact {
             let sha = sha.context("checked exact original step source")?;
             let raw_path = format!("resources/runtime-scripts/{sha}.js");
-            if identity.is_some_and(|source| source.capture_instrumentation)
+            if identity.is_some_and(|source| source.capture_instrumentation == Some(true))
                 && !project.join(&raw_path).is_file()
             {
                 let _ = write!(page,
@@ -458,38 +500,15 @@ pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -
             let _ = write!(view,
                 "Exact captured source SHA-256: **{sha}**. [Raw recorded code](../../../resources/runtime-scripts/{sha}.js).\n\n"
             );
-            // The per-instance CDP origin is stronger context than a URL
-            // pooled across unrelated identical source bodies.
-            let matched_instance = runtime
-                .get("sources")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter(|source| source.get("sha256").and_then(Value::as_str) == Some(sha))
-                .flat_map(|source| {
-                    source
-                        .get("script_instances")
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                })
-                .find(|instance| {
-                    instance.get("cdp_session").and_then(Value::as_str) == session.as_deref()
-                        && instance
-                            .get("script_id")
-                            .and_then(script_id_text)
-                            .as_deref()
-                            == Some(script)
-                });
-            if let Some(instance) = matched_instance {
-                if let Some(url) = instance.get("script_url").and_then(Value::as_str) {
+            if let Some(identity) = actual {
+                if let Some(url) = identity.origin.url.as_deref() {
                     if let Ok(mut parsed) = url::Url::parse(url) {
                         parsed.set_query(None);
                         parsed.set_fragment(None);
                         let _ = write!(view, "Script origin (query omitted): {}\n\n", parsed);
                     }
                 }
-                if let Some(context) = instance.get("execution_context_id") {
+                if let Some(context) = identity.origin.execution_context_id {
                     let _ = write!(view, "V8 execution context ID: {}\n\n", context);
                 }
             }
@@ -621,6 +640,51 @@ mod tests {
     }
 
     #[test]
+    fn source_excerpt_uses_ecmascript_line_terminators_and_eof() {
+        let source = "zero\rone\r\ntwo\n\u{2028}four\u{2029}";
+        assert_eq!(
+            js_source_lines(source).collect::<Vec<_>>(),
+            ["zero", "one", "two", "", "four", ""]
+        );
+        assert!(source_excerpt(source, 14, Some(10)).contains(">     15 | four"));
+        assert!(source_excerpt(source, 15, Some(10)).contains(">     16 |"));
+        assert!(source_excerpt(source, 16, Some(10)).contains("outside"));
+        assert!(source_excerpt(source, u64::MAX, Some(u64::MAX))
+            .contains("18446744073709551616 | zero"));
+    }
+
+    #[test]
+    fn runtime_origin_metadata_agrees_independently_of_captured_bytes() -> Result<()> {
+        let digest = "a".repeat(64);
+        let row = |script: &str, url: &str, context: u64, line: u64, column: u64| json!({"cdp_session":"main","script_id":script,"script_url":url,"execution_context_id":context,"start_line":line,"start_column":column});
+        let a = row("1", "https://example.test/a.js", 1, 0, 0);
+        let b = row("1", "https://example.test/b.js", 2, 0, 5);
+        let runtime = json!({"sources":[{"sha256":digest,"classification":"network_response","script_instances":[a,b,a,row("2","https://example.test/a.js",1,0,0),row("2","https://example.test/a.js",1,1,0),row("3","https://example.test/a.js",1,0,0),row("4","https://example.test/a.js",1,0,0)]},{"sha256":"malformed-digest","script_instances":[row("4","https://example.test/a.js",1,0,0)]}],"script_identity_conflicts":[{"cdp_session":"main","script_id":"3"}]});
+        let identities = runtime_identity_index(
+            &runtime,
+            &work_budget::WorkBudget::unlimited("origin-agreement"),
+        )?;
+        let one = identities
+            .get("main", "1")
+            .context("body identity must survive independent metadata conflicts")?;
+        assert_eq!(one.sha256, digest);
+        assert_eq!(one.start_line, Some(0));
+        assert_eq!(one.start_column, None);
+        assert_eq!(one.origin.url, None);
+        assert_eq!(one.origin.execution_context_id, None);
+        let two = identities
+            .get("main", "2")
+            .context("body identity must survive coordinate disagreement")?;
+        assert_eq!(two.start_line, None);
+        assert_eq!(two.start_column, Some(0));
+        assert_eq!(two.origin.url.as_deref(), Some("https://example.test/a.js"));
+        assert_eq!(two.origin.execution_context_id, Some(1));
+        assert!(identities.get("main", "3").is_none());
+        assert!(identities.get("main", "4").is_none());
+        Ok(())
+    }
+
+    #[test]
     fn exact_invocation_renders_raw_location_and_values_not_deob_offsets() -> Result<()> {
         let tmp = TempDir::new()?;
         let project = tmp.path();
@@ -641,7 +705,7 @@ mod tests {
                 "sources":[{
                     "sha256":digest,
                     "classification":"application",
-                    "script_instances":[{"cdp_session":"main","script_id":"6","start_line":0}],
+                    "script_instances":[{"cdp_session":"main","script_id":"6","start_line":0,"script_url":"https://example.test/first.js","execution_context_id":1},{"cdp_session":"main","script_id":"6","start_line":0,"script_url":"https://example.test/second.js","execution_context_id":1}],
                 },{
                     "sha256":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
                     "classification":"capture_instrumentation",
@@ -689,6 +753,8 @@ mod tests {
         assert!(page.contains("return handler(opcode)"));
         assert!(page.contains("handler === registry[opcode]"));
         assert!(page.contains("Raw recorded code"));
+        assert!(!page.contains("Script origin (query omitted)"));
+        assert!(page.contains("V8 execution context ID: 1"));
         assert!(page.contains("Source identity **unresolved**"));
         assert!(page.contains("Verified observed callable definitions"));
         assert!(page.contains("original line 1, column 10"));

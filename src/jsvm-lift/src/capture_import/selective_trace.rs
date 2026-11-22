@@ -81,9 +81,8 @@ pub(super) fn import_selective_trace(
     }
     let runtime = load_artifact(project, RUNTIME_SCRIPTS, false)?
         .context("runtime inventory required for breakpoint source verification")?;
-    let identities = ScriptIdentityIndex::from_runtime_report(&runtime, &budget, |sha, _, _| {
-        Some(sha.to_owned())
-    })?;
+    let identities =
+        ScriptIdentityIndex::from_runtime_report(&runtime, &budget, |sha, _, _| sha.to_owned())?;
     let mut verified = 0_u64;
     let mut unresolved = 0_u64;
     let mut verified_step_frames = 0_u64;

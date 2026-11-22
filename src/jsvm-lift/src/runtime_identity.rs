@@ -41,6 +41,18 @@ impl<T> Default for ScriptIdentityIndex<T> {
 
 impl<T: Eq> ScriptIdentityIndex<T> {
     pub(crate) fn register(&mut self, session: &str, script: &str, identity: T) {
+        self.register_with(session, script, identity, |previous, next| {
+            *previous == next
+        });
+    }
+
+    fn register_with(
+        &mut self,
+        session: &str,
+        script: &str,
+        identity: T,
+        merge: impl FnOnce(&mut T, T) -> bool,
+    ) {
         match self
             .sessions
             .entry(session.to_owned())
@@ -51,8 +63,10 @@ impl<T: Eq> ScriptIdentityIndex<T> {
                 entry.insert(IdentityState::Unique(identity));
             }
             Entry::Occupied(mut entry) => {
-                if matches!(entry.get(), IdentityState::Unique(previous) if previous != &identity) {
-                    entry.insert(IdentityState::Conflict);
+                if let IdentityState::Unique(previous) = entry.get_mut() {
+                    if !merge(previous, identity) {
+                        entry.insert(IdentityState::Conflict);
+                    }
                 }
             }
         }
@@ -96,14 +110,22 @@ impl<T: Eq> ScriptIdentityIndex<T> {
     pub(crate) fn from_runtime_report(
         report: &Value,
         budget: &WorkBudget,
-        mut identity: impl FnMut(&str, &Value, &Value) -> Option<T>,
+        identity: impl FnMut(&str, &Value, &Value) -> T,
+    ) -> Result<Self> {
+        Self::from_runtime_report_with(report, budget, identity, |previous, next| *previous == next)
+    }
+
+    /// Merge independent contextual claims while rejecting incompatible identities.
+    pub(crate) fn from_runtime_report_with(
+        report: &Value,
+        budget: &WorkBudget,
+        mut identity: impl FnMut(&str, &Value, &Value) -> T,
+        merge: impl Fn(&mut T, T) -> bool,
     ) -> Result<Self> {
         let mut index = Self::default();
         for source in rows(report, "sources") {
             budget.consume(1)?;
-            let Some(sha) = nonempty_text(source.get("sha256")) else {
-                continue;
-            };
+            let sha = nonempty_text(source.get("sha256"));
             for instance in rows(source, "script_instances") {
                 budget.consume(1)?;
                 let Some(session) = session_name(instance.get("cdp_session")) else {
@@ -112,8 +134,12 @@ impl<T: Eq> ScriptIdentityIndex<T> {
                 let Some(script) = instance.get("script_id").and_then(script_id_text) else {
                     continue;
                 };
-                if let Some(value) = identity(sha, source, instance) {
-                    index.register(session, &script, value);
+                if let Some(sha) = sha {
+                    index.register_with(session, &script, identity(sha, source, instance), &merge);
+                } else {
+                    // A scoped occurrence with no body claim cannot become
+                    // invisible evidence merely because its digest is absent.
+                    index.invalidate(session, &script);
                 }
             }
         }
@@ -128,6 +154,33 @@ impl<T: Eq> ScriptIdentityIndex<T> {
             index.invalidate(session, &script);
         }
         Ok(index)
+    }
+}
+
+/// Retain only fields on which all inventory occurrences agree. Unknown or
+/// contradictory values remain unknown when more occurrences are merged.
+pub(crate) fn retain_agreed<T: Eq>(current: &mut Option<T>, next: Option<T>) {
+    if *current != next {
+        *current = None;
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ScriptOriginContext {
+    pub(crate) url: Option<String>,
+    pub(crate) execution_context_id: Option<u64>,
+}
+
+impl ScriptOriginContext {
+    pub(crate) fn from_instance(instance: &Value) -> Self {
+        Self {
+            url: nonempty_text(instance.get("script_url")).map(ToOwned::to_owned),
+            execution_context_id: instance.get("execution_context_id").and_then(Value::as_u64),
+        }
+    }
+    pub(crate) fn retain_agreed(&mut self, other: Self) {
+        retain_agreed(&mut self.url, other.url);
+        retain_agreed(&mut self.execution_context_id, other.execution_context_id);
     }
 }
 
@@ -157,13 +210,30 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn missing_body_claims_invalidate_only_their_scoped_instances() -> Result<()> {
+        let digest = "body";
+        let rows = json!([{"sha256":digest,"script_instances":[{"cdp_session":"main","script_id":"1"},{"cdp_session":"worker","script_id":"1"},{"cdp_session":"main","script_id":"2"}]},{"script_instances":[{"cdp_session":"main","script_id":"1"},{"script_id":"2"}]},{"sha256":digest,"script_instances":[{"cdp_session":"main","script_id":"1"}]}]);
+        let budget = WorkBudget::unlimited("missing-inventory-claim");
+        let index = ScriptIdentityIndex::from_runtime_report(
+            &json!({"sources":rows}),
+            &budget,
+            |sha, _, _| sha.to_owned(),
+        )?;
+        assert!(matches!(
+            index.lookup("main", "1"),
+            Some(IdentityState::Conflict)
+        ));
+        assert_eq!(index.get("worker", "1").map(String::as_str), Some(digest));
+        assert_eq!(index.get("main", "2").map(String::as_str), Some(digest));
+        Ok(())
+    }
+
+    #[test]
     fn raw_event_conflicts_invalidate_stored_body_and_coordinate_indices() -> Result<()> {
         let report = json!({"sources":[{"sha256":"body-present","script_instances":[{"cdp_session":"main","script_id":"1","start_line":4},{"cdp_session":"worker","script_id":"1","start_line":6},{"cdp_session":"main","script_id":2,"start_line":8}]}],"script_identity_conflicts":[{"cdp_session":"main","script_id":"1","sha256_claims":["body-present","body-missing"]}]});
         let budget = WorkBudget::unlimited("identity-index");
         let mut bodies =
-            ScriptIdentityIndex::from_runtime_report(&report, &budget, |sha, _, _| {
-                Some(sha.to_owned())
-            })?;
+            ScriptIdentityIndex::from_runtime_report(&report, &budget, |sha, _, _| sha.to_owned())?;
         assert!(matches!(
             bodies.lookup("main", "1"),
             Some(IdentityState::Conflict)
@@ -180,7 +250,7 @@ mod tests {
         );
         let coords =
             ScriptIdentityIndex::from_runtime_report(&report, &budget, |sha, _, instance| {
-                Some((sha.to_owned(), instance["start_line"].as_u64()))
+                (sha.to_owned(), instance["start_line"].as_u64())
             })?;
         assert!(coords.get("main", "1").is_none());
         assert_eq!(
