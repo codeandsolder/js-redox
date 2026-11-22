@@ -116,7 +116,7 @@ fn runtime_identity_index(
                 &mut previous.capture_instrumentation,
                 next.capture_instrumentation.as_ref(),
             );
-            previous.origin.retain_agreed(next.origin);
+            previous.origin.retain_agreed(&next.origin);
             true
         },
     )

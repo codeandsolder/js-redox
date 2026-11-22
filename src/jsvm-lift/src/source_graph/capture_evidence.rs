@@ -22,9 +22,9 @@ fn resolve_url(base: &str, reference: &str) -> String {
 
 #[derive(Debug, Default)]
 pub(super) struct InlineSourceIndex {
-    by_identity: BTreeMap<(String, u64, u64), String>,
-    by_site: BTreeSet<(u64, u64)>,
-    by_unique_raw: BTreeMap<String, Option<String>>,
+    identities: BTreeMap<(String, u64, u64), String>,
+    occupied_sites: BTreeSet<(u64, u64)>,
+    unique_raw: BTreeMap<String, Option<String>>,
 }
 
 impl InlineSourceIndex {
@@ -36,12 +36,12 @@ impl InlineSourceIndex {
         node: String,
     ) -> Result<()> {
         anyhow::ensure!(
-            self.by_site.insert((parent, ordinal)),
+            self.occupied_sites.insert((parent, ordinal)),
             "duplicate inline script site ({parent}, {ordinal})"
         );
-        self.by_identity
+        self.identities
             .insert((raw.to_owned(), parent, ordinal), node.clone());
-        self.by_unique_raw
+        self.unique_raw
             .entry(raw.to_owned())
             .and_modify(|existing| *existing = None)
             .or_insert(Some(node));
@@ -49,7 +49,7 @@ impl InlineSourceIndex {
     }
 
     pub(super) fn exact(&self, raw: &str, parent: u64, ordinal: u64) -> Option<String> {
-        self.by_identity
+        self.identities
             .get(&(raw.to_owned(), parent, ordinal))
             .cloned()
     }
@@ -61,7 +61,7 @@ impl InlineSourceIndex {
             u64_field(record, "ordinal"),
         ) {
             (Some(parent), Some(ordinal)) => self.exact(raw, parent, ordinal),
-            _ => self.by_unique_raw.get(raw).and_then(Clone::clone),
+            _ => self.unique_raw.get(raw).and_then(Clone::clone),
         }
     }
 }

@@ -84,7 +84,7 @@ impl RuntimeCoverageIndex {
                 if previous.0 != next.0 || previous.1 != next.1 || previous.2 != next.2 {
                     return false;
                 }
-                previous.3.retain_agreed(next.3);
+                previous.3.retain_agreed(&next.3);
                 true
             },
         )?;

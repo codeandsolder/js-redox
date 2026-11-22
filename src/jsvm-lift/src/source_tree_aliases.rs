@@ -537,9 +537,8 @@ pub fn explain_captured_handler_origins(
             hash == expected_hash,
             "handler {path} has a different original source SHA-256"
         );
-        let [span_start, span_end] = span;
         ensure!(
-            functions.0.contains(&(span_start, span_end)),
+            functions.0.contains(&<(u32, u32)>::from(span)),
             "handler {path} original byte span is not an AST function"
         );
         let mut by_name: BTreeMap<String, (SymbolId, CapturedAlias)> = BTreeMap::new();

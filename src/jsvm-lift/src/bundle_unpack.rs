@@ -1152,7 +1152,7 @@ impl Collector<'_, '_> {
                 .items
                 .get(2)
                 .and_then(|param| binding_symbol(&param.pattern));
-            let dependencies = if let Some(require_symbol) = require_symbol {
+            let dependencies = require_symbol.map_or_else(BTreeSet::new, |require_symbol| {
                 let mut collector = DependencyCollector {
                     scoping: self.scoping,
                     require_symbol,
@@ -1160,9 +1160,7 @@ impl Collector<'_, '_> {
                 };
                 collector.visit_function_body(body);
                 collector.dependencies
-            } else {
-                BTreeSet::new()
-            };
+            });
 
             let module_symbol = params
                 .items

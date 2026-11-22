@@ -4841,7 +4841,7 @@ fn numeric_case_map<'a>(
 
 impl LoopRunner<'_, '_> {
     fn simulate_opcode<'a>(
-        &mut self,
+        &self,
         opcode: u64,
         case_map: &BTreeMap<u64, &'a [Statement<'a>]>,
         observed_opcodes: &BTreeSet<u64>,

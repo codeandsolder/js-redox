@@ -178,7 +178,7 @@ impl ScriptOriginContext {
             execution_context_id: instance.get("execution_context_id").and_then(Value::as_u64),
         }
     }
-    pub(crate) fn retain_agreed(&mut self, other: Self) {
+    pub(crate) fn retain_agreed(&mut self, other: &Self) {
         retain_agreed(&mut self.url, other.url.as_ref());
         retain_agreed(
             &mut self.execution_context_id,

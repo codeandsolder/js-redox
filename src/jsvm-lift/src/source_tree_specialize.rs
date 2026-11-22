@@ -61,13 +61,13 @@ fn literal_argument<'a>(arg: &'a Argument<'a>, source: &'a str) -> Option<String
         .map(str::to_owned)
 }
 
-struct Calls<'s> {
+struct LiteralCallCollector<'s> {
     source: &'s str,
     scoping: &'s Scoping,
     calls: Vec<LiteralCall>,
 }
 
-impl<'a> Visit<'a> for Calls<'_> {
+impl<'a> Visit<'a> for LiteralCallCollector<'_> {
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         if !call.optional {
             if let Expression::Identifier(callee) = unparen(&call.callee) {
@@ -111,7 +111,7 @@ pub fn literal_calls(source: &str) -> Result<Vec<LiteralCall>> {
     let parsed = parse_program(&allocator, source, SourceType::unambiguous());
     ensure!(parsed.is_clean(), "invalid JavaScript in handler");
     let semantic = SemanticBuilder::new().build(&parsed.program);
-    let mut visitor = Calls {
+    let mut visitor = LiteralCallCollector {
         source,
         scoping: semantic.semantic.scoping(),
         calls: Vec::new(),
@@ -177,7 +177,7 @@ impl<'a> Visit<'a> for StablePrimitiveBindings<'_> {
 
 /// Primitive arguments at exact source-resolved original callsites. Resolve
 /// literal expressions and immutable lexical constant chains by `SymbolId`.
-/// Calls with a spread stop collecting at its position: later indexes cannot
+/// LiteralCallCollector with a spread stop collecting at its position: later indexes cannot
 /// be reliably mapped to formal parameters.
 #[derive(Clone, Debug)]
 enum ExpressionInput {
