@@ -13,9 +13,8 @@ use crate::value_eval::{
 };
 use crate::{
     argument_integer, array_element, decoder_argument_integer, expression_integer, fragment,
-    reference_is_statically_resolved_read, statically_resolved_symbol,
-    statically_unresolved_global_reference, string_literal_value, symbol_has_only_read_references,
-    symbol_of, template_element_value,
+    statically_resolved_symbol, statically_unresolved_global_reference, string_literal_value,
+    symbol_has_only_read_references, symbol_of, template_element_value,
 };
 use fixed_base64_proof::fixed_base64_algorithm_proven;
 use oxc_ast::ast::{
