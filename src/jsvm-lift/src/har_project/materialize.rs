@@ -6,8 +6,9 @@ use super::parse::{Har, HarEntry, NameValue};
 use super::resource::{
     decode_body, format_json_if_possible, output_path_for, refine_resource_kind, resource_kind,
 };
-use super::{resource_store::ResourceStore, HarProjectOptions, HarProjectSummary};
+use super::{HarProjectOptions, HarProjectSummary};
 use crate::{
+    archive_storage::ResourceStore,
     browser_decode::decode_html,
     capture_project::{write_manifest, CaptureManifest, CaptureSource, MANIFEST_NAME, SCHEMA},
 };

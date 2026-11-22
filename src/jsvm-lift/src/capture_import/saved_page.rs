@@ -1,4 +1,5 @@
 use crate::{
+    archive_storage::reserve_directory,
     browser_decode::{decode_html, DecodedHtml},
     browser_script_types::{inline_script_extension, is_executable_script, script_type_essence},
     capture_project::{write_manifest, CaptureManifest, CaptureSource, MANIFEST_NAME, SCHEMA},
@@ -41,6 +42,17 @@ pub(super) struct SavedPageSummary {
 
 fn path_text(path: &Path) -> String {
     path.to_string_lossy().into_owned()
+}
+
+/// Project paths have a portable slash-separated spelling, unlike original
+/// input path metadata. Reject unrepresentable components before writing.
+fn archive_path(path: &Path) -> Result<String> {
+    let value = path
+        .to_str()
+        .with_context(|| format!("saved archive path is not UTF-8: {}", path.display()))?
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    crate::capture_project::validate_project_relative_path(&value, "saved archive path")?;
+    Ok(value)
 }
 
 fn canonical_url(relative: &Path) -> Result<String> {
@@ -383,6 +395,7 @@ fn materialize_saved_resources(
             format!("saved-page source path is not UTF-8: {}", source.display())
         })?;
         let output_rel = PathBuf::from("resources").join(capture_rel);
+        let archive_path = archive_path(&output_rel)?;
         let url = canonical_url(capture_rel)?;
         // The page body is exactly the snapshot decoded by the importer.
         // Other assets are read once into the staged capture.
@@ -410,7 +423,7 @@ fn materialize_saved_resources(
         object.insert("body_bytes".into(), json!(data.len()));
         object.insert("sha256".into(), json!(sha256_hex(&data)));
         object.insert("kind".into(), json!(kind));
-        object.insert("output_path".into(), json!(path_text(&output_rel)));
+        object.insert("output_path".into(), json!(archive_path));
         object.insert("reused_body".into(), json!(false));
         object.insert("request_headers".into(), json!([]));
         object.insert("response_headers".into(), json!([]));
@@ -561,7 +574,7 @@ fn materialize_saved_inline_scripts(
     budget: &WorkBudget,
 ) -> Result<Vec<Value>> {
     let mut inline_scripts = Vec::<Value>::new();
-    let mut inline_seen = HashMap::<String, String>::new();
+    let mut inline_directory: Option<String> = None;
     budget.checkpoint()?;
     for (offset, script) in extract_script_tags(page_text).into_iter().enumerate() {
         budget.checkpoint()?;
@@ -592,42 +605,26 @@ fn materialize_saved_inline_scripts(
         let bytes = script.body.as_bytes();
         let extension = inline_script_extension(Some(&script_type));
         let digest = sha256_hex(bytes);
-        let desired = PathBuf::from("resources")
-            .join(page_rel.parent().unwrap_or_else(|| Path::new("")))
-            .join(format!(
-                "{}.inline",
-                page_rel
-                    .file_name()
-                    .and_then(OsStr::to_str)
-                    .unwrap_or("page")
-            ))
-            .join(format!("script-{ordinal:03}.{extension}"));
-        let mut output_rel = desired.clone();
-        if let Some(existing) = inline_seen.get(&path_text(&output_rel)) {
-            if existing != &digest {
-                let stem = desired
-                    .file_stem()
-                    .and_then(OsStr::to_str)
-                    .unwrap_or("script");
-                output_rel =
-                    desired.with_file_name(format!("{stem}-{}.{}", &digest[..10], extension));
-            }
+        if inline_directory.is_none() {
+            let page_path = archive_path(&PathBuf::from("resources").join(page_rel))?;
+            inline_directory = Some(reserve_directory(
+                output,
+                &format!("{page_path}.inline"),
+                budget,
+            )?);
         }
-        let output_key = path_text(&output_rel);
-        if let std::collections::hash_map::Entry::Vacant(entry) = inline_seen.entry(output_key) {
-            if let Some(parent) = output.join(&output_rel).parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(output.join(&output_rel), bytes)?;
-            entry.insert(digest.clone());
-        }
+        let directory = inline_directory
+            .as_deref()
+            .context("inline directory allocation")?;
+        let output_rel = format!("{directory}/script-{ordinal:03}.{extension}");
+        crate::report_file::write_bytes(&output.join(&output_rel), bytes)?;
         inline_scripts.push(json!({
             "parent_resource_id": page_id,
             "ordinal": ordinal,
             "script_type": script_type,
             "src": null,
             "resolved_src": null,
-            "output_path": path_text(&output_rel),
+            "output_path": output_rel,
             "body_bytes": bytes.len(),
             "sha256": digest,
             "charset": script.attrs.get("charset").cloned(),
@@ -860,6 +857,46 @@ mod tests {
                 .map(|(_, relative)| relative.clone())
                 .collect::<Vec<_>>(),
             [PathBuf::from("first.txt"), PathBuf::from("z/last.txt")]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn generated_inline_directory_does_not_replace_an_archived_asset_tree() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let page = root.path().join("Example.html");
+        // An explicit assets directory may have exactly the generated name.
+        let assets = root.path().join("Example.html.inline");
+        fs::create_dir(&assets)?;
+        fs::write(assets.join("script-001.js"), "const archived=1;")?;
+        fs::write(&page, "<script>const inline=2;</script>")?;
+        let output = root.path().join("project");
+        import_saved_page(
+            &page,
+            &output,
+            &SavedPageOptions {
+                assets_dir: Some(assets),
+                overwrite: false,
+            },
+            &WorkBudget::unlimited("archive collision fixture"),
+        )?;
+        let manifest = crate::capture_project::load_manifest(&output)?;
+        let asset = manifest.resources[1]["output_path"]
+            .as_str()
+            .context("asset path")?;
+        let inline = manifest.inline_scripts[0]["output_path"]
+            .as_str()
+            .context("inline path")?;
+        assert_ne!(asset, inline);
+        assert_eq!(fs::read_to_string(output.join(asset))?, "const archived=1;");
+        assert_eq!(fs::read_to_string(output.join(inline))?, "const inline=2;");
+        assert_eq!(
+            manifest.resources[1]["sha256"],
+            sha256_hex(b"const archived=1;")
+        );
+        assert_eq!(
+            manifest.inline_scripts[0]["sha256"],
+            sha256_hex(b"const inline=2;")
         );
         Ok(())
     }
