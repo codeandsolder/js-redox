@@ -32,10 +32,15 @@ impl Fact {
         Ok(self.join_proven(other))
     }
 
+    pub(super) fn copy(&self, budget: &WorkBudget) -> Result<Self, BudgetExceeded> {
+        charge(budget, self.clone_weight())?;
+        Ok(self.clone())
+    }
+
     fn clone_weight(&self) -> usize {
         match self {
-            Self::Primitive(Value::String(value)) => value.len().saturating_add(1),
-            _ => 1,
+            Self::Primitive(value) => value_weight(value),
+            Self::Objects(_) => 1,
         }
     }
 
@@ -61,11 +66,7 @@ impl Fact {
     fn join_proven(&self, other: &Self) -> Option<Self> {
         match (self, other) {
             (Self::Primitive(a), Self::Primitive(b)) => {
-                let equal = match (a, b) {
-                    (Value::Number(a), Value::Number(b)) => a.to_bits() == b.to_bits(),
-                    _ => same_value(a, b),
-                };
-                equal.then(|| self.clone())
+                same_primitive_fact(a, b).then(|| self.clone())
             }
             (Self::Objects(a), Self::Objects(b)) => {
                 if Rc::ptr_eq(a, b) || a == b {
@@ -139,6 +140,22 @@ impl Fact {
             Self::Primitive(value) => Some(value),
             Self::Objects(_) => None,
         }
+    }
+}
+
+/// Heap facts must retain signed zero even though strict equality does
+/// not distinguish it. Keep this predicate separate from JS equality.
+fn same_primitive_fact(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Number(left), Value::Number(right)) => left.to_bits() == right.to_bits(),
+        _ => same_value(left, right),
+    }
+}
+
+pub(super) fn value_weight(value: &Value) -> usize {
+    match value {
+        Value::String(value) => value.len().saturating_add(1),
+        _ => 1,
     }
 }
 
@@ -547,8 +564,7 @@ impl LookupValues {
         };
         match self {
             Self::Unseen => {
-                charge(budget, value.clone_weight())?;
-                *self = Self::Single(value.clone());
+                *self = Self::Single(value.copy(budget)?);
             }
             Self::Single(previous) => {
                 if let (Fact::Objects(left), Fact::Objects(right)) = (&*previous, value) {
@@ -562,7 +578,16 @@ impl LookupValues {
                         union.extend(right.iter().copied());
                         *self = Self::Union(union);
                     }
-                } else if previous.join(value, budget)?.is_none() {
+                } else if let (Fact::Primitive(left), Fact::Primitive(right)) = (&*previous, value)
+                {
+                    charge(
+                        budget,
+                        value_weight(left).saturating_add(value_weight(right)),
+                    )?;
+                    if !same_primitive_fact(left, right) {
+                        *self = Self::Unknown;
+                    }
+                } else {
                     *self = Self::Unknown;
                 }
             }
@@ -718,6 +743,14 @@ impl Environment {
 
     pub(super) fn get(&self, symbol: &SymbolId) -> Option<&Fact> {
         self.bindings.get(symbol)
+    }
+
+    pub(super) fn read_binding(
+        &self,
+        symbol: &SymbolId,
+        budget: &WorkBudget,
+    ) -> Result<Option<Fact>, BudgetExceeded> {
+        self.get(symbol).map(|fact| fact.copy(budget)).transpose()
     }
 
     fn charge_binding_copy(&self, budget: &WorkBudget) -> Result<(), BudgetExceeded> {
@@ -1190,6 +1223,29 @@ mod tests {
             ),
             Property::Opaque => (3, None),
         }
+    }
+
+    #[test]
+    fn binding_reads_charge_primitive_copies_but_not_shared_location_contents(
+    ) -> Result<(), BudgetExceeded> {
+        let unlimited = WorkBudget::unlimited("binding-setup");
+        let mut heap = Environment::new();
+        let symbol = SymbolId::new(0);
+        heap.insert(
+            symbol,
+            Fact::Primitive(Value::String("x".repeat(8192))),
+            &unlimited,
+        )?;
+        let bounded = WorkBudget::new("binding-read", work_budget::BudgetLimits::work(32));
+        assert!(heap.read_binding(&symbol, &bounded).is_err());
+        let locations = Rc::from((0..1024).collect::<Vec<_>>());
+        heap.insert(symbol, Fact::Objects(Rc::clone(&locations)), &unlimited)?;
+        let bounded = WorkBudget::new("binding-read", work_budget::BudgetLimits::work(32));
+        let Some(Fact::Objects(read)) = heap.read_binding(&symbol, &bounded)? else {
+            unreachable!()
+        };
+        assert!(Rc::ptr_eq(&read, &locations));
+        Ok(())
     }
 
     #[test]
