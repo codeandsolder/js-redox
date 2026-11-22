@@ -87,7 +87,10 @@ fn select_replacements(mut replacements: Vec<Replacement>) -> Vec<Replacement> {
         }
         selected.push(candidate);
     }
-    selected.sort_by_key(|replacement| replacement.start);
+    // Match MagicString's original-byte ordering: insertions must precede
+    // a nonempty edit starting at the same offset. Preserve input order
+    // between multiple insertions at one offset.
+    selected.sort_by_key(|replacement| (replacement.start, replacement.end));
     selected
 }
 
@@ -320,21 +323,37 @@ fn apply_raw(
     arithmetic_state_proofs: &mut Vec<ArithmeticStateProof>,
     iteration: usize,
 ) -> Option<String> {
+    // Validate every candidate before span-width subtraction or overlap
+    // arbitration. A malformed candidate must not panic or silently vanish
+    // behind a larger, valid overlapping replacement.
+    if replacements
+        .iter()
+        .any(|edit| source.get(edit.start..edit.end).is_none())
+    {
+        return None;
+    }
     let mut selected = select_replacements(replacements);
     let adjusted = lexically_safe_texts(source, &selected)?;
     let mut magic = MagicString::try_new(source).ok()?;
     magic
-        .apply_edits(
-            selected
-                .iter()
-                .zip(adjusted)
-                .map(|(replacement, text)| TextEdit::new(replacement.start, replacement.end, text)),
-        )
+        .apply_edits(selected.iter().zip(&adjusted).map(|(replacement, text)| {
+            TextEdit::new(replacement.start, replacement.end, text.as_str())
+        }))
         .ok()?;
 
     // Do not publish accounting/proof side effects until every edit was
     // accepted. A malformed range therefore fails closed as one transaction.
-    for replacement in &mut selected {
+    // Lexical repair can also restore the original text of an edit, or
+    // multiple edits can cancel. Neither changes the source nor proves a
+    // transformation occurred.
+    let rewritten = magic.to_string();
+    if rewritten == source {
+        return Some(rewritten);
+    }
+    for (replacement, text) in selected.iter_mut().zip(&adjusted) {
+        if source.get(replacement.start..replacement.end) == Some(text.as_str()) {
+            continue;
+        }
         counts.bump(replacement.kind);
         if let Some(mut proof) = replacement.arithmetic_state_proof.take() {
             proof.iteration = iteration;
@@ -342,7 +361,7 @@ fn apply_raw(
         }
     }
 
-    Some(magic.to_string())
+    Some(rewritten)
 }
 
 #[cfg(test)]
@@ -411,7 +430,7 @@ mod tests {
             }
             selected.push(candidate);
         }
-        selected.sort_by_key(|replacement| replacement.start);
+        selected.sort_by_key(|replacement| (replacement.start, replacement.end));
         selected
     }
 
@@ -448,6 +467,24 @@ mod tests {
     }
 
     #[test]
+    fn orders_boundary_insertions_before_same_start_replacements() {
+        assert_eq!(
+            rewrite(
+                "()",
+                vec![
+                    replacement(0, 1, "["),
+                    replacement(0, 0, "{"),
+                    replacement(0, 0, "("),
+                    replacement(1, 2, "]"),
+                    replacement(2, 2, ")"),
+                    replacement(2, 2, "}"),
+                ],
+            ),
+            "{([])}"
+        );
+    }
+
+    #[test]
     fn uses_oxc_compatible_utf8_byte_offsets() {
         let source = "ππfooXXbar";
         assert_eq!(
@@ -459,18 +496,92 @@ mod tests {
         );
     }
 
+    fn replacement_with_proof(start: usize, end: usize, text: &str) -> Replacement {
+        let mut edit = replacement(start, end, text);
+        edit.arithmetic_state_proof = Some(ArithmeticStateProof {
+            iteration: 0,
+            input_start: start,
+            input_end: end,
+            state_var: "state".to_owned(),
+            state_path: vec!["1".to_owned()],
+            termination: "test".to_owned(),
+            register_reads_rewritten: 0,
+            branch_test: None,
+            branch_paths: Vec::new(),
+            branch_terminations: Vec::new(),
+        });
+        edit
+    }
+
+    #[test]
+    fn only_counts_effective_edits_after_lexical_repair() {
+        let mut counts = Counts::default();
+        let mut proofs = Vec::new();
+        assert_eq!(
+            apply_raw(
+                "a b",
+                vec![replacement_with_proof(1, 2, "")],
+                &mut counts,
+                &mut proofs,
+                1,
+            )
+            .as_deref(),
+            Some("a b")
+        );
+        assert!(counts.0.is_empty());
+        assert!(proofs.is_empty());
+        assert_eq!(
+            apply_raw(
+                "a b; 7",
+                vec![
+                    replacement_with_proof(1, 2, ""),
+                    replacement_with_proof(5, 6, "8")
+                ],
+                &mut counts,
+                &mut proofs,
+                2,
+            )
+            .as_deref(),
+            Some("a b; 8")
+        );
+        assert_eq!(
+            counts.into_inner(),
+            BTreeMap::from([("test".to_owned(), 1)])
+        );
+        assert_eq!(proofs.len(), 1);
+        assert_eq!(proofs[0].input_start, 5);
+        assert_eq!(proofs[0].iteration, 2);
+    }
+
+    #[test]
+    fn cancelling_edits_do_not_publish_accounting() {
+        let mut counts = Counts::default();
+        assert_eq!(
+            apply_raw(
+                "()",
+                vec![replacement(0, 0, "("), replacement(0, 1, "")],
+                &mut counts,
+                &mut Vec::new(),
+                1,
+            )
+            .as_deref(),
+            Some("()")
+        );
+        assert!(counts.into_inner().is_empty());
+    }
+
     #[test]
     fn malformed_spans_fail_before_accounting() {
         let mut counts = Counts::default();
         let mut proofs = Vec::new();
-        assert!(apply_raw(
-            "πx",
+        for edits in [
             vec![replacement(1, 2, "y")],
-            &mut counts,
-            &mut proofs,
-            1
-        )
-        .is_none());
+            vec![replacement(2, 0, "y")],
+            vec![replacement(2, 4, "y")],
+            vec![replacement(0, 3, "z"), replacement(1, 2, "y")],
+        ] {
+            assert!(apply_raw("πx", edits, &mut counts, &mut proofs, 1).is_none());
+        }
         assert!(counts.into_inner().is_empty());
         assert!(proofs.is_empty());
     }
