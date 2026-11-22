@@ -252,10 +252,193 @@ impl<'a> Visit<'a> for References<'_> {
     }
 }
 
+type SourceEdit = (usize, usize, String);
+
+struct AliasEdits {
+    accepted: BTreeMap<u32, Vec<Span>>,
+    edits: Vec<SourceEdit>,
+    count: usize,
+}
+
+fn plan_alias_edits(
+    source: &str,
+    program: &Program<'_>,
+    found: &Collect<'_>,
+    context: &Context,
+) -> AliasEdits {
+    let scoping = found.scoping;
+    let mut accepted = BTreeMap::<u32, Vec<Span>>::new();
+    let mut edits = Vec::new();
+    let mut count = 0;
+    for alias in &found.aliases {
+        if context.modified_intrinsics.contains(&alias.root)
+            || context.exported.contains(&alias.symbol)
+            || context.tagged.contains(&alias.symbol)
+            || !scoping.symbol_redeclarations(alias.symbol).is_empty()
+            || scoping
+                .get_resolved_reference_ids(alias.symbol)
+                .iter()
+                .any(|id| {
+                    let r = scoping.get_reference(*id);
+                    r.is_write() || r.flags().is_member_write_target()
+                })
+        {
+            continue;
+        }
+        let group = &found.declarations[&alias.declaration];
+        // Comments inside retained initializers survive reconstruction.
+        // A comment in an eliminated declarator or between declarators
+        // would be dropped; reject just those cases. Raw substring checks
+        // incorrectly treat URL strings and template contents as comments.
+        let Some(alias_fragment) = group
+            .fragments
+            .iter()
+            .find(|span| span.start <= alias.binding.start && alias.binding.end <= span.end)
+        else {
+            continue;
+        };
+        if program.comments.iter().any(|comment| {
+            let comment = comment.span;
+            comment.start >= group.span.start
+                && comment.end <= group.span.end
+                && ((comment.start >= alias_fragment.start && comment.end <= alias_fragment.end)
+                    || !group
+                        .fragments
+                        .iter()
+                        .any(|span| span.start <= comment.start && comment.end <= span.end))
+        }) {
+            continue;
+        }
+        let Some(value) = source.get(alias.value.start as usize..alias.value.end as usize) else {
+            continue;
+        };
+        let uses = context
+            .refs
+            .get(&alias.symbol)
+            .map_or(&[][..], Vec::as_slice);
+        if uses.iter().any(|span| {
+            span.start <= alias.value.end
+                || context
+                    .reference_scopes
+                    .get(&span.start)
+                    .is_none_or(|scope| {
+                        scoping
+                            .find_binding(*scope, alias.root.as_str().into())
+                            .is_some()
+                    })
+        }) {
+            continue;
+        }
+        for span in uses {
+            let replacement = context.shorthand.get(&span.start).map_or_else(
+                || {
+                    if context.calls.contains(&span.start) {
+                        // Keep detached call receiver semantics (including optional calls).
+                        format!("(0, {value})")
+                    } else {
+                        format!("({value})")
+                    }
+                },
+                |key| format!("{key}: {value}"),
+            );
+            edits.push((span.start as usize, span.end as usize, replacement));
+        }
+        accepted
+            .entry(alias.declaration)
+            .or_default()
+            .push(alias.binding);
+        count += 1;
+    }
+    AliasEdits {
+        accepted,
+        edits,
+        count,
+    }
+}
+
+fn rewrite_declaration(
+    source: &str,
+    group: &Decl,
+    bindings: &[Span],
+    edits: &[SourceEdit],
+) -> Option<String> {
+    let remaining: Vec<_> = group
+        .fragments
+        .iter()
+        .filter(|span| {
+            !bindings
+                .iter()
+                .any(|b| span.start <= b.start && b.end <= span.end)
+        })
+        .collect();
+    let replacement = if remaining.is_empty() {
+        ";".to_string()
+    } else {
+        let first = group.fragments.first()?;
+        let last = group.fragments.last()?;
+        let prefix = source.get(group.span.start as usize..first.start as usize)?;
+        let suffix = source.get(last.end as usize..group.span.end as usize)?;
+        let mut parts = Vec::with_capacity(remaining.len());
+        for fragment in remaining {
+            let fragment_start = fragment.start as usize;
+            let fragment_end = fragment.end as usize;
+            let mut part = source.get(fragment_start..fragment_end)?.to_owned();
+            let mut nested_edits: Vec<_> = edits
+                .iter()
+                .filter(|(s, e, _)| *s >= fragment_start && *e <= fragment_end)
+                .collect();
+            nested_edits.sort_by_key(|(s, _, _)| std::cmp::Reverse(*s));
+            let mut right = fragment_end;
+            for (s, e, new_text) in nested_edits {
+                if *s > *e || *e > right {
+                    return None;
+                }
+                part.replace_range(s - fragment_start..e - fragment_start, new_text);
+                right = *s;
+            }
+            parts.push(part);
+        }
+        format!("{prefix}{}{suffix}", parts.join(", "))
+    };
+    Some(replacement)
+}
+
+impl AliasEdits {
+    fn apply(self, source: &str, declarations: &BTreeMap<u32, Decl>) -> Option<String> {
+        let mut edits = self.edits;
+        // An alias may be referenced in a surviving initializer of its own
+        // declaration group. Incorporate those nested reference edits into
+        // each retained declarator before replacing the whole group.
+        // Overlapping absolute source edits would discard the whole pass.
+        let mut group_edits = Vec::new();
+        for (start, bindings) in self.accepted {
+            let group = &declarations[&start];
+            let replacement = rewrite_declaration(source, group, &bindings, &edits)?;
+            let group_start = group.span.start as usize;
+            let group_end = group.span.end as usize;
+            edits.retain(|(s, e, _)| !(*s >= group_start && *e <= group_end));
+            group_edits.push((group_start, group_end, replacement));
+        }
+        edits.extend(group_edits);
+        edits.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
+        let mut result = source.to_string();
+        let mut right = source.len();
+        for (start, end, replacement) in edits {
+            if start > end || end > right {
+                return None;
+            }
+            result.replace_range(start..end, &replacement);
+            right = start;
+        }
+        Some(result)
+    }
+}
+
 /// Produce a human-readable alias view, not executable-equivalence evidence.
 ///
 /// Aliases capture values once; substituted member lookups occur later
 /// and depend on the pristine-builtins assumption.
+#[must_use]
 pub fn inline_readable_intrinsic_aliases(source: &str) -> Option<(String, usize)> {
     for source_type in [SourceType::mjs(), SourceType::cjs()] {
         let allocator = Allocator::default();
@@ -287,153 +470,12 @@ pub fn inline_readable_intrinsic_aliases(source: &str) -> Option<(String, usize)
         if refs.ctx.dynamic {
             continue;
         }
-        let mut accepted = BTreeMap::<u32, Vec<Span>>::new();
-        let mut edits = Vec::<(usize, usize, String)>::new();
-        let mut count = 0;
-        for alias in &found.aliases {
-            if refs.ctx.modified_intrinsics.contains(&alias.root)
-                || refs.ctx.exported.contains(&alias.symbol)
-                || refs.ctx.tagged.contains(&alias.symbol)
-                || !scoping.symbol_redeclarations(alias.symbol).is_empty()
-                || scoping
-                    .get_resolved_reference_ids(alias.symbol)
-                    .iter()
-                    .any(|id| {
-                        let r = scoping.get_reference(*id);
-                        r.is_write() || r.flags().is_member_write_target()
-                    })
-            {
-                continue;
-            }
-            let group = &found.declarations[&alias.declaration];
-            // Comments inside retained initializers survive reconstruction.
-            // A comment in an eliminated declarator or between declarators
-            // would be dropped; reject just those cases. Raw substring checks
-            // incorrectly treat URL strings and template contents as comments.
-            let Some(alias_fragment) = group
-                .fragments
-                .iter()
-                .find(|span| span.start <= alias.binding.start && alias.binding.end <= span.end)
-            else {
-                continue;
-            };
-            if parsed.program.comments.iter().any(|comment| {
-                let comment = comment.span;
-                comment.start >= group.span.start
-                    && comment.end <= group.span.end
-                    && ((comment.start >= alias_fragment.start
-                        && comment.end <= alias_fragment.end)
-                        || !group
-                            .fragments
-                            .iter()
-                            .any(|span| span.start <= comment.start && comment.end <= span.end))
-            }) {
-                continue;
-            }
-            let Some(value) = source.get(alias.value.start as usize..alias.value.end as usize)
-            else {
-                continue;
-            };
-            let uses = refs
-                .ctx
-                .refs
-                .get(&alias.symbol)
-                .map_or(&[][..], Vec::as_slice);
-            if uses.iter().any(|span| {
-                span.start <= alias.value.end
-                    || refs
-                        .ctx
-                        .reference_scopes
-                        .get(&span.start)
-                        .is_none_or(|scope| {
-                            scoping
-                                .find_binding(*scope, alias.root.as_str().into())
-                                .is_some()
-                        })
-            }) {
-                continue;
-            }
-            for span in uses {
-                let replacement = if let Some(key) = refs.ctx.shorthand.get(&span.start) {
-                    format!("{key}: {value}")
-                } else if refs.ctx.calls.contains(&span.start) {
-                    // Keep detached call receiver semantics (including optional calls).
-                    format!("(0, {value})")
-                } else {
-                    format!("({value})")
-                };
-                edits.push((span.start as usize, span.end as usize, replacement));
-            }
-            accepted
-                .entry(alias.declaration)
-                .or_default()
-                .push(alias.binding);
-            count += 1;
-        }
+        let plan = plan_alias_edits(source, &parsed.program, &found, &refs.ctx);
+        let count = plan.count;
         if count == 0 {
             continue;
         }
-        // An alias may be referenced in a surviving initializer of its own
-        // declaration group. Incorporate those nested reference edits into
-        // each retained declarator before replacing the whole group.
-        // Overlapping absolute source edits would discard the whole pass.
-        let mut group_edits = Vec::new();
-        for (start, bindings) in accepted {
-            let group = &found.declarations[&start];
-            let remaining: Vec<_> = group
-                .fragments
-                .iter()
-                .filter(|span| {
-                    !bindings
-                        .iter()
-                        .any(|b| span.start <= b.start && b.end <= span.end)
-                })
-                .collect();
-            let replacement = if remaining.is_empty() {
-                ";".to_string()
-            } else {
-                let first = group.fragments.first()?;
-                let last = group.fragments.last()?;
-                let prefix = source.get(group.span.start as usize..first.start as usize)?;
-                let suffix = source.get(last.end as usize..group.span.end as usize)?;
-                let mut parts = Vec::with_capacity(remaining.len());
-                for fragment in remaining {
-                    let fragment_start = fragment.start as usize;
-                    let fragment_end = fragment.end as usize;
-                    let mut part = source.get(fragment_start..fragment_end)?.to_owned();
-                    let mut nested_edits: Vec<_> = edits
-                        .iter()
-                        .filter(|(s, e, _)| *s >= fragment_start && *e <= fragment_end)
-                        .collect();
-                    nested_edits.sort_by_key(|(s, _, _)| std::cmp::Reverse(*s));
-                    let mut right = fragment_end;
-                    for (s, e, new_text) in nested_edits {
-                        if *s > *e || *e > right {
-                            return None;
-                        }
-                        part.replace_range(s - fragment_start..e - fragment_start, new_text);
-                        right = *s;
-                    }
-                    parts.push(part);
-                }
-                format!("{prefix}{}{suffix}", parts.join(", "))
-            };
-            let group_start = group.span.start as usize;
-            let group_end = group.span.end as usize;
-            edits.retain(|(s, e, _)| !(*s >= group_start && *e <= group_end));
-            group_edits.push((group_start, group_end, replacement));
-        }
-        edits.extend(group_edits);
-        edits.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
-        let mut result = source.to_string();
-        let mut right = source.len();
-        for (start, end, replacement) in edits {
-            if start > end || end > right {
-                return None;
-            }
-            result.replace_range(start..end, &replacement);
-            right = start;
-        }
+        let result = plan.apply(source, &found.declarations)?;
         let checked_allocator = Allocator::default();
         let checked = parse_program(&checked_allocator, &result, source_type);
         if checked.is_clean()
