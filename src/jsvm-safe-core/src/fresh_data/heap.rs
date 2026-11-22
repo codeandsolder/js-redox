@@ -32,10 +32,15 @@ impl Fact {
         Ok(self.join_proven(other))
     }
 
+    pub(super) fn copy(&self, budget: &WorkBudget) -> Result<Self, BudgetExceeded> {
+        charge(budget, self.clone_weight())?;
+        Ok(self.clone())
+    }
+
     fn clone_weight(&self) -> usize {
         match self {
-            Self::Primitive(Value::String(value)) => value.len().saturating_add(1),
-            _ => 1,
+            Self::Primitive(value) => value_weight(value),
+            Self::Objects(_) => 1,
         }
     }
 
@@ -61,11 +66,7 @@ impl Fact {
     fn join_proven(&self, other: &Self) -> Option<Self> {
         match (self, other) {
             (Self::Primitive(a), Self::Primitive(b)) => {
-                let equal = match (a, b) {
-                    (Value::Number(a), Value::Number(b)) => a.to_bits() == b.to_bits(),
-                    _ => same_value(a, b),
-                };
-                equal.then(|| self.clone())
+                same_primitive_fact(a, b).then(|| self.clone())
             }
             (Self::Objects(a), Self::Objects(b)) => {
                 if Rc::ptr_eq(a, b) || a == b {
@@ -139,6 +140,22 @@ impl Fact {
             Self::Primitive(value) => Some(value),
             Self::Objects(_) => None,
         }
+    }
+}
+
+/// Heap facts must retain signed zero even though strict equality does
+/// not distinguish it. Keep this predicate separate from JS equality.
+fn same_primitive_fact(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Number(left), Value::Number(right)) => left.to_bits() == right.to_bits(),
+        _ => same_value(left, right),
+    }
+}
+
+pub(super) fn value_weight(value: &Value) -> usize {
+    match value {
+        Value::String(value) => value.len().saturating_add(1),
+        _ => 1,
     }
 }
 
@@ -524,21 +541,90 @@ impl OwnData {
     }
 }
 
-/// Outer None means no proved normal lookup yet; inner None is an
-/// effect-free data lookup whose value is unknown.
-fn join_lookup(
-    result: &mut Option<Option<Fact>>,
-    value: Option<Fact>,
-    budget: &WorkBudget,
-) -> Result<(), BudgetExceeded> {
-    if let (Some(Some(previous)), Some(next)) = (result.as_ref(), value.as_ref()) {
-        previous.charge_merge(next, budget)?;
+/// Merge an arbitrary number of possible property values without
+/// repeatedly allocating growing sorted location unions. Preserve the
+/// original shared fact until a genuinely different location set arrives.
+#[derive(Default)]
+enum LookupValues {
+    #[default]
+    Unseen,
+    Unknown,
+    Single(Fact),
+    Union(HashSet<AllocationId>),
+}
+
+impl LookupValues {
+    fn add(&mut self, value: Option<&Fact>, budget: &WorkBudget) -> Result<(), BudgetExceeded> {
+        if matches!(self, Self::Unknown) {
+            return Ok(());
+        }
+        let Some(value) = value else {
+            *self = Self::Unknown;
+            return Ok(());
+        };
+        match self {
+            Self::Unseen => {
+                *self = Self::Single(value.copy(budget)?);
+            }
+            Self::Single(previous) => {
+                if let (Fact::Objects(left), Fact::Objects(right)) = (&*previous, value) {
+                    if Rc::ptr_eq(left, right) {
+                        return Ok(());
+                    }
+                    charge(budget, left.len().saturating_add(right.len()))?;
+                    if left != right {
+                        let mut union = HashSet::new();
+                        union.extend(left.iter().copied());
+                        union.extend(right.iter().copied());
+                        *self = Self::Union(union);
+                    }
+                } else if let (Fact::Primitive(left), Fact::Primitive(right)) = (&*previous, value)
+                {
+                    charge(
+                        budget,
+                        value_weight(left).saturating_add(value_weight(right)),
+                    )?;
+                    if !same_primitive_fact(left, right) {
+                        *self = Self::Unknown;
+                    }
+                } else {
+                    *self = Self::Unknown;
+                }
+            }
+            Self::Union(union) => {
+                if let Fact::Objects(locations) = value {
+                    charge(budget, locations.len())?;
+                    union.extend(locations.iter().copied());
+                } else {
+                    *self = Self::Unknown;
+                }
+            }
+            Self::Unknown => {}
+        }
+        Ok(())
     }
-    *result = Some(match result.take() {
-        Some(previous) => join_value(&previous, &value),
-        None => value,
-    });
-    Ok(())
+
+    fn finish(self, budget: &WorkBudget) -> Result<Option<Fact>, BudgetExceeded> {
+        match self {
+            Self::Unseen | Self::Unknown => Ok(None),
+            Self::Single(value) => Ok(Some(value)),
+            Self::Union(union) => {
+                charge(
+                    budget,
+                    union.capacity().saturating_add(
+                        union.len().saturating_mul(
+                            usize::try_from(union.len().max(1).ilog2())
+                                .unwrap_or(usize::MAX)
+                                .saturating_add(1),
+                        ),
+                    ),
+                )?;
+                let mut locations = union.into_iter().collect::<Vec<_>>();
+                locations.sort_unstable();
+                Ok(Some(Fact::Objects(locations.into())))
+            }
+        }
+    }
 }
 
 /// Bound dead allocation retention without tracing the entire live heap
@@ -657,6 +743,14 @@ impl Environment {
 
     pub(super) fn get(&self, symbol: &SymbolId) -> Option<&Fact> {
         self.bindings.get(symbol)
+    }
+
+    pub(super) fn read_binding(
+        &self,
+        symbol: &SymbolId,
+        budget: &WorkBudget,
+    ) -> Result<Option<Fact>, BudgetExceeded> {
+        self.get(symbol).map(|fact| fact.copy(budget)).transpose()
     }
 
     fn charge_binding_copy(&self, budget: &WorkBudget) -> Result<(), BudgetExceeded> {
@@ -944,67 +1038,84 @@ impl Environment {
         }
     }
 
-    /// Resolve ordinary [[Get]] from every possible receiver and prototype.
-    /// Every successful path must reach either known ordinary writable data
-    /// or a null prototype, without an opaque descriptor or unknown object.
-    /// This is also sufficient to establish ordinary [[Set]] eligibility.
-    pub(super) fn read(
+    /// Prove ordinary property resolution on every possible receiver.
+    /// The caller chooses whether to materialize data values or merely
+    /// establish that no opaque descriptor can intercept the operation.
+    fn visit_resolved_data(
         &self,
         locations: &Locations,
         key: &str,
         budget: &WorkBudget,
-    ) -> Result<Option<Option<Fact>>, BudgetExceeded> {
+        mut visit: impl FnMut(Option<&Fact>) -> Result<(), BudgetExceeded>,
+    ) -> Result<bool, BudgetExceeded> {
         if let [id] = locations.as_ref() {
             charge(budget, key.len())?;
             let Some(data) = self.allocations.get(id) else {
-                return Ok(None);
+                return Ok(false);
             };
             if let Property::Data(value) = data.property(key) {
-                if let Some(value) = value {
-                    charge(budget, value.clone_weight())?;
-                }
-                return Ok(Some(value.clone()));
+                visit(value.as_ref())?;
+                return Ok(true);
             }
         }
         charge(budget, locations.len())?;
         let mut pending = locations.to_vec();
         let mut visited = HashSet::new();
-        let mut result = None;
+        let undefined = Fact::Primitive(Value::Undefined);
+        let mut found = false;
         while let Some(id) = pending.pop() {
             charge(budget, 1)?;
             if !visited.insert(id) {
                 continue;
             }
             let Some(data) = self.allocations.get(&id) else {
-                return Ok(None);
+                return Ok(false);
             };
-            let property = data.property(key);
-            charge(budget, key.len().saturating_add(property.clone_weight()))?;
-            match property {
+            charge(budget, key.len())?;
+            match data.property(key) {
                 Property::Data(value) => {
-                    join_lookup(&mut result, value.clone(), budget)?;
+                    visit(value.as_ref())?;
+                    found = true;
                     continue;
                 }
-                Property::MaybeData(value) => join_lookup(&mut result, value.clone(), budget)?,
+                Property::MaybeData(value) => {
+                    visit(value.as_ref())?;
+                    found = true;
+                }
                 Property::Absent => {}
-                Property::Opaque => return Ok(None),
+                Property::Opaque => return Ok(false),
             }
             match &data.prototype {
-                Prototype::Unknown => return Ok(None),
+                Prototype::Unknown => return Ok(false),
                 Prototype::Null => {
-                    join_lookup(&mut result, Some(Fact::Primitive(Value::Undefined)), budget)?;
+                    visit(Some(&undefined))?;
+                    found = true;
                 }
                 Prototype::Objects(prototypes) => {
                     charge(budget, prototypes.len())?;
                     if prototypes.is_empty() || prototypes.iter().any(|&prototype| prototype >= id)
                     {
-                        return Ok(None);
+                        return Ok(false);
                     }
                     pending.extend(prototypes.iter().copied());
                 }
             }
         }
-        Ok(result)
+        Ok(found)
+    }
+
+    pub(super) fn read(
+        &self,
+        locations: &Locations,
+        key: &str,
+        budget: &WorkBudget,
+    ) -> Result<Option<Option<Fact>>, BudgetExceeded> {
+        let mut values = LookupValues::default();
+        if self.visit_resolved_data(locations, key, budget, |value| values.add(value, budget))? {
+            Ok(Some(values.finish(budget)?))
+        } else {
+            Ok(None)
+        }
     }
 
     fn update(
@@ -1040,7 +1151,7 @@ impl Environment {
         value: Option<Fact>,
         budget: &WorkBudget,
     ) -> Result<bool, BudgetExceeded> {
-        if self.read(locations, key, budget)?.is_none() {
+        if !self.visit_resolved_data(locations, key, budget, |_| Ok(()))? {
             return Ok(false);
         }
         charge(budget, locations.len())?;
@@ -1112,6 +1223,107 @@ mod tests {
             ),
             Property::Opaque => (3, None),
         }
+    }
+
+    #[test]
+    fn binding_reads_charge_primitive_copies_but_not_shared_location_contents(
+    ) -> Result<(), BudgetExceeded> {
+        let unlimited = WorkBudget::unlimited("binding-setup");
+        let mut heap = Environment::new();
+        let symbol = SymbolId::new(0);
+        heap.insert(
+            symbol,
+            Fact::Primitive(Value::String("x".repeat(8192))),
+            &unlimited,
+        )?;
+        let bounded = WorkBudget::new("binding-read", work_budget::BudgetLimits::work(32));
+        assert!(heap.read_binding(&symbol, &bounded).is_err());
+        let locations = Rc::from((0..1024).collect::<Vec<_>>());
+        heap.insert(symbol, Fact::Objects(Rc::clone(&locations)), &unlimited)?;
+        let bounded = WorkBudget::new("binding-read", work_budget::BudgetLimits::work(32));
+        let Some(Fact::Objects(read)) = heap.read_binding(&symbol, &bounded)? else {
+            unreachable!()
+        };
+        assert!(Rc::ptr_eq(&read, &locations));
+        Ok(())
+    }
+
+    #[test]
+    fn lookup_accumulates_many_object_values_in_one_set() -> Result<(), BudgetExceeded> {
+        let unlimited = WorkBudget::unlimited("lookup-setup");
+        let mut heap = Environment::new();
+        let mut receivers = Vec::new();
+        let count = 1024;
+        for index in 0..count {
+            let target = heap.allocate(
+                index * 2,
+                OwnData::new(AllocationKind::Ordinary),
+                &unlimited,
+            )?;
+            let mut receiver = OwnData::new(AllocationKind::Ordinary);
+            receiver.define_data("x".into(), Some(target));
+            heap.allocate(index * 2 + 1, receiver, &unlimited)?;
+            receivers.push(index * 2 + 1);
+        }
+        let receivers = Rc::from(receivers);
+        // A sequential union would traverse more than 500,000 IDs.
+        let bounded = WorkBudget::new("lookup-many-values", work_budget::BudgetLimits::work(32768));
+        let Some(Some(Fact::Objects(result))) = heap.read(&receivers, "x", &bounded)? else {
+            unreachable!()
+        };
+        assert_eq!(result.len(), count);
+        assert!(result.iter().copied().eq((0..count).map(|index| index * 2)));
+        let mut values = LookupValues::default();
+        let fact = Fact::Objects(Rc::clone(&result));
+        values.add(Some(&fact), &unlimited)?;
+        values.add(Some(&fact), &unlimited)?;
+        let Some(Fact::Objects(shared)) = values.finish(&unlimited)? else {
+            unreachable!()
+        };
+        assert!(Rc::ptr_eq(&shared, &result));
+        Ok(())
+    }
+
+    #[test]
+    fn descriptor_proof_does_not_materialize_unused_inherited_values() -> Result<(), BudgetExceeded>
+    {
+        let unlimited = WorkBudget::unlimited("lookup-setup");
+        let mut heap = Environment::new();
+        for id in 0..2 {
+            let mut data = OwnData::new(AllocationKind::Ordinary);
+            data.define_data(
+                "x".into(),
+                Some(Fact::Primitive(Value::String("a".repeat(8192)))),
+            );
+            let parent = heap.allocate(id * 2, data, &unlimited)?;
+            let mut child = OwnData::new(AllocationKind::Ordinary);
+            child.set_literal_prototype(Some(parent));
+            heap.allocate(id * 2 + 1, child, &unlimited)?;
+        }
+        let locations = Rc::from([1, 3]);
+        let bounded = WorkBudget::new(
+            "write-with-large-inherited-value",
+            work_budget::BudgetLimits::work(128),
+        );
+        assert!(heap.write(
+            &locations,
+            "x",
+            Some(Fact::Primitive(Value::Number(9.0))),
+            &bounded
+        )?);
+        assert!(matches!(
+            heap.read(&locations, "x", &unlimited)?,
+            Some(None)
+        ));
+        // An opaque path must still reject a write, even when earlier
+        // paths have already established unknown ordinary data.
+        let mut opaque = OwnData::new(AllocationKind::Ordinary);
+        opaque.define_accessor("x".into());
+        heap.allocate(4, opaque, &unlimited)?;
+        assert!(!heap.write(&Rc::from([1, 3, 4]), "x", None, &unlimited)?);
+        let bounded = WorkBudget::new("read-large-value", work_budget::BudgetLimits::work(128));
+        assert!(heap.read(&Rc::from([0]), "x", &bounded).is_err());
+        Ok(())
     }
 
     #[test]

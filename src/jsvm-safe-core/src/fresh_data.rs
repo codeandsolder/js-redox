@@ -7,8 +7,7 @@
 //! bodies and unsupported control regions are analyzed from an empty state.
 use crate::binding_facts::BindingFacts;
 use crate::value_eval::{
-    eval, eval_binary, eval_logical_left, eval_unary_value, is_prototype_setter,
-    literal_property_key, LogicalStep, Value,
+    eval, eval_binary, eval_unary_value, is_prototype_setter, literal_property_key, Value,
 };
 use oxc_ast::ast::{
     Argument, ArrayExpressionElement, BindingPattern, Declaration, Expression, IdentifierReference,
@@ -23,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 use work_budget::{BudgetExceeded, WorkBudget};
 
 mod heap;
-use heap::{AllocationId, AllocationKind, Environment, Fact, Locations, OwnData};
+use heap::{value_weight, AllocationId, AllocationKind, Environment, Fact, Locations, OwnData};
 
 enum Reference {
     Binding(SymbolId),
@@ -37,7 +36,7 @@ impl Reference {
         budget: &WorkBudget,
     ) -> Result<Option<Option<Fact>>, BudgetExceeded> {
         match self {
-            Self::Binding(symbol) => Ok(Some(environment.get(symbol).cloned())),
+            Self::Binding(symbol) => Ok(Some(environment.read_binding(symbol, budget)?)),
             Self::Member { locations, key } => environment.read(locations, key, budget),
         }
     }
@@ -45,9 +44,10 @@ impl Reference {
     fn write(
         &self,
         environment: &mut Environment,
-        value: Option<Fact>,
+        value: Option<&Fact>,
         budget: &WorkBudget,
     ) -> Result<bool, BudgetExceeded> {
+        let value = value.map(|fact| fact.copy(budget)).transpose()?;
         match self {
             Self::Binding(symbol) => {
                 if let Some(value) = value {
@@ -143,6 +143,18 @@ impl Analyzer<'_> {
         }
     }
 
+    fn charge_values<'a>(&mut self, values: impl IntoIterator<Item = &'a Value>) -> bool {
+        let units = values
+            .into_iter()
+            .map(value_weight)
+            .fold(0usize, usize::saturating_add);
+        self.heap_result(
+            self.budget
+                .consume(u64::try_from(units).unwrap_or(u64::MAX)),
+        )
+        .is_some()
+    }
+
     fn heap_result<T>(&mut self, result: Result<T, BudgetExceeded>) -> Option<T> {
         match result {
             Ok(value) => Some(value),
@@ -189,7 +201,7 @@ impl Analyzer<'_> {
     }
 
     fn identifier(
-        &self,
+        &mut self,
         identifier: &IdentifierReference<'_>,
         environment: &mut Environment,
     ) -> Evaluation {
@@ -206,9 +218,12 @@ impl Analyzer<'_> {
         if !reference_flags.is_read() || reference_flags.is_write() {
             return Self::barrier(environment);
         }
-        if let Some(fact) = environment.get(&symbol) {
+        let Some(fact) = self.heap_result(environment.read_binding(&symbol, self.budget)) else {
+            return Self::barrier(environment);
+        };
+        if let Some(fact) = fact {
             return Evaluation {
-                fact: Some(fact.clone()),
+                fact: Some(fact),
                 inert: true,
             };
         }
@@ -277,6 +292,9 @@ impl Analyzer<'_> {
         let inert = object.inert && key.inert;
         if let Some(Fact::Primitive(value)) = &fact {
             if inert {
+                if !self.charge_values([value]) {
+                    return Self::barrier(environment);
+                }
                 self.reads
                     .values
                     .insert((span.start, span.end), value.clone());
@@ -337,10 +355,14 @@ impl Analyzer<'_> {
     }
 
     fn logical_decision(operator: &str, fact: &Fact) -> Option<bool> {
-        match fact {
-            Fact::Primitive(value) => eval_logical_left(operator, value.clone())
-                .map(|step| matches!(step, LogicalStep::EvaluateRight)),
-            Fact::Objects(_) => Some(operator == "&&"),
+        match operator {
+            "&&" => Some(fact.truthy()),
+            "||" => Some(!fact.truthy()),
+            "??" => Some(matches!(
+                fact.primitive(),
+                Some(Value::Null | Value::Undefined)
+            )),
+            _ => None,
         }
     }
 
@@ -360,7 +382,7 @@ impl Analyzer<'_> {
         if operator == AssignmentOperator::Assign {
             let value = self.expression(&assignment.right, environment);
             if !self
-                .heap_result(reference.write(environment, value.fact.clone(), self.budget))
+                .heap_result(reference.write(environment, value.fact.as_ref(), self.budget))
                 .unwrap_or(false)
             {
                 environment.clear();
@@ -390,7 +412,7 @@ impl Analyzer<'_> {
             let skipped = (decision.is_none()).then(|| (environment.clone(), self.next_allocation));
             let value = self.expression(&assignment.right, environment);
             if !self
-                .heap_result(reference.write(environment, value.fact.clone(), self.budget))
+                .heap_result(reference.write(environment, value.fact.as_ref(), self.budget))
                 .unwrap_or(false)
             {
                 environment.clear();
@@ -411,19 +433,24 @@ impl Analyzer<'_> {
         }
 
         let right = self.expression(&assignment.right, environment);
-        let value = operator.to_binary_operator().and_then(|binary| {
-            eval_binary(
-                binary.as_str(),
-                previous.as_ref()?.primitive()?,
-                right.primitive_value()?,
-            )
-        });
+        let value = if let (Some(binary), Some(left), Some(right)) = (
+            operator.to_binary_operator(),
+            previous.as_ref().and_then(Fact::primitive),
+            right.primitive_value(),
+        ) {
+            if !self.charge_values([left, right]) {
+                return Self::barrier(environment);
+            }
+            eval_binary(binary.as_str(), left, right)
+        } else {
+            None
+        };
         let Some(value) = value else {
             return Self::barrier(environment);
         };
         let fact = Fact::Primitive(value);
         if !self
-            .heap_result(reference.write(environment, Some(fact.clone()), self.budget))
+            .heap_result(reference.write(environment, Some(&fact), self.budget))
             .unwrap_or(false)
         {
             environment.clear();
@@ -458,7 +485,7 @@ impl Analyzer<'_> {
         if !self
             .heap_result(reference.write(
                 environment,
-                Some(Fact::Primitive(Value::Number(next))),
+                Some(&Fact::Primitive(Value::Number(next))),
                 self.budget,
             ))
             .unwrap_or(false)
@@ -530,9 +557,14 @@ impl Analyzer<'_> {
                     return self.delete_expression(&unary.argument, environment);
                 }
                 let argument = self.expression(&unary.argument, environment);
-                let value = argument
-                    .primitive_value()
-                    .and_then(|value| eval_unary_value(operator, value));
+                let value = if let Some(value) = argument.primitive_value() {
+                    if !self.charge_values([value]) {
+                        return Self::barrier(environment);
+                    }
+                    eval_unary_value(operator, value)
+                } else {
+                    None
+                };
                 if let Some(value) = value {
                     return Evaluation::primitive(value, argument.inert);
                 }
@@ -562,6 +594,9 @@ impl Analyzer<'_> {
                 if let (Some(left_value), Some(right_value)) =
                     (left.primitive_value(), right.primitive_value())
                 {
+                    if !self.charge_values([left_value, right_value]) {
+                        return Self::barrier(environment);
+                    }
                     if let Some(value) = eval_binary(operator, left_value, right_value) {
                         return Evaluation::primitive(value, left.inert && right.inert);
                     }
