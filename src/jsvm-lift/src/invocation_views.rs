@@ -9,6 +9,7 @@ use crate::{
         retain_agreed, script_id_text, session_name, ScriptIdentityIndex, ScriptOriginContext,
     },
     sha256_hex,
+    source_text::js_line_ranges,
 };
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
@@ -37,26 +38,6 @@ fn verified_sha(value: &Value) -> Option<&str> {
         .filter(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
-/// ECMAScript lines include CR, LF, CRLF and Unicode line/paragraph separators.
-/// Retain an empty final line so a coordinate at EOF is representable.
-fn js_source_lines(source: &str) -> impl Iterator<Item = &str> {
-    let mut remaining = Some(source);
-    std::iter::from_fn(move || {
-        let text = remaining.take()?;
-        let Some(end) = text.find(['\r', '\n', '\u{2028}', '\u{2029}']) else {
-            return Some(text);
-        };
-        let (line, terminator) = text.split_at(end);
-        let width = if terminator.starts_with("\r\n") {
-            2
-        } else {
-            terminator.chars().next()?.len_utf8()
-        };
-        remaining = terminator.get(width..);
-        Some(line)
-    })
-}
-
 fn source_excerpt(raw: &str, line: u64, first_line: Option<u64>) -> String {
     let Some(start) = first_line else {
         return "CDP script start offset was not recorded; raw source link is authoritative.\n"
@@ -72,7 +53,12 @@ fn source_excerpt(raw: &str, line: u64, first_line: Option<u64>) -> String {
     let end = local_line.saturating_add(3);
     let mut excerpt = String::new();
     let mut found = false;
-    for (index, text) in js_source_lines(raw).enumerate().take(end).skip(begin) {
+    for (index, text) in js_line_ranges(raw)
+        .map(|range| &raw[range])
+        .enumerate()
+        .take(end)
+        .skip(begin)
+    {
         found |= index == local_line;
         let mut chars = text.chars();
         let shown = chars.by_ref().take(260).collect::<String>();
@@ -643,7 +629,9 @@ mod tests {
     fn source_excerpt_uses_ecmascript_line_terminators_and_eof() {
         let source = "zero\rone\r\ntwo\n\u{2028}four\u{2029}";
         assert_eq!(
-            js_source_lines(source).collect::<Vec<_>>(),
+            js_line_ranges(source)
+                .map(|range| &source[range])
+                .collect::<Vec<_>>(),
             ["zero", "one", "two", "", "four", ""]
         );
         assert!(source_excerpt(source, 14, Some(10)).contains(">     15 | four"));

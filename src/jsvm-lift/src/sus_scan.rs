@@ -1,6 +1,7 @@
 use crate::{
     browser_decode::{decode_script, ScriptDecodeContext},
     numeric::exact_u64,
+    source_text::SourceLineIndex,
 };
 use anyhow::{ensure, Context, Result};
 use base64::{engine::general_purpose, Engine as _};
@@ -1000,20 +1001,6 @@ fn hot_api_name(value: &str) -> bool {
     )
 }
 
-fn line_starts(source: &str) -> Vec<usize> {
-    let mut starts = vec![0usize];
-    for (index, byte) in source.bytes().enumerate() {
-        if byte == b'\n' {
-            starts.push(index + 1);
-        }
-    }
-    starts
-}
-
-fn line_for(starts: &[usize], offset: usize) -> usize {
-    starts.partition_point(|&start| start <= offset).max(1)
-}
-
 fn compact_snippet(source: &str, start: usize, end: usize) -> String {
     let start = start.min(source.len());
     let end = end.min(source.len()).max(start);
@@ -1037,13 +1024,13 @@ fn compact_snippet(source: &str, start: usize, end: usize) -> String {
     out
 }
 
-fn materialize_signal(raw: &RawSignal, lines: &[usize]) -> SusSignal {
+fn materialize_signal(raw: &RawSignal, lines: &SourceLineIndex) -> SusSignal {
     SusSignal {
         kind: raw.kind.to_string(),
         weight: raw.weight,
         start: raw.start,
         end: raw.end,
-        line: line_for(lines, raw.start as usize),
+        line: lines.byte_line_column(raw.start as usize).0,
         subject: raw.subject.clone(),
         detail: raw.detail.clone(),
     }
@@ -1238,8 +1225,8 @@ fn materialize_clusters(
     source: &str,
     signals: &[RawSignal],
     candidates: Vec<ClusterCandidate>,
+    lines: &SourceLineIndex,
 ) -> Vec<SusCluster> {
-    let lines = line_starts(source);
     let mut selected = Vec::with_capacity(candidates.len());
     for candidate in candidates {
         let window = &signals[candidate.left..candidate.right];
@@ -1262,14 +1249,16 @@ fn materialize_clusters(
             density_per_kib: candidate.density_per_kib,
             start: candidate.start,
             end: candidate.end,
-            start_line: line_for(&lines, candidate.start as usize),
-            end_line: line_for(&lines, candidate.end.saturating_sub(1) as usize),
+            start_line: lines.byte_line_column(candidate.start as usize).0,
+            end_line: lines
+                .byte_line_column(candidate.end.saturating_sub(1) as usize)
+                .0,
             signal_count: window.len(),
             kinds,
             repeated_subjects,
             signals: window
                 .iter()
-                .map(|signal| materialize_signal(signal, &lines))
+                .map(|signal| materialize_signal(signal, lines))
                 .collect(),
             snippet: compact_snippet(source, candidate.start as usize, candidate.end as usize),
         });
@@ -1281,11 +1270,16 @@ fn materialize_clusters(
 fn cluster_signals(
     source: &str,
     raw: &[RawSignal],
-    window_bytes: usize,
-    min_score: u32,
-    min_signals: usize,
-    max_clusters: usize,
+    options: &SusScanOptions,
+    lines: &SourceLineIndex,
 ) -> Vec<SusCluster> {
+    let SusScanOptions {
+        window_bytes,
+        min_score,
+        min_signals,
+        max_clusters,
+        ..
+    } = *options;
     if raw.is_empty() || max_clusters == 0 {
         return Vec::new();
     }
@@ -1293,7 +1287,7 @@ fn cluster_signals(
     signals.sort_by_key(|signal| (signal.start, signal.end));
     let candidates = score_cluster_candidates(&signals, window_bytes, min_score, min_signals);
     let selected = suppress_overlapping_candidates(candidates, max_clusters);
-    materialize_clusters(source, &signals, selected)
+    materialize_clusters(source, &signals, selected, lines)
 }
 
 fn primary_source_type(path: &Path) -> SourceType {
@@ -1352,14 +1346,8 @@ fn analyze_program(
     for signal in &signals {
         *signal_kinds.entry(signal.kind.to_string()).or_default() += 1;
     }
-    let clusters = cluster_signals(
-        source,
-        &signals,
-        options.window_bytes,
-        options.min_score,
-        options.min_signals,
-        options.max_clusters,
-    );
+    let lines = SourceLineIndex::new(source);
+    let clusters = cluster_signals(source, &signals, options, &lines);
     let top_score = clusters.first().map_or(0, |cluster| cluster.score);
     let actionable_signals = signals
         .iter()
@@ -1372,18 +1360,10 @@ fn analyze_program(
             .entry(signal.kind.to_string())
             .or_default() += 1;
     }
-    let actionable_clusters = cluster_signals(
-        source,
-        &actionable_signals,
-        options.window_bytes,
-        options.min_score,
-        options.min_signals,
-        options.max_clusters,
-    );
+    let actionable_clusters = cluster_signals(source, &actionable_signals, options, &lines);
     let actionable_top_score = actionable_clusters
         .first()
         .map_or(0, |cluster| cluster.score);
-    let lines = line_starts(source);
 
     SusFileReport {
         input: input.display().to_string(),
@@ -1733,6 +1713,29 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../corpus/generated/sus-scanner")
             .join(name)
+    }
+
+    #[test]
+    fn structural_signal_locations_use_all_javascript_line_terminators() -> Result<()> {
+        let source = "// comment\rconst a = atob('YQ==');\r\nconst b = atob('Yg==');\u{2028}const c = atob('Yw==');\u{2029}const d = atob('ZA==');";
+        let report = analyze_source(
+            source,
+            PathBuf::from("line-terminators.js").as_path(),
+            &options(),
+        )?;
+        assert!(!report.fatal_error);
+        let signals = report.signals.context("included signals")?;
+        for (index, expected) in source.match_indices("atob(").enumerate() {
+            let offset = expected.0;
+            assert!(
+                signals
+                    .iter()
+                    .any(|signal| signal.start as usize == offset && signal.line == index + 2),
+                "missing signal on line {}: {signals:?}",
+                index + 2
+            );
+        }
+        Ok(())
     }
 
     #[test]

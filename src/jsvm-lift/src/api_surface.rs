@@ -1,3 +1,4 @@
+use crate::source_text::SourceLineIndex;
 use anyhow::{anyhow, Result};
 use jsvm_safe_core::{
     exact_property_key, is_prototype_setter, ProvenConstantEnvironment, StaticPrimitiveValue,
@@ -304,33 +305,6 @@ fn source_fragment(source: &str, span: Span) -> String {
         .to_string()
 }
 
-#[derive(Debug)]
-struct LineIndex {
-    starts: Vec<usize>,
-}
-
-impl LineIndex {
-    fn new(source: &str) -> Self {
-        let mut starts = vec![0];
-        starts.extend(
-            source
-                .bytes()
-                .enumerate()
-                .filter_map(|(index, byte)| (byte == b'\n').then_some(index + 1)),
-        );
-        Self { starts }
-    }
-
-    fn line_column(&self, offset: u32) -> (usize, usize) {
-        let offset = offset as usize;
-        let index = self
-            .starts
-            .partition_point(|start| *start <= offset)
-            .saturating_sub(1);
-        (index + 1, offset.saturating_sub(self.starts[index]))
-    }
-}
-
 fn allowed_fetch_path(path: &str) -> bool {
     matches!(
         path,
@@ -472,7 +446,7 @@ impl SinkMutations {
         operation: &str,
         reflective: bool,
         source: &str,
-        lines: &LineIndex,
+        lines: &SourceLineIndex,
     ) {
         let (target_pattern, bound_function_span) = match path {
             MutationPath::Global(path) => (path, None),
@@ -541,7 +515,7 @@ impl SinkMutations {
         if affected.is_empty() {
             return;
         }
-        let (line, column) = lines.line_column(span.start);
+        let (line, column) = lines.byte_line_column(span.start as usize);
         self.sites.insert(ApiMutationSite {
             start: span.start,
             end: span.end,
@@ -584,7 +558,7 @@ impl SinkMutations {
 
 struct SinkMutationCollector<'s, 'c> {
     source: &'s str,
-    lines: LineIndex,
+    lines: &'c SourceLineIndex,
     scoping: &'c Scoping,
     constants: &'c ProvenConstantEnvironment,
     callables: &'c CallableIndex,
@@ -672,7 +646,7 @@ impl SinkMutationCollector<'_, '_> {
     ) {
         if let Some(path) = path {
             self.mutations
-                .record(&path, span, operation, reflective, self.source, &self.lines);
+                .record(&path, span, operation, reflective, self.source, self.lines);
         }
     }
 
@@ -921,7 +895,7 @@ struct Collector<'s, 'c> {
     mutations: &'c SinkMutations,
     callables: &'c CallableIndex,
     safe_member_refs: &'c BTreeSet<ReferenceId>,
-    lines: LineIndex,
+    lines: &'c SourceLineIndex,
     callsites: BTreeSet<ApiCallsite>,
 }
 
@@ -1069,7 +1043,7 @@ impl Collector<'_, '_> {
         };
         let callee_text = global_path(self.scoping, self.constants, callee)
             .unwrap_or_else(|| source_fragment(self.source, callee.span()));
-        let (line, column) = self.lines.line_column(span.start);
+        let (line, column) = self.lines.byte_line_column(span.start as usize);
         self.callsites.insert(ApiCallsite {
             kind: callable.kind.callsite_kind(candidate).to_owned(),
             start: span.start,
@@ -1188,9 +1162,10 @@ pub fn analyze_api_surface(source: &str, budget: &WorkBudget) -> Result<ApiSurfa
             .map(|(name, family)| (name.to_owned(), family))
             .collect();
 
+        let lines = SourceLineIndex::new(source);
         let mut mutations = SinkMutationCollector {
             source,
-            lines: LineIndex::new(source),
+            lines: &lines,
             scoping,
             constants: &constants,
             callables: &callables,
@@ -1220,7 +1195,7 @@ pub fn analyze_api_surface(source: &str, budget: &WorkBudget) -> Result<ApiSurfa
             mutations: &mutations.mutations,
             callables: &callables,
             safe_member_refs: &safe_member_refs.refs,
-            lines: LineIndex::new(source),
+            lines: &lines,
             callsites: BTreeSet::new(),
         };
         collector.visit_program(&program);
@@ -1278,6 +1253,19 @@ mod tests {
             analyze_api_surface_budgeted(source, &WorkBudget::unlimited("api-surface-test"))?
                 .callsites,
         )
+    }
+
+    #[test]
+    fn api_callsites_use_ecmascript_lines_and_byte_columns() -> Result<()> {
+        let source = "// comment\r/*💡*/fetch('/a');\r\nfetch('/b');\u{2028}fetch('/c');\u{2029}fetch('/d');";
+        let rows = analyze_api_surface(source)?;
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.line, row.column))
+                .collect::<Vec<_>>(),
+            [(2, 8), (3, 0), (4, 0), (5, 0)]
+        );
+        Ok(())
     }
 
     #[test]

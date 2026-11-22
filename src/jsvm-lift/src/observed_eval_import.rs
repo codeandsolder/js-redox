@@ -1,5 +1,8 @@
 //! Execution-conditioned, AST-linked source evidence for static source trees.
-use crate::sha256_hex;
+use crate::{
+    sha256_hex,
+    source_text::{utf16_byte_offset, SourceLineIndex},
+};
 use anyhow::{bail, Context, Result};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
@@ -147,7 +150,7 @@ fn canonical_argument(expression: &Expression<'_>) -> String {
 }
 
 struct Scan<'s> {
-    source: &'s str,
+    lines: SourceLineIndex,
     scoping: &'s Scoping,
     bindings: HashMap<(u32, u32), String>,
     frames: Vec<Frame>,
@@ -155,9 +158,9 @@ struct Scan<'s> {
 }
 
 impl<'s> Scan<'s> {
-    fn new(source: &'s str, scoping: &'s Scoping) -> Self {
+    fn new(source: &str, scoping: &'s Scoping) -> Self {
         Self {
-            source,
+            lines: SourceLineIndex::new(source),
             scoping,
             bindings: HashMap::new(),
             frames: Vec::new(),
@@ -281,13 +284,7 @@ impl<'a> Visit<'a> for Scan<'_> {
             self.calls.push(Site {
                 start: call.span.start,
                 end: call.span.end,
-                line: 1 + self
-                    .source
-                    .get(..call.span.start as usize)
-                    .unwrap_or_default()
-                    .bytes()
-                    .filter(|byte| *byte == b'\n')
-                    .count(),
+                line: self.lines.byte_line_column(call.span.start as usize).0,
                 argument: parts.join(","),
                 argument_shapes: shapes,
                 argument_references: refs.references,
@@ -410,20 +407,7 @@ pub fn discover_direct_eval_sites(original_path: &Path) -> Result<serde_json::Va
 }
 
 fn utf16_to_bytes(text: &str, offset: usize) -> Result<u32> {
-    let mut units = 0;
-    for (index, ch) in text.char_indices() {
-        if units == offset {
-            return Ok(index.try_into()?);
-        }
-        units += ch.len_utf16();
-        if units > offset {
-            bail!("UTF-16 offset falls inside a surrogate pair");
-        }
-    }
-    if units == offset {
-        return Ok(text.len().try_into()?);
-    }
-    bail!("UTF-16 offset exceeds source length");
+    Ok(utf16_byte_offset(text, offset)?.try_into()?)
 }
 
 fn js_files(root: &Path) -> Result<Vec<PathBuf>> {
@@ -1916,6 +1900,18 @@ mod tests {
         let cjs = "const oU = (D) => eval(D);";
         assert_eq!(parse_sites_file(cjs, Path::new("original.cjs"))?.len(), 1);
         assert_eq!(parse_sites_file(cjs, Path::new("original.js"))?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn recovered_source_site_locations_use_ecmascript_lines() -> Result<()> {
+        let source =
+            "// comment\rfunction f(x){\r\n  return eval(x);\u{2028}}\u{2029}eval('text');";
+        let sites = parse_sites(source)?;
+        assert_eq!(
+            sites.iter().map(|site| site.line).collect::<Vec<_>>(),
+            [3, 5]
+        );
         Ok(())
     }
 

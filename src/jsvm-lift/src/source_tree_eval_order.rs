@@ -11,7 +11,7 @@ use oxc_syntax::operator::AssignmentOperator;
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
-use crate::source_tree_navigation::long_assignment_roots;
+use crate::{source_text::SourceLineIndex, source_tree_navigation::long_assignment_roots};
 
 struct Phase {
     span: Span,
@@ -521,14 +521,11 @@ fn cell(s: &str) -> String {
         .replace(['\n', '\r'], " ")
         .replace(char::from(96), "'")
 }
-fn line_col(source: &str, start: usize) -> (usize, usize) {
-    let pre = source.get(..start).unwrap_or("");
-    (
-        pre.bytes().filter(|b| *b == b'\n').count() + 1,
-        pre.rsplit('\n').next().unwrap_or("").chars().count() + 1,
-    )
-}
-pub fn ordered_assignment_phases(source: &str, program: &Program<'_>) -> Option<String> {
+pub(crate) fn ordered_assignment_phases(
+    source: &str,
+    program: &Program<'_>,
+    lines: &SourceLineIndex,
+) -> Option<String> {
     let roots = long_assignment_roots(source, program);
     if roots.is_empty() {
         return None;
@@ -569,7 +566,7 @@ pub fn ordered_assignment_phases(source: &str, program: &Program<'_>) -> Option<
     );
     collector.sections.sort_by_key(|(span, _)| span.start);
     for (root, phases) in &collector.sections {
-        let (line, col) = line_col(source, root.start as usize);
+        let (line, col) = lines.character_line_column(source, root.start as usize)?;
         let _ = write!(
             out,
             "## Assignment at {line}:{col} (source bytes {}–{})\n\n",
@@ -602,7 +599,7 @@ pub fn ordered_assignment_phases(source: &str, program: &Program<'_>) -> Option<
 
 #[cfg(test)]
 mod tests {
-    use super::ordered_assignment_phases;
+    use super::{ordered_assignment_phases, SourceLineIndex};
     use oxc_allocator::Allocator;
     use oxc_span::SourceType;
     use rolldown_redox::ecmascript::parse_program;
@@ -611,7 +608,8 @@ mod tests {
         let arena = Allocator::default();
         let parsed = parse_program(&arena, source, SourceType::unambiguous());
         assert!(parsed.is_clean(), "{source}");
-        let result = ordered_assignment_phases(source, &parsed.program);
+        let result =
+            ordered_assignment_phases(source, &parsed.program, &SourceLineIndex::new(source));
         assert!(result.is_some(), "{source}");
         result.unwrap_or_default()
     }
