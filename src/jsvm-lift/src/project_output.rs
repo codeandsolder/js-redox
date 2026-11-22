@@ -2,6 +2,7 @@
 use crate::capture_project::{read_manifest, MANIFEST_NAME};
 use anyhow::{bail, ensure, Context, Result};
 use std::{
+    collections::HashMap,
     fs,
     io::ErrorKind,
     path::{Path, PathBuf},
@@ -53,6 +54,41 @@ fn resolve_destination(path: &Path) -> Result<PathBuf> {
 
 fn validate_project_directory(path: &Path) -> Result<()> {
     read_manifest(&path.join(MANIFEST_NAME))?;
+    Ok(())
+}
+
+/// The importer owns the private staged tree. Verify its manifest refers to
+/// actual regular files and agrees with their lengths before publishing it.
+/// Digests were computed from the same bytes by the materializers; no second
+/// full-body hash pass is needed.
+fn validate_staged_directory(path: &Path) -> Result<()> {
+    let manifest = read_manifest(&path.join(MANIFEST_NAME))?;
+    let mut lengths = HashMap::new();
+    for row in manifest.resources.iter().chain(&manifest.inline_scripts) {
+        let Some(relative) = row["output_path"].as_str() else {
+            continue;
+        };
+        let length = match lengths.entry(relative) {
+            std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let file = path.join(relative);
+                let metadata = fs::symlink_metadata(&file)
+                    .with_context(|| format!("checking staged capture file {}", file.display()))?;
+                ensure!(
+                    metadata.is_file(),
+                    "staged capture path is not a regular file: {}",
+                    file.display()
+                );
+                *entry.insert(metadata.len())
+            }
+        };
+        if let Some(claim) = row["body_bytes"].as_u64() {
+            ensure!(
+                length == claim,
+                "staged capture file {relative} has {length} bytes, expected {claim}"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -136,7 +172,7 @@ impl ProjectOutput {
     /// Publish the validated import. Prefer an atomic exchange where the
     /// filesystem supports it; neither path promises crash durability.
     pub(crate) fn publish(self) -> Result<()> {
-        validate_project_directory(&self.staged).context("validating staged capture project")?;
+        validate_staged_directory(&self.staged).context("validating staged capture project")?;
         ensure!(
             existing_destination(&self.destination, self.overwrite)? == self.existed,
             "project destination changed during import: {}",
@@ -244,6 +280,78 @@ mod tests {
         );
         assert!(!output.join("old.txt").exists());
         assert_eq!(fs::read_dir(root.path())?.count(), 1);
+        Ok(())
+    }
+
+    fn manifest_with_body(path: &Path, input: &str, body_bytes: u64) -> Result<()> {
+        manifest(path, input)?;
+        let file = path.join(MANIFEST_NAME);
+        let mut document = read_manifest(&file)?;
+        document
+            .resources
+            .push(json!({"id":0,"output_path":"resources/body.bin"}));
+        // When multiple rows reference the same file, check a later known
+        // length even if an earlier resource did not have a size claim.
+        document
+            .resources
+            .push(json!({"id":1,"output_path":"resources/body.bin","body_bytes":body_bytes}));
+        write_manifest(&file, &document)
+    }
+
+    #[test]
+    fn staged_manifest_references_must_match_actual_files_before_replacement() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let output = root.path().join("project");
+        manifest(&output, "old")?;
+        for content in [
+            None,
+            Some(b"short".as_slice()),
+            Some(b"correct body".as_slice()),
+        ] {
+            let pending = ProjectOutput::new(&output, true, &[])?;
+            manifest_with_body(pending.path(), "replacement", 12)?;
+            if let Some(bytes) = content {
+                fs::create_dir(pending.path().join("resources"))?;
+                fs::write(pending.path().join("resources/body.bin"), bytes)?;
+            }
+            let published = pending.publish();
+            if content == Some(b"correct body".as_slice()) {
+                published?;
+                assert_eq!(
+                    read_manifest(&output.join(MANIFEST_NAME))?.source.input,
+                    "replacement"
+                );
+                assert_eq!(
+                    fs::read(output.join("resources/body.bin"))?,
+                    b"correct body"
+                );
+            } else {
+                assert!(published.is_err());
+                assert_eq!(
+                    read_manifest(&output.join(MANIFEST_NAME))?.source.input,
+                    "old"
+                );
+            }
+            assert_eq!(fs::read_dir(root.path())?.count(), 1);
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_body_symlinks_are_not_regular_archive_files() -> Result<()> {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir()?;
+        let outside = root.path().join("outside");
+        fs::write(&outside, "body")?;
+        let output = root.path().join("project");
+        let pending = ProjectOutput::new(&output, false, &[])?;
+        manifest_with_body(pending.path(), "new", 4)?;
+        fs::create_dir(pending.path().join("resources"))?;
+        symlink(&outside, pending.path().join("resources/body.bin"))?;
+        assert!(pending.publish().is_err());
+        assert!(!output.exists());
+        assert_eq!(fs::read(&outside)?, b"body");
         Ok(())
     }
 
