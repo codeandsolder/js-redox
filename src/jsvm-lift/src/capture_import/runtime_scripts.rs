@@ -727,12 +727,26 @@ pub(super) fn analyze_recorder_runtime_scripts(
             if let Some(value) = event.get("executionContextId") {
                 execution_context_values.push(value);
             }
-            let execution = coverage.as_ref().map_or_else(
-                || json!({"status":"unavailable"}),
-                |index| index.for_script(&event_session(event), &stringish(event.get("scriptId"))),
-            );
+            let session = event_session(event);
+            let script = script_id(event.get("scriptId"));
+            let execution = match (&coverage, script.as_deref()) {
+                (Some(index), Some(script)) => {
+                    let raw = index.for_script(&session, script);
+                    if events_by_script_id
+                        .get(&session, script)
+                        .and_then(ParentEventEvidence::digest)
+                        == Some(digest.as_str())
+                    {
+                        raw
+                    } else {
+                        json!({"status":"unresolved_source_identity","unattributed_coverage":raw})
+                    }
+                }
+                (Some(_), None) => json!({"status":"invalid_script_id"}),
+                (None, _) => json!({"status":"unavailable"}),
+            };
             script_instances.push(json!({
-                "cdp_session": event_session(event),
+                "cdp_session": session,
                 "script_id": event.get("scriptId").cloned().unwrap_or(Value::Null),
                 "execution_context_id": event.get("executionContextId").cloned().unwrap_or(Value::Null),
                 "script_url": event.get("url").cloned().unwrap_or(Value::Null),

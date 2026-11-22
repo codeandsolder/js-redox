@@ -70,6 +70,19 @@ impl<T: Eq> ScriptIdentityIndex<T> {
         }
     }
 
+    pub(crate) fn unique_entries(&self) -> impl Iterator<Item = (&str, &str, &T)> {
+        self.sessions.iter().flat_map(|(session, scripts)| {
+            scripts
+                .iter()
+                .filter_map(move |(script, state)| match state {
+                    IdentityState::Unique(value) => {
+                        Some((session.as_str(), script.as_str(), value))
+                    }
+                    IdentityState::Conflict => None,
+                })
+        })
+    }
+
     /// Join the stored body inventory to the raw-event conflict inventory.
     /// Contradictory source claims remain significant even when some claimed
     /// bodies were not saved. Enriching the record with coordinates can only

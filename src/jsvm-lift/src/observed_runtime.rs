@@ -8,12 +8,17 @@ use crate::{
     analysis_budget::{AnalysisBudgets, AnalysisOperation},
     capture_project::read_manifest,
     js_format::format_source,
+    runtime_coverage::RuntimeCoverageIndex,
     sha256_hex,
 };
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::fmt::Write as _;
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::Path,
+};
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ObservedSourceSummary {
@@ -46,37 +51,6 @@ fn display_origin(source: &Value) -> Option<String> {
         let truncated = if path.chars().count() > 88 { "…" } else { "" };
         Some(format!("{host}{short_path}{truncated}"))
     })
-}
-
-fn observed_execution_counts(source: &Value) -> (u64, u64, usize) {
-    let mut functions = 0_u64;
-    let mut ranges = 0_u64;
-    let mut instances = 0;
-    for instance in source
-        .get("script_instances")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let execution = &instance["execution"];
-        if execution.get("status").and_then(Value::as_str) != Some("positive") {
-            continue;
-        }
-        instances += 1;
-        functions = functions.saturating_add(
-            execution
-                .get("positive_functions")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-        );
-        ranges = ranges.saturating_add(
-            execution
-                .get("positive_ranges")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-        );
-    }
-    (functions, ranges, instances)
 }
 
 fn classification_heading(classification: &str) -> &'static str {
@@ -126,6 +100,27 @@ pub fn materialize_observed_runtime_sources(
         })
         .collect::<std::collections::HashMap<_, _>>();
     let capture = Path::new(&manifest.source.input);
+    let coverage_budget = budgets.operation(
+        AnalysisOperation::SourceMaterialization,
+        "positive runtime coverage witnesses",
+    );
+    let coverage = RuntimeCoverageIndex::build(&index, &coverage_budget)?;
+    let previous = load_artifact(project, OBSERVED_SOURCE, true)?;
+    let mut stale_paths = previous
+        .as_ref()
+        .and_then(|artifact| artifact.get("sources"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|row| {
+            let digest = row.get("sha256")?.as_str()?;
+            if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return None;
+            }
+            let path = format!("src/_observed/{digest}.js");
+            (row.get("source_path")?.as_str()? == path).then_some(path)
+        })
+        .collect::<BTreeSet<_>>();
     let sources = index
         .get_mut("sources")
         .and_then(Value::as_array_mut)
@@ -142,17 +137,29 @@ pub fn materialize_observed_runtime_sources(
     let mut grouped_links = BTreeMap::<&str, Vec<String>>::new();
     let mut summary = ObservedSourceSummary::default();
     for source in sources {
-        if source.get("observed_executed") != Some(&Value::Bool(true))
-            || source.get("classification").and_then(Value::as_str)
-                == Some("capture_instrumentation")
-        {
-            continue;
-        }
+        coverage_budget.consume(1)?;
         let digest = source
             .get("sha256")
             .and_then(Value::as_str)
             .context("runtime source has no digest")?
             .to_owned();
+        let all_witnesses = coverage.witnesses(&digest);
+        coverage_budget.consume(u64::try_from(all_witnesses.len())?)?;
+        source["observed_executed"] = json!(!all_witnesses.is_empty());
+        let witnesses = all_witnesses
+            .iter()
+            .filter(|witness| !witness.capture_instrumentation)
+            .collect::<Vec<_>>();
+        if witnesses.is_empty()
+            || source.get("classification").and_then(Value::as_str)
+                == Some("capture_instrumentation")
+        {
+            if let Some(row) = source.as_object_mut() {
+                row.remove("observed_source_path");
+                row.remove("observed_source_formatted");
+            }
+            continue;
+        }
         if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
             bail!("invalid runtime source digest: {digest}");
         }
@@ -204,6 +211,7 @@ pub fn materialize_observed_runtime_sources(
             fs::create_dir_all(parent)?;
         }
         fs::write(&absolute, text)?;
+        stale_paths.remove(&target);
         summary.witnessed_sources += 1;
         if was_formatted {
             summary.formatted_sources += 1;
@@ -218,7 +226,16 @@ pub fn materialize_observed_runtime_sources(
         source["observed_source_path"] = json!(target);
         source["observed_source_formatted"] = json!(was_formatted);
         let origin = display_origin(source).unwrap_or_else(|| category.clone());
-        let (functions, ranges, instances) = observed_execution_counts(source);
+        let (functions, ranges) =
+            witnesses
+                .iter()
+                .fold((0_u64, 0_u64), |(functions, ranges), witness| {
+                    (
+                        functions.saturating_add(witness.positive_functions),
+                        ranges.saturating_add(witness.positive_ranges),
+                    )
+                });
+        let instances = witnesses.len();
         let (status, readable_link) = match &safe_deob {
             Some(info) if info["changed"] == true => (
                 "safe transform",
@@ -245,13 +262,22 @@ pub fn materialize_observed_runtime_sources(
             "classification":category,
             "urls":source.get("urls").cloned().unwrap_or(Value::Null),
             "script_instances":source.get("script_instances").cloned().unwrap_or(Value::Null),
+            "positive_witnesses":witnesses,
             "coverage_mode":source.get("coverage_mode").cloned().unwrap_or(Value::Null),
             "formatted":was_formatted,
             "format_error":error,
             "safe_deob": safe_deob,
         }));
     }
-    if summary.witnessed_sources > 0 {
+    for path in stale_paths {
+        coverage_budget.consume(1)?;
+        match fs::remove_file(project.join(path)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if summary.witnessed_sources > 0 || project.join("src/_observed/README.md").is_file() {
         for (heading, links) in grouped_links {
             let _ = write!(readme, "## {heading} ({})\n\n", links.len());
             for link in links {
@@ -346,7 +372,7 @@ mod tests {
                 "gtm_families":[],"sources":[{
                     "sha256":digest,"path":rel,"classification":"network_response",
                     "observed_executed":true,"script_instances":[{"cdp_session":"main",
-                        "script_id":"7","execution":{"status":"positive"}}],
+                        "script_id":"7","execution":{"status":"positive","positive_functions":1,"positive_ranges":2}}],
                 }],
             }),
         )?;
@@ -367,10 +393,26 @@ mod tests {
         assert!(readme.contains(&digest[..12]));
         assert!(project.join(format!("src/_observed/{digest}.js")).is_file());
         assert_eq!(fs::read_to_string(capture.join(rel))?, script);
-        let runtime = load_artifact(&project, RUNTIME_SCRIPTS, false)?.context("index")?;
+        let mut runtime = load_artifact(&project, RUNTIME_SCRIPTS, false)?.context("index")?;
         assert_eq!(
             runtime["sources"][0]["observed_source_path"],
             json!(format!("src/_observed/{digest}.js"))
+        );
+        runtime["script_identity_conflicts"] = json!([{"cdp_session":"main","script_id":"7","sha256_claims":[digest,"unavailable-body"]}]);
+        write_artifact(&project, RUNTIME_SCRIPTS, &runtime)?;
+        let again = materialize_observed_runtime_sources(
+            &project,
+            &AnalysisBudgets::standard("observed-conflicting"),
+        )?;
+        assert_eq!(again.witnessed_sources, 0);
+        assert!(!project.join(format!("src/_observed/{digest}.js")).is_file());
+        let runtime = load_artifact(&project, RUNTIME_SCRIPTS, false)?.context("index")?;
+        assert_eq!(runtime["sources"][0]["observed_executed"], false);
+        assert!(runtime["sources"][0].get("observed_source_path").is_none());
+        assert!(
+            load_artifact(&project, OBSERVED_SOURCE, false)?.context("observed report")?["sources"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
         );
         Ok(())
     }

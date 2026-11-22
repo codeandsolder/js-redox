@@ -206,6 +206,7 @@ mod tests {
     };
     use super::runtime_evidence::add_runtime_network_source_edges;
     use super::*;
+    use crate::runtime_coverage::RuntimeCoverageIndex;
     use crate::{
         analysis_artifacts::{load_artifact, write_artifact, JS_REFERENCES, SOURCE_GRAPH},
         capture_project::{write_manifest, CaptureManifest, CaptureSource, MANIFEST_NAME},
@@ -356,11 +357,20 @@ mod tests {
             "observed_executed":true,
             "coverage_mode":"best-effort",
             "script_instances":[{
-                "script_url":"https://fixture.invalid/copy.js",
-                "execution":{"status":"positive"}
+                "cdp_session":"main","script_id":"1","script_url":"https://fixture.invalid/copy.js",
+                "execution":{"status":"positive","positive_functions":1,"positive_ranges":1}
             }]
         });
-        add_runtime_network_source_edges(&mut graph, &runtime, "runtime:parsed", &hashes)?;
+        let budget = work_budget::WorkBudget::unlimited("runtime-network-test");
+        let coverage = RuntimeCoverageIndex::build(&json!({"sources":[runtime]}), &budget)?;
+        add_runtime_network_source_edges(
+            &mut graph,
+            &runtime,
+            "runtime:parsed",
+            &hashes,
+            coverage.witnesses(runtime["sha256"].as_str().unwrap_or_default()),
+            &budget,
+        )?;
         let parsed = graph
             .edges()
             .values()
@@ -376,7 +386,16 @@ mod tests {
 
         let mut confirmed = runtime;
         confirmed["script_instances"][0]["script_url"] = json!("https://fixture.invalid/app.js");
-        add_runtime_network_source_edges(&mut graph, &confirmed, "runtime:executed", &hashes)?;
+        let budget = work_budget::WorkBudget::unlimited("runtime-network-test");
+        let coverage = RuntimeCoverageIndex::build(&json!({"sources":[confirmed]}), &budget)?;
+        add_runtime_network_source_edges(
+            &mut graph,
+            &confirmed,
+            "runtime:executed",
+            &hashes,
+            coverage.witnesses(confirmed["sha256"].as_str().unwrap_or_default()),
+            &budget,
+        )?;
         let executed = graph
             .edges()
             .values()
@@ -397,11 +416,20 @@ mod tests {
             "sha256":"missing","urls":["https://fixture.invalid/app.js"],
             "observed_executed":true,
             "script_instances":[{
-                "script_url":"https://fixture.invalid/app.js",
-                "execution":{"status":"positive"}
+                "cdp_session":"main","script_id":"1","script_url":"https://fixture.invalid/app.js",
+                "execution":{"status":"positive","positive_functions":1,"positive_ranges":1}
             }]
         });
-        add_runtime_network_source_edges(&mut graph, &runtime, "runtime:url-only", &hashes)?;
+        let budget = work_budget::WorkBudget::unlimited("runtime-network-test");
+        let coverage = RuntimeCoverageIndex::build(&json!({"sources":[runtime]}), &budget)?;
+        add_runtime_network_source_edges(
+            &mut graph,
+            &runtime,
+            "runtime:url-only",
+            &hashes,
+            coverage.witnesses(runtime["sha256"].as_str().unwrap_or_default()),
+            &budget,
+        )?;
         let url_edges = graph
             .edges()
             .values()
@@ -422,7 +450,16 @@ mod tests {
             assert_eq!(edge["exact_response_identity"], false);
         }
         let sha_only = json!({"sha256":"alpha","urls":[],"observed_executed":true});
-        add_runtime_network_source_edges(&mut graph, &sha_only, "runtime:sha-only", &hashes)?;
+        let budget = work_budget::WorkBudget::unlimited("runtime-network-test");
+        let coverage = RuntimeCoverageIndex::build(&json!({"sources":[sha_only]}), &budget)?;
+        add_runtime_network_source_edges(
+            &mut graph,
+            &sha_only,
+            "runtime:sha-only",
+            &hashes,
+            coverage.witnesses(sha_only["sha256"].as_str().unwrap_or_default()),
+            &budget,
+        )?;
         let hash_edges = graph
             .edges()
             .values()

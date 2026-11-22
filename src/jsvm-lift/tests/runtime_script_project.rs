@@ -403,10 +403,21 @@ fn missing_conflicting_parent_body_does_not_turn_claim_into_exact_graph_link() -
     let row = |id: &str, source: &str| json!({"cdpSession":"main","scriptId":id,"captured":{"kind":"javascript","sha256":digest(source),"size":source.len(),"path":format!("runtime-scripts/{}.js",digest(source))}});
     let mut child_event = row("2", child);
     child_event["stackTrace"] = json!({"callFrames":[{"scriptId":"1","url":"https://fixture.invalid/parent.js","lineNumber":0,"columnNumber":0}]});
-    let events = [row("1", parent), row("1", missing), child_event];
+    let events = [
+        row("1", parent),
+        row("1", missing),
+        child_event.clone(),
+        child_event,
+    ];
     fs::write(
         capture.join("runtime-scripts.json"),
         serde_json::to_vec(&events)?,
+    )?;
+    let profile = |id: &str| json!({"scriptId":id,"functions":[{"ranges":[{"startOffset":0,"endOffset":3,"count":1}]}]});
+    let coverage = json!({"schema":"js-redox/execution-coverage/v2","mode":"best-effort","offsetUnits":"utf16","sessions":[{"cdpSession":"main","status":"captured","scripts":[profile("1"),profile("2"),profile("2")]}]});
+    fs::write(
+        capture.join("execution-coverage.json"),
+        serde_json::to_vec(&coverage)?,
     )?;
     let project = workspace.path().join("project");
     let budget = AnalysisBudgets::standard("missing-conflicting-parent-body");
@@ -428,6 +439,20 @@ fn missing_conflicting_parent_body_does_not_turn_claim_into_exact_graph_link() -
         .iter()
         .find(|row| row["sha256"] == digest(child))
         .context("child source missing")?;
+    let parent_row = sources
+        .iter()
+        .find(|row| row["sha256"] == digest(parent))
+        .context("parent source missing")?;
+    assert_eq!(parent_row["observed_executed"], false);
+    assert_eq!(
+        parent_row["script_instances"][0]["execution"]["status"],
+        "unresolved_source_identity"
+    );
+    assert_eq!(
+        parent_row["script_instances"][0]["execution"]["unattributed_coverage"]["positive_ranges"],
+        1
+    );
+    assert_eq!(child_row["observed_executed"], true);
     let conflicts = report["script_identity_conflicts"]
         .as_array()
         .context("raw conflict inventory missing")?;
@@ -468,6 +493,31 @@ fn missing_conflicting_parent_body_does_not_turn_claim_into_exact_graph_link() -
         unresolved["parent_event_digest_claims"],
         claim["parent_event_digest_claims"]
     );
+    let nodes = graph["nodes"].as_array().context("graph nodes missing")?;
+    let parent_node = nodes
+        .iter()
+        .find(|row| row["type"] == "runtime_script" && row["sha256"] == digest(parent))
+        .context("parent node missing")?;
+    let child_node = nodes
+        .iter()
+        .find(|row| row["type"] == "runtime_script" && row["sha256"] == digest(child))
+        .context("child node missing")?;
+    assert_eq!(parent_node["observed_executed"], false);
+    assert_eq!(parent_node["positive_coverage_witnesses"], json!([]));
+    let child_witnesses = child_node["positive_coverage_witnesses"]
+        .as_array()
+        .context("child coverage missing")?;
+    assert_eq!(child_witnesses.len(), 1);
+    assert_eq!(child_witnesses[0]["positive_ranges"], 1);
+    let observed =
+        jsvm_lift::observed_runtime::materialize_observed_runtime_sources(&project, &budget)?;
+    assert_eq!(observed.witnessed_sources, 1);
+    assert!(project
+        .join(format!("src/_observed/{}.js", digest(child)))
+        .is_file());
+    assert!(!project
+        .join(format!("src/_observed/{}.js", digest(parent)))
+        .is_file());
     assert_eq!(graph["unresolved_edges"], json!([]));
     Ok(())
 }
