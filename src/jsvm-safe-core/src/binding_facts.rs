@@ -209,6 +209,39 @@ impl BindingFacts {
         self.resolve_scope(scoping, scope, Some(symbol)) == ReferenceIdentity::Lexical(symbol)
     }
 
+    /// Prove that resolving this identifier to an assignment Reference
+    /// commutes with arbitrary RHS evaluation. A declarative binding's
+    /// environment record does not become a different record just because
+    /// its value changes. Sloppy direct eval can introduce a nearer binding
+    /// and object-backed global environments can perform observable lookup,
+    /// however. Those references must be evaluated in their original order.
+    ///
+    /// This is a reference-identity proof, not an initialized-value proof:
+    /// simple assignment to an uninitialized or immutable declarative
+    /// binding still evaluates the RHS before PutValue throws.
+    pub(crate) fn fixed_assignment_reference(
+        &self,
+        scoping: &Scoping,
+        reference_id: oxc_semantic::ReferenceId,
+    ) -> Option<SymbolId> {
+        let reference = scoping.get_reference(reference_id);
+        let symbol = reference.symbol_id()?;
+        if !reference.is_write()
+            || !self.proves_reference_identity(scoping, symbol, reference.scope_id())
+        {
+            return None;
+        }
+        if self.ambient_root
+            && scoping.symbol_scope_id(symbol) == scoping.root_scope_id()
+            && !scoping.symbol_flags(symbol).intersects(
+                oxc_semantic::SymbolFlags::BlockScoped | oxc_semantic::SymbolFlags::Import,
+            )
+        {
+            return None;
+        }
+        Some(symbol)
+    }
+
     /// Immutable bindings can be read by a later-created closure: once
     /// initialized, their value cannot be changed. A hoisted declaration is
     /// different; the enclosing lexical scope's entry (not the declaration's

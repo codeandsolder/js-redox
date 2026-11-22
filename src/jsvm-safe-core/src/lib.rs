@@ -719,6 +719,7 @@ impl Collector<'_, '_> {
                     expression,
                     self.source,
                     self.scoping,
+                    &self.constants.initialization,
                 ) {
                     self.push(expression.span, code, "assignment_conditional_lowering");
                 } else if let Some(code) =
@@ -1639,7 +1640,12 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
             // dead RHS subtrees. Give it precedence over presentation-only
             // statement lowering; the next fixed-point iteration may then
             // lower the surviving effects into readable statements.
-            if let Some(replacement) = effect_statements::lower(it, self.source, self.scoping) {
+            if let Some(replacement) = effect_statements::lower(
+                it,
+                self.source,
+                self.scoping,
+                &self.constants.initialization,
+            ) {
                 self.push(it.span, replacement, "effect_statement_lowering");
                 return;
             }

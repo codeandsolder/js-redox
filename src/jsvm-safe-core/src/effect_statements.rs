@@ -6,7 +6,7 @@
 //! directive prologue (and to preserve dangling-else grammar). Atomically
 //! retained expressions remain wrapped so object/function literals are valid
 //! statement syntax. Dynamic branches are evaluated exactly once.
-use crate::{fragment, statically_resolved_symbol, value_eval::eval};
+use crate::{binding_facts::BindingFacts, fragment, value_eval::eval};
 use oxc_ast::ast::{
     AssignmentExpression, AssignmentTarget, Expression, ExpressionStatement, IfStatement,
     SequenceExpression,
@@ -59,25 +59,26 @@ impl Lowered {
         logical: &oxc_ast::ast::LogicalExpression<'_>,
         source: &str,
         scoping: &Scoping,
+        bindings: &BindingFacts,
         depth: usize,
     ) -> Option<()> {
         self.structured = true;
         let and = logical.operator.as_str() == "&&";
         if let Some(value) = eval(&logical.left) {
             if value.truthy() == and {
-                self.emit(&logical.right, source, scoping, depth + 1)?;
+                self.emit(&logical.right, source, scoping, bindings, depth + 1)?;
             }
             return Some(());
         }
         if eval(&logical.right).is_some() {
             // The result is discarded; this RHS is pure, so only
             // the LHS's evaluation may have effects or throw.
-            return self.emit(&logical.left, source, scoping, depth + 1);
+            return self.emit(&logical.left, source, scoping, bindings, depth + 1);
         }
         let mut branch = Self::default();
-        branch.emit(&logical.right, source, scoping, depth + 1)?;
+        branch.emit(&logical.right, source, scoping, bindings, depth + 1)?;
         if branch.statements.is_empty() {
-            return self.emit(&logical.left, source, scoping, depth + 1);
+            return self.emit(&logical.left, source, scoping, bindings, depth + 1);
         }
         let test = fragment(source, logical.left.span());
         let test = if and {
@@ -97,6 +98,7 @@ impl Lowered {
         conditional: &oxc_ast::ast::ConditionalExpression<'_>,
         source: &str,
         scoping: &Scoping,
+        bindings: &BindingFacts,
         depth: usize,
     ) -> Option<()> {
         self.structured = true;
@@ -109,15 +111,22 @@ impl Lowered {
                 },
                 source,
                 scoping,
+                bindings,
                 depth + 1,
             );
         }
         let mut yes = Self::default();
         let mut no = Self::default();
-        yes.emit(&conditional.consequent, source, scoping, depth + 1)?;
-        no.emit(&conditional.alternate, source, scoping, depth + 1)?;
+        yes.emit(
+            &conditional.consequent,
+            source,
+            scoping,
+            bindings,
+            depth + 1,
+        )?;
+        no.emit(&conditional.alternate, source, scoping, bindings, depth + 1)?;
         if yes.statements.is_empty() && no.statements.is_empty() {
-            return self.emit(&conditional.test, source, scoping, depth + 1);
+            return self.emit(&conditional.test, source, scoping, bindings, depth + 1);
         }
         let test = fragment(source, conditional.test.span());
         let body = match (yes.statements.is_empty(), no.statements.is_empty()) {
@@ -139,6 +148,7 @@ impl Lowered {
         expr: &Expression<'_>,
         source: &str,
         scoping: &Scoping,
+        bindings: &BindingFacts,
         depth: usize,
     ) -> Option<()> {
         if depth > 96 {
@@ -146,22 +156,22 @@ impl Lowered {
         }
         match expr {
             Expression::ParenthesizedExpression(paren) => {
-                self.emit(&paren.expression, source, scoping, depth + 1)
+                self.emit(&paren.expression, source, scoping, bindings, depth + 1)
             }
             Expression::SequenceExpression(sequence) => {
                 self.structured = true;
                 for item in &sequence.expressions {
-                    self.emit(item, source, scoping, depth + 1)?;
+                    self.emit(item, source, scoping, bindings, depth + 1)?;
                 }
                 Some(())
             }
             Expression::LogicalExpression(logical)
                 if matches!(logical.operator.as_str(), "&&" | "||") =>
             {
-                self.emit_logical(logical, source, scoping, depth)
+                self.emit_logical(logical, source, scoping, bindings, depth)
             }
             Expression::ConditionalExpression(conditional) => {
-                self.emit_conditional(conditional, source, scoping, depth)
+                self.emit_conditional(conditional, source, scoping, bindings, depth)
             }
             Expression::AssignmentExpression(assign) if assign.operator.as_str() == "=" => {
                 // LHS reference evaluation may be moved past RHS prefixes
@@ -175,7 +185,10 @@ impl Lowered {
                     self.push_expression(expr, source);
                     return Some(());
                 };
-                if statically_resolved_symbol(scoping, reference_id).is_none() {
+                if bindings
+                    .fixed_assignment_reference(scoping, reference_id)
+                    .is_none()
+                {
                     self.push_expression(expr, source);
                     return Some(());
                 }
@@ -193,7 +206,7 @@ impl Lowered {
                 }
                 self.structured = true;
                 for prefix in prefixes {
-                    self.emit(prefix, source, scoping, depth + 1)?;
+                    self.emit(prefix, source, scoping, bindings, depth + 1)?;
                 }
                 // With a proved lexical identifier and no anonymous
                 // name-inference hazard, an assignment is valid statement
@@ -291,6 +304,7 @@ pub fn lower_conditional_assignment(
     statement: &ExpressionStatement<'_>,
     source: &str,
     scoping: &Scoping,
+    bindings: &BindingFacts,
 ) -> Option<String> {
     fn clean_boundaries(expr: &Expression<'_>, source: &str, depth: usize) -> Option<()> {
         if depth > 96 {
@@ -334,17 +348,7 @@ pub fn lower_conditional_assignment(
     let AssignmentTarget::AssignmentTargetIdentifier(identifier) = &assignment.left else {
         return None;
     };
-    let symbol = statically_resolved_symbol(scoping, identifier.reference_id.get()?)?;
-    // A script-global var/function can be backed by a global-object property:
-    // resolving it may run proxy-like HasProperty hooks. Only an actual
-    // lexical/import binding has the same fixed reference at root scope.
-    if scoping.symbol_scope_id(symbol) == scoping.root_scope_id()
-        && !scoping
-            .symbol_flags(symbol)
-            .intersects(oxc_semantic::SymbolFlags::BlockScoped | oxc_semantic::SymbolFlags::Import)
-    {
-        return None;
-    }
+    bindings.fixed_assignment_reference(scoping, identifier.reference_id.get()?)?;
     conditional_rhs(&assignment.right)?;
     if conditional_has_name_hazard(&assignment.right, 0) {
         return None;
@@ -687,12 +691,13 @@ pub fn lower(
     statement: &ExpressionStatement<'_>,
     source: &str,
     scoping: &Scoping,
+    bindings: &BindingFacts,
 ) -> Option<String> {
     if simple_guarded_call(&statement.expression) {
         return None;
     }
     let mut lowered = Lowered::default();
-    lowered.emit(&statement.expression, source, scoping, 0)?;
+    lowered.emit(&statement.expression, source, scoping, bindings, 0)?;
     if !lowered.structured {
         return None;
     }
@@ -1144,6 +1149,43 @@ mod tests {
             output.contains("if (flag)"),
             "root lexical let is a stable target: {output}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn assignment_reference_motion_requires_a_fixed_environment_record(
+    ) -> Result<(), BudgetExceeded> {
+        for source in [
+            "let x;function f(){x=(eval('var x=1'),2);return x;}",
+            "let x;function f(){x=eval('var x=1;true')?2:3;return x;}",
+            "let x;function f(){eval('var x=1');x=(side(),2);return x;}",
+            "let x;function f(){eval('var x=1');return function(){x=(side(),2);return x;};}",
+            "var x;function f(){x=(side(),2);return x;}",
+            "function x(){}function f(){x=(side(),2);return x;}",
+            "function f(o){let x;with(o){x=(side(),2);}}",
+        ] {
+            let output = rewritten(source)?;
+            assert!(
+                output.contains("x=(") || output.contains("x=eval("),
+                "assignment reference must not move: {source} -> {output}"
+            );
+        }
+        for source in [
+            "let x;function f(){'use strict';x=(eval('var x=1'),2);return x;}",
+            "let x;function f(){'use strict';x=eval('var x=1;true')?2:3;return x;}",
+            "function f(){let x;x=(eval('1'),2);return x;}",
+            "function f(x){x=(eval('var x=1'),2);return x;}",
+            "let x;function f(){function g(){eval('1')}x=(g(),2);return x;}",
+            "let x;function f(){x=(eval?.('1'),2);return x;}",
+            "let x;function f(){x=((0,eval)('1'),2);return x;}",
+            "export var x;function f(){x=(side(),2);return x;}",
+        ] {
+            let output = rewritten(source)?;
+            assert!(
+                output.contains("x = "),
+                "declarative reference should remain eligible: {source} -> {output}"
+            );
+        }
         Ok(())
     }
 
