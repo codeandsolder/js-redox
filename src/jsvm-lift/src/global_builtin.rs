@@ -2,7 +2,8 @@ use jsvm_safe_core::BindingFacts;
 use oxc_ast::ast::{BindingPattern, Expression, Program};
 use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::Scoping;
-use oxc_syntax::symbol::SymbolId;
+use oxc_span::Span;
+use oxc_syntax::{scope::ScopeId, symbol::SymbolId};
 use std::collections::HashMap;
 
 use work_budget::{BudgetExceeded, BudgetPoller, WorkBudget};
@@ -27,6 +28,15 @@ fn direct_global_name(
     }
     matches!(identifier.name.as_str(), "window" | "globalThis" | "self")
         .then(|| identifier.name.to_string())
+}
+
+/// A statically identified invocation of a function declaration. Its
+/// captured environment is shared with the declaration's lexical owner.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) struct InvocationSite {
+    pub(crate) callee: SymbolId,
+    pub(crate) scope: ScopeId,
+    pub(crate) span: Span,
 }
 
 /// Namespace aliases and the exact lexical proof for the source snapshot.
@@ -60,6 +70,42 @@ impl GlobalAliases {
                 .get(&self.alias_symbol(scoping, expression)?)
                 .cloned()
         })
+    }
+
+    /// Resolve a captured namespace at a particular known invocation, not
+    /// at the textual location of a deferred body. Only bindings outside
+    /// the callee's own activation may be proved by this caller context.
+    pub(crate) fn captured_namespace_at_invocation(
+        &self,
+        scoping: &Scoping,
+        expression: &Expression<'_>,
+        namespace: &str,
+        invocation: InvocationSite,
+    ) -> Option<(SymbolId, String)> {
+        let object = namespace_receiver(expression, namespace)?;
+        let Expression::Identifier(identifier) = unparenthesized(object) else {
+            return None;
+        };
+        let reference = identifier.reference_id.get()?;
+        let symbol = self.facts.resolved_symbol(scoping, reference)?;
+        let flags = scoping.get_reference(reference);
+        let owner = scoping.symbol_scope_id(symbol);
+        let callee_owner = scoping.symbol_scope_id(invocation.callee);
+        if !flags.is_read()
+            || flags.is_write()
+            || !scoping
+                .scope_ancestors(callee_owner)
+                .any(|scope| scope == owner)
+            || !self.facts.proves_value_initialized(
+                scoping,
+                symbol,
+                invocation.scope,
+                invocation.span,
+            )
+        {
+            return None;
+        }
+        Some((symbol, self.aliases.get(&symbol)?.clone()))
     }
 
     pub(crate) fn symbols(&self) -> impl Iterator<Item = SymbolId> + '_ {
@@ -159,20 +205,25 @@ fn namespace_global(
         }
     }
 
+    let receiver = namespace_receiver(expression, namespace)?;
+    global_aliases.global_object_name(scoping, receiver)
+}
+
+fn namespace_receiver<'a>(
+    expression: &'a Expression<'a>,
+    namespace: &str,
+) -> Option<&'a Expression<'a>> {
     match unparenthesized(expression) {
         Expression::StaticMemberExpression(member)
             if !member.optional && member.property.name.as_str() == namespace =>
         {
-            global_aliases.global_object_name(scoping, &member.object)
+            Some(&member.object)
         }
         Expression::ComputedMemberExpression(member) if !member.optional => {
             let Expression::StringLiteral(property) = unparenthesized(&member.expression) else {
                 return None;
             };
-            if property.value.as_str()? != namespace {
-                return None;
-            }
-            global_aliases.global_object_name(scoping, &member.object)
+            (property.value.as_str()? == namespace).then_some(&member.object)
         }
         _ => None,
     }

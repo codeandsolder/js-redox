@@ -1553,6 +1553,46 @@ fn matching_usages(document: &Value, import_module: &str, import_name: &str) -> 
         .collect()
 }
 
+/// Context-dependent handler shapes are not transferable to other
+/// instantiations. Restrict the usage evidence to this assignment and to
+/// the initialization witnesses for the exact sites.
+fn contextual_handler_usages(usages: Vec<Value>, handler: &Value) -> Vec<Value> {
+    let witnesses = array_field(handler, "initialization_witnesses");
+    if witnesses.is_empty() {
+        return usages;
+    }
+    let Some(assignment) =
+        i64_field(handler, "assignment_start").zip(i64_field(handler, "assignment_end"))
+    else {
+        return Vec::new();
+    };
+    let proven_sites = witnesses
+        .iter()
+        .filter_map(|witness| i64_field(witness, "site_start").zip(i64_field(witness, "site_end")))
+        .collect::<HashSet<_>>();
+    usages
+        .into_iter()
+        .filter_map(|usage| {
+            if i64_field(&usage, "assignment_start").zip(i64_field(&usage, "assignment_end"))
+                != Some(assignment)
+            {
+                return None;
+            }
+            let sites = array_field(&usage, "instantiation_sites")
+                .iter()
+                .filter(|site| {
+                    i64_field(site, "start")
+                        .zip(i64_field(site, "end"))
+                        .is_some_and(|span| proven_sites.contains(&span))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            (!sites.is_empty())
+                .then(|| object_with(&usage, "instantiation_sites", Value::Array(sites)))
+        })
+        .collect()
+}
+
 struct BoundaryExport<'a> {
     module: &'a Value,
     export: &'a Value,
@@ -2150,12 +2190,20 @@ impl BoundaryCorrelation<'_> {
             return None;
         }
         let set_usages = matching_usages(document, set_module, set_name);
-        let constructor_usages = matching_usages(document, constructor_module, constructor_name);
+        let constructor_usages = contextual_handler_usages(
+            matching_usages(document, constructor_module, constructor_name),
+            &constructor_matches[0],
+        );
         let binding_proofs = common_exact_binding_proofs(
             &set_usages,
             &constructor_usages,
             string_field(module, "sha256"),
         );
+        if !array_field(&constructor_matches[0], "initialization_witnesses").is_empty()
+            && binding_proofs.is_empty()
+        {
+            return None;
+        }
         let memory_match_context = ModuleMemoryMatchContext {
             document,
             module_sha256: string_field(module, "sha256"),
@@ -2512,7 +2560,7 @@ impl BoundaryCorrelation<'_> {
         let document = json!({
             "schema": WASM_JS_BOUNDARY.schema,
             "wasm_schema_required": "wasm-redox/deep-v14",
-            "js_schema": "jsvm-wasm-import-semantics/v8",
+            "js_schema": "jsvm-wasm-import-semantics/v9",
             "safe_static_only": true,
             "bounded_wasm_ir_interpretation": true,
             "source_word_semantic_overlay_contract": "deep runtime bindings and semantic returns preserve raw plus normalized structured semantic IR and exact SSA runtime-dependency edges. Boundary validation requires both IR forms to have the same exact runtime leaf set as the declared direct dependencies and to contain no duplicate definitions or dangling SSA references. Proven copied loads become source_word leaves in both boundary IR forms; unmatched runtime leaves retain exact identity plus transitive source-word provenance. Presentation is rendered from the validated structured IR; no $runtimeN text matching is used.",
@@ -2798,6 +2846,30 @@ mod tests {
         assert_eq!(
             row["module_memory_identity_proofs"][1]["source_path"],
             "src/b.js"
+        );
+    }
+
+    #[test]
+    fn contextual_handler_evidence_never_migrates_to_other_assignment_or_site() {
+        let handler = json!({
+            "assignment_start": 10, "assignment_end": 20,
+            "initialization_witnesses": [{"site_start": 100, "site_end": 120}]
+        });
+        let usages = vec![
+            json!({"assignment_start":10,"assignment_end":20,"instantiation_sites":[
+                {"start":40,"end":60},{"start":100,"end":120},{"start":100,"end":121}
+            ]}),
+            json!({"assignment_start":11,"assignment_end":20,"instantiation_sites":[
+                {"start":100,"end":120}
+            ]}),
+        ];
+        assert_eq!(
+            contextual_handler_usages(usages, &handler),
+            vec![
+                json!({"assignment_start":10,"assignment_end":20,"instantiation_sites":[
+                    {"start":100,"end":120}
+                ]}),
+            ]
         );
     }
 

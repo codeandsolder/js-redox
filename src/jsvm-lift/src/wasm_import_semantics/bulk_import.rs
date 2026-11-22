@@ -1,3 +1,4 @@
+use super::import_object::WasmInstantiationSite;
 use super::{
     exact_zero, expression_is_symbol, expression_property_name, global_constructor,
     parameter_symbols, static_member_of_symbol, symbol_binding_is_stable, symbol_of,
@@ -50,6 +51,18 @@ pub enum WasmImportHandlerSemantic {
     },
 }
 
+/// A captured namespace initializer justified by the invocation which
+/// created this handler for one source-local instantiation. Not a claim
+/// about arbitrary invocations of the same factory.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+pub struct AliasInitializationWitness {
+    pub alias: String,
+    pub invocation_start: u32,
+    pub invocation_end: u32,
+    pub site_start: u32,
+    pub site_end: u32,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct WasmImportHandlerShape {
     pub import_module: Option<String>,
@@ -60,6 +73,10 @@ pub struct WasmImportHandlerShape {
     pub import_object: Option<String>,
     pub assignment_start: u32,
     pub assignment_end: u32,
+    /// Empty for an unconditional initializer-dominance proof. Otherwise
+    /// the shape is admissible only for the listed exact source sites.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub initialization_witnesses: Vec<AliasInitializationWitness>,
     #[serde(flatten)]
     pub semantic: WasmImportHandlerSemantic,
 }
@@ -116,7 +133,8 @@ fn uint32_array_constructor(
     function: &Function<'_>,
     scoping: &Scoping,
     global_aliases: &GlobalAliases,
-) -> Option<WasmImportHandlerSemantic> {
+    sites: &[WasmInstantiationSite],
+) -> Option<(WasmImportHandlerSemantic, Vec<AliasInitializationWitness>)> {
     let params = stable_parameters(function, scoping)?;
     let [source] = params.as_slice() else {
         return None;
@@ -126,24 +144,56 @@ fn uint32_array_constructor(
     else {
         return None;
     };
-    let global = global_constructor(
+    let [argument] = new_expression.arguments.as_slice() else {
+        return None;
+    };
+    if !expression_is_symbol(scoping, argument.as_expression()?, *source) {
+        return None;
+    }
+    let mut witnesses = Vec::new();
+    let global = if let Some(global) = global_constructor(
         scoping,
         global_aliases,
         &new_expression.callee,
         "Uint32Array",
-    )?;
-    let [argument] = new_expression.arguments.as_slice() else {
-        return None;
+    ) {
+        global
+    } else {
+        let mut global = None;
+        // The linked instantiation paths carry the exact factory call
+        // that allocated the callback. A proof for one path is not a proof
+        // for another, even when their callback source spans are identical.
+        for site in sites {
+            let Some(invocation) = site.factory_invocation else {
+                continue;
+            };
+            if let Some((alias, name)) = global_aliases.captured_namespace_at_invocation(
+                scoping,
+                &new_expression.callee,
+                "Uint32Array",
+                invocation,
+            ) {
+                global = Some(name);
+                witnesses.push(AliasInitializationWitness {
+                    alias: scoping.symbol_name(alias).to_string(),
+                    invocation_start: invocation.span.start,
+                    invocation_end: invocation.span.end,
+                    site_start: site.start,
+                    site_end: site.end,
+                });
+            }
+        }
+        global?
     };
-    let source_expression = argument.as_expression()?;
-    expression_is_symbol(scoping, source_expression, *source).then_some(
+    Some((
         WasmImportHandlerSemantic::Uint32ArrayConstructor {
             source_param: 0,
             element_width_bits: 32,
             global_object: global,
             standard_builtin_semantics_required: true,
         },
-    )
+        witnesses,
+    ))
 }
 
 fn u32_coerced_symbol(scoping: &Scoping, argument: &Argument<'_>, symbol: SymbolId) -> bool {
@@ -610,9 +660,12 @@ pub(super) fn analyze_import_handler(
     function: &Function<'_>,
     scoping: &Scoping,
     global_aliases: &GlobalAliases,
-) -> Option<WasmImportHandlerSemantic> {
-    uint32_array_constructor(function, scoping, global_aliases)
-        .or_else(|| typed_array_set(function, scoping))
-        .or_else(|| property_getter(function, scoping))
-        .or_else(|| table_initializer_only(function, scoping, global_aliases))
+    sites: &[WasmInstantiationSite],
+) -> Option<(WasmImportHandlerSemantic, Vec<AliasInitializationWitness>)> {
+    uint32_array_constructor(function, scoping, global_aliases, sites).or_else(|| {
+        typed_array_set(function, scoping)
+            .or_else(|| property_getter(function, scoping))
+            .or_else(|| table_initializer_only(function, scoping, global_aliases))
+            .map(|semantic| (semantic, Vec::new()))
+    })
 }

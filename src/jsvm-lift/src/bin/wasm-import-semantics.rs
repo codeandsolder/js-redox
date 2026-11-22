@@ -60,7 +60,7 @@ fn main() -> Result<()> {
         _ => bail!("--import-module, --import-name and --offset must be supplied together"),
     };
     let report = Report {
-        schema: "jsvm-wasm-import-semantics/v8",
+        schema: "jsvm-wasm-import-semantics/v9",
         source: args.input.display().to_string(),
         shapes: analysis.shapes,
         handler_semantics: analysis.handler_semantics,

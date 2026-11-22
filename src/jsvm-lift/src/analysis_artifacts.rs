@@ -93,7 +93,7 @@ artifact!(
     WASM_JS_BOUNDARY,
     "WASM/JavaScript boundary correlation",
     "analysis/wasm-js-boundary.json",
-    "wasm-js-boundary-correlation/v6",
+    "wasm-js-boundary-correlation/v7",
     arrays = ["host_effect_rows", "copied_input_rows", "skipped_modules"],
     objects = ["summary"]
 );

@@ -19,7 +19,9 @@ mod import_object;
 mod memory_identity;
 mod module_identity;
 use bulk_import::analyze_import_handler;
-pub use bulk_import::{WasmImportHandlerSemantic, WasmImportHandlerShape};
+pub use bulk_import::{
+    AliasInitializationWitness, WasmImportHandlerSemantic, WasmImportHandlerShape,
+};
 use import_object::{assignment_import_object, collect_instantiation_sites};
 pub use import_object::{WasmImportObjectUsage, WasmInstantiationSite};
 use memory_identity::collect_module_memory_identity_proofs;
@@ -658,9 +660,16 @@ impl<'a> Visit<'a> for HandlerCollector<'_, '_, '_, '_> {
                             }
                         }
                     }
-                    if let Some(semantic) =
-                        analyze_import_handler(function, self.scoping, self.global_aliases)
-                    {
+                    let linked_sites = self
+                        .instantiation_sites
+                        .get(&(assignment.span.start, assignment.span.end))
+                        .map_or(&[][..], Vec::as_slice);
+                    if let Some((semantic, initialization_witnesses)) = analyze_import_handler(
+                        function,
+                        self.scoping,
+                        self.global_aliases,
+                        linked_sites,
+                    ) {
                         let import_object =
                             assignment_import_object(self.scoping, &assignment.left).and_then(
                                 |(symbol, import_object, module, name)| {
@@ -676,6 +685,7 @@ impl<'a> Visit<'a> for HandlerCollector<'_, '_, '_, '_> {
                             import_object,
                             assignment_start: assignment.span.start,
                             assignment_end: assignment.span.end,
+                            initialization_witnesses,
                             semantic,
                         });
                     }
@@ -799,8 +809,8 @@ impl<'a> Visit<'a> for NormalizedHandlerSemanticsCollector<'_, '_> {
                     .assignment_counts
                     .entry((import_module.map(str::to_string), import_name.to_string()))
                     .or_default() += 1;
-                if let Some(semantic) =
-                    analyze_import_handler(function, self.scoping, self.global_aliases)
+                if let Some((semantic, initialization_witnesses)) =
+                    analyze_import_handler(function, self.scoping, self.global_aliases, &[])
                 {
                     if matches!(
                         semantic,
@@ -821,6 +831,7 @@ impl<'a> Visit<'a> for NormalizedHandlerSemanticsCollector<'_, '_> {
                             import_object,
                             assignment_start: assignment.span.start,
                             assignment_end: assignment.span.end,
+                            initialization_witnesses,
                             semantic,
                         });
                     }
@@ -1618,6 +1629,71 @@ mod tests {
                 standard_builtin_semantics_required: true,
             }
         ));
+    }
+
+    #[test]
+    fn captured_namespace_evidence_is_scoped_to_specific_factory_invocations() {
+        let source = r#"
+            const early = make();
+            WebAssembly.instantiate(bytes, early);
+            const host = globalThis;
+            const late = make();
+            WebAssembly.instantiate(bytes, late);
+            function make() {
+                const imports = {wbg: {}};
+                imports.wbg.ctor = function(value) { return new host.Uint32Array(value); };
+                return imports;
+            }
+        "#;
+        let analysis = proven_wasm_import_semantics(source);
+        let constructor = analysis
+            .handler_semantics
+            .iter()
+            .find(|shape| shape.import_name == "ctor")
+            .unwrap_or_else(|| unreachable!("expected one contextual constructor shape"));
+        let [witness] = constructor.initialization_witnesses.as_slice() else {
+            unreachable!("only the late invocation establishes initialization: {constructor:#?}");
+        };
+        assert_eq!(witness.alias, "host");
+        assert_eq!(
+            &source[witness.invocation_start as usize..witness.invocation_end as usize],
+            "make()"
+        );
+        assert_eq!(
+            &source[witness.site_start as usize..witness.site_end as usize],
+            "WebAssembly.instantiate(bytes, late)"
+        );
+        let usage = analysis
+            .import_object_usages
+            .iter()
+            .find(|usage| usage.import_name == "ctor")
+            .unwrap_or_else(|| {
+                unreachable!("both constructor uses have a lexical assignment identity")
+            });
+        assert_eq!(usage.instantiation_sites.len(), 2);
+        assert!(usage
+            .instantiation_sites
+            .iter()
+            .any(|site| site.start != witness.site_start));
+
+        // Unknown invocation, dynamic reassignment, and nonordinary factory
+        // returns cannot establish the captured initializer.
+        for source in [
+            r#"const host=globalThis; function make(){const imports={wbg:{}};imports.wbg.ctor=function(v){return new host.Uint32Array(v)};return imports} consume(make);"#,
+            r#"let host=globalThis;host=fake;const result=make();WebAssembly.instantiate(bytes,result);function make(){const imports={wbg:{}};imports.wbg.ctor=function(v){return new host.Uint32Array(v)};return imports}"#,
+            r#"const host=globalThis;const result=make();WebAssembly.instantiate(bytes,result);async function make(){const imports={wbg:{}};imports.wbg.ctor=function(v){return new host.Uint32Array(v)};return imports}"#,
+            r#"const host=globalThis;const result=make();WebAssembly.instantiate(bytes,result);function* make(){const imports={wbg:{}};imports.wbg.ctor=function(v){return new host.Uint32Array(v)};return imports}"#,
+            r#"const result=make();WebAssembly.instantiate(bytes,result);const host=globalThis;function make(){const imports={wbg:{}};imports.wbg.ctor=function(v){return new host.Uint32Array(v)};return imports}"#,
+        ] {
+            let analysis = proven_wasm_import_semantics(source);
+            assert!(
+                analysis
+                    .handler_semantics
+                    .iter()
+                    .all(|shape| shape.import_name != "ctor"),
+                "{source}: {analysis:#?}"
+            );
+        }
     }
 
     #[test]
