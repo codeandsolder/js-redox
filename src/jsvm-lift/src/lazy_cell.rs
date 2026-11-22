@@ -3714,10 +3714,11 @@ fn getter_descriptor_delegate(
         let ObjectPropertyKind::ObjectProperty(property) = item else {
             return None;
         };
-        let name = property.key.static_name()?;
-        if property.computed && property.key.static_name().is_none() {
-            return None;
-        }
+        let name = jsvm_safe_core::exact_property_key(
+            &property.key,
+            property.computed,
+            jsvm_safe_core::eval_static_primitive,
+        )?;
         if name != "get" {
             continue;
         }
@@ -3880,10 +3881,11 @@ fn descriptor_parameter_for_projection(
         let ObjectPropertyKind::ObjectProperty(property) = item else {
             return None;
         };
-        let name = property.key.static_name()?;
-        if property.computed && property.key.static_name().is_none() {
-            return None;
-        }
+        let name = jsvm_safe_core::exact_property_key(
+            &property.key,
+            property.computed,
+            jsvm_safe_core::eval_static_primitive,
+        )?;
         if name != projection_property {
             continue;
         }

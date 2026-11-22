@@ -1,9 +1,12 @@
-use jsvm_safe_core::string_literal_value;
+use jsvm_safe_core::{
+    eval_static_primitive, exact_computed_property_key, exact_property_key, exact_u32,
+    is_prototype_setter, string_literal_value, StaticPrimitiveValue,
+};
 use oxc_allocator::Allocator;
 use oxc_ast::{
     ast::{
         Argument, ArrayExpressionElement, AssignmentTarget, BindingPattern, Expression,
-        IdentifierReference, ObjectPropertyKind, PropertyKey, Statement,
+        IdentifierReference, ObjectPropertyKind, Statement,
     },
     AstKind,
 };
@@ -88,10 +91,17 @@ fn arrow_block_body<'a>(
     }
 }
 
-fn computed_string(expr: &Expression<'_>) -> Option<String> {
-    match expr {
-        Expression::StringLiteral(value) => string_literal_value(value),
-        Expression::ParenthesizedExpression(paren) => computed_string(&paren.expression),
+fn computed_key(expr: &Expression<'_>) -> Option<String> {
+    exact_computed_property_key(expr, eval_static_primitive)
+}
+
+/// Recognized loader IDs are strings or numbers. Both select the same
+/// property identity when used as a module-table key; preserve the language's
+/// number spelling rather than manufacturing a decimal integer string.
+fn module_id(expr: &Expression<'_>) -> Option<String> {
+    match eval_static_primitive(expr)? {
+        StaticPrimitiveValue::String(value) => Some(value),
+        value @ StaticPrimitiveValue::Number(_) => value.js_string(),
         _ => None,
     }
 }
@@ -116,15 +126,7 @@ impl<'a> Visit<'a> for DependencyCollector<'_> {
         let Some(first) = call.arguments.first() else {
             return;
         };
-        let dependency = match first {
-            Argument::NumericLiteral(value)
-                if value.value.is_finite() && value.value.fract() == 0.0 =>
-            {
-                Some(format!("{:.0}", value.value))
-            }
-            Argument::StringLiteral(value) => string_literal_value(value),
-            _ => None,
-        };
+        let dependency = first.as_expression().and_then(module_id);
         if let Some(dependency) = dependency {
             self.dependencies.insert(dependency);
         }
@@ -156,7 +158,7 @@ impl ExportCollector<'_> {
                     && expression_symbol(self.scoping, &member.object) == Some(module_symbol)
             }
             Expression::ComputedMemberExpression(member) => {
-                computed_string(&member.expression).as_deref() == Some("exports")
+                computed_key(&member.expression).as_deref() == Some("exports")
                     && expression_symbol(self.scoping, &member.object) == Some(module_symbol)
             }
             Expression::ParenthesizedExpression(paren) => {
@@ -188,7 +190,7 @@ impl ExportCollector<'_> {
                 }
             }
             AssignmentTarget::ComputedMemberExpression(member) => {
-                let Some(name) = computed_string(&member.expression) else {
+                let Some(name) = computed_key(&member.expression) else {
                     return;
                 };
                 if self.is_exports_expr(&member.object)
@@ -215,7 +217,7 @@ impl ExportCollector<'_> {
                 (&member.object, Some(member.property.name.to_string()))
             }
             Expression::ComputedMemberExpression(member) => {
-                (&member.object, computed_string(&member.expression))
+                (&member.object, computed_key(&member.expression))
             }
             _ => return,
         };
@@ -239,11 +241,12 @@ impl ExportCollector<'_> {
             let ObjectPropertyKind::ObjectProperty(property) = property else {
                 continue;
             };
-            if property.computed {
-                continue;
-            }
-            if let Some(name) = Collector::property_key(&property.key) {
-                self.add_name(name);
+            if let Some(name) =
+                exact_property_key(&property.key, property.computed, eval_static_primitive)
+            {
+                if !is_prototype_setter(property, &name) {
+                    self.add_name(name);
+                }
             }
         }
     }
@@ -339,7 +342,7 @@ impl<'a> Visit<'a> for BootstrapProbe<'_> {
                         Some(&member.object)
                     }
                     AssignmentTarget::ComputedMemberExpression(member)
-                        if computed_string(&member.expression).as_deref() == Some("m") =>
+                        if computed_key(&member.expression).as_deref() == Some("m") =>
                     {
                         Some(&member.object)
                     }
@@ -398,31 +401,11 @@ impl Collector<'_, '_> {
             .unwrap_or_default()
     }
 
-    fn property_key(key: &PropertyKey<'_>) -> Option<String> {
-        match key {
-            PropertyKey::StaticIdentifier(id) => Some(id.name.to_string()),
-            PropertyKey::NumericLiteral(n) if n.value.is_finite() && n.value.fract() == 0.0 => {
-                Some(format!("{:.0}", n.value))
-            }
-            PropertyKey::StringLiteral(s) => string_literal_value(s),
-            _ => None,
-        }
-    }
-
     fn array_literal_ids(arr: &oxc_ast::ast::ArrayExpression<'_>) -> Option<Vec<String>> {
-        let mut ids = Vec::new();
-        for element in &arr.elements {
-            match element {
-                ArrayExpressionElement::NumericLiteral(n)
-                    if n.value.is_finite() && n.value.fract() == 0.0 =>
-                {
-                    ids.push(format!("{:.0}", n.value));
-                }
-                ArrayExpressionElement::StringLiteral(s) => ids.push(string_literal_value(s)?),
-                _ => return None,
-            }
-        }
-        Some(ids)
+        arr.elements
+            .iter()
+            .map(|element| module_id(element.as_expression()?))
+            .collect()
     }
 
     fn amd_factory_expression_parts<'a>(
@@ -543,7 +526,7 @@ impl Collector<'_, '_> {
             }
             Expression::ComputedMemberExpression(member) => {
                 let base = self.unresolved_global_path(&member.object)?;
-                let property = computed_string(&member.expression)?;
+                let property = computed_key(&member.expression)?;
                 Some(format!("{base}.{property}"))
             }
             Expression::ParenthesizedExpression(paren) => {
@@ -561,7 +544,7 @@ impl Collector<'_, '_> {
                 &member.object
             }
             Expression::ComputedMemberExpression(member)
-                if computed_string(&member.expression).as_deref() == Some("define") =>
+                if computed_key(&member.expression).as_deref() == Some("define") =>
             {
                 &member.object
             }
@@ -637,7 +620,7 @@ impl Collector<'_, '_> {
                 (&member.object, Some(member.property.name.to_string()))
             }
             AssignmentTarget::ComputedMemberExpression(member) => {
-                (&member.object, computed_string(&member.expression))
+                (&member.object, computed_key(&member.expression))
             }
             _ => return,
         };
@@ -716,14 +699,18 @@ impl Collector<'_, '_> {
         module_table: &oxc_ast::ast::ObjectExpression<'_>,
     ) -> Option<Vec<ModuleRecord>> {
         let mut modules = Vec::with_capacity(module_table.properties.len());
+        let mut seen_ids = HashSet::with_capacity(module_table.properties.len());
         for item in &module_table.properties {
             let ObjectPropertyKind::ObjectProperty(prop) = item else {
                 return None;
             };
-            if prop.computed || prop.kind != oxc_ast::ast::PropertyKind::Init {
+            if prop.kind != oxc_ast::ast::PropertyKind::Init {
                 return None;
             }
-            let id = Self::property_key(&prop.key)?;
+            let id = exact_property_key(&prop.key, prop.computed, eval_static_primitive)?;
+            if is_prototype_setter(prop, &id) || !seen_ids.insert(id.clone()) {
+                return None;
+            }
             let value = unwrap_parenthesized(&prop.value);
             let (value_kind, span) = match value {
                 Expression::FunctionExpression(f) => ("function", f.span),
@@ -758,24 +745,20 @@ impl Collector<'_, '_> {
             let ObjectPropertyKind::ObjectProperty(prop) = item else {
                 return None;
             };
-            if prop.computed || prop.kind != oxc_ast::ast::PropertyKind::Init {
+            if prop.kind != oxc_ast::ast::PropertyKind::Init {
                 return None;
             }
-            let name = Self::property_key(&prop.key)?;
-            let target = match unwrap_parenthesized(&prop.value) {
-                Expression::NumericLiteral(value)
-                    if value.value.is_finite() && value.value.fract() == 0.0 =>
-                {
-                    format!("{:.0}", value.value)
-                }
-                Expression::StringLiteral(value) => string_literal_value(value)?,
-                Expression::Identifier(value)
-                    if value.name.as_str() == "undefined"
-                        && reference_symbol(self.scoping, value).is_none() =>
-                {
-                    name.clone()
-                }
-                _ => return None,
+            let name = exact_property_key(&prop.key, prop.computed, eval_static_primitive)?;
+            if is_prototype_setter(prop, &name) {
+                return None;
+            }
+            let target = if matches!(unwrap_parenthesized(&prop.value),
+                Expression::Identifier(value) if value.name.as_str() == "undefined"
+                    && reference_symbol(self.scoping, value).is_none())
+            {
+                name.clone()
+            } else {
+                module_id(&prop.value)?
             };
             dependencies.insert(name, target);
         }
@@ -810,14 +793,18 @@ impl Collector<'_, '_> {
             return None;
         }
         let mut modules = Vec::with_capacity(module_table.properties.len());
+        let mut seen_ids = HashSet::with_capacity(module_table.properties.len());
         for item in &module_table.properties {
             let ObjectPropertyKind::ObjectProperty(prop) = item else {
                 return None;
             };
-            if prop.computed || prop.kind != oxc_ast::ast::PropertyKind::Init {
+            if prop.kind != oxc_ast::ast::PropertyKind::Init {
                 return None;
             }
-            let id = Self::property_key(&prop.key)?;
+            let id = exact_property_key(&prop.key, prop.computed, eval_static_primitive)?;
+            if is_prototype_setter(prop, &id) || !seen_ids.insert(id.clone()) {
+                return None;
+            }
             let Expression::ArrayExpression(pair) = unwrap_parenthesized(&prop.value) else {
                 return None;
             };
@@ -1073,7 +1060,7 @@ impl Collector<'_, '_> {
                 &member.object
             }
             AssignmentTarget::ComputedMemberExpression(member)
-                if computed_string(&member.expression).as_deref() == Some("m") =>
+                if computed_key(&member.expression).as_deref() == Some("m") =>
             {
                 &member.object
             }
@@ -1248,10 +1235,8 @@ impl Collector<'_, '_> {
         let Some(Argument::NumericLiteral(offset)) = array_ctor.arguments.first() else {
             return None;
         };
-        if !offset.value.is_finite() || offset.value < 0.0 || offset.value.fract() != 0.0 {
-            return None;
-        }
-        let mut next_id = format!("{:.0}", offset.value).parse::<usize>().ok()?;
+        // Array(length) accepts only the exact uint32 length domain.
+        let mut next_id = usize::try_from(exact_u32(offset.value)?).ok()?;
         let mut modules = Vec::new();
         for argument in &concat.arguments {
             let Argument::ArrayExpression(table) = argument else {
@@ -1267,6 +1252,8 @@ impl Collector<'_, '_> {
                 return None;
             }
             next_id = next_id.checked_add(table.elements.len())?;
+            // The resulting Array also has a uint32 length, not usize.
+            u32::try_from(next_id).ok()?;
         }
         (!modules.is_empty()).then_some(modules)
     }
@@ -1757,6 +1744,94 @@ mod tests {
                 assert!(module.commonjs_export);
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn module_inventory_uses_exact_property_and_dependency_identity() -> Result<(), BudgetExceeded>
+    {
+        let budget = WorkBudget::unlimited("canonical-module-ids");
+        let source = r#"
+            webpackJsonp([1e21, -0, "chunk"], {
+                1e21:function(module,exports,require){exports.main=require(1e-7);exports[1e21]=require(-0);require.d(exports,{["ex"+"port"]:()=>1});},
+                1e-7:function(module,exports,require){exports.other=require("a"+"b");},
+                [(-0)]:function(module,exports){},
+                ["a"+"b"]:function(module,exports){},
+                ["__proto__"]:function(module,exports){}
+            });
+        "#;
+        let report = analyze_bundle_source(source, "canonical-webpack", &budget)?;
+        let Some(bundle) = report
+            .bundles
+            .iter()
+            .find(|bundle| bundle.kind == "webpack_jsonp_call")
+        else {
+            unreachable!("expected explicit webpack inventory: {report:#?}");
+        };
+        assert_eq!(bundle.chunk_ids, ["1e+21", "0", "chunk"]);
+        assert_eq!(
+            bundle
+                .modules
+                .iter()
+                .map(|module| module.id.as_str())
+                .collect::<Vec<_>>(),
+            ["1e+21", "1e-7", "0", "ab", "__proto__"]
+        );
+        assert_eq!(bundle.modules[0].dependencies, ["0", "1e-7"]);
+        assert_eq!(bundle.modules[0].export_names, ["1e+21", "export", "main"]);
+        assert_eq!(bundle.modules[1].dependencies, ["ab"]);
+
+        let browserify = r#"
+            (function(modules,cache,entries){})({
+                1e21:[function(require,module,exports){exports.a=require("./dep");}, {["./"+"dep"]:1e-7}],
+                [1e-7]:[function(require,module,exports){exports.b=1;}, {}]
+            },{},[1e21]);
+        "#;
+        let report = analyze_bundle_source(browserify, "canonical-browserify", &budget)?;
+        let Some(bundle) = report
+            .bundles
+            .iter()
+            .find(|bundle| bundle.kind == "browserify_module_table")
+        else {
+            unreachable!("expected explicit browserify inventory: {report:#?}");
+        };
+        assert_eq!(bundle.modules[0].id, "1e+21");
+        assert_eq!(bundle.modules[0].dependencies, ["1e-7"]);
+        assert_eq!(
+            bundle.modules[0]
+                .dependency_map
+                .get("./dep")
+                .map(String::as_str),
+            Some("1e-7")
+        );
+        assert_eq!(bundle.modules[1].id, "1e-7");
+        Ok(())
+    }
+
+    #[test]
+    fn ambiguous_module_slots_and_impossible_array_lengths_are_rejected(
+    ) -> Result<(), BudgetExceeded> {
+        let budget = WorkBudget::unlimited("canonical-module-rejections");
+        for source in [
+            "webpackJsonp([1],{1e21:function(){},'1e+21':function(){}});",
+            "webpackJsonp([1],{[(-0)]:function(){},0:function(){}});",
+            "webpackJsonp([1],{__proto__:function(){},1:function(){}});",
+            "webpackJsonp([1],{[/x/]:function(){},1:function(){}});",
+            "webpackChunkExample.push([[1],Array(4294967296).concat([function(){}])]);",
+            "webpackChunkExample.push([[1],Array(4294967295).concat([function(){}])]);",
+        ] {
+            let report = analyze_bundle_source(source, "rejected-table", &budget)?;
+            assert!(report.bundles.is_empty(), "{source}: {report:#?}");
+        }
+        let report = analyze_bundle_source(
+            "webpackChunkExample.push([[1],Array(4294967294).concat([function(){}])]);",
+            "max-valid-array",
+            &budget,
+        )?;
+        let Some(bundle) = report.bundles.first() else {
+            unreachable!("valid max array length");
+        };
+        assert_eq!(bundle.modules[0].id, "4294967294");
         Ok(())
     }
 

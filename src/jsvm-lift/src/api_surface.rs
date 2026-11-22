@@ -1,5 +1,7 @@
 use anyhow::{anyhow, Result};
-use jsvm_safe_core::{ProvenConstantEnvironment, StaticPrimitiveValue};
+use jsvm_safe_core::{
+    exact_property_key, is_prototype_setter, ProvenConstantEnvironment, StaticPrimitiveValue,
+};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     BindingPattern, CallExpression, ComputedMemberExpression, Expression, NewExpression,
@@ -697,15 +699,15 @@ impl SinkMutationCollector<'_, '_> {
             for property in &object.properties {
                 match property {
                     ObjectPropertyKind::ObjectProperty(property) => {
-                        let key = property
-                            .key
-                            .static_name()
-                            .and_then(|name| name.into_cow_str().map(|text| text.into_owned()))
-                            .or_else(|| {
-                                property.key.as_expression().and_then(|expr| {
-                                    static_string(expr, self.scoping, self.constants)
-                                })
-                            });
+                        let key = exact_property_key(&property.key, property.computed, |expr| {
+                            self.constants.exact_primitive(expr, self.scoping)
+                        });
+                        if key
+                            .as_deref()
+                            .is_some_and(|key| is_prototype_setter(property, key))
+                        {
+                            continue;
+                        }
                         self.record(Some(target.with_key(key)), call_span, "Object.assign", true);
                     }
                     ObjectPropertyKind::SpreadProperty(spread) => {
@@ -811,38 +813,14 @@ enum FetchInitMethod {
     Unknown,
 }
 
-/// Literal property keys use the same proven constant environment as
-/// native computed member accesses. A computed regular expression is not
-/// a primitive key: its coercion can execute user code.
-fn literal_property_name(
-    property: &oxc_ast::ast::ObjectProperty<'_>,
-    primitive: impl FnOnce(&Expression<'_>) -> Option<StaticPrimitiveValue>,
-) -> Option<String> {
-    if property.computed {
-        let expression = property.key.as_expression()?;
-        if let Some(key) = primitive(expression) {
-            return key.js_string();
-        }
-        // The shared primitive domain deliberately excludes BigInt.
-        if !matches!(expression, Expression::BigIntLiteral(_)) {
-            return None;
-        }
-    }
-    property
-        .key
-        .static_name()?
-        .into_cow_str()
-        .map(|key| key.into_owned())
-}
-
 fn literal_data_key(
     property: &oxc_ast::ast::ObjectProperty<'_>,
     primitive: impl FnOnce(&Expression<'_>) -> Option<StaticPrimitiveValue>,
 ) -> Option<String> {
-    let name = literal_property_name(property, primitive)?;
+    let name = exact_property_key(&property.key, property.computed, primitive)?;
     if property.kind != PropertyKind::Init
         || property.method
-        || (name == "__proto__" && !property.computed && !property.shorthand)
+        || is_prototype_setter(property, &name)
     {
         return None;
     }
@@ -884,19 +862,14 @@ fn fetch_init_method(
             continue;
         };
 
-        let Some(name) =
-            literal_property_name(property, |expr| constants.exact_primitive(expr, scoping))
-        else {
+        let Some(name) = exact_property_key(&property.key, property.computed, |expr| {
+            constants.exact_primitive(expr, scoping)
+        }) else {
             state = FetchInitMethod::Unknown;
             continue;
         };
 
-        let prototype_setter = name == "__proto__"
-            && !property.computed
-            && !property.method
-            && !property.shorthand
-            && property.kind == PropertyKind::Init;
-        if prototype_setter {
+        if is_prototype_setter(property, &name) {
             if matches!(state, FetchInitMethod::NoOwnMethod) {
                 state = FetchInitMethod::Unknown;
             }
@@ -2725,6 +2698,27 @@ xhr.open("POST", "https://api.example.test/uncertain");
         assert!(result.mutation_sites.iter().any(|site| {
             site.target_pattern == [Some("window".into()), Some("WebSocket".into())]
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn computed_object_keys_use_primitive_identity_not_regex_spelling() -> Result<()> {
+        let source = r#"
+const k = "fe" + "tch";
+const {[k]: alias} = window;
+alias("/before");
+Object.assign(window, {[/x/]:replacement});
+fetch("/after");
+"#;
+        let result =
+            super::analyze_api_surface(source, &WorkBudget::unlimited("computed-key-coercion"))?;
+        assert_eq!(result.callsites.len(), 2, "{result:#?}");
+        assert_eq!(result.mutation_sites.len(), 1, "{result:#?}");
+        assert_eq!(
+            result.mutation_sites[0].target_pattern,
+            [Some("window".into()), None]
+        );
+        assert_eq!(result.callsites[1].kind, "fetch_candidate");
         Ok(())
     }
 

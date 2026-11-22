@@ -1,5 +1,5 @@
 use crate::binding_facts::BindingFacts;
-use crate::value_eval::{eval, literal_property_key, Value};
+use crate::value_eval::{eval, exact_property_key, is_prototype_setter, Value};
 use crate::{direct_identifier_name, reference_is_statically_resolved_read};
 use oxc_ast::ast::{
     BindingPattern, ComputedMemberExpression, Expression, PropertyKind, Statement,
@@ -209,24 +209,12 @@ fn analyze_proxy_object(
             properties.clear();
             continue;
         };
-        let key = if prop.computed {
-            prop.key
-                .as_expression()
-                .and_then(eval)
-                .and_then(|value| value.js_string())
-        } else {
-            literal_property_key(&prop.key)
-        };
+        let key = exact_property_key(&prop.key, prop.computed, eval);
         let Some(key) = key else {
             properties.clear();
             continue;
         };
-        if key == "__proto__"
-            && prop.kind == PropertyKind::Init
-            && !prop.computed
-            && !prop.method
-            && !prop.shorthand
-        {
+        if is_prototype_setter(prop, &key) {
             // The special colon-form prototype setter does not write an own property.
             continue;
         }
