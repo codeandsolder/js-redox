@@ -1164,7 +1164,8 @@ mod tests {
           const api={};api.run=()=>{
               const other=doubled+1;
               return leaf(other, !false, through(0,7))
-                  +leaf(2**3, -0, null);
+                  +leaf(2**3, -0, null)
+                  +leaf(2**0, true, null);
           };";
         let views = reconstruct_caller_views(src, Some("run"))?;
         let variants = specialize_resolved_call_graph(src, &views)?;
@@ -1175,15 +1176,14 @@ mod tests {
         assert!(left.constants.contains(&(1, "true".into())), "{left:?}");
         let right = variants
             .iter()
-            .find(|v| v.helper == "leaf" && v.constants.iter().any(|x| x == &(0, "8".into())))
-            .ok_or_else(|| anyhow!("pure exponent not recovered: {variants:?}"))?;
-        assert!(
-            right
-                .constants
-                .iter()
-                .any(|x| x.0 == 1 && (x.1 == "-0" || x.1 == "(-0)")),
-            "{right:?}"
-        );
+            .find(|v| v.helper == "leaf" && v.constants.iter().any(|x| x == &(1, "-0".into())))
+            .ok_or_else(|| anyhow!("independent exact arguments not recovered: {variants:?}"))?;
+        assert_eq!(right.constants, [(1, "-0".into()), (2, "null".into())]);
+        let exact_power = variants
+            .iter()
+            .find(|v| v.helper == "leaf" && v.constants.iter().any(|x| x == &(0, "1".into())))
+            .ok_or_else(|| anyhow!("specified exact exponent case not recovered: {variants:?}"))?;
+        assert!(exact_power.constants.contains(&(1, "true".into())));
         Ok(())
     }
 
