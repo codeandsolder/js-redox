@@ -116,6 +116,93 @@ fn enclosing_context_and_guard(
     (None, guarded)
 }
 
+#[derive(Default)]
+struct Definitions(HashMap<SymbolId, Option<Span>>);
+
+impl Definitions {
+    fn record(&mut self, symbol: SymbolId, span: Span) {
+        self.0
+            .entry(symbol)
+            .and_modify(|previous| {
+                if *previous != Some(span) {
+                    *previous = None;
+                }
+            })
+            .or_insert(Some(span));
+    }
+
+    fn resolve(
+        &self,
+        callee: &Expression<'_>,
+        semantic: &Semantic<'_>,
+    ) -> Option<(Span, &'static str)> {
+        if let Some(span) = function_literal(callee) {
+            return Some((span, "direct_inline_function"));
+        }
+        let symbol = ref_symbol(callee, semantic)?;
+        Some(((*self.0.get(&symbol)?)?, "lexical_binding_candidate"))
+    }
+}
+
+fn collect_definitions(
+    semantic: &Semantic<'_>,
+    budget: &WorkBudget,
+) -> Result<(Definitions, BTreeSet<(u32, u32)>), BudgetExceeded> {
+    let nodes = semantic.nodes();
+    let mut definitions = Definitions::default();
+    let mut functions = BTreeSet::new();
+    for node in nodes.iter() {
+        budget.consume(1)?;
+        match node.kind() {
+            AstKind::Function(fun) if fun.body.is_some() => {
+                functions.insert((fun.span.start, fun.span.end));
+                if fun.r#type == FunctionType::FunctionDeclaration {
+                    if let Some(symbol) = fun.id.as_ref().and_then(|id| id.symbol_id.get()) {
+                        definitions.record(symbol, fun.span);
+                    }
+                }
+            }
+            AstKind::ArrowFunctionExpression(fun) => {
+                functions.insert((fun.span.start, fun.span.end));
+            }
+            AstKind::VariableDeclarator(decl) => {
+                if let Some((symbol, function)) = decl
+                    .id
+                    .get_binding_identifier()
+                    .and_then(|ident| ident.symbol_id.get())
+                    .zip(decl.init.as_ref().and_then(function_literal))
+                {
+                    definitions.record(symbol, function);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok((definitions, functions))
+}
+
+fn top_level_reachability(
+    direct_edges: &[StaticCallEdge],
+    budget: &WorkBudget,
+) -> Result<Vec<[u32; 2]>, BudgetExceeded> {
+    let mut adjacency = BTreeMap::<Option<[u32; 2]>, Vec<[u32; 2]>>::new();
+    for edge in direct_edges {
+        adjacency.entry(edge.caller).or_default().push(edge.callee);
+    }
+    let mut reachable = BTreeSet::<[u32; 2]>::new();
+    let mut pending = VecDeque::from([None]);
+    while let Some(caller) = pending.pop_front() {
+        budget.consume(1)?;
+        for callee in adjacency.get(&caller).into_iter().flatten() {
+            if reachable.insert(*callee) {
+                pending.push_back(Some(*callee));
+            }
+        }
+    }
+    Ok(reachable.into_iter().collect())
+}
+
 /// Build source-local direct-call candidates with exact semantic symbol identity.
 ///
 /// The graph deliberately does not assert value immutability, cross-script
@@ -132,43 +219,8 @@ pub fn analyze_static_calls(
     semantic: &Semantic<'_>,
     budget: &WorkBudget,
 ) -> Result<StaticCallGraph, BudgetExceeded> {
+    let (definitions, functions) = collect_definitions(semantic, budget)?;
     let nodes = semantic.nodes();
-    let mut definitions = HashMap::<SymbolId, BTreeSet<(u32, u32)>>::new();
-    let mut functions = BTreeSet::<(u32, u32)>::new();
-    for node in nodes.iter() {
-        budget.consume(1)?;
-        match node.kind() {
-            AstKind::Function(fun) if fun.body.is_some() => {
-                functions.insert((fun.span.start, fun.span.end));
-                if fun.r#type == FunctionType::FunctionDeclaration {
-                    if let Some(symbol) = fun.id.as_ref().and_then(|id| id.symbol_id.get()) {
-                        definitions
-                            .entry(symbol)
-                            .or_default()
-                            .insert((fun.span.start, fun.span.end));
-                    }
-                }
-            }
-            AstKind::ArrowFunctionExpression(fun) => {
-                functions.insert((fun.span.start, fun.span.end));
-            }
-            AstKind::VariableDeclarator(decl) => {
-                if let Some((symbol, function)) = decl
-                    .id
-                    .get_binding_identifier()
-                    .and_then(|ident| ident.symbol_id.get())
-                    .zip(decl.init.as_ref().and_then(function_literal))
-                {
-                    definitions
-                        .entry(symbol)
-                        .or_default()
-                        .insert((function.start, function.end));
-                }
-            }
-            _ => {}
-        }
-    }
-
     let mut direct_edges = Vec::new();
     let mut unresolved_calls = Vec::new();
     for (node_id, node) in nodes.iter_enumerated() {
@@ -179,17 +231,7 @@ pub fn analyze_static_calls(
             _ => continue,
         };
         let (enclosing_function, path_dependent) = enclosing_context_and_guard(semantic, node_id);
-        let target = function_literal(callee)
-            .map(|span| (span, "direct_inline_function"))
-            .or_else(|| {
-                let symbol = ref_symbol(callee, semantic)?;
-                let matches = definitions.get(&symbol)?;
-                if matches.len() != 1 {
-                    return None;
-                }
-                let &(start, end) = matches.iter().next()?;
-                Some((Span::new(start, end), "lexical_binding_candidate"))
-            });
+        let target = definitions.resolve(callee, semantic);
         if let Some((target, resolution)) = target {
             direct_edges.push(StaticCallEdge {
                 caller: enclosing_function,
@@ -214,26 +256,13 @@ pub fn analyze_static_calls(
     direct_edges.sort_by_key(|edge| (edge.call, edge.callee));
     unresolved_calls.sort_by_key(|call| call.call);
 
-    let mut adjacency = BTreeMap::<Option<[u32; 2]>, Vec<[u32; 2]>>::new();
-    for edge in &direct_edges {
-        adjacency.entry(edge.caller).or_default().push(edge.callee);
-    }
-    let mut reachable = BTreeSet::<[u32; 2]>::new();
-    let mut pending = VecDeque::from([None]);
-    while let Some(caller) = pending.pop_front() {
-        budget.consume(1)?;
-        for callee in adjacency.get(&caller).into_iter().flatten() {
-            if reachable.insert(*callee) {
-                pending.push_back(Some(*callee));
-            }
-        }
-    }
+    let reachable = top_level_reachability(&direct_edges, budget)?;
     Ok(StaticCallGraph {
         schema: "jsvm-static-calls/v1",
         functions: functions.into_iter().map(Into::into).collect(),
         direct_edges,
         unresolved_calls,
-        possibly_reachable_from_top_level: reachable.into_iter().collect(),
+        possibly_reachable_from_top_level: reachable,
     })
 }
 

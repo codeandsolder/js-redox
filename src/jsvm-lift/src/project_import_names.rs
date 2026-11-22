@@ -66,6 +66,53 @@ fn usable_name(name: &str) -> bool {
         && !keyword::is_reserved_keyword(name)
 }
 
+impl ModuleExports {
+    fn record_declaration(&mut self, declaration: &Declaration<'_>) {
+        match declaration {
+            Declaration::VariableDeclaration(vars) => {
+                for declarator in &vars.declarations {
+                    if let BindingPattern::BindingIdentifier(id) = &declarator.id {
+                        let name = id.name.to_string();
+                        self.local.push((name.clone(), name));
+                    }
+                }
+            }
+            Declaration::FunctionDeclaration(function) => {
+                if let Some(id) = &function.id {
+                    let name = id.name.to_string();
+                    self.local.push((name.clone(), name));
+                }
+            }
+            Declaration::ClassDeclaration(class) => {
+                if let Some(id) = &class.id {
+                    let name = id.name.to_string();
+                    self.local.push((name.clone(), name));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn record_default(&mut self, declaration: &ExportDefaultDeclarationKind<'_>) {
+        match declaration {
+            ExportDefaultDeclarationKind::Identifier(id) => {
+                self.local.push(("default".to_owned(), id.name.to_string()));
+            }
+            ExportDefaultDeclarationKind::FunctionDeclaration(function) => {
+                if let Some(id) = &function.id {
+                    self.local.push(("default".to_owned(), id.name.to_string()));
+                }
+            }
+            ExportDefaultDeclarationKind::ClassDeclaration(class) => {
+                if let Some(id) = &class.id {
+                    self.local.push(("default".to_owned(), id.name.to_string()));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn parse_exports(source: &str) -> Option<ModuleExports> {
     let allocator = Allocator::default();
     let parsed = parse_program(&allocator, source, SourceType::mjs());
@@ -124,51 +171,12 @@ fn parse_exports(source: &str) -> Option<ModuleExports> {
                     .star_reexports
                     .push(star.source.value.as_str()?.to_owned());
             }
-            Statement::ExportDeclaration(declaration) => match &declaration.declaration {
-                Declaration::VariableDeclaration(vars) => {
-                    for declarator in &vars.declarations {
-                        if let BindingPattern::BindingIdentifier(id) = &declarator.id {
-                            let name = id.name.to_string();
-                            exports.local.push((name.clone(), name));
-                        }
-                    }
-                }
-                Declaration::FunctionDeclaration(function) => {
-                    if let Some(id) = &function.id {
-                        let name = id.name.to_string();
-                        exports.local.push((name.clone(), name));
-                    }
-                }
-                Declaration::ClassDeclaration(class) => {
-                    if let Some(id) = &class.id {
-                        let name = id.name.to_string();
-                        exports.local.push((name.clone(), name));
-                    }
-                }
-                _ => {}
-            },
-            Statement::ExportDefaultDeclaration(default) => match &default.declaration {
-                ExportDefaultDeclarationKind::Identifier(id) => {
-                    exports
-                        .local
-                        .push(("default".to_owned(), id.name.to_string()));
-                }
-                ExportDefaultDeclarationKind::FunctionDeclaration(function) => {
-                    if let Some(id) = &function.id {
-                        exports
-                            .local
-                            .push(("default".to_owned(), id.name.to_string()));
-                    }
-                }
-                ExportDefaultDeclarationKind::ClassDeclaration(class) => {
-                    if let Some(id) = &class.id {
-                        exports
-                            .local
-                            .push(("default".to_owned(), id.name.to_string()));
-                    }
-                }
-                _ => {}
-            },
+            Statement::ExportDeclaration(declaration) => {
+                exports.record_declaration(&declaration.declaration);
+            }
+            Statement::ExportDefaultDeclaration(default) => {
+                exports.record_default(&default.declaration);
+            }
             _ => {}
         }
     }
@@ -490,23 +498,7 @@ Names come from readable source and statically resolved captured ESM exports. Th
     crate::report_file::write_text(&path, &output)
 }
 
-/// Make downstream imports use descriptive component names in the readable
-/// view only. The existing module resolution artifact is authoritative.
-///
-/// # Errors
-///
-/// Fails if existing project artifacts cannot be loaded, an indexed readable module cannot be
-/// read, or renamed output and related artifacts cannot be persisted.
-pub fn propagate_imported_names(project: &Path) -> Result<usize> {
-    let Some(refs) = load_optional_artifact(project, JS_REFERENCES)? else {
-        return Ok(0);
-    };
-    let Some(deob) = load_optional_artifact(project, DEOBFUSCATION)? else {
-        return Ok(0);
-    };
-    let Some(source_index) = load_optional_artifact(project, SOURCE_INDEX)? else {
-        return Ok(0);
-    };
+fn unique_module_urls(source_index: &Value) -> BTreeMap<String, Option<String>> {
     let mut urls = BTreeMap::<String, Option<String>>::new();
     for unit in source_index["units"].as_array().into_iter().flatten() {
         if field(unit, "kind") != Some("javascript") {
@@ -523,6 +515,10 @@ pub fn propagate_imported_names(project: &Path) -> Result<usize> {
             }
         }
     }
+    urls
+}
+
+fn readable_modules(project: &Path, deob: &Value) -> Result<BTreeMap<String, (String, String)>> {
     let mut by_raw = BTreeMap::<String, (String, String)>::new();
     for unit in deob["units"].as_array().into_iter().flatten() {
         if let (Some(raw), Some(readable)) =
@@ -539,7 +535,13 @@ pub fn propagate_imported_names(project: &Path) -> Result<usize> {
             }
         }
     }
-    let mut resolutions = BTreeMap::<String, BTreeMap<String, Option<String>>>::new();
+    Ok(by_raw)
+}
+
+type Resolutions = BTreeMap<String, Option<String>>;
+
+fn module_resolutions(refs: &Value) -> BTreeMap<String, Resolutions> {
+    let mut resolutions = BTreeMap::<String, Resolutions>::new();
     for unit in refs["code_units"].as_array().into_iter().flatten() {
         let Some(raw) = field(unit, "raw_path") else {
             continue;
@@ -564,6 +566,18 @@ pub fn propagate_imported_names(project: &Path) -> Result<usize> {
             }
         }
     }
+    resolutions
+}
+
+fn collect_modules(
+    project: &Path,
+    refs: &Value,
+    deob: &Value,
+    source_index: &Value,
+) -> Result<BTreeMap<String, SourceModule>> {
+    let urls = unique_module_urls(source_index);
+    let by_raw = readable_modules(project, deob)?;
+    let mut resolutions = module_resolutions(refs);
     let mut modules = BTreeMap::<String, SourceModule>::new();
     for (url, raw) in urls {
         let Some(raw) = raw else { continue };
@@ -583,6 +597,27 @@ pub fn propagate_imported_names(project: &Path) -> Result<usize> {
             },
         );
     }
+    Ok(modules)
+}
+
+/// Make downstream imports use descriptive component names in the readable
+/// view only. The existing module resolution artifact is authoritative.
+///
+/// # Errors
+///
+/// Fails if existing project artifacts cannot be loaded, an indexed readable module cannot be
+/// read, or renamed output and related artifacts cannot be persisted.
+pub fn propagate_imported_names(project: &Path) -> Result<usize> {
+    let Some(refs) = load_optional_artifact(project, JS_REFERENCES)? else {
+        return Ok(0);
+    };
+    let Some(deob) = load_optional_artifact(project, DEOBFUSCATION)? else {
+        return Ok(0);
+    };
+    let Some(source_index) = load_optional_artifact(project, SOURCE_INDEX)? else {
+        return Ok(0);
+    };
+    let mut modules = collect_modules(project, &refs, &deob, &source_index)?;
     let mut count = 0;
     // Renaming one module can reveal a descriptive local export name to an
     // upstream consumer. Reparse the renamed modules and rerun graph linking

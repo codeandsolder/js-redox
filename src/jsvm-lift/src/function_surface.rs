@@ -131,6 +131,36 @@ impl SurfaceAccumulator {
         }
     }
 
+    fn observe_reference(
+        &mut self,
+        semantic: &Semantic<'_>,
+        identifier: &oxc_ast::ast::IdentifierReference<'_>,
+    ) {
+        let resolved = identifier
+            .reference_id
+            .get()
+            .map(|reference_id| semantic.scoping().get_reference(reference_id));
+        let declaration = resolved
+            .and_then(Reference::symbol_id)
+            .map(|symbol| semantic.scoping().symbol_span(symbol));
+        if declaration
+            .is_some_and(|decl| self.span.start <= decl.start && decl.end <= self.span.end)
+        {
+            return;
+        }
+        let key = (
+            identifier.name.to_string(),
+            declaration.map(|decl| (decl.start, decl.end)),
+        );
+        let entry = self.references.entry(key).or_default();
+        if resolved.is_none_or(Reference::is_read) {
+            entry.0 += 1;
+        }
+        if resolved.is_some_and(Reference::is_write) {
+            entry.1 += 1;
+        }
+    }
+
     fn observe(&mut self, source: &str, semantic: &Semantic<'_>, kind: AstKind<'_>, depth: usize) {
         match kind {
             AstKind::Function(function) => self.nested_functions.push(range(function.span)),
@@ -138,29 +168,7 @@ impl SurfaceAccumulator {
                 self.nested_functions.push(range(function.span));
             }
             AstKind::IdentifierReference(identifier) => {
-                let resolved = identifier
-                    .reference_id
-                    .get()
-                    .map(|reference_id| semantic.scoping().get_reference(reference_id));
-                let declaration = resolved
-                    .and_then(Reference::symbol_id)
-                    .map(|symbol| semantic.scoping().symbol_span(symbol));
-                if declaration
-                    .is_some_and(|decl| self.span.start <= decl.start && decl.end <= self.span.end)
-                {
-                    return;
-                }
-                let key = (
-                    identifier.name.to_string(),
-                    declaration.map(|decl| (decl.start, decl.end)),
-                );
-                let entry = self.references.entry(key).or_default();
-                if resolved.is_none_or(Reference::is_read) {
-                    entry.0 += 1;
-                }
-                if resolved.is_some_and(Reference::is_write) {
-                    entry.1 += 1;
-                }
+                self.observe_reference(semantic, identifier);
             }
             AstKind::CallExpression(call) => {
                 self.add_event(
