@@ -276,9 +276,11 @@ where
     }
 }
 
-/// A literal expression whose complete evaluation cannot access bindings,
-/// invoke user code, or throw. Proving effects does not require proving the
-/// exact returned value (for example implementation-approximated powers).
+/// Prove a literal expression neither accesses bindings nor invokes user code or throws.
+///
+/// Proving effects does not require proving the exact returned value, for
+/// example for implementation-approximated powers.
+#[must_use = "Only discard a literal evaluation when its effects are proven inert"]
 pub fn inert_literal_value(expr: &Expression<'_>) -> bool {
     inert_literal_kind(expr).is_some()
 }
