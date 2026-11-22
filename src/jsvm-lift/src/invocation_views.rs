@@ -5,6 +5,7 @@ mod observed_guards;
 use crate::{
     analysis_artifacts::{load_artifact, write_artifact, RUNTIME_SCRIPTS, SELECTIVE_TRACE},
     analysis_budget::{AnalysisBudgets, AnalysisOperation},
+    report_markdown::{code_span, fenced_code, literal_text},
     runtime_identity::{
         retain_agreed, script_id_text, session_name, ScriptIdentityIndex, ScriptOriginContext,
     },
@@ -16,20 +17,14 @@ use serde_json::{json, Value};
 use std::fmt::Write as _;
 use std::{collections::BTreeMap, fs, path::Path};
 
-fn fence(value: &str, language: &str) -> String {
-    let longest = value.split(|ch| ch != '~').map(str::len).max().unwrap_or(0);
-    let border = "~".repeat((longest + 1).max(3));
-    format!("{border}{language}\n{value}\n{border}\n")
-}
-
 fn display_json(value: &Value) -> Result<String> {
     let raw = serde_json::to_string_pretty(value)?;
     let limit = 16_000;
     let (shortened, clipped) = clip_chars(&raw, limit);
     if !clipped {
-        return Ok(fence(shortened, "json"));
+        return Ok(fenced_code(shortened, "json"));
     }
-    Ok(fence(&format!("{shortened}\n... truncated in this view; complete values remain in analysis/selective-trace.json"), "text"))
+    Ok(fenced_code(&format!("{shortened}\n... truncated in this view; complete values remain in analysis/selective-trace.json"), "text"))
 }
 
 fn verified_sha(value: &Value) -> Option<&str> {
@@ -73,7 +68,7 @@ fn source_excerpt(raw: &str, line: u64, first_line: Option<u64>) -> String {
         return "Paused location is outside the captured raw source lines; no excerpt claimed.\n"
             .into();
     }
-    fence(excerpt.trim_end(), "js")
+    fenced_code(excerpt.trim_end(), "js")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -223,6 +218,7 @@ fn append_observed_callable_definitions(
         }
         let source = String::from_utf8(bytes)
             .with_context(|| format!("non-UTF8 callable definition source: {sha}"))?;
+        let script = code_span(&script);
         let _ = write!(
             page,
             "### V8 script {script}, original line {}, column {} (1-based)\n\n",
@@ -258,7 +254,7 @@ fn build_observed_path_view(
         .get("steps")
         .and_then(Value::as_array)
         .context("path view requires bounded steps[]")?;
-    let session_label = session.unwrap_or("unresolved");
+    let session_label = code_span(session.unwrap_or("unresolved"));
     let mut page = format!(
         "# Observed execution path {ordinal:04}\n\n         This is an **ordered sequence of {} debugger step pauses** in CDP session {session_label}.          It is not a complete or universally feasible program path, and debugger instrumentation          may perturb timing. Source excerpts refer to original captured code only.\n\n",
         steps.len()
@@ -266,31 +262,37 @@ fn build_observed_path_view(
     let _ = write!(
         page,
         "Requested mode: {}. Capture status: {}.\n\n",
-        hit.get("pathWitnessMode")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown"),
-        hit.get("pathWitnessStatus")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown"),
+        literal_text(
+            hit.get("pathWitnessMode")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+        ),
+        literal_text(
+            hit.get("pathWitnessStatus")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+        ),
     );
     let guard_witnesses = hit
         .get("observed_guard_witnesses")
         .and_then(Value::as_array);
     if let Some(witnesses) = guard_witnesses.filter(|items| !items.is_empty()) {
         page.push_str("## Guard observations matched to original AST\n\n");
-        page.push_str("Only side-effect-checked booleans at an exact captured guard site appear here. A selected-arm label requires the next debugger pause in the same verified stack and original AST arm. Missing steps are not inferred.\n\n");
+        page.push_str("Only side-effect-checked booleans at an exact captured guard site appear here. A selected-arm label requires the next debugger pause with the same verified stack shape and in the original AST arm. A matching shape does not establish activation continuity. Missing steps are not inferred.\n\n");
         for witness in witnesses {
             let _ = writeln!(
                 page,
                 "- **Step {}** — {} guard observed **{}**; next pause in selected arm: **{}**.",
                 witness["step_index"].as_u64().unwrap_or(0),
-                witness["kind"].as_str().unwrap_or("?"),
+                literal_text(witness["kind"].as_str().unwrap_or("?")),
                 witness["observed_value"].as_bool().unwrap_or(false),
-                witness["next_pause_in_selected_arm"]
-                    .as_str()
-                    .unwrap_or("not witnessed")
+                literal_text(
+                    witness["next_pause_in_selected_arm"]
+                        .as_str()
+                        .unwrap_or("not witnessed")
+                )
             );
-            page.push_str(&fence(
+            page.push_str(&fenced_code(
                 &serde_json::to_string(&witness["expression"])?,
                 "json",
             ));
@@ -314,12 +316,12 @@ fn build_observed_path_view(
             .unwrap_or("<anonymous>");
         let location = &top["location"];
         let script_id = location.get("scriptId").and_then(script_id_text);
-        let script = script_id.as_deref().unwrap_or("?");
+        let script = code_span(script_id.as_deref().unwrap_or("?"));
         let line = location.get("lineNumber").and_then(Value::as_u64);
         let column = location.get("columnNumber").and_then(Value::as_u64);
         let _ = write!(page,
-            "## Step {index}: {}\n\nV8 script **{script}**, original line {}, column {} (zero-based).\n\n",
-            function.replace('\n', " "),
+            "## Step {index}: {}\n\nV8 script {script}, original line {}, column {} (zero-based).\n\n",
+            literal_text(function),
             line.map_or_else(|| "?".to_owned(), |v| v.to_string()),
             column.map_or_else(|| "?".to_owned(), |v| v.to_string()),
         );
@@ -422,10 +424,10 @@ pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -
         let name = format!("{ordinal:04}.md");
         let destination = format!("src/_observed/invocations/{name}");
         let session = session_name(hit.get("cdpSession")).map(ToOwned::to_owned);
-        let session_label = session.as_deref().unwrap_or("unresolved");
+        let session_label = code_span(session.as_deref().unwrap_or("unresolved"));
         let mut view = format!(
             "# Observed invocation {ordinal:04}\n\n\
-             CDP session: **{session_label}**. Breakpoint point, pause state and provenance:\n\n"
+             CDP session: {session_label}. Breakpoint point, pause state and provenance:\n\n"
         );
         let header = json!({
             "pointId": hit.get("pointId"),
@@ -452,12 +454,12 @@ pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -
                 .unwrap_or("<anonymous>");
             let location = frame.get("location").unwrap_or(&Value::Null);
             let script_id = location.get("scriptId").and_then(script_id_text);
-            let script = script_id.as_deref().unwrap_or("?");
+            let script = code_span(script_id.as_deref().unwrap_or("?"));
             let line = location.get("lineNumber").and_then(Value::as_u64);
             let column = location.get("columnNumber").and_then(Value::as_u64);
             let _ = write!(view,
-                "### Frame {depth}: {}\n\nCDP script ID: **{script}**, line: **{}**, column: **{}** (zero-based).\n\n",
-                function.replace('\n', " "),
+                "### Frame {depth}: {}\n\nCDP script ID: {script}, line: **{}**, column: **{}** (zero-based).\n\n",
+                literal_text(function),
                 line.map_or_else(|| "?".into(), |n| n.to_string()),
                 column.map_or_else(|| "?".into(), |n| n.to_string())
             );
@@ -490,7 +492,11 @@ pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -
                     if let Ok(mut parsed) = url::Url::parse(url) {
                         parsed.set_query(None);
                         parsed.set_fragment(None);
-                        let _ = write!(view, "Script origin (query omitted): {}\n\n", parsed);
+                        let _ = write!(
+                            view,
+                            "Script origin (query omitted): {}\n\n",
+                            code_span(parsed.as_str())
+                        );
                     }
                 }
                 if let Some(context) = identity.origin.execution_context_id {
@@ -569,7 +575,7 @@ pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -
         let _ = writeln!(
             index,
             "- [Invocation {ordinal:04}](./{name}) — breakpoint point {} in CDP session {session_label}",
-            point.replace('\n', " ")
+            code_span(point)
         );
     }
 

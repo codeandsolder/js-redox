@@ -4,7 +4,10 @@
 //! derived independently. Neither represents a proposed evaluation order or
 //! a semantics-changing transformation. Nested callback bodies never extend
 //! an enclosing call spine.
-use crate::source_text::SourceLineIndex;
+use crate::{
+    report_markdown::{link_destination, literal_text, table_code},
+    source_text::SourceLineIndex,
+};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     ArrowFunctionExpression, AssignmentExpression, BinaryExpression, CallExpression,
@@ -126,18 +129,9 @@ fn assignment_rhs_summary(source: &str, right: &Expression<'_>) -> String {
     let fragment = source.get(span.start as usize..span.end as usize);
     if let Some(value) = fragment.filter(|value| {
         value.len() <= MAX_INLINE_ASSIGNMENT_RHS_BYTES
-            && !value.contains(char::from(10))
-            && !value.contains(char::from(13))
-            && !value.contains(char::from(96))
+            && !value.contains(['\r', '\n', '\u{2028}', '\u{2029}'])
     }) {
-        // Code spans preserve JS operators (especially the pipe character)
-        // without interpreting them as Markdown table delimiters.
-        return format!(
-            "{}{}{}",
-            char::from(96),
-            value.replace('|', "\\|"),
-            char::from(96)
-        );
+        return table_code(value);
     }
     let kind = match right {
         Expression::AssignmentExpression(_) => "assignment",
@@ -263,14 +257,12 @@ fn append_assignment_outline_node(
 ) -> Option<()> {
     let node = &nodes[index];
     let (line, col) = lines.character_line_column(source, node.span.start as usize)?;
-    let target = if node.target.len() > 80
-        || node.target.contains(char::from(96))
-        || node.target.contains(char::from(10))
-    {
-        "<complex target>".to_owned()
-    } else {
-        node.target.replace('|', r"\|")
-    };
+    let target =
+        if node.target.len() > 80 || node.target.contains(['\r', '\n', '\u{2028}', '\u{2029}']) {
+            literal_text("<complex target>")
+        } else {
+            literal_text(&node.target)
+        };
     let role = if node.parent.is_none() {
         "root"
     } else if node.in_target_reference {
@@ -288,10 +280,10 @@ fn append_assignment_outline_node(
         depth,
         index + 1,
         target,
-        node.operator,
+        literal_text(&node.operator),
         node.rhs,
         role,
-        guard,
+        literal_text(&guard),
         line,
         col,
         node.span.start,
@@ -447,10 +439,10 @@ impl<'a> Visit<'a> for ExpressionBreaks<'_> {
 }
 
 fn label(raw: &str) -> String {
-    if raw.len() > 80 || raw.contains('\n') || raw.contains('`') {
-        "<computed callee>".to_owned()
+    if raw.len() > 80 || raw.contains(['\r', '\n', '\u{2028}', '\u{2029}']) {
+        table_code("<computed callee>")
     } else {
-        raw.replace('|', "\\|")
+        table_code(raw)
     }
 }
 
@@ -552,10 +544,10 @@ pub fn helper_navigation(source: &str, helper_path: &str) -> Option<HelperNaviga
         None
     } else {
         let mut markdown = format!(
-            r"# Deep call nesting — {helper_path}
+            r"# Deep call nesting — {helper_label}
 
-[Open the readable lexical helper](../{helper_path}) or
-[view its whitespace-only nested-call layout](../expression-layouts/{layout_path}).
+[Open the readable lexical helper](../{helper_link}) or
+[view its whitespace-only nested-call layout](../expression-layouts/{layout_link}).
 Both preserve the original tokens; the layout is an analyst view, not the
 original executable or a valid replacement for byte-sensitive JavaScript.
 In addition to the deepest call chain, long single-line assignments,
@@ -571,7 +563,10 @@ in the original JavaScript. Byte ranges refer to that readable helper.
 
 | Depth | Callee | Location | Nested within |
 |---:|---|---|---|
-"
+",
+            helper_label = literal_text(helper_path),
+            helper_link = link_destination(helper_path),
+            layout_link = link_destination(layout_path),
         );
         for (depth, index) in path.into_iter().enumerate() {
             let call = &collector.calls[index];
@@ -582,11 +577,12 @@ in the original JavaScript. Byte ranges refer to that readable helper.
             );
             let _ = writeln!(
                 markdown,
-                "| {} | `{}` | line {line}:{column}, bytes {}–{} | {slot} |",
+                "| {} | {} | line {line}:{column}, bytes {}–{} | {} |",
                 depth + 1,
                 label(&call.callee),
                 call.span.start,
                 call.span.end,
+                literal_text(&slot),
             );
         }
         Some(markdown)
@@ -694,6 +690,23 @@ mod tests {
         );
         assert!(outline.contains("not an execution trace"), "{outline}");
         assert!(outline.contains("Source location"), "{outline}");
+    }
+
+    #[test]
+    fn assignment_tables_preserve_pipes_and_markdown_delimiters() {
+        let effects = (0..24)
+            .map(|index| format!("obj.member{index}={index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let source=format!("function f(obj,flag){{root=(obj['a|b'] ||= (obj.value = {0}x{0}, {effects}),flag || (obj.last = 7));}}",char::from(96));
+        let view = helper_navigation(&source, "helpers/f (draft)#.js").unwrap_or_default();
+        let outline = view.assignment_outline_markdown.unwrap_or_default();
+        assert!(outline.contains(r"obj\['a\|b'\] \|\|="), "{outline}");
+        assert!(outline.contains("`` `x` ``"), "{outline}");
+        assert!(outline.contains(r"logical \|\| right operand"), "{outline}");
+        let phases = view.ordered_assignment_phases_markdown.unwrap_or_default();
+        assert!(!phases.contains(" ||= (setter"), "{phases}");
+        assert!(phases.contains(r"\|\|= (setter may run)"), "{phases}");
     }
 
     #[test]

@@ -5,6 +5,7 @@
 use crate::{
     analysis_artifacts::{load_artifact, DEOBFUSCATION, JS_REFERENCES, SOURCE_INDEX},
     readable_names::{recover_readable_names_with_imports, ImportedNames},
+    report_markdown::{code_span, link_destination},
     source_text::SourceLineIndex,
 };
 use anyhow::{Context, Result};
@@ -17,7 +18,6 @@ use oxc_span::SourceType;
 use oxc_syntax::{identifier, keyword};
 use rolldown_redox::ecmascript::parse_program;
 use serde_json::Value;
-use std::fmt::Write as _;
 use std::{
     collections::{btree_map::Entry, BTreeMap, BTreeSet},
     fs,
@@ -382,39 +382,6 @@ fn safe_readable_path(path: &str) -> bool {
         && path
             .components()
             .all(|component| matches!(component, Component::Normal(_)))
-}
-
-/// Escape a captured path for a Markdown link without interpreting its
-/// characters as markup or allowing a captured URL to become the link target.
-fn link_destination(path: &str) -> String {
-    let mut output = String::new();
-    for byte in path.bytes() {
-        if byte.is_ascii_alphanumeric() || b"/-_.~".contains(&byte) {
-            output.push(char::from(byte));
-        } else {
-            let _ = write!(output, "%{byte:02X}");
-        }
-    }
-    output
-}
-
-/// Use a delimiter longer than any backtick run in captured names/URLs.
-fn code_span(source: &str) -> String {
-    let safe = source
-        .replace('\r', "\\r")
-        .replace('\n', "\\n")
-        .replace('\t', "\\t");
-    let longest = safe
-        .split(|ch| ch != '`')
-        .map(str::len)
-        .max()
-        .unwrap_or_default();
-    let delimiter = "`".repeat(longest + 1);
-    if longest == 0 {
-        format!("{delimiter}{safe}{delimiter}")
-    } else {
-        format!("{delimiter} {safe} {delimiter}")
-    }
 }
 
 fn symbol_index_link(module: &SourceModule) -> Result<String> {
