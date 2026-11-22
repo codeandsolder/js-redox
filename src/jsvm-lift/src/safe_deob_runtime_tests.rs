@@ -840,6 +840,69 @@ fn depythonify_safe_deob_rotation_effects_runtime_equivalence() -> Result<()> {
     script_runtime_equivalence(&refs, "rotation-effects", false)
 }
 
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_fixed_rotation_runtime_equivalence() -> Result<()> {
+    let prefix = "const table=['a','b','c'];";
+    let rotation = "(function(a,n){const rotate=function(k){while(--k){a.push(a.shift());}};rotate(++n);})(table,4);";
+    let decoder = "const decode=function(i,_unused){i=i-0;let value=table[i];return value;};[decode(0),decode(1)];";
+    let sources = [
+        (rotation.to_string(), decoder.to_string()),
+        (
+            rotation.replace("a.push(a.shift())", "a['push'](a['shift']())"),
+            decoder.to_string(),
+        ),
+        (
+            rotation.replace(
+                "while(--k){a.push(a.shift());}",
+                "while((--k))a.push(a.shift());",
+            ),
+            decoder.to_string(),
+        ),
+        (
+            rotation.to_string(),
+            decoder.replace("table[i]", "(table)[(i)]"),
+        ),
+        (
+            rotation.to_string(),
+            decoder.replace("i=i-0;", "i=(i)-(0);"),
+        ),
+        (
+            rotation.replace("(table,4)", "(table,0)"),
+            decoder.to_string(),
+        ),
+        (
+            rotation.replace("while(--k)", "while(k--)"),
+            decoder.to_string(),
+        ),
+        (
+            rotation.replace("rotate(++n)", "rotate(n++)"),
+            decoder.to_string(),
+        ),
+        (
+            rotation.replace("a.push(a.shift());", "a.push(a.shift());events.push(k);"),
+            decoder.to_string(),
+        ),
+        (
+            rotation.replace("a.push(a.shift());", "a.push(a.shift());a.push(a.shift());"),
+            decoder.to_string(),
+        ),
+        (
+            rotation.to_string(),
+            decoder.replace("function(i,_unused)", "function(i,i)"),
+        ),
+        (
+            rotation.to_string(),
+            decoder.replace("return value;", "events.push(value);return value;"),
+        ),
+    ]
+    .into_iter()
+    .map(|(rotation, decoder)| format!("{prefix}{rotation}{decoder}"))
+    .collect::<Vec<_>>();
+    let refs = sources.iter().map(String::as_str).collect::<Vec<_>>();
+    script_runtime_equivalence(&refs, "fixed-rotation", false)
+}
+
 fn script_runtime_equivalence(sources: &[&str], suite: &str, browser_globals: bool) -> Result<()> {
     let scratch = TempDir::new()?;
     // Browser decoders assume standard atob. Node's isolated VM does not

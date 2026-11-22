@@ -233,23 +233,9 @@ impl Setup<'_> {
         }
     }
 
-    fn member(&self, expression: &Expression<'_>) -> Option<(SymbolId, String)> {
-        match unparenthesized(expression) {
-            Expression::StaticMemberExpression(member) if !member.optional => Some((
-                self.identifier(&member.object)?,
-                member.property.name.to_string(),
-            )),
-            Expression::ComputedMemberExpression(member) if !member.optional => Some((
-                self.identifier(&member.object)?,
-                exact_computed_property_key(&member.expression, eval)?,
-            )),
-            _ => None,
-        }
-    }
-
     fn integer(&self, expression: &Expression<'_>) -> Option<i64> {
         expression_integer(expression).or_else(|| {
-            let (symbol, property) = self.member(expression)?;
+            let (symbol, property) = member(expression, self.scoping, self.facts)?;
             self.objects.get(&symbol)?.get(&property).copied()
         })
     }
@@ -339,32 +325,6 @@ impl Setup<'_> {
         })
     }
 
-    fn rotate(&self, statement: &Statement<'_>) -> Option<()> {
-        let Statement::ExpressionStatement(statement) = single_statement(statement)? else {
-            return None;
-        };
-        let Expression::CallExpression(push) = unparenthesized(&statement.expression) else {
-            return None;
-        };
-        let [argument] = push.arguments.as_slice() else {
-            return None;
-        };
-        let Expression::CallExpression(shift) = unparenthesized(argument.as_expression()?) else {
-            return None;
-        };
-        let (table, _, _) = self.table?;
-        let (push_table, push_name) = self.member(&push.callee)?;
-        let (shift_table, shift_name) = self.member(&shift.callee)?;
-        (!push.optional
-            && !shift.optional
-            && shift.arguments.is_empty()
-            && push_table == table
-            && shift_table == table
-            && push_name == "push"
-            && shift_name == "shift")
-            .then_some(())
-    }
-
     fn comparison<'a>(
         &self,
         expression: &'a Expression<'a>,
@@ -433,7 +393,8 @@ impl Setup<'_> {
         let [catch] = handler.body.body.as_slice() else {
             return None;
         };
-        self.rotate(catch)?;
+        let (table, _, _) = self.table?;
+        rotation_step(catch, table, self.scoping, self.facts)?;
         let mut statements = statement.block.body.as_slice();
         let prepared = if let Some(Statement::VariableDeclaration(declaration)) = statements.first()
         {
@@ -463,19 +424,67 @@ impl Setup<'_> {
             if !tail.is_empty() {
                 return None;
             }
-            self.rotate(alternate)?;
+            rotation_step(alternate, table, self.scoping, self.facts)?;
         } else {
             let [rotate] = tail else {
                 return None;
             };
-            self.rotate(rotate)?;
+            rotation_step(rotate, table, self.scoping, self.facts)?;
         }
         let (target, expression) = self.comparison(&branch.test, prepared)?;
         Some((target, self.checksum(expression)?))
     }
 }
 
-fn ordinary_declaration(declaration: &VariableDeclaration<'_>) -> bool {
+fn member(
+    expression: &Expression<'_>,
+    scoping: &Scoping,
+    facts: &BindingFacts,
+) -> Option<(SymbolId, String)> {
+    match unparenthesized(expression) {
+        Expression::StaticMemberExpression(member) if !member.optional => Some((
+            exact_identifier(&member.object, scoping, facts)?,
+            member.property.name.to_string(),
+        )),
+        Expression::ComputedMemberExpression(member) if !member.optional => Some((
+            exact_identifier(&member.object, scoping, facts)?,
+            exact_computed_property_key(&member.expression, eval)?,
+        )),
+        _ => None,
+    }
+}
+
+fn rotation_step(
+    statement: &Statement<'_>,
+    table: SymbolId,
+    scoping: &Scoping,
+    facts: &BindingFacts,
+) -> Option<()> {
+    let Statement::ExpressionStatement(statement) = single_statement(statement)? else {
+        return None;
+    };
+    let Expression::CallExpression(push) = unparenthesized(&statement.expression) else {
+        return None;
+    };
+    let [argument] = push.arguments.as_slice() else {
+        return None;
+    };
+    let Expression::CallExpression(shift) = unparenthesized(argument.as_expression()?) else {
+        return None;
+    };
+    let (push_table, push_name) = member(&push.callee, scoping, facts)?;
+    let (shift_table, shift_name) = member(&shift.callee, scoping, facts)?;
+    (!push.optional
+        && !shift.optional
+        && shift.arguments.is_empty()
+        && push_table == table
+        && shift_table == table
+        && push_name == "push"
+        && shift_name == "shift")
+        .then_some(())
+}
+
+pub(super) fn ordinary_declaration(declaration: &VariableDeclaration<'_>) -> bool {
     matches!(
         declaration.kind,
         VariableDeclarationKind::Var
@@ -505,45 +514,11 @@ pub(super) fn prove_checksum_rotation(
     facts: &BindingFacts,
 ) -> Option<RotationProof> {
     let scope = function.scope_id.get()?;
-    if function.r#async
-        || function.generator
-        || function.params.rest.is_some()
-        || !super::function_parameters_have_no_runtime_effects(function)
-    {
-        return None;
-    }
-    let parameters = function
-        .params
-        .items
-        .iter()
-        .map(|parameter| parameter.pattern.get_binding_identifier()?.symbol_id.get())
-        .collect::<Option<Vec<_>>>()?;
-    if parameters.iter().collect::<HashSet<_>>().len() != parameters.len() {
-        return None;
-    }
+    let parameters = simple_parameters(function)?;
     let (provider, target) = if parameter_target.is_some() {
-        let provider = function
-            .params
-            .items
-            .first()?
-            .pattern
-            .get_binding_identifier()?
-            .symbol_id
-            .get()?;
-        let target = function
-            .params
-            .items
-            .get(1)?
-            .pattern
-            .get_binding_identifier()?
-            .symbol_id
-            .get()?;
-        if provider == target {
-            return None;
-        }
-        (Some(provider), Some(target))
+        (Some(*parameters.first()?), Some(*parameters.get(1)?))
     } else {
-        if !function.params.items.is_empty() {
+        if !parameters.is_empty() {
             return None;
         }
         (None, None)
@@ -601,4 +576,117 @@ pub(super) fn prove_checksum_rotation(
         target: parameter_target.unwrap_or(target),
         checksum,
     })
+}
+
+/// Exact prefix arithmetic on a single parameter cell. A same-spelled
+/// shadowing declaration, property update or postfix operation is not
+/// equivalent to the countdown represented here.
+fn prefix_update(
+    expression: &Expression<'_>,
+    operator: &str,
+    symbol: SymbolId,
+    scoping: &Scoping,
+    facts: &BindingFacts,
+) -> bool {
+    let Expression::UpdateExpression(update) = unparenthesized(expression) else {
+        return false;
+    };
+    let oxc_ast::ast::SimpleAssignmentTarget::AssignmentTargetIdentifier(identifier) =
+        &update.argument
+    else {
+        return false;
+    };
+    update.prefix
+        && update.operator.as_str() == operator
+        && identifier
+            .reference_id
+            .get()
+            .and_then(|reference| facts.fixed_assignment_reference(scoping, reference))
+            == Some(symbol)
+}
+
+pub(super) fn simple_parameters(function: &Function<'_>) -> Option<Vec<SymbolId>> {
+    if function.r#async
+        || function.generator
+        || function.params.rest.is_some()
+        || !super::function_parameters_have_no_runtime_effects(function)
+    {
+        return None;
+    }
+    let symbols = function
+        .params
+        .items
+        .iter()
+        .map(|parameter| parameter.pattern.get_binding_identifier()?.symbol_id.get())
+        .collect::<Option<Vec<_>>>()?;
+    (symbols.iter().collect::<HashSet<_>>().len() == symbols.len()).then_some(symbols)
+}
+
+/// Prove a helper implementing an exact nonnegative countdown:
+/// increment the original count once, then decrement before each test.
+/// Restrict the input so both increment and decrement are exact Numbers.
+pub(super) fn prove_fixed_rotation(
+    function: &Function<'_>,
+    count: i64,
+    scoping: &Scoping,
+    facts: &BindingFacts,
+) -> Option<()> {
+    if !(0..=(1i64 << 53) - 2).contains(&count) {
+        return None;
+    }
+    let parameters = simple_parameters(function)?;
+    let [table, count_symbol] = parameters.as_slice() else {
+        return None;
+    };
+    let statements = function.body.as_ref()?.statements.as_slice();
+    let [Statement::VariableDeclaration(declaration), Statement::ExpressionStatement(invocation)] =
+        statements
+    else {
+        return None;
+    };
+    if !ordinary_declaration(declaration) {
+        return None;
+    }
+    let [declarator] = declaration.declarations.as_slice() else {
+        return None;
+    };
+    let helper_symbol = declarator.id.get_binding_identifier()?.symbol_id.get()?;
+    if parameters.contains(&helper_symbol)
+        || !scoping.symbol_redeclarations(helper_symbol).is_empty()
+    {
+        return None;
+    }
+    let Expression::FunctionExpression(helper) = unparenthesized(declarator.init.as_ref()?) else {
+        return None;
+    };
+    let helper_parameters = simple_parameters(helper)?;
+    let [cursor] = helper_parameters.as_slice() else {
+        return None;
+    };
+    let [Statement::WhileStatement(countdown)] = helper.body.as_ref()?.statements.as_slice() else {
+        return None;
+    };
+    if !prefix_update(&countdown.test, "--", *cursor, scoping, facts) {
+        return None;
+    }
+    rotation_step(&countdown.body, *table, scoping, facts)?;
+    let Expression::CallExpression(call) = unparenthesized(&invocation.expression) else {
+        return None;
+    };
+    let [argument] = call.arguments.as_slice() else {
+        return None;
+    };
+    if call.optional
+        || exact_identifier(&call.callee, scoping, facts) != Some(helper_symbol)
+        || !prefix_update(
+            argument.as_expression()?,
+            "++",
+            *count_symbol,
+            scoping,
+            facts,
+        )
+    {
+        return None;
+    }
+    Some(())
 }

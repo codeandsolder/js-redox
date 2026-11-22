@@ -27,7 +27,7 @@ use oxc_syntax::{
     scope::{ScopeFlags, ScopeId},
     symbol::SymbolId,
 };
-use rotation_proof::{prove_checksum_rotation, ChecksumExpression};
+use rotation_proof::{prove_checksum_rotation, prove_fixed_rotation, ChecksumExpression};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     rc::Rc,
@@ -57,7 +57,6 @@ const fn js_number_from_i64(value: i64) -> f64 {
 #[derive(Debug, Clone)]
 struct StaticArrayInfo {
     symbol: SymbolId,
-    name: String,
     values: Vec<Value>,
     span: Span,
 }
@@ -90,7 +89,6 @@ impl<'a> Visit<'a> for StaticArrayCollector {
             if !values.is_empty() {
                 self.candidates.push(StaticArrayInfo {
                     symbol,
-                    name: id.name.to_string(),
                     values,
                     span: arr.span,
                 });
@@ -1490,53 +1488,104 @@ fn all_functions(
 }
 
 #[derive(Debug)]
-struct VariableFunctionInfo {
+struct FixedDirectDecoder {
     symbol: SymbolId,
     span: Span,
-    params: Vec<String>,
+    table: SymbolId,
+    table_reference: ReferenceId,
+    offset: i64,
 }
 
-#[derive(Default)]
-struct VariableFunctionCollector {
-    out: Vec<VariableFunctionInfo>,
+fn fixed_direct_decoder(
+    symbol: SymbolId,
+    function: &oxc_ast::ast::Function<'_>,
+    scoping: &Scoping,
+    facts: &BindingFacts,
+) -> Option<FixedDirectDecoder> {
+    let parameters = rotation_proof::simple_parameters(function)?;
+    let index = *parameters.first()?;
+    let [Statement::ExpressionStatement(adjust), Statement::VariableDeclaration(declaration), Statement::ReturnStatement(result)] =
+        function.body.as_ref()?.statements.as_slice()
+    else {
+        return None;
+    };
+    let offset = sequence_decoder_offset(&adjust.expression, index, scoping)?;
+    if !rotation_proof::ordinary_declaration(declaration) {
+        return None;
+    }
+    let [declarator] = declaration.declarations.as_slice() else {
+        return None;
+    };
+    let value = declarator.id.get_binding_identifier()?.symbol_id.get()?;
+    if parameters.contains(&value) || !scoping.symbol_redeclarations(value).is_empty() {
+        return None;
+    }
+    let Expression::ComputedMemberExpression(member) = unparenthesized(declarator.init.as_ref()?)
+    else {
+        return None;
+    };
+    if member.optional
+        || exact_identifier(&member.expression, scoping, facts) != Some(index)
+        || exact_identifier(result.argument.as_ref()?, scoping, facts) != Some(value)
+    {
+        return None;
+    }
+    let Expression::Identifier(table) = unparenthesized(&member.object) else {
+        return None;
+    };
+    let table_reference = table.reference_id.get()?;
+    let table = facts.resolved_symbol(scoping, table_reference)?;
+    if parameters.contains(&table) || table == value || table == symbol {
+        return None;
+    }
+    Some(FixedDirectDecoder {
+        symbol,
+        span: function.span,
+        table,
+        table_reference,
+        offset,
+    })
 }
 
-impl<'a> Visit<'a> for VariableFunctionCollector {
+struct FixedDirectDecoderCollector<'c> {
+    scoping: &'c Scoping,
+    facts: &'c BindingFacts,
+    out: Vec<FixedDirectDecoder>,
+}
+
+impl<'a> Visit<'a> for FixedDirectDecoderCollector<'_> {
     fn visit_variable_declaration(&mut self, it: &oxc_ast::ast::VariableDeclaration<'a>) {
-        for declaration in &it.declarations {
-            let BindingPattern::BindingIdentifier(id) = &declaration.id else {
-                continue;
-            };
-            let Some(symbol) = id.symbol_id.get() else {
-                continue;
-            };
-            let Some(Expression::FunctionExpression(function)) = &declaration.init else {
-                continue;
-            };
-            let Some(params) = function
-                .params
-                .items
-                .iter()
-                .map(|param| match &param.pattern {
-                    BindingPattern::BindingIdentifier(id) => Some(id.name.to_string()),
-                    _ => None,
-                })
-                .collect::<Option<Vec<_>>>()
-            else {
-                continue;
-            };
-            self.out.push(VariableFunctionInfo {
-                symbol,
-                span: function.span,
-                params,
-            });
+        if rotation_proof::ordinary_declaration(it) {
+            for declaration in &it.declarations {
+                if let (Some(symbol), Some(Expression::FunctionExpression(function))) = (
+                    declaration
+                        .id
+                        .get_binding_identifier()
+                        .and_then(|id| id.symbol_id.get()),
+                    declaration.init.as_ref(),
+                ) {
+                    if let Some(proof) =
+                        fixed_direct_decoder(symbol, function, self.scoping, self.facts)
+                    {
+                        self.out.push(proof);
+                    }
+                }
+            }
         }
         walk::walk_variable_declaration(self, it);
     }
 }
 
-fn variable_functions(program: &oxc_ast::ast::Program<'_>) -> Vec<VariableFunctionInfo> {
-    let mut collector = VariableFunctionCollector::default();
+fn fixed_direct_decoders(
+    program: &oxc_ast::ast::Program<'_>,
+    scoping: &Scoping,
+    facts: &BindingFacts,
+) -> Vec<FixedDirectDecoder> {
+    let mut collector = FixedDirectDecoderCollector {
+        scoping,
+        facts,
+        out: Vec::new(),
+    };
     collector.visit_program(program);
     collector.out
 }
@@ -1800,9 +1849,6 @@ fn contains_function_reassignment(body: &str, name: &str) -> bool {
 static RC4_CHAR_CODE_AT_RE: LazyLock<Option<regex::Regex>> = LazyLock::new(|| {
     compile_regex(r"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*\.\s*charCodeAt\s*\(([^)]*)\)")
 });
-static DIRECT_ARRAY_ACCESS_RE: LazyLock<Option<regex::Regex>> =
-    LazyLock::new(|| compile_regex(r"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*\[\s*([^\s\]]+)\s*\]"));
-
 fn function_has_external_write(
     span: Span,
     scoping: &Scoping,
@@ -2084,15 +2130,17 @@ pub fn js_parse_int(text: &str, mut radix: u32) -> Option<f64> {
 }
 
 #[derive(Debug, Clone)]
+enum RotationOperation {
+    Checksum(ChecksumExpression),
+    FixedCount,
+}
+
+#[derive(Debug, Clone)]
 struct RotationIife {
     provider: SymbolId,
     provider_reference: ReferenceId,
     target: i64,
-    array_param: String,
-    count_param: String,
-    checksum: Option<ChecksumExpression>,
-    proof_eligible: bool,
-    body_span: Span,
+    operation: Option<RotationOperation>,
     statement_span: Span,
     call_span: Span,
     execution: Option<RotationExecution>,
@@ -2239,104 +2287,6 @@ impl<'a> Visit<'a> for RotationStatementSpanCollector {
     }
 }
 
-fn rotation_parameter_names_unshadowed(
-    function: &oxc_ast::ast::Function<'_>,
-    scoping: &Scoping,
-) -> bool {
-    let Some(body) = &function.body else {
-        return false;
-    };
-    let parameter_symbols = function
-        .params
-        .items
-        .iter()
-        .filter_map(|param| match &param.pattern {
-            BindingPattern::BindingIdentifier(id) => id.symbol_id.get(),
-            _ => None,
-        })
-        .collect::<HashSet<_>>();
-    let parameter_names = parameter_symbols
-        .iter()
-        .map(|symbol| scoping.symbol_name(*symbol))
-        .collect::<HashSet<_>>();
-
-    scoping.symbol_ids().all(|symbol| {
-        parameter_symbols.contains(&symbol)
-            || !span_contains(body.span, scoping.symbol_span(symbol))
-            || !parameter_names.contains(scoping.symbol_name(symbol))
-    })
-}
-
-#[derive(Default)]
-struct RotationDynamicScopeProbe {
-    found: bool,
-}
-
-impl<'a> Visit<'a> for RotationDynamicScopeProbe {
-    fn visit_with_statement(&mut self, _statement: &oxc_ast::ast::WithStatement<'a>) {
-        self.found = true;
-    }
-
-    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
-        if crate::is_potential_direct_eval(call) {
-            self.found = true;
-            return;
-        }
-        walk::walk_call_expression(self, call);
-    }
-}
-
-fn rotation_has_dynamic_scope(function: &oxc_ast::ast::Function<'_>) -> bool {
-    let Some(body) = &function.body else {
-        return true;
-    };
-    let mut probe = RotationDynamicScopeProbe::default();
-    probe.visit_function_body(body);
-    probe.found
-}
-
-fn rotation_parse_int_references_are_global(
-    function: &oxc_ast::ast::Function<'_>,
-    scoping: &Scoping,
-) -> bool {
-    struct Probe<'c> {
-        scoping: &'c Scoping,
-        valid: bool,
-    }
-
-    impl<'a> Visit<'a> for Probe<'_> {
-        fn visit_identifier_reference(
-            &mut self,
-            identifier: &oxc_ast::ast::IdentifierReference<'a>,
-        ) {
-            if identifier.name.as_str() == "parseInt" {
-                self.valid &= identifier.reference_id.get().is_some_and(|reference_id| {
-                    statically_unresolved_global_reference(self.scoping, reference_id)
-                });
-            }
-        }
-
-        fn visit_function(&mut self, _function: &oxc_ast::ast::Function<'a>, _flags: ScopeFlags) {}
-
-        fn visit_arrow_function_expression(
-            &mut self,
-            _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
-        ) {
-        }
-    }
-
-    let Some(body) = &function.body else {
-        return false;
-    };
-
-    let mut probe = Probe {
-        scoping,
-        valid: true,
-    };
-    probe.visit_function_body(body);
-    probe.valid
-}
-
 fn numeric_object_values(
     object: &oxc_ast::ast::ObjectExpression<'_>,
 ) -> Option<HashMap<String, i64>> {
@@ -2378,30 +2328,24 @@ impl<'a> Visit<'a> for RotationIifeCollector<'_, '_> {
                 if let Some(proof) =
                     prove_checksum_rotation(function, None, self.scoping, self.facts)
                 {
-                    if let Some(body) = &function.body {
-                        self.out.push(RotationIife {
-                            provider: proof.provider,
-                            provider_reference: proof.provider_reference,
-                            target: proof.target,
-                            array_param: String::new(),
-                            count_param: String::new(),
-                            checksum: Some(proof.checksum),
-                            proof_eligible: true,
-                            body_span: body.span,
-                            statement_span: self
-                                .statement_spans
-                                .spans
-                                .get(&(call.span.start, call.span.end))
-                                .copied()
-                                .unwrap_or(call.span),
-                            call_span: call.span,
-                            execution: self
-                                .statement_spans
-                                .executions
-                                .get(&(call.span.start, call.span.end))
-                                .copied(),
-                        });
-                    }
+                    self.out.push(RotationIife {
+                        provider: proof.provider,
+                        provider_reference: proof.provider_reference,
+                        target: proof.target,
+                        operation: Some(RotationOperation::Checksum(proof.checksum)),
+                        statement_span: self
+                            .statement_spans
+                            .spans
+                            .get(&(call.span.start, call.span.end))
+                            .copied()
+                            .unwrap_or(call.span),
+                        call_span: call.span,
+                        execution: self
+                            .statement_spans
+                            .executions
+                            .get(&(call.span.start, call.span.end))
+                            .copied(),
+                    });
                 }
             }
         }
@@ -2413,49 +2357,30 @@ impl<'a> Visit<'a> for RotationIifeCollector<'_, '_> {
             let target = argument_integer(&call.arguments[1]);
             let function = rotation_iife_function(&call.callee);
             if let (Some(provider), Some(target), Some(function)) = (provider, target, function) {
-                if let (Some(body), Some(provider_reference)) =
-                    (&function.body, provider.reference_id.get())
-                {
+                if let Some(provider_reference) = provider.reference_id.get() {
                     let Some(provider_symbol) =
                         self.scoping.get_reference(provider_reference).symbol_id()
                     else {
                         walk::walk_call_expression(self, call);
                         return;
                     };
-                    let local_params = function
-                        .params
-                        .items
-                        .iter()
-                        .map(|param| match &param.pattern {
-                            BindingPattern::BindingIdentifier(id) => Some(id.name.to_string()),
-                            _ => None,
-                        })
-                        .collect::<Option<Vec<_>>>();
-                    let mut references = ExactBodyReferences {
-                        scoping: self.scoping,
-                        facts: self.facts,
-                        valid: true,
-                    };
-                    references.visit_function(function, ScopeFlags::Function);
-                    let proof_eligible = !function.r#async
-                        && !function.generator
-                        && function.params.rest.is_none()
-                        && function_parameters_have_no_runtime_effects(function)
-                        && local_params
-                            .as_ref()
-                            .is_some_and(|params| params.len() >= 2)
-                        && self.facts.resolved_symbol(self.scoping, provider_reference)
-                            == Some(provider_symbol)
-                        && references.valid
-                        && rotation_parameter_names_unshadowed(function, self.scoping)
-                        && rotation_parse_int_references_are_global(function, self.scoping)
-                        && !rotation_has_dynamic_scope(function);
-                    let local_params = local_params.unwrap_or_default();
-                    let array_param = local_params.first().cloned().unwrap_or_default();
-                    let count_param = local_params.get(1).cloned().unwrap_or_default();
-                    let checksum = if proof_eligible {
-                        prove_checksum_rotation(function, Some(target), self.scoping, self.facts)
-                            .map(|proof| proof.checksum)
+                    let operation = if self.facts.resolved_symbol(self.scoping, provider_reference)
+                        == Some(provider_symbol)
+                    {
+                        if let Some(proof) = prove_checksum_rotation(
+                            function,
+                            Some(target),
+                            self.scoping,
+                            self.facts,
+                        ) {
+                            Some(RotationOperation::Checksum(proof.checksum))
+                        } else if prove_fixed_rotation(function, target, self.scoping, self.facts)
+                            .is_some()
+                        {
+                            Some(RotationOperation::FixedCount)
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     };
@@ -2468,11 +2393,7 @@ impl<'a> Visit<'a> for RotationIifeCollector<'_, '_> {
                         provider: provider_symbol,
                         provider_reference,
                         target,
-                        array_param,
-                        count_param,
-                        checksum,
-                        proof_eligible,
-                        body_span: body.span,
+                        operation,
                         statement_span: standalone_statement.unwrap_or(call.span),
                         call_span: call.span,
                         execution: self
@@ -2505,22 +2426,8 @@ fn collect_rotation_iifes(
     collector.out
 }
 
-fn fixed_count_rotation(source: &str, iife: &RotationIife, table_len: usize) -> Option<usize> {
-    if !iife.proof_eligible || iife.target < 0 || table_len == 0 {
-        return None;
-    }
-    let identifier = r"[A-Za-z_$][A-Za-z0-9_$]*";
-    let body = fragment(source, iife.body_span);
-    let pattern = format!(
-        r#"(?s)^\{{\s*(?:const|let|var)\s+(?P<helper>{identifier})\s*=\s*function\s*\(\s*(?P<arg>{identifier})\s*\)\s*\{{\s*while\s*\(\s*--\s*(?P<while_arg>{identifier})\s*\)\s*\{{\s*{}\s*(?:\.\s*push|\[\s*["']push["']\s*\])\s*\(\s*{}\s*(?:\.\s*shift|\[\s*["']shift["']\s*\])\s*\(\s*\)\s*\)\s*;\s*\}}\s*;?\s*\}}\s*;\s*(?P<call_helper>{identifier})\s*\(\s*\+\+\s*{}\s*\)\s*;\s*\}}\s*$"#,
-        regex::escape(&iife.array_param),
-        regex::escape(&iife.array_param),
-        regex::escape(&iife.count_param),
-    );
-    let captures = compile_regex(&pattern)?.captures(body)?;
-    if captures.name("helper")?.as_str() != captures.name("call_helper")?.as_str()
-        || captures.name("arg")?.as_str() != captures.name("while_arg")?.as_str()
-    {
+fn fixed_count_rotation(iife: &RotationIife, table_len: usize) -> Option<usize> {
+    if !matches!(iife.operation, Some(RotationOperation::FixedCount)) || table_len == 0 {
         return None;
     }
     usize::try_from(iife.target)
@@ -2528,93 +2435,28 @@ fn fixed_count_rotation(source: &str, iife: &RotationIife, table_len: usize) -> 
         .map(|count| count % table_len)
 }
 
-fn simple_direct_decoder_offset(
-    source: &str,
-    function: &VariableFunctionInfo,
-    array: &StaticArrayInfo,
-) -> Option<i64> {
-    let public_param = function.params.first()?;
-    let params = function
-        .params
-        .iter()
-        .map(|param| regex::escape(param))
-        .collect::<Vec<_>>()
-        .join(r"\s*,\s*");
-    let identifier = r"[A-Za-z_$][A-Za-z0-9_$]*";
-    let pattern = format!(
-        r"(?s)^function\s*\(\s*{params}\s*\)\s*\{{\s*{}\s*=\s*{}\s*-\s*(?P<offset>0[xX][0-9A-Fa-f]+|[0-9]+)\s*;\s*(?:const|let|var)\s+(?P<value>{identifier})\s*=\s*{}\s*\[\s*{}\s*\]\s*;\s*return\s+(?P<returned>{identifier})\s*;\s*\}}\s*$",
-        regex::escape(public_param),
-        regex::escape(public_param),
-        regex::escape(&array.name),
-        regex::escape(public_param),
-    );
-    let captures = compile_regex(&pattern)?.captures(fragment(source, function.span))?;
-    if captures.name("value")?.as_str() != captures.name("returned")?.as_str() {
-        return None;
-    }
-    parse_i64_literal(captures.name("offset")?.as_str())
-}
-
 const fn span_contains(outer: Span, inner: Span) -> bool {
     outer.start <= inner.start && inner.end <= outer.end
 }
 
-/// All table references must occur exclusively in the one rotation call
-/// or the one proven decoder read, without writes or outside observers.
+/// The exact two semantic reads are the entire table exposure.
 fn fixed_rotation_references_confined(
     array: &StaticArrayInfo,
-    function: &VariableFunctionInfo,
+    function: &FixedDirectDecoder,
     rotation: &RotationIife,
     scoping: &Scoping,
-    reference_spans: &HashMap<ReferenceId, Span>,
 ) -> bool {
-    let mut decoder_reads = 0usize;
-    let mut rotation_reads = 0usize;
-    let mut safe_references = true;
-    for reference_id in scoping.get_resolved_reference_ids(array.symbol) {
-        let Some(span) = reference_spans.get(reference_id).copied() else {
-            safe_references = false;
-            break;
-        };
-        let reference = scoping.get_reference(*reference_id);
-        if reference.is_write() || reference.flags().is_member_write_target() {
-            safe_references = false;
-            break;
-        }
-        if span_contains(function.span, span) {
-            decoder_reads += 1;
-        } else if span_contains(rotation.statement_span, span) {
-            rotation_reads += 1;
-        } else {
-            safe_references = false;
-            break;
-        }
-    }
-    safe_references && decoder_reads == 1 && rotation_reads == 1
-}
-
-/// Candidate discovery is lexical only; semantic table and rotation
-/// confinement checks remain mandatory before materializing any table.
-fn fixed_rotated_candidate_names(source: &str, function: &VariableFunctionInfo) -> HashSet<String> {
-    let Some(public_param) = function.params.first() else {
-        return HashSet::new();
-    };
-    let Some(access) = DIRECT_ARRAY_ACCESS_RE.as_ref() else {
-        return HashSet::new();
-    };
-    let body = fragment(source, function.span);
-    let candidate_names = access
-        .captures_iter(body)
-        .filter(|captures| {
-            captures
-                .get(2)
-                .is_some_and(|capture| capture.as_str() == public_param)
+    let references = scoping.get_resolved_reference_ids(array.symbol);
+    references.len() == 2
+        && function.table_reference != rotation.provider_reference
+        && references.contains(&function.table_reference)
+        && references.contains(&rotation.provider_reference)
+        && references.iter().all(|&reference| {
+            let reference = scoping.get_reference(reference);
+            reference.is_read()
+                && !reference.is_write()
+                && !reference.flags().is_member_write_target()
         })
-        .filter_map(|captures| captures.get(1).map(|capture| capture.as_str()))
-        .map(str::to_owned)
-        .collect::<HashSet<_>>();
-
-    candidate_names
 }
 
 fn detect_fixed_rotated_direct_decoders(
@@ -2630,14 +2472,11 @@ fn detect_fixed_rotated_direct_decoders(
         budget,
     } = *context;
     let arrays = all_static_arrays(program);
-    let functions = variable_functions(program);
-    let mut arrays_by_name: HashMap<&str, Vec<&StaticArrayInfo>> = HashMap::new();
-    for array in &arrays {
-        arrays_by_name
-            .entry(array.name.as_str())
-            .or_default()
-            .push(array);
-    }
+    let functions = fixed_direct_decoders(program, scoping, facts);
+    let arrays_by_symbol = arrays
+        .iter()
+        .map(|array| (array.symbol, array))
+        .collect::<HashMap<_, _>>();
     let mut decoders = HashMap::new();
     let mut protected_spans = Vec::new();
     let mut replacements = Vec::new();
@@ -2662,117 +2501,108 @@ fn detect_fixed_rotated_direct_decoders(
         {
             continue;
         }
-        let candidate_names = fixed_rotated_candidate_names(source, function);
-        for array in candidate_names
-            .into_iter()
-            .filter_map(|name| arrays_by_name.get(name.as_str()))
-            .flat_map(|candidates| candidates.iter().copied())
+        let Some(array) = arrays_by_symbol.get(&function.table).copied() else {
+            continue;
+        };
+        if !facts.source_local_data_binding(scoping, array.symbol)
+            || !facts.binding_has_stable_value(scoping, function.symbol)
         {
-            if !facts.source_local_data_binding(scoping, array.symbol)
-                || !facts.binding_has_stable_value(scoping, function.symbol)
-            {
-                continue;
-            }
-            let Some(offset) = simple_direct_decoder_offset(source, function, array) else {
-                continue;
-            };
-            let matching_rotations = rotations
-                .iter()
-                .filter(|rotation| {
-                    rotation.provider == array.symbol
-                        && rotation.statement_span.end <= function.span.start
-                })
-                .collect::<Vec<_>>();
-            if matching_rotations.len() != 1 {
-                continue;
-            }
-            let rotation = matching_rotations[0];
-            let Some(execution) = rotation.execution else {
-                continue;
-            };
-            if execution.owner != scoping.symbol_scope_id(array.symbol) {
-                continue;
-            }
-            let mut ordered = true;
-            for &reference in scoping.get_resolved_reference_ids(function.symbol) {
-                let Some(&span) = reference_spans.get(&reference) else {
-                    ordered = false;
-                    break;
-                };
-                let scope = scoping.get_reference(reference).scope_id();
-                if !facts.proves_execution_region_through_calls(
-                    scoping,
-                    execution.owner,
-                    execution.after,
-                    (scope, span),
-                    budget,
-                )? {
-                    ordered = false;
-                    break;
-                }
-            }
-            if !ordered {
-                continue;
-            }
-            let Some(amount) = fixed_count_rotation(source, rotation, array.values.len()) else {
-                continue;
-            };
-
-            // The table must become observable only through the proven rotation
-            // IIFE and the direct decoder. In particular, require the rotation
-            // to be adjacent to the literal declaration so pre-materializing the
-            // final table cannot change an intervening observation (including
-            // direct eval or another aliasing call).
-            let between = &source[array.span.end as usize..rotation.statement_span.start as usize];
-            if !between.chars().all(|ch| ch.is_whitespace() || ch == ';') {
-                continue;
-            }
-            if !fixed_rotation_references_confined(
-                array,
-                function,
-                rotation,
-                scoping,
-                reference_spans,
-            ) {
-                continue;
-            }
-
-            let mut values = array.values.clone();
-            values.rotate_left(amount);
-            let Some(array_text) = render_value_array(&values) else {
-                continue;
-            };
-            replacements.push(Replacement {
-                start: array.span.start as usize,
-                end: array.span.end as usize,
-                text: array_text,
-                kind: "materialize_fixed_decoder_rotation",
-                arithmetic_state_proof: None,
-            });
-            replacements.push(Replacement {
-                start: rotation.call_span.start as usize,
-                end: rotation.call_span.end as usize,
-                text: "(void 0)".to_string(),
-                kind: "remove_fixed_decoder_rotation_iife",
-                arithmetic_state_proof: None,
-            });
-            protected_spans.push((
-                rotation.statement_span.start as usize,
-                rotation.statement_span.end as usize,
-            ));
-            decoders.insert(
-                function.symbol,
-                Decoder {
-                    values: values.into(),
-                    proven_alias_reads: None,
-                    offset,
-                    provider: array.symbol,
-                    provider_array_span: array.span,
-                    transform: DecoderTransform::Plain,
-                },
-            );
-            break;
+            continue;
         }
+        let offset = function.offset;
+        let matching_rotations = rotations
+            .iter()
+            .filter(|rotation| {
+                rotation.provider == array.symbol
+                    && rotation.statement_span.end <= function.span.start
+            })
+            .collect::<Vec<_>>();
+        if matching_rotations.len() != 1 {
+            continue;
+        }
+        let rotation = matching_rotations[0];
+        let Some(execution) = rotation.execution else {
+            continue;
+        };
+        if execution.owner != scoping.symbol_scope_id(array.symbol) {
+            continue;
+        }
+        let mut ordered = true;
+        for &reference in scoping.get_resolved_reference_ids(function.symbol) {
+            let Some(&span) = reference_spans.get(&reference) else {
+                ordered = false;
+                break;
+            };
+            let scope = scoping.get_reference(reference).scope_id();
+            if !facts.proves_execution_region_through_calls(
+                scoping,
+                execution.owner,
+                execution.after,
+                (scope, span),
+                budget,
+            )? {
+                ordered = false;
+                break;
+            }
+        }
+        if !ordered {
+            continue;
+        }
+        let Some(amount) = fixed_count_rotation(rotation, array.values.len()) else {
+            continue;
+        };
+
+        // The table must become observable only through the proven rotation
+        // IIFE and the direct decoder. In particular, require the rotation
+        // to be adjacent to the literal declaration so pre-materializing the
+        // final table cannot change an intervening observation (including
+        // direct eval or another aliasing call).
+        let Some(between) =
+            source.get(array.span.end as usize..rotation.statement_span.start as usize)
+        else {
+            continue;
+        };
+        if !between.chars().all(|ch| ch.is_whitespace() || ch == ';') {
+            continue;
+        }
+        if !fixed_rotation_references_confined(array, function, rotation, scoping) {
+            continue;
+        }
+
+        let mut values = array.values.clone();
+        values.rotate_left(amount);
+        let Some(array_text) = render_value_array(&values) else {
+            continue;
+        };
+        replacements.push(Replacement {
+            start: array.span.start as usize,
+            end: array.span.end as usize,
+            text: array_text,
+            kind: "materialize_fixed_decoder_rotation",
+            arithmetic_state_proof: None,
+        });
+        replacements.push(Replacement {
+            start: rotation.call_span.start as usize,
+            end: rotation.call_span.end as usize,
+            text: "(void 0)".to_string(),
+            kind: "remove_fixed_decoder_rotation_iife",
+            arithmetic_state_proof: None,
+        });
+        protected_spans.push((
+            rotation.statement_span.start as usize,
+            rotation.statement_span.end as usize,
+        ));
+        decoders.insert(
+            function.symbol,
+            Decoder {
+                values: values.into(),
+                proven_alias_reads: None,
+                offset,
+                provider: array.symbol,
+                provider_array_span: array.span,
+                transform: DecoderTransform::Plain,
+            },
+        );
     }
 
     Ok((decoders, protected_spans, replacements))
@@ -2793,10 +2623,7 @@ fn prove_rotation_iife(
     decoders: &mut HashMap<SymbolId, Decoder>,
     budget: &WorkBudget,
 ) -> Result<bool, BudgetExceeded> {
-    if !iife.proof_eligible {
-        return Ok(false);
-    }
-    let Some(checksum) = &iife.checksum else {
+    let Some(RotationOperation::Checksum(checksum)) = &iife.operation else {
         return Ok(false);
     };
     let mut table: Option<&Decoder> = None;
@@ -3919,16 +3746,12 @@ mod tests {
             provider,
             provider_reference: ReferenceId::new(0),
             target: 22,
-            array_param: "array".into(),
-            count_param: "target".into(),
-            checksum: Some(ChecksumExpression::ParseInt {
+            operation: Some(RotationOperation::Checksum(ChecksumExpression::ParseInt {
                 decoder: first,
                 raw: 0,
                 key: None,
                 radix: 0,
-            }),
-            proof_eligible: true,
-            body_span: Span::new(0, 10),
+            })),
             statement_span: Span::new(0, 10),
             call_span: Span::new(0, 10),
             execution: None,
