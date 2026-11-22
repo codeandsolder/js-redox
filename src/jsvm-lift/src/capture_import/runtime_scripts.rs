@@ -3,7 +3,7 @@ use crate::{
     analysis_artifacts::{write_artifact, RUNTIME_SCRIPTS},
     capture_project::CaptureManifest,
     har_project::html::{find_tag_end, parse_attrs},
-    runtime_identity::captured_javascript_digest,
+    runtime_identity::{captured_javascript_digest, session_name},
     sha256_hex,
 };
 use anyhow::{bail, Context, Result};
@@ -89,15 +89,6 @@ fn text(value: Option<&Value>) -> Option<&str> {
     value.and_then(Value::as_str)
 }
 
-fn stringish(value: Option<&Value>) -> String {
-    match value {
-        Some(Value::String(value)) => value.clone(),
-        Some(Value::Number(value)) => value.to_string(),
-        Some(Value::Bool(value)) => value.to_string(),
-        _ => String::new(),
-    }
-}
-
 fn truthy(value: Option<&Value>) -> bool {
     match value {
         None | Some(Value::Null) => false,
@@ -109,13 +100,8 @@ fn truthy(value: Option<&Value>) -> bool {
     }
 }
 
-fn event_session(event: &Map<String, Value>) -> String {
-    let session = stringish(event.get("cdpSession"));
-    if session.is_empty() {
-        "main".into()
-    } else {
-        session
-    }
+fn event_session(event: &Map<String, Value>) -> Option<&str> {
+    session_name(event.get("cdpSession"))
 }
 
 fn sorted_unique_values<'a>(values: impl Iterator<Item = &'a Value>) -> Vec<Value> {
@@ -413,8 +399,11 @@ impl<'a> ParentEventIndex<'a> {
         let Some(id) = script_id(event.get("scriptId")) else {
             return;
         };
+        let Some(session) = event_session(event) else {
+            return;
+        };
         self.sessions
-            .entry(event_session(event))
+            .entry(session.to_owned())
             .or_default()
             .entry(id)
             .and_modify(|evidence| evidence.add(event))
@@ -475,8 +464,13 @@ fn generation_origins(
                 termination = "cycle";
                 break;
             }
-            let parent = events_by_script_id.get(&session, &parent_script_id);
-            let status = parent.map_or("unavailable", ParentEventEvidence::status);
+            let parent =
+                session.and_then(|session| events_by_script_id.get(session, &parent_script_id));
+            let status = if session.is_none() {
+                "unresolved_session_identity"
+            } else {
+                parent.map_or("unavailable", ParentEventEvidence::status)
+            };
             let parent_url = text(frame.get("url"))
                 .filter(|url| !url.is_empty())
                 .or_else(|| {
@@ -501,7 +495,11 @@ fn generation_origins(
                 "parent_event_digest_claims":parent.map(|evidence| &evidence.digests),
             }));
             let Some(parent) = parent else {
-                termination = "unavailable_parent_event";
+                termination = if session.is_none() {
+                    "unresolved_session_identity"
+                } else {
+                    "unavailable_parent_event"
+                };
                 break;
             };
             match status {
@@ -519,7 +517,7 @@ fn generation_origins(
         if chain.is_empty() {
             continue;
         }
-        let origin = json!({"cdp_session":session,"child_script_id":child_script_id,"chain":chain,"chain_termination":termination});
+        let origin = json!({"cdp_session":session,"cdp_session_claim":event.get("cdpSession"),"child_script_id":child_script_id,"chain":chain,"chain_termination":termination});
         if seen.insert(serde_json::to_string(&origin)?) {
             output.push(origin);
         }
@@ -562,6 +560,7 @@ fn document_inline_origins(event_rows: &[usize], events: &[Value]) -> Vec<Value>
         }
         output.push(json!({
             "cdp_session": event_session(event),
+            "cdp_session_claim":event.get("cdpSession"),
             "script_id": event.get("scriptId").cloned().unwrap_or(Value::Null),
             "url": url,
             "frame_id": aux.get("frameId").cloned().unwrap_or(Value::Null),
@@ -722,18 +721,18 @@ pub(super) fn analyze_recorder_runtime_scripts(
             if let Some(url) = text(event.get("url")).filter(|url| !url.is_empty()) {
                 urls.insert(url.to_owned());
             }
-            sessions.insert(event_session(event));
+            let session = event_session(event);
+            sessions.extend(session);
             script_ids.push(event.get("scriptId").cloned().unwrap_or(Value::Null));
             if let Some(value) = event.get("executionContextId") {
                 execution_context_values.push(value);
             }
-            let session = event_session(event);
             let script = script_id(event.get("scriptId"));
-            let execution = match (&coverage, script.as_deref()) {
-                (Some(index), Some(script)) => {
-                    let raw = index.for_script(&session, script);
+            let execution = match (&coverage, session, script.as_deref()) {
+                (Some(index), Some(session), Some(script)) => {
+                    let raw = index.for_script(session, script);
                     if events_by_script_id
-                        .get(&session, script)
+                        .get(session, script)
                         .and_then(ParentEventEvidence::digest)
                         == Some(digest.as_str())
                     {
@@ -742,11 +741,13 @@ pub(super) fn analyze_recorder_runtime_scripts(
                         json!({"status":"unresolved_source_identity","unattributed_coverage":raw})
                     }
                 }
-                (Some(_), None) => json!({"status":"invalid_script_id"}),
-                (None, _) => json!({"status":"unavailable"}),
+                (Some(_), None, _) => json!({"status":"unresolved_session_identity"}),
+                (Some(_), Some(_), None) => json!({"status":"invalid_script_id"}),
+                (None, _, _) => json!({"status":"unavailable"}),
             };
             script_instances.push(json!({
                 "cdp_session": session,
+                "cdp_session_claim":event.get("cdpSession"),
                 "script_id": event.get("scriptId").cloned().unwrap_or(Value::Null),
                 "execution_context_id": event.get("executionContextId").cloned().unwrap_or(Value::Null),
                 "script_url": event.get("url").cloned().unwrap_or(Value::Null),
@@ -1044,6 +1045,48 @@ mod tests {
             "consistent_duplicate"
         );
         assert_eq!(origins[2]["chain"][0]["sha256"], "root");
+        Ok(())
+    }
+
+    #[test]
+    fn incomplete_session_claims_cannot_resolve_main_generation_parents() -> Result<()> {
+        let parent = event(
+            "main",
+            "1",
+            "parent",
+            "https://fixture.test/parent.js",
+            None,
+        );
+        let mut events = vec![parent];
+        for session in [Value::Null, json!(true), json!(""), json!("   ")] {
+            let mut child = event("main", "2", "child", "", Some("1"));
+            child["cdpSession"] = session;
+            events.push(child);
+        }
+        let mut absent = event("main", "2", "child", "", Some("1"));
+        absent
+            .as_object_mut()
+            .context("event object")?
+            .remove("cdpSession");
+        events.push(absent);
+        let mut index = ParentEventIndex::default();
+        for row in &events {
+            index.register(row.as_object().context("event object")?);
+        }
+        assert!(index.get("main", "2").is_none());
+        let origins = generation_origins(
+            &[1, 2, 3, 4, 5],
+            &events,
+            &index,
+            &WorkBudget::unlimited("unscoped-generation"),
+        )?;
+        assert!(!origins.is_empty());
+        for origin in origins {
+            assert!(origin["cdp_session"].is_null());
+            assert_eq!(origin["chain_termination"], "unresolved_session_identity");
+            assert_eq!(origin["chain"][0]["script_id"], "1");
+            assert!(origin["chain"][0]["sha256"].is_null());
+        }
         Ok(())
     }
 

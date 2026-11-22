@@ -5,7 +5,7 @@ mod observed_guards;
 use crate::{
     analysis_artifacts::{load_artifact, write_artifact, RUNTIME_SCRIPTS, SELECTIVE_TRACE},
     analysis_budget::{AnalysisBudgets, AnalysisOperation},
-    runtime_identity::{script_id_text, ScriptIdentityIndex},
+    runtime_identity::{script_id_text, session_name, ScriptIdentityIndex},
     sha256_hex,
 };
 use anyhow::{bail, Context, Result};
@@ -104,9 +104,12 @@ fn append_observed_callable_definitions(
     page: &mut String,
     project: &Path,
     identities: &RuntimeIdentityIndex,
-    session: &str,
+    session: Option<&str>,
     hit: &Value,
 ) -> Result<()> {
+    let Some(session) = session else {
+        return Ok(());
+    };
     let mut sites = BTreeMap::<(String, String, u64, u64), Vec<Value>>::new();
     let mut add = |value: &Value, seen_as: Value| {
         let Some(definition) = value.get("functionDefinition") else {
@@ -220,7 +223,7 @@ fn append_observed_callable_definitions(
 fn build_observed_path_view(
     project: &Path,
     identities: &RuntimeIdentityIndex,
-    session: &str,
+    session: Option<&str>,
     hit: &Value,
     ordinal: usize,
 ) -> Result<String> {
@@ -228,8 +231,9 @@ fn build_observed_path_view(
         .get("steps")
         .and_then(Value::as_array)
         .context("path view requires bounded steps[]")?;
+    let session_label = session.unwrap_or("unresolved");
     let mut page = format!(
-        "# Observed execution path {ordinal:04}\n\n         This is an **ordered sequence of {} debugger step pauses** in CDP session {session}.          It is not a complete or universally feasible program path, and debugger instrumentation          may perturb timing. Source excerpts refer to original captured code only.\n\n",
+        "# Observed execution path {ordinal:04}\n\n         This is an **ordered sequence of {} debugger step pauses** in CDP session {session_label}.          It is not a complete or universally feasible program path, and debugger instrumentation          may perturb timing. Source excerpts refer to original captured code only.\n\n",
         steps.len()
     );
     let _ = write!(
@@ -295,7 +299,7 @@ fn build_observed_path_view(
         let sha = top.get("sourceSha256").and_then(verified_sha);
         let identity = script_id
             .as_deref()
-            .and_then(|id| identities.get(session, id));
+            .and_then(|id| identities.get(session?, id));
         let exact = top.get("source_identity").and_then(Value::as_str) == Some("exact")
             && sha.is_some()
             && identity.is_some_and(|source| Some(source.sha256.as_str()) == sha);
@@ -390,14 +394,11 @@ pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -
         budget.checkpoint()?;
         let name = format!("{ordinal:04}.md");
         let destination = format!("src/_observed/invocations/{name}");
-        let session = hit
-            .get("cdpSession")
-            .and_then(Value::as_str)
-            .context("observed invocation missing CDP session")?
-            .to_owned();
+        let session = session_name(hit.get("cdpSession")).map(ToOwned::to_owned);
+        let session_label = session.as_deref().unwrap_or("unresolved");
         let mut view = format!(
             "# Observed invocation {ordinal:04}\n\n\
-             CDP session: **{session}**. Breakpoint point, pause state and provenance:\n\n"
+             CDP session: **{session_label}**. Breakpoint point, pause state and provenance:\n\n"
         );
         let header = json!({
             "pointId": hit.get("pointId"),
@@ -436,7 +437,7 @@ pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -
             let expected = frame.get("sourceSha256").and_then(verified_sha);
             let actual = script_id
                 .as_deref()
-                .and_then(|id| identities.get(&session, id));
+                .and_then(|id| identities.get(session.as_deref()?, id));
             let identity_verified = frame.get("source_identity").and_then(Value::as_str)
                 == Some("exact")
                 && expected.is_some()
@@ -473,7 +474,7 @@ pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -
                         .flatten()
                 })
                 .find(|instance| {
-                    instance.get("cdp_session").and_then(Value::as_str) == Some(session.as_str())
+                    instance.get("cdp_session").and_then(Value::as_str) == session.as_deref()
                         && instance
                             .get("script_id")
                             .and_then(script_id_text)
@@ -515,7 +516,13 @@ pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -
                 view.push('\n');
             }
         }
-        append_observed_callable_definitions(&mut view, project, &identities, &session, hit)?;
+        append_observed_callable_definitions(
+            &mut view,
+            project,
+            &identities,
+            session.as_deref(),
+            hit,
+        )?;
         if hit
             .get("steps")
             .and_then(Value::as_array)
@@ -526,14 +533,15 @@ pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -
             let guards = observed_guards::observe(
                 project,
                 &identities,
-                &session,
+                session.as_deref(),
                 hit.get("steps")
                     .and_then(Value::as_array)
                     .context("steps")?,
                 &budget,
             )?;
             hit["observed_guard_witnesses"] = json!(guards);
-            let path_view = build_observed_path_view(project, &identities, &session, hit, ordinal)?;
+            let path_view =
+                build_observed_path_view(project, &identities, session.as_deref(), hit, ordinal)?;
             fs::write(output.join(&path_name), path_view)?;
             hit["path_view_path"] = json!(path_destination);
             let _ = write!(view,
@@ -556,7 +564,7 @@ pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -
             .unwrap_or("unnamed");
         let _ = writeln!(
             index,
-            "- [Invocation {ordinal:04}](./{name}) — breakpoint point {} in CDP session {session}",
+            "- [Invocation {ordinal:04}](./{name}) — breakpoint point {} in CDP session {session_label}",
             point.replace('\n', " ")
         );
     }
@@ -703,6 +711,20 @@ mod tests {
             trace["hits"][0]["path_view_path"],
             "src/_observed/invocations/0000-path.md"
         );
+        let mut unscoped = trace;
+        unscoped["hits"][0]["cdpSession"] = Value::Null;
+        write_artifact(project, SELECTIVE_TRACE, &unscoped)?;
+        assert_eq!(
+            materialize_invocation_views(project, &AnalysisBudgets::standard("unscoped-view"))?,
+            1
+        );
+        let page = fs::read_to_string(project.join("src/_observed/invocations/0000.md"))?;
+        assert!(page.contains("Source identity **unresolved**"));
+        assert!(!page.contains("Raw recorded code"));
+        assert!(!page.contains("Verified observed callable definitions"));
+        let path = fs::read_to_string(project.join("src/_observed/invocations/0000-path.md"))?;
+        assert!(path.contains("Step 0: dispatch"));
+        assert!(!path.contains("return handler(opcode)"));
         Ok(())
     }
 }

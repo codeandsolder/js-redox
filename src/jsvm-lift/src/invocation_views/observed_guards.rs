@@ -135,10 +135,13 @@ fn top_frame(step: &Value) -> Option<&Value> {
 pub(super) fn observe(
     project: &Path,
     identities: &RuntimeIdentityIndex,
-    session: &str,
+    session: Option<&str>,
     steps: &[Value],
     budget: &WorkBudget,
 ) -> Result<Vec<Value>> {
+    let Some(session) = session else {
+        return Ok(Vec::new());
+    };
     let mut by_sha: HashMap<String, Option<(String, Vec<Guard>)>> = HashMap::new();
     let mut out = Vec::new();
     for (step_index, step) in steps.iter().enumerate() {
@@ -346,7 +349,7 @@ mod tests {
         let witnesses = observe(
             project,
             &identities,
-            "main",
+            Some("main"),
             &[guard.clone(), consequent],
             &budget,
         )?;
@@ -367,7 +370,7 @@ mod tests {
         let false_witnesses = observe(
             project,
             &identities,
-            "main",
+            Some("main"),
             &[false_guard, alternate],
             &budget,
         )?;
@@ -380,7 +383,7 @@ mod tests {
         let none = observe(
             project,
             &identities,
-            "main",
+            Some("main"),
             std::slice::from_ref(&guard),
             &budget,
         )?;
@@ -390,7 +393,7 @@ mod tests {
         let mut unrelated = guard.clone();
         unrelated["expressions"][0]["expression"] = json!("value !== 34");
         assert_eq!(
-            observe(project, &identities, "main", &[unrelated], &budget)?.len(),
+            observe(project, &identities, Some("main"), &[unrelated], &budget)?.len(),
             0
         );
 
@@ -398,7 +401,7 @@ mod tests {
         let mut unresolved = guard;
         unresolved["frames"][0]["source_identity"] = json!("unresolved");
         assert_eq!(
-            observe(project, &identities, "main", &[unresolved], &budget)?.len(),
+            observe(project, &identities, Some("main"), &[unresolved], &budget)?.len(),
             0
         );
         Ok(())

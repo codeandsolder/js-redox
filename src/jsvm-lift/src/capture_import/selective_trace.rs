@@ -2,7 +2,7 @@
 use crate::{
     analysis_artifacts::{load_artifact, write_artifact, RUNTIME_SCRIPTS, SELECTIVE_TRACE},
     analysis_budget::AnalysisBudgets,
-    runtime_identity::{script_id_text, ScriptIdentityIndex},
+    runtime_identity::{script_id_text, session_name, ScriptIdentityIndex},
 };
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
@@ -13,7 +13,7 @@ use std::{fs, path::Path};
 /// not that the function was invoked or selected for every possible input.
 fn verify_function_definition(
     value: &mut Value,
-    session: &str,
+    session: Option<&str>,
     identities: &ScriptIdentityIndex<String>,
     verified: &mut u64,
     unresolved: &mut u64,
@@ -33,7 +33,7 @@ fn verify_function_definition(
             return None;
         }
         let script = script?;
-        identities.get(session, &script).map(String::as_str)
+        identities.get(session?, &script).map(String::as_str)
     })();
     if let Some(sha) = exact {
         definition["source_identity"] = json!("exact");
@@ -47,7 +47,7 @@ fn verify_function_definition(
 
 fn verify_observed_frame_source(
     frame: &mut Value,
-    session: &str,
+    session: Option<&str>,
     identities: &ScriptIdentityIndex<String>,
 ) -> bool {
     let script = frame
@@ -56,7 +56,7 @@ fn verify_observed_frame_source(
         .and_then(script_id_text);
     let reported = frame.get("sourceSha256").and_then(Value::as_str);
     let actual = script
-        .and_then(|id| identities.get(session, &id))
+        .and_then(|id| identities.get(session?, &id))
         .map(String::as_str);
     let exact = actual.is_some() && actual == reported;
     frame["source_identity"] = json!(if exact { "exact" } else { "unresolved" });
@@ -96,18 +96,14 @@ pub(super) fn import_selective_trace(
         .context("selective trace requires hits[]")?;
     for hit in hits {
         budget.consume(1)?;
-        let session = hit
-            .get("cdpSession")
-            .and_then(Value::as_str)
-            .context("trace hit missing cdpSession")?
-            .to_owned();
+        let session = session_name(hit.get("cdpSession")).map(ToOwned::to_owned);
         let frames = hit
             .get_mut("frames")
             .and_then(Value::as_array_mut)
             .context("trace hit missing frames[]")?;
         for frame in frames {
             budget.consume(1)?;
-            if verify_observed_frame_source(frame, &session, &identities) {
+            if verify_observed_frame_source(frame, session.as_deref(), &identities) {
                 verified += 1;
             } else {
                 unresolved += 1;
@@ -129,7 +125,7 @@ pub(super) fn import_selective_trace(
                     .context("observed path step requires frames[]")?;
                 for frame in frames {
                     budget.consume(1)?;
-                    if verify_observed_frame_source(frame, &session, &identities) {
+                    if verify_observed_frame_source(frame, session.as_deref(), &identities) {
                         verified_step_frames += 1;
                     } else {
                         unresolved_step_frames += 1;
@@ -154,7 +150,7 @@ pub(super) fn import_selective_trace(
                 if let Some(value) = variable.get_mut("value") {
                     verify_function_definition(
                         value,
-                        &session,
+                        session.as_deref(),
                         &identities,
                         &mut verified_definitions,
                         &mut unresolved_definitions,
@@ -175,7 +171,7 @@ pub(super) fn import_selective_trace(
             if let Some(value) = expression.get_mut("value") {
                 verify_function_definition(
                     value,
-                    &session,
+                    session.as_deref(),
                     &identities,
                     &mut verified_definitions,
                     &mut unresolved_definitions,

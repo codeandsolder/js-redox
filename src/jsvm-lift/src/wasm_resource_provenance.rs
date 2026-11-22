@@ -2,7 +2,9 @@ use crate::{
     analysis_artifacts::{write_artifact, WASM_RESOURCE_PROVENANCE},
     analysis_budget::{AnalysisBudgets, AnalysisOperation},
     capture_project::load_manifest,
-    runtime_identity::{captured_javascript_digest, script_id_text, ScriptIdentityIndex},
+    runtime_identity::{
+        captured_javascript_digest, script_id_text, session_name, ScriptIdentityIndex,
+    },
 };
 use anyhow::{Context, Result};
 use serde_json::{json, Map, Value};
@@ -43,13 +45,6 @@ fn status_code(value: Option<&Value>) -> i64 {
                 .or_else(|| value.as_str().and_then(|s| s.parse::<i64>().ok()))
         })
         .unwrap_or_default()
-}
-
-fn cdp_session(row: &Map<String, Value>) -> String {
-    text(row.get("cdpSession"))
-        .filter(|value| !value.is_empty())
-        .unwrap_or("main")
-        .to_owned()
 }
 
 fn is_wasm_response(url: Option<&Value>, mime_type: Option<&Value>) -> bool {
@@ -115,15 +110,17 @@ fn runtime_script_identities(capture: &Path, budget: &WorkBudget) -> Result<RawS
         let Some(script) = event.get("scriptId").and_then(script_id_text) else {
             continue;
         };
-        let session = cdp_session(event);
+        let Some(session) = session_name(event.get("cdpSession")) else {
+            continue;
+        };
         let captured = event.get("captured").and_then(Value::as_object);
         let digest = captured_javascript_digest(event);
         if let Some(digest) = digest {
             identities
                 .digests
-                .register(&session, &script, digest.to_owned());
+                .register(session, &script, digest.to_owned());
             identities.paths.register(
-                &session,
+                session,
                 &script,
                 captured
                     .and_then(|row| text(row.get("path")))
@@ -132,8 +129,8 @@ fn runtime_script_identities(capture: &Path, budget: &WorkBudget) -> Result<RawS
         } else {
             // A partial or non-JS raw event for the same session/script cannot
             // be dropped to manufacture exact identity from the remaining row.
-            identities.digests.invalidate(&session, &script);
-            identities.paths.invalidate(&session, &script);
+            identities.digests.invalidate(session, &script);
+            identities.paths.invalidate(session, &script);
         }
     }
     Ok(identities)
@@ -378,7 +375,7 @@ impl<'r> ResponseEvidenceIndex<'r> {
     fn observation(
         &self,
         row: &Map<String, Value>,
-        session: &str,
+        session: Option<&str>,
         url: &str,
         resolved: &ResolvedResponse,
         runtime_scripts: &RawScriptIdentities,
@@ -391,12 +388,14 @@ impl<'r> ResponseEvidenceIndex<'r> {
         let mut initiator_resource_ids = Vec::new();
         if let Some(primary_object) = primary.as_ref().and_then(Value::as_object) {
             if let Some(script_id) = text(primary_object.get("script_id")) {
-                runtime_digest = runtime_scripts.digests.get(session, script_id);
-                if runtime_digest.is_some() {
-                    runtime_path = runtime_scripts
-                        .paths
-                        .get(session, script_id)
-                        .and_then(Option::as_deref);
+                if let Some(session) = session {
+                    runtime_digest = runtime_scripts.digests.get(session, script_id);
+                    if runtime_digest.is_some() {
+                        runtime_path = runtime_scripts
+                            .paths
+                            .get(session, script_id)
+                            .and_then(Option::as_deref);
+                    }
                 }
             }
             if let Some(primary_url) = text(primary_object.get("url")) {
@@ -411,6 +410,7 @@ impl<'r> ResponseEvidenceIndex<'r> {
         }
         json!({
             "cdp_session": session,
+            "cdp_session_claim":row.get("cdpSession"),
             "request_id": row.get("requestId").cloned().unwrap_or(Value::Null),
             "url": url,
             "sha256": resolved.digest,
@@ -447,10 +447,11 @@ impl<'r> ResponseEvidenceIndex<'r> {
             if !is_wasm_response(row.get("url"), row.get("mimeType")) {
                 continue;
             }
-            let session = cdp_session(row);
+            let session = session_name(row.get("cdpSession"));
             if !response_body_expected(row.get("method"), row.get("status")) {
                 results.ignored_non_body.push(json!({
                     "cdp_session": session,
+                    "cdp_session_claim":row.get("cdpSession"),
                     "request_id": row.get("requestId").cloned().unwrap_or(Value::Null),
                     "url": url,
                     "method": row.get("method").cloned().unwrap_or(Value::Null),
@@ -464,7 +465,7 @@ impl<'r> ResponseEvidenceIndex<'r> {
             match self.resolve(url, body) {
                 Ok(resolved) => results.observations.push(self.observation(
                     row,
-                    &session,
+                    session,
                     url,
                     &resolved,
                     runtime_scripts,
