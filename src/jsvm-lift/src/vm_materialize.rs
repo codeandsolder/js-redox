@@ -407,6 +407,55 @@ fn write_js_module(path: &Path, header: &str, pseudo_name: &str, payload: &Value
     .with_context(|| format!("writing {}", path.display()))
 }
 
+struct VmOutputPaths {
+    source: PathBuf,
+    pseudocode: PathBuf,
+}
+
+impl VmOutputPaths {
+    fn new(scan_id: u64, ordinal: usize, family: &str, stem: &str) -> Self {
+        let base = PathBuf::from("src/_devirtualized")
+            .join(format!("{scan_id:04}"))
+            .join(format!("{family}-vm-{ordinal:02}-{stem}"));
+        Self {
+            source: base.with_extension("js"),
+            pseudocode: base.with_extension("pseudo.txt"),
+        }
+    }
+
+    fn publish(
+        &self,
+        project: &Path,
+        header: &str,
+        payload: &Value,
+        pseudocode: &str,
+    ) -> Result<()> {
+        let pseudo_name = self
+            .pseudocode
+            .file_name()
+            .and_then(|value| value.to_str())
+            .context("generated pseudocode path is not UTF-8")?;
+        write_js_module(&project.join(&self.source), header, pseudo_name, payload)?;
+        let path = project.join(&self.pseudocode);
+        crate::report_file::write_text(&path, pseudocode)
+            .with_context(|| format!("writing {}", path.display()))
+    }
+}
+
+fn source_provenance(row: &Map<String, Value>) -> Map<String, Value> {
+    [
+        ("resource_id", "resource_id"),
+        ("url", "url"),
+        ("captured_raw_path", "raw_path"),
+        ("analysis_path", "path"),
+        ("analysis_origin", "analysis_origin"),
+        ("scan_report", "report"),
+    ]
+    .into_iter()
+    .map(|(key, source)| (key.to_owned(), field(row, source)))
+    .collect()
+}
+
 fn materialize_switch_vms(
     project: &Path,
     row: &Map<String, Value>,
@@ -425,31 +474,8 @@ fn materialize_switch_vms(
                 .as_deref()
                 .or(Some(vm.parent_function_id.as_str())),
         );
-        let base = PathBuf::from("src/_devirtualized")
-            .join(format!("{scan_id:04}"))
-            .join(format!("switch-vm-{ordinal:02}-{stem}"));
-        let rel = base.with_extension("js");
-        let pseudo_rel = base.with_extension("pseudo.txt");
-        let out = project.join(&rel);
-        let pseudo_out = project.join(&pseudo_rel);
-
-        let mut provenance = Map::new();
-        for key in [
-            "resource_id",
-            "url",
-            "raw_path",
-            "path",
-            "analysis_origin",
-            "report",
-        ] {
-            provenance.insert(key.to_owned(), field(row, key));
-        }
-        let captured_raw = provenance.remove("raw_path").unwrap_or(Value::Null);
-        let analysis_path = provenance.remove("path").unwrap_or(Value::Null);
-        let scan_report = provenance.remove("report").unwrap_or(Value::Null);
-        provenance.insert("captured_raw_path".into(), captured_raw);
-        provenance.insert("analysis_path".into(), analysis_path);
-        provenance.insert("scan_report".into(), scan_report);
+        let paths = VmOutputPaths::new(scan_id, ordinal, "switch", &stem);
+        let mut provenance = source_provenance(row);
         provenance.insert("switch_ir".into(), Value::String(relative_ir.to_owned()));
         provenance.insert(
             "parent_function_id".into(),
@@ -500,18 +526,12 @@ fn materialize_switch_vms(
             "opcode_map": opcode_map,
             "handlers": handlers,
         });
-        let pseudo_name = pseudo_rel
-            .file_name()
-            .and_then(|value| value.to_str())
-            .context("generated pseudocode path is not UTF-8")?;
-        write_js_module(
-            &out,
+        paths.publish(
+            project,
             "Generated semantic view of a captured JavaScript VM.",
-            pseudo_name,
             &payload,
+            &render_switch_pseudocode(vm, &provenance),
         )?;
-        crate::report_file::write_text(&pseudo_out, &render_switch_pseudocode(vm, &provenance))
-            .with_context(|| format!("writing {}", pseudo_out.display()))?;
 
         units.push(json!({
             "vm_kind": "direct_switch",
@@ -526,8 +546,8 @@ fn materialize_switch_vms(
             "switch_end": vm.switch_end,
             "selector_style": vm.selector_style,
             "handler_count": vm.handlers.len(),
-            "source_path": rel.to_string_lossy(),
-            "pseudocode_path": pseudo_rel.to_string_lossy(),
+            "source_path": paths.source.to_string_lossy(),
+            "pseudocode_path": paths.pseudocode.to_string_lossy(),
             "ir_path": relative_ir,
         }));
     }
@@ -548,21 +568,8 @@ fn materialize_table_vms(
         budget.checkpoint()?;
         let ordinal = index + 1;
         let stem = safe_name(Some(&vm.handler_table));
-        let base = PathBuf::from("src/_devirtualized")
-            .join(format!("{scan_id:04}"))
-            .join(format!("table-vm-{ordinal:02}-{stem}"));
-        let rel = base.with_extension("js");
-        let pseudo_rel = base.with_extension("pseudo.txt");
-        let out = project.join(&rel);
-        let pseudo_out = project.join(&pseudo_rel);
-
-        let mut provenance = Map::new();
-        provenance.insert("resource_id".into(), field(row, "resource_id"));
-        provenance.insert("url".into(), field(row, "url"));
-        provenance.insert("captured_raw_path".into(), field(row, "raw_path"));
-        provenance.insert("analysis_path".into(), field(row, "path"));
-        provenance.insert("analysis_origin".into(), field(row, "analysis_origin"));
-        provenance.insert("scan_report".into(), field(row, "report"));
+        let paths = VmOutputPaths::new(scan_id, ordinal, "table", &stem);
+        let mut provenance = source_provenance(row);
         provenance.insert("table_ir".into(), Value::String(relative_ir.to_owned()));
         provenance.insert("parent_scan_id".into(), Value::from(scan_id));
 
@@ -579,18 +586,12 @@ fn materialize_table_vms(
             "method_bindings": vm.method_bindings,
             "handlers": vm.handlers,
         });
-        let pseudo_name = pseudo_rel
-            .file_name()
-            .and_then(|value| value.to_str())
-            .context("generated pseudocode path is not UTF-8")?;
-        write_js_module(
-            &out,
+        paths.publish(
+            project,
             "Generated semantic view of a captured function-table JavaScript VM.",
-            pseudo_name,
             &payload,
+            &render_table_pseudocode(vm, &provenance),
         )?;
-        crate::report_file::write_text(&pseudo_out, &render_table_pseudocode(vm, &provenance))
-            .with_context(|| format!("writing {}", pseudo_out.display()))?;
 
         units.push(json!({
             "vm_kind": "function_table",
@@ -602,8 +603,8 @@ fn materialize_table_vms(
             "handler_table": vm.handler_table,
             "architecture": vm.architecture,
             "handler_count": vm.handlers.len(),
-            "source_path": rel.to_string_lossy(),
-            "pseudocode_path": pseudo_rel.to_string_lossy(),
+            "source_path": paths.source.to_string_lossy(),
+            "pseudocode_path": paths.pseudocode.to_string_lossy(),
             "ir_path": relative_ir,
         }));
     }
@@ -681,14 +682,12 @@ pub fn materialize_project(
         row.insert("devirtualized_units".into(), Value::Array(units.clone()));
         all_units.extend(units);
     }
-    object.insert(
-        "devirtualized_units".into(),
-        Value::Array(all_units.clone()),
-    );
+    let devirtualized_units = all_units.len();
+    object.insert("devirtualized_units".into(), Value::Array(all_units));
     stage_budget.checkpoint()?;
     write_artifact(project, JSVM_INDEX, &index)?;
     Ok(MaterializeSummary {
-        devirtualized_units: all_units.len(),
+        devirtualized_units,
         switch_vms,
         table_vms,
     })
@@ -708,79 +707,84 @@ mod tests {
         Ok(path)
     }
 
+    fn write_vm_fixture(project: &Path) -> Result<()> {
+        let index = json!({
+            "schema": JSVM_INDEX.schema,
+            "code_units": [{
+                "scan_id": 7,
+                "resource_id": 42,
+                "url": "https://example.test/app.js",
+                "raw_path": "resources/app.js",
+                "path": "src/app.js",
+                "analysis_origin": "safe_deobfuscated",
+                "report": "analysis/jsvm/0007.json",
+                "switch_ir": "analysis/jsvm/0007.switch.json",
+                "table_ir": "analysis/jsvm/0007.table.json"
+            }],
+            "dynamic_code_units": []
+        });
+        write_artifact(project, JSVM_INDEX, &index)?;
+        fs::write(
+            project.join("analysis/jsvm/0007.switch.json"),
+            serde_json::to_string_pretty(&json!({
+                "schema": SWITCH_IR_SCHEMA,
+                "source": "src/app.js",
+                "vms": [{
+                    "parent_function_id": "fn:1",
+                    "function_name": "dispatch weird/name",
+                    "function_start": 10,
+                    "function_end": 90,
+                    "switch_start": 30,
+                    "switch_end": 80,
+                    "selector": "ops[ip]",
+                    "selector_style": "indexed",
+                    "role_bindings": {"ip": "i"},
+                    "helper_bindings": {},
+                    "handlers": [{
+                        "opcode": 3,
+                        "semantic_label": "add",
+                        "semantic_hash": "exact",
+                        "coarse_semantic_hash": "coarse",
+                        "effects": [{"source": "a+b", "normalized": "lhs+rhs", "ir": {"kind": "binary"}}]
+                    }]
+                }]
+            }))?,
+        )?;
+        fs::write(
+            project.join("analysis/jsvm/0007.table.json"),
+            serde_json::to_string_pretty(&json!({
+                "schema": TABLE_IR_SCHEMA,
+                "source": "src/app.js",
+                "vms": [{
+                    "dispatcher_function_id": "fn:2",
+                    "handler_table": "handlers",
+                    "handler_count": 1,
+                    "architecture": "function_table",
+                    "producer_method": null,
+                    "linked_transducer": null,
+                    "role_bindings": {"control_stack": "frames"},
+                    "method_bindings": {"ctx.getByte": "read_byte"},
+                    "handlers": [{
+                        "key": "0",
+                        "start": 100,
+                        "end": 120,
+                        "parameter": "ctx",
+                        "semantic_hash": "table-exact",
+                        "op_kinds": ["read_byte"],
+                        "statements": [{"source": "ctx.getByte()", "normalized": "read_byte()", "ir": {"kind": "read_byte"}}]
+                    }]
+                }]
+            }))?,
+        )?;
+
+        Ok(())
+    }
+
     #[test]
     fn materializes_switch_and_table_views_and_updates_index() -> Result<()> {
         let project = test_project()?;
         let result = (|| -> Result<()> {
-            let index = json!({
-                "schema": JSVM_INDEX.schema,
-                "code_units": [{
-                    "scan_id": 7,
-                    "resource_id": 42,
-                    "url": "https://example.test/app.js",
-                    "raw_path": "resources/app.js",
-                    "path": "src/app.js",
-                    "analysis_origin": "safe_deobfuscated",
-                    "report": "analysis/jsvm/0007.json",
-                    "switch_ir": "analysis/jsvm/0007.switch.json",
-                    "table_ir": "analysis/jsvm/0007.table.json"
-                }],
-                "dynamic_code_units": []
-            });
-            write_artifact(&project, JSVM_INDEX, &index)?;
-            fs::write(
-                project.join("analysis/jsvm/0007.switch.json"),
-                serde_json::to_string_pretty(&json!({
-                    "schema": SWITCH_IR_SCHEMA,
-                    "source": "src/app.js",
-                    "vms": [{
-                        "parent_function_id": "fn:1",
-                        "function_name": "dispatch weird/name",
-                        "function_start": 10,
-                        "function_end": 90,
-                        "switch_start": 30,
-                        "switch_end": 80,
-                        "selector": "ops[ip]",
-                        "selector_style": "indexed",
-                        "role_bindings": {"ip": "i"},
-                        "helper_bindings": {},
-                        "handlers": [{
-                            "opcode": 3,
-                            "semantic_label": "add",
-                            "semantic_hash": "exact",
-                            "coarse_semantic_hash": "coarse",
-                            "effects": [{"source": "a+b", "normalized": "lhs+rhs", "ir": {"kind": "binary"}}]
-                        }]
-                    }]
-                }))?,
-            )?;
-            fs::write(
-                project.join("analysis/jsvm/0007.table.json"),
-                serde_json::to_string_pretty(&json!({
-                    "schema": TABLE_IR_SCHEMA,
-                    "source": "src/app.js",
-                    "vms": [{
-                        "dispatcher_function_id": "fn:2",
-                        "handler_table": "handlers",
-                        "handler_count": 1,
-                        "architecture": "function_table",
-                        "producer_method": null,
-                        "linked_transducer": null,
-                        "role_bindings": {"control_stack": "frames"},
-                        "method_bindings": {"ctx.getByte": "read_byte"},
-                        "handlers": [{
-                            "key": "0",
-                            "start": 100,
-                            "end": 120,
-                            "parameter": "ctx",
-                            "semantic_hash": "table-exact",
-                            "op_kinds": ["read_byte"],
-                            "statements": [{"source": "ctx.getByte()", "normalized": "read_byte()", "ir": {"kind": "read_byte"}}]
-                        }]
-                    }]
-                }))?,
-            )?;
-
+            write_vm_fixture(&project)?;
             let summary =
                 materialize_project(&project, &AnalysisBudgets::standard("vm-materialize-test"))?;
             assert_eq!(

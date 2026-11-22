@@ -518,6 +518,10 @@ impl Collector<'_> {
             }
         }
 
+        self.record_dynamic_decoder_calls(it, callee, lower);
+    }
+
+    fn record_dynamic_decoder_calls(&mut self, it: &CallExpression<'_>, callee: &str, lower: &str) {
         if lower == "atob"
             || has_dotted_member_suffix(lower, "atob")
             || (callee == "Buffer.from"
