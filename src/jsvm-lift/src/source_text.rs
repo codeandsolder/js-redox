@@ -79,33 +79,41 @@ pub(crate) fn js_line_ranges(source: &str) -> impl Iterator<Item = std::ops::Ran
 /// Shared index for AST byte positions and original debugger coordinates.
 #[derive(Debug)]
 pub(crate) struct SourceLineIndex {
-    ranges: Vec<std::ops::Range<usize>>,
+    starts: Vec<usize>,
 }
 
 impl SourceLineIndex {
     pub(crate) fn new(source: &str) -> Self {
         Self {
-            ranges: js_line_ranges(source).collect(),
+            starts: js_line_ranges(source).map(|range| range.start).collect(),
         }
     }
 
     pub(crate) fn retained_bytes(&self) -> usize {
-        self.ranges
+        self.starts
             .capacity()
-            .saturating_mul(std::mem::size_of::<std::ops::Range<usize>>())
+            .saturating_mul(std::mem::size_of::<usize>())
     }
 
     pub(crate) fn line_text<'a>(&self, source: &'a str, local_line: usize) -> Option<&'a str> {
-        source.get(self.ranges.get(local_line)?.clone())
+        let start = *self.starts.get(local_line)?;
+        if let Some(&next) = self.starts.get(local_line + 1) {
+            let terminated = source.get(start..next)?;
+            terminated
+                .strip_suffix("\r\n")
+                .or_else(|| terminated.strip_suffix(['\r', '\n', '\u{2028}', '\u{2029}']))
+        } else {
+            source.get(start..)
+        }
     }
 
     /// One-based line, zero-based UTF-8 byte column (not a CDP column).
     pub(crate) fn byte_line_column(&self, offset: usize) -> (usize, usize) {
         let index = self
-            .ranges
-            .partition_point(|range| range.start <= offset)
+            .starts
+            .partition_point(|start| *start <= offset)
             .saturating_sub(1);
-        (index + 1, offset - self.ranges[index].start)
+        (index + 1, offset - self.starts[index])
     }
 
     /// One-based line and Unicode scalar column for human-readable navigation.
@@ -115,7 +123,7 @@ impl SourceLineIndex {
         offset: usize,
     ) -> Option<(usize, usize)> {
         let (line, _) = self.byte_line_column(offset);
-        let prefix = source.get(self.ranges[line - 1].start..offset)?;
+        let prefix = source.get(self.starts[line - 1]..offset)?;
         Some((line, prefix.chars().count() + 1))
     }
 
@@ -134,9 +142,8 @@ impl SourceLineIndex {
         let units =
             usize::try_from(column.checked_sub(if local_line == 0 { start_column } else { 0 })?)
                 .ok()?;
-        let range = self.ranges.get(local_line)?;
-        let text = source.get(range.clone())?;
-        Some(range.start + utf16_byte_offset(text, units).ok()?)
+        let text = self.line_text(source, local_line)?;
+        Some(self.starts[local_line] + utf16_byte_offset(text, units).ok()?)
     }
 }
 
@@ -204,6 +211,10 @@ mod tests {
             .map(|range| &source[range])
             .collect::<Vec<_>>();
         assert_eq!(lines, ["💡x", "y", "z", "💡", ""]);
+        for (line, text) in lines.iter().enumerate() {
+            assert_eq!(index.line_text(source, line), Some(*text));
+        }
+        assert_eq!(index.line_text(source, lines.len()), None);
         for (row, col, expected) in [
             (0, 0, Some(0)),
             (0, 1, None),

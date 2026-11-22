@@ -4,6 +4,7 @@ use anyhow::{ensure, Context, Result};
 use std::{
     collections::{HashMap, VecDeque},
     fs,
+    io::Read,
     mem::size_of,
     path::Path,
     rc::Rc,
@@ -74,10 +75,23 @@ impl<'a> VerifiedSources<'a> {
         let path = self
             .project
             .join(format!("resources/runtime-scripts/{sha}.js"));
-        let bytes = fs::read(&path)
+        let mut file = fs::File::open(&path)
+            .with_context(|| format!("opening original runtime source {}", path.display()))?;
+        let metadata = file.metadata()?;
+        ensure!(
+            metadata.is_file(),
+            "original runtime source is not a regular file: {}",
+            path.display()
+        );
+        // Reserve the known byte-reading work before allocating the source.
+        // If an external writer grew the file, account for the extra bytes too.
+        let reserved = metadata.len().div_ceil(1024);
+        self.budget.consume(reserved)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
             .with_context(|| format!("reading original runtime source {}", path.display()))?;
         self.budget
-            .consume(u64::try_from(bytes.len().div_ceil(1024))?)?;
+            .consume(u64::try_from(bytes.len().div_ceil(1024))?.saturating_sub(reserved))?;
         ensure!(
             sha256_hex(&bytes) == sha,
             "captured runtime source hash mismatch: {sha}"
