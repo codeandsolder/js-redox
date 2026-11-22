@@ -8,6 +8,7 @@ use super::{
     array_field, bool_field, compact_key, digest_id, field, nonempty_string_field, string_field,
     GraphBuilder,
 };
+use crate::runtime_identity::script_id_text;
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -35,15 +36,6 @@ pub(super) fn captured_runtime_source(graph: &GraphBuilder, digest: &str) -> Opt
     (string_field(record, "type") == Some("runtime_script")
         && string_field(record, "sha256") == Some(digest))
     .then_some(node)
-}
-
-fn script_id_text(value: &Value) -> Option<std::borrow::Cow<'_, str>> {
-    use std::borrow::Cow;
-    match value {
-        Value::String(id) if !id.is_empty() => Some(Cow::Borrowed(id)),
-        Value::Number(id) if id.is_u64() => Some(Cow::Owned(id.to_string())),
-        _ => None,
-    }
 }
 
 impl RuntimeInstances {
@@ -245,6 +237,10 @@ impl GenerationParent<'_> {
         graph: &GraphBuilder,
         instances: &RuntimeInstances,
     ) -> GenerationParentResolution {
+        let event_status = string_field(self.frame, "parent_event_status");
+        if event_status == Some("conflicting_source_claims") {
+            return GenerationParentResolution::Unresolved("conflicting_parent_event_claims");
+        }
         let registered = self
             .frame
             .get("script_id")
@@ -258,9 +254,14 @@ impl GenerationParent<'_> {
             (Some(InstanceSource::Unique(registered)), Some(claimed)) if registered != claimed => {
                 return GenerationParentResolution::Unresolved("conflicting_parent_digest")
             }
-            (Some(InstanceSource::Unique(registered)), _) => {
-                (registered.as_str(), "session_script_id_and_captured_digest")
-            }
+            (Some(InstanceSource::Unique(registered)), _) => (
+                registered.as_str(),
+                if event_status == Some("ambiguous_ancestry") {
+                    "captured_digest_with_ambiguous_ancestry"
+                } else {
+                    "session_script_id_and_captured_digest"
+                },
+            ),
             (None, Some(claimed)) => (claimed, "captured_digest_only"),
             (None, None) => {
                 return if nonempty_string_field(self.frame, "url").is_some() {
@@ -303,6 +304,10 @@ fn add_runtime_generated_code_edges(
         };
         let mut fields = json!({
             "origin_ordinal":ordinal,
+            "chain_termination":field(origin,"chain_termination"),
+            "parent_event_status":field(frame,"parent_event_status"),
+            "parent_event_count":field(frame,"parent_event_count"),
+            "parent_event_digest_claims":field(frame,"parent_event_digest_claims"),
             "cdp_session":child_session,
             "parent_cdp_session":parent.session,
             "child_script_id":field(origin,"child_script_id"),

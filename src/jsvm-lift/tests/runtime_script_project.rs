@@ -384,3 +384,84 @@ fn recorder_runtime_provenance_flows_into_source_graph() -> Result<()> {
     assert_eq!(helper["application_source"], false);
     Ok(())
 }
+
+#[test]
+fn missing_conflicting_parent_body_does_not_turn_claim_into_exact_graph_link() -> Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let capture = workspace.path().join("capture");
+    let runtime = capture.join("runtime-scripts");
+    fs::create_dir_all(&runtime)?;
+    let parent = "let parent = 1;";
+    let missing = "let otherParent = 2;";
+    let child = "let child = 3;";
+    for body in [parent, child] {
+        fs::write(runtime.join(format!("{}.js", digest(body))), body)?;
+    }
+    fs::write(capture.join("recorder-manifest.json"), b"{}")?;
+    let har = json!({"log":{"version":"1.2","creator":{"name":"fixture","version":"1"},"pages":[],"entries":[har_entry("https://fixture.invalid/", "text/html", "<!doctype html>")]}});
+    fs::write(capture.join("capture.har"), serde_json::to_vec(&har)?)?;
+    let row = |id: &str, source: &str| json!({"cdpSession":"main","scriptId":id,"captured":{"kind":"javascript","sha256":digest(source),"size":source.len(),"path":format!("runtime-scripts/{}.js",digest(source))}});
+    let mut child_event = row("2", child);
+    child_event["stackTrace"] = json!({"callFrames":[{"scriptId":"1","url":"https://fixture.invalid/parent.js","lineNumber":0,"columnNumber":0}]});
+    let events = [row("1", parent), row("1", missing), child_event];
+    fs::write(
+        capture.join("runtime-scripts.json"),
+        serde_json::to_vec(&events)?,
+    )?;
+    let project = workspace.path().join("project");
+    let budget = AnalysisBudgets::standard("missing-conflicting-parent-body");
+    import_capture_project(
+        &CaptureImportOptions {
+            input: capture,
+            output: project.clone(),
+            assets_dir: None,
+            overwrite: false,
+        },
+        &budget,
+    )?;
+    let report = read_json(&project.join("analysis/runtime-scripts.json"))?;
+    let sources = report["sources"]
+        .as_array()
+        .context("runtime sources missing")?;
+    assert_eq!(sources.len(), 2);
+    let child_row = sources
+        .iter()
+        .find(|row| row["sha256"] == digest(child))
+        .context("child source missing")?;
+    let claim = &child_row["generated"]["origins"][0]["chain"][0];
+    assert_eq!(claim["parent_event_status"], "conflicting_source_claims");
+    assert!(claim["sha256"].is_null());
+    let expected = BTreeSet::from([digest(parent), digest(missing)]);
+    let actual = claim["parent_event_digest_claims"]
+        .as_array()
+        .context("parent claims missing")?
+        .iter()
+        .filter_map(Value::as_str)
+        .map(ToOwned::to_owned)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(actual, expected);
+    assert_eq!(child_row["generated"]["root_sha256s"], json!([]));
+    build_source_graph(&project, &budget)?;
+    let graph = read_json(&project.join("analysis/source-graph.json"))?;
+    let edges = graph["edges"].as_array().context("graph edges missing")?;
+    assert!(!edges
+        .iter()
+        .any(|edge| edge["kind"] == "runtime_generated_code"
+            || edge["kind"] == "runtime_generated_code_candidate"));
+    let unresolved = edges
+        .iter()
+        .find(|edge| edge["kind"] == "runtime_generated_code_unresolved")
+        .context("unresolved generated parent missing")?;
+    assert_eq!(
+        unresolved["identity_basis"],
+        "conflicting_parent_event_claims"
+    );
+    assert_eq!(unresolved["exact_parent_source_identity"], false);
+    assert_eq!(unresolved["exact_parent_runtime_instance"], false);
+    assert_eq!(
+        unresolved["parent_event_digest_claims"],
+        claim["parent_event_digest_claims"]
+    );
+    assert_eq!(graph["unresolved_edges"], json!([]));
+    Ok(())
+}
