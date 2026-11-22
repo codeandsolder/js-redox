@@ -27,7 +27,7 @@ enum StaticWasmValue {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum HelperKind {
     Base64ArrayBufferPair,
-    ArrayIdentity,
+    ArrayIdentity { alias: Option<SymbolId> },
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -121,11 +121,13 @@ impl<'a> Visit<'a> for ExactNamedSymbolReferences<'_, '_> {
             self.valid = false;
             return;
         };
-        if self.global_aliases.facts().initialized_reference(
-            self.scoping,
-            reference_id,
-            identifier.span,
-        ) != Some(self.symbol)
+        if self
+            .global_aliases
+            .facts()
+            .resolved_symbol(self.scoping, reference_id)
+            != Some(self.symbol)
+            || !self.scoping.get_reference(reference_id).is_read()
+            || self.scoping.get_reference(reference_id).is_write()
         {
             self.valid = false;
             return;
@@ -267,19 +269,15 @@ fn classify_array_identity(
     scoping: &Scoping,
     global_aliases: &GlobalAliases,
     parameter: &str,
-) -> bool {
-    let Some(body) = &function.body else {
-        return false;
-    };
+) -> Option<HelperKind> {
+    let body = function.body.as_ref()?;
     let [statement] = body.statements.as_slice() else {
-        return false;
+        return None;
     };
     let Statement::ReturnStatement(_) = statement else {
-        return false;
+        return None;
     };
-    let Some(statement) = compact_statement(source, statement) else {
-        return false;
-    };
+    let statement = compact_statement(source, statement)?;
     let prefix = format!("returnfunction({parameter}){{");
     let suffix = format!("}}({parameter})||");
     let suffix_semicolon = format!(";}}({parameter})||");
@@ -287,7 +285,7 @@ fn classify_array_identity(
         statement.starts_with(&format!("{prefix}{guard}"))
             && (statement.contains(&suffix) || statement.contains(&suffix_semicolon))
     };
-    let local_alias_identity = global_aliases.symbols().any(|symbol| {
+    let local_alias_identity = global_aliases.symbols().find(|&symbol| {
         let alias = scoping.symbol_name(symbol);
         has_shape(&format!(
             "if({alias}.Array.isArray({parameter}))return{parameter}"
@@ -301,7 +299,13 @@ fn classify_array_identity(
     });
     let direct_identity = has_shape(&format!("if(Array.isArray({parameter}))return{parameter}"))
         && has_required_unresolved_globals(function, scoping, global_aliases, &["Array"]);
-    local_alias_identity || direct_identity
+    if direct_identity {
+        Some(HelperKind::ArrayIdentity { alias: None })
+    } else {
+        local_alias_identity.map(|symbol| HelperKind::ArrayIdentity {
+            alias: Some(symbol),
+        })
+    }
 }
 
 fn classify_helper(
@@ -318,7 +322,6 @@ fn classify_helper(
         return Some(HelperKind::Base64ArrayBufferPair);
     }
     classify_array_identity(source, function, scoping, global_aliases, parameter)
-        .then_some(HelperKind::ArrayIdentity)
 }
 
 struct HelperCollector<'c, 's, 'g> {
@@ -400,13 +403,35 @@ impl Evaluator<'_, '_, '_, '_> {
             Expression::CallExpression(call)
                 if !call.optional && !call.arguments.iter().any(Argument::is_spread) =>
             {
-                let helper = self.helpers.get(&symbol_of(self.scoping, &call.callee)?)?;
+                let Expression::Identifier(callee) = unparenthesized(&call.callee) else {
+                    return None;
+                };
+                let reference = callee.reference_id.get()?;
+                let facts = self.global_aliases.facts();
+                let symbol = facts.resolved_symbol(self.scoping, reference)?;
+                if !facts.binding_has_stable_value(self.scoping, symbol) {
+                    return None;
+                }
+                let helper = self.helpers.get(&symbol)?;
+                // A helper declaration can be hoisted. Its captured alias
+                // identity is checked at discovery; its initialized value
+                // must be available at this particular invocation.
+                if let HelperKind::ArrayIdentity { alias: Some(alias) } = helper {
+                    if !facts.proves_value_initialized(
+                        self.scoping,
+                        *alias,
+                        self.scoping.get_reference(reference).scope_id(),
+                        call.span,
+                    ) {
+                        return None;
+                    }
+                }
                 let first = call.arguments.first()?.as_expression()?;
                 match (helper, self.expression(first)?) {
                     (HelperKind::Base64ArrayBufferPair, StaticWasmValue::Base64Module(sha256)) => {
                         Some(StaticWasmValue::BufferPair(sha256))
                     }
-                    (HelperKind::ArrayIdentity, StaticWasmValue::BufferPair(sha256)) => {
+                    (HelperKind::ArrayIdentity { .. }, StaticWasmValue::BufferPair(sha256)) => {
                         Some(StaticWasmValue::BufferPair(sha256))
                     }
                     _ => None,
@@ -750,6 +775,63 @@ mod tests {
     use oxc_semantic::SemanticBuilder;
     use oxc_span::SourceType;
     use rolldown_redox::ecmascript::parse_program;
+
+    #[test]
+    fn deferred_alias_proof_is_anchored_to_each_invocation() -> Result<(), BudgetExceeded> {
+        let source = r#"
+            const input = null;
+            const early = identity(input);
+            const host = globalThis;
+            const late = identity(input);
+            function identity(value) {
+                return function(value) {
+                    if (host.Array.isArray(value)) return value;
+                }(value) || fallback(value);
+            }
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new()
+            .with_check_syntax_error(true)
+            .build(&parsed.program);
+        assert!(semantic.diagnostics.is_empty());
+        let scoping = semantic.semantic.scoping();
+        let budget = WorkBudget::unlimited("deferred-alias-test");
+        let aliases =
+            crate::global_builtin::collect_global_aliases(&parsed.program, scoping, &budget)?;
+        let helpers = collect_helpers(source, &parsed.program, scoping, &aliases);
+        let Some(input) = scoping.get_binding(scoping.root_scope_id(), "input".into()) else {
+            unreachable!("input binding");
+        };
+        let abstract_input = StaticWasmValue::BufferPair("synthetic-input".to_string());
+        let values = HashMap::from([(input, abstract_input.clone())]);
+        let evaluator = Evaluator {
+            scoping,
+            helpers: &helpers,
+            values: &values,
+            global_aliases: &aliases,
+        };
+        let mut collector = WriteCollector {
+            evaluator,
+            writes: HashMap::new(),
+        };
+        collector.visit_program(&parsed.program);
+        for (name, expected) in [("early", None), ("late", Some(abstract_input))] {
+            let Some(symbol) = scoping.get_binding(scoping.root_scope_id(), name.into()) else {
+                unreachable!("result binding");
+            };
+            assert_eq!(
+                collector
+                    .writes
+                    .remove(&symbol)
+                    .and_then(WriteState::proven),
+                expected,
+                "{name}"
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn generic_static_byte_assembly_augments_exact_module_sites() -> Result<(), BudgetExceeded> {

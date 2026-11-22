@@ -213,7 +213,7 @@ impl BindingFacts {
     /// initialized, their value cannot be changed. A hoisted declaration is
     /// different; the enclosing lexical scope's entry (not the declaration's
     /// text) is its earliest creation site.
-    pub(crate) fn proves_value_initialized(
+    pub fn proves_value_initialized(
         &self,
         scoping: &Scoping,
         symbol: SymbolId,
