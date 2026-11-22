@@ -4,6 +4,7 @@
 //! derived independently. Neither represents a proposed evaluation order or
 //! a semantics-changing transformation. Nested callback bodies never extend
 //! an enclosing call spine.
+use crate::source_text::SourceLineIndex;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     ArrowFunctionExpression, AssignmentExpression, BinaryExpression, CallExpression,
@@ -255,12 +256,13 @@ fn append_assignment_outline_node(
     nodes: &[AssignmentNode],
     children: &[Vec<usize>],
     source: &str,
+    lines: &SourceLineIndex,
     index: usize,
     depth: usize,
     output: &mut String,
-) {
+) -> Option<()> {
     let node = &nodes[index];
-    let (line, col) = line_col(source, node.span.start as usize);
+    let (line, col) = lines.character_line_column(source, node.span.start as usize)?;
     let target = if node.target.len() > 80
         || node.target.contains(char::from(96))
         || node.target.contains(char::from(10))
@@ -296,11 +298,16 @@ fn append_assignment_outline_node(
         node.span.end,
     );
     for &child in &children[index] {
-        append_assignment_outline_node(nodes, children, source, child, depth + 1, output);
+        append_assignment_outline_node(nodes, children, source, lines, child, depth + 1, output)?;
     }
+    Some(())
 }
 
-fn assignment_outline(source: &str, program: &oxc_ast::ast::Program<'_>) -> Option<String> {
+fn assignment_outline(
+    source: &str,
+    program: &oxc_ast::ast::Program<'_>,
+    lines: &SourceLineIndex,
+) -> Option<String> {
     let mut collector = AssignmentOutlineCollector {
         source,
         ..AssignmentOutlineCollector::default()
@@ -343,14 +350,14 @@ by AST type and byte length, not evaluated or silently truncated.
     );
     for root in roots {
         let node = &nodes[root];
-        let (line, col) = line_col(source, node.span.start as usize);
+        let (line, col) = lines.character_line_column(source, node.span.start as usize)?;
         let _ = write!(
             output,
             "\n## Long assignment at {line}:{col} ({} source bytes)\n\n",
             node.span.end - node.span.start,
         );
         output.push_str("| Depth | ID | Assignment target/operator | Assigned RHS | Containment | Nearest guard | Source location |\n|---:|---:|---|---|---|---|---|\n");
-        append_assignment_outline_node(nodes, &children, source, root, 0, &mut output);
+        append_assignment_outline_node(nodes, &children, source, lines, root, 0, &mut output)?;
         output.push(char::from(10));
     }
     Some(output)
@@ -371,7 +378,9 @@ impl ExpressionBreaks<'_> {
         };
         // Only unfold an expression that's too long *on the same source
         // line*. Existing multiline syntax, including comments, is retained.
-        if fragment.len() <= LONG_EXPRESSION_BYTES || fragment.contains('\n') {
+        if fragment.len() <= LONG_EXPRESSION_BYTES
+            || fragment.contains(['\r', '\n', '\u{2028}', '\u{2029}'])
+        {
             return;
         }
         let position = operand.start as usize;
@@ -437,13 +446,6 @@ impl<'a> Visit<'a> for ExpressionBreaks<'_> {
     }
 }
 
-fn line_col(source: &str, byte: usize) -> (usize, usize) {
-    let prefix = source.get(..byte).unwrap_or("");
-    let line = prefix.bytes().filter(|b| *b == b'\n').count() + 1;
-    let column = prefix.rsplit('\n').next().unwrap_or("").chars().count() + 1;
-    (line, column)
-}
-
 fn label(raw: &str) -> String {
     if raw.len() > 80 || raw.contains('\n') || raw.contains('`') {
         "<computed callee>".to_owned()
@@ -462,9 +464,10 @@ pub fn helper_navigation(source: &str, helper_path: &str) -> Option<HelperNaviga
     if !parsed.is_clean() {
         return None;
     }
-    let assignment_outline_markdown = assignment_outline(source, &parsed.program);
+    let lines = SourceLineIndex::new(source);
+    let assignment_outline_markdown = assignment_outline(source, &parsed.program, &lines);
     let ordered_assignment_phases_markdown =
-        crate::source_tree_eval_order::ordered_assignment_phases(source, &parsed.program);
+        crate::source_tree_eval_order::ordered_assignment_phases(source, &parsed.program, &lines);
     let mut collector = Collector {
         source,
         ..Collector::default()
@@ -572,7 +575,7 @@ in the original JavaScript. Byte ranges refer to that readable helper.
         );
         for (depth, index) in path.into_iter().enumerate() {
             let call = &collector.calls[index];
-            let (line, column) = line_col(source, call.span.start as usize);
+            let (line, column) = lines.character_line_column(source, call.span.start as usize)?;
             let slot = call.parent.map_or_else(
                 || "root of this chain".to_owned(),
                 |parent| collector.slot(parent, call.span),
@@ -602,12 +605,13 @@ mod tests {
 
     #[test]
     fn shows_deep_argument_chain_with_exact_offsets() {
-        let source = "function f(){return a(b(c(d(e(f(g(h(1))))))));}";
+        let source = "// comment\r\u{2028}function f(){return /*💡*/a(b(c(d(e(f(g(h(1))))))));}";
         let outline = helper_navigation(source, "helpers/f.js");
         assert!(outline.is_some());
         let view = outline.unwrap_or_default();
         let markdown = view.call_spine_markdown.as_deref().unwrap_or_default();
         assert!(markdown.contains("| 8 | `h`"), "{markdown}");
+        assert!(markdown.contains("`a` | line 3:26,"), "{markdown}");
         assert!(markdown.contains("argument 1"), "{markdown}");
         assert!(markdown.contains("bytes "), "{markdown}");
         assert!(markdown.contains("../helpers/f.js"), "{markdown}");
@@ -674,10 +678,13 @@ mod tests {
 
     #[test]
     fn outlines_nested_writes_with_guards_without_merging_callback_bodies() {
-        let source = "function f(U,flag){let result;result=(U.a=1,flag&&(U.b=2),U.c=(U.d=3),U.e=4,U.f=5,U.g=6,U.h=7,U.i=8,U.j=9,U.k=10,U.l=11,U.m=12,U.n=13,U.o=14,U.p=15,U.q=16,U.r=17,U.s=18,U.t=19,U.fn=function(){hidden=123;},U.u=20);return result;}";
+        let source = "function f(U,flag){let result;\r\u{2029}/*💡*/result=(U.a=1,flag&&(U.b=2),U.c=(U.d=3),U.e=4,U.f=5,U.g=6,U.h=7,U.i=8,U.j=9,U.k=10,U.l=11,U.m=12,U.n=13,U.o=14,U.p=15,U.q=16,U.r=17,U.s=18,U.t=19,U.fn=function(){hidden=123;},U.u=20);return result;}";
         let view = helper_navigation(source, "helpers/f.js").unwrap_or_default();
         let outline = view.assignment_outline_markdown.unwrap_or_default();
         assert!(outline.contains("result ="), "{outline}");
+        assert!(outline.contains("Long assignment at 3:6"), "{outline}");
+        let phases = view.ordered_assignment_phases_markdown.unwrap_or_default();
+        assert!(phases.contains("Assignment at 3:6"), "{phases}");
         assert!(outline.contains("U.b ="), "{outline}");
         assert!(outline.contains("logical && right operand"), "{outline}");
         assert!(outline.contains("U.d ="), "{outline}");

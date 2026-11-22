@@ -5,6 +5,7 @@
 use crate::{
     analysis_artifacts::{load_artifact, DEOBFUSCATION, JS_REFERENCES, SOURCE_INDEX},
     readable_names::{recover_readable_names_with_imports, ImportedNames},
+    source_text::SourceLineIndex,
 };
 use anyhow::{Context, Result};
 use oxc_allocator::Allocator;
@@ -178,45 +179,47 @@ fn parse_exports(source: &str) -> Option<ModuleExports> {
 /// source. Forwarded exports and import aliases have no declaration location
 /// in this module and must not receive invented line numbers.
 fn declaration_lines(source: &str) -> BTreeMap<String, usize> {
-    fn record(source: &str, names: &mut BTreeMap<String, usize>, name: &str, offset: u32) {
+    fn record(
+        lines: &SourceLineIndex,
+        names: &mut BTreeMap<String, usize>,
+        name: &str,
+        offset: u32,
+    ) {
         let Ok(offset) = usize::try_from(offset) else {
-            return;
-        };
-        let Some(prefix) = source.get(..offset) else {
             return;
         };
         names
             .entry(name.to_owned())
-            .or_insert_with(|| prefix.bytes().filter(|byte| *byte == b'\n').count() + 1);
+            .or_insert_with(|| lines.byte_line_column(offset).0);
     }
 
     fn variables(
-        source: &str,
+        lines: &SourceLineIndex,
         names: &mut BTreeMap<String, usize>,
         declaration: &VariableDeclaration<'_>,
     ) {
         for declarator in &declaration.declarations {
             if let BindingPattern::BindingIdentifier(id) = &declarator.id {
-                record(source, names, &id.name, id.span.start);
+                record(lines, names, &id.name, id.span.start);
             }
         }
     }
 
     fn declaration(
-        source: &str,
+        lines: &SourceLineIndex,
         names: &mut BTreeMap<String, usize>,
         declaration: &Declaration<'_>,
     ) {
         match declaration {
-            Declaration::VariableDeclaration(vars) => variables(source, names, vars),
+            Declaration::VariableDeclaration(vars) => variables(lines, names, vars),
             Declaration::FunctionDeclaration(function) => {
                 if let Some(id) = &function.id {
-                    record(source, names, &id.name, id.span.start);
+                    record(lines, names, &id.name, id.span.start);
                 }
             }
             Declaration::ClassDeclaration(class) => {
                 if let Some(id) = &class.id {
-                    record(source, names, &id.name, id.span.start);
+                    record(lines, names, &id.name, id.span.start);
                 }
             }
             _ => {}
@@ -228,32 +231,33 @@ fn declaration_lines(source: &str) -> BTreeMap<String, usize> {
     if !parsed.is_clean() {
         return BTreeMap::new();
     }
+    let lines = SourceLineIndex::new(source);
     let mut names = BTreeMap::new();
     for stmt in &parsed.program.body {
         match stmt {
-            Statement::VariableDeclaration(vars) => variables(source, &mut names, vars),
+            Statement::VariableDeclaration(vars) => variables(&lines, &mut names, vars),
             Statement::FunctionDeclaration(function) => {
                 if let Some(id) = &function.id {
-                    record(source, &mut names, &id.name, id.span.start);
+                    record(&lines, &mut names, &id.name, id.span.start);
                 }
             }
             Statement::ClassDeclaration(class) => {
                 if let Some(id) = &class.id {
-                    record(source, &mut names, &id.name, id.span.start);
+                    record(&lines, &mut names, &id.name, id.span.start);
                 }
             }
             Statement::ExportDeclaration(export) => {
-                declaration(source, &mut names, &export.declaration);
+                declaration(&lines, &mut names, &export.declaration);
             }
             Statement::ExportDefaultDeclaration(export) => match &export.declaration {
                 ExportDefaultDeclarationKind::FunctionDeclaration(function) => {
                     if let Some(id) = &function.id {
-                        record(source, &mut names, &id.name, id.span.start);
+                        record(&lines, &mut names, &id.name, id.span.start);
                     }
                 }
                 ExportDefaultDeclarationKind::ClassDeclaration(class) => {
                     if let Some(id) = &class.id {
-                        record(source, &mut names, &id.name, id.span.start);
+                        record(&lines, &mut names, &id.name, id.span.start);
                     }
                 }
                 _ => {}
@@ -679,7 +683,7 @@ mod tests {
 
     #[test]
     fn declaration_locations_are_ast_grounded_and_ignore_nested_scopes() {
-        let source = "const other=1;\n\nconst Transition = () => 2;\n{ const Inside = 3; }\nexport {Transition as x};";
+        let source = "const other=1;\r\u{2028}const Transition = () => 2;\r\n{ const Inside = 3; }\u{2029}export {Transition as x};";
         let lines = declaration_lines(source);
         assert_eq!(lines.get("other"), Some(&1));
         assert_eq!(lines.get("Transition"), Some(&3));

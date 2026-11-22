@@ -56,6 +56,17 @@ impl SourceLineIndex {
         (index + 1, offset - self.ranges[index].start)
     }
 
+    /// One-based line and Unicode scalar column for human-readable navigation.
+    pub(crate) fn character_line_column(
+        &self,
+        source: &str,
+        offset: usize,
+    ) -> Option<(usize, usize)> {
+        let (line, _) = self.byte_line_column(offset);
+        let prefix = source.get(self.ranges[line - 1].start..offset)?;
+        Some((line, prefix.chars().count() + 1))
+    }
+
     /// CDP uses UTF-16 columns relative to document coordinates; the recorded
     /// script origin column applies only to the first local line. Reject
     /// surrogate midpoints, terminator interiors and out-of-range columns.
@@ -121,6 +132,10 @@ mod tests {
                 assert_eq!(index.byte_line_column(offset).0, row as usize + 1);
             }
         }
+        assert_eq!(index.character_line_column(source, 4), Some((1, 2)));
+        assert_eq!(index.byte_line_column(4), (1, 4));
+        assert_eq!(index.character_line_column(source, 1), None);
+        assert_eq!(index.character_line_column(source, 20), Some((5, 1)));
         assert_eq!(index.cdp_byte_offset(source, 5, 17, 5, 17), Some(0));
         assert_eq!(index.cdp_byte_offset(source, 5, 16, 5, 17), None);
         assert_eq!(index.cdp_byte_offset(source, 6, 0, 5, 17), Some(7));

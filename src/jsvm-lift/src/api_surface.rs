@@ -646,7 +646,7 @@ impl SinkMutationCollector<'_, '_> {
     ) {
         if let Some(path) = path {
             self.mutations
-                .record(&path, span, operation, reflective, self.source, &self.lines);
+                .record(&path, span, operation, reflective, self.source, self.lines);
         }
     }
 
