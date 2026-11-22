@@ -920,6 +920,24 @@ fn depythonify_safe_deob_decoder_number_runtime_equivalence() -> Result<()> {
     script_runtime_equivalence(&refs, "decoder-number", false)
 }
 
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_heap_liveness_runtime_equivalence() -> Result<()> {
+    let churn = "{let waste={x:1};}".repeat(128);
+    let temporaries = "({x:1}),".repeat(128);
+    let sources = [
+        format!("let holder;{{let p={{x:7}};let a={{__proto__:p}};holder={{a}};}}{churn}holder.a.x;"),
+        format!("let holder={{x:{{y:7}},self:null}};holder.self=holder;{churn}holder.self.x.y;"),
+        format!("function f(flag){{let h; if(flag){{let a={{x:7}};h=a;{churn}}}else{{let b={{x:7}};h=b;{churn}}}return h.x;}} [f(true),f(false)];"),
+        format!("function f(flag){{let h={{x:7}};if(flag){{h={{x:7}};{churn}}}return h.x;}}[f(true),f(false)];"),
+        format!("let a={{x:7}};let b=a;b.x=({temporaries}a={{x:9}},8);[b.x,a.x];"),
+        format!("let a={{child:{{x:7}},extra:({temporaries}0)}};a.child.x;"),
+        format!("let holder;{{let a={{x:7}};holder=a;}}{churn}events.push(holder.x);holder.x=8;holder.x;"),
+    ];
+    let refs = sources.iter().map(String::as_str).collect::<Vec<_>>();
+    script_runtime_equivalence(&refs, "heap-liveness", false)
+}
+
 fn script_runtime_equivalence(sources: &[&str], suite: &str, browser_globals: bool) -> Result<()> {
     let scratch = TempDir::new()?;
     // Browser decoders assume standard atob. Node's isolated VM does not

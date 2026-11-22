@@ -747,13 +747,25 @@ impl Analyzer<'_> {
         }
     }
 
+    /// A completed statement has no pending expression references. A
+    /// completed lexical block additionally retires exactly its own cells;
+    /// object identities can still be live through outer aliases.
+    fn collect_heap(&mut self, environment: &mut Environment) -> bool {
+        if let Err(failure) = environment.collect_if_needed(self.budget) {
+            self.failure = Some(failure);
+            environment.clear();
+            return false;
+        }
+        true
+    }
+
     fn statements(&mut self, statements: &[Statement<'_>], environment: &mut Environment) -> bool {
         if let (Some(first), Some(last)) = (statements.first(), statements.last()) {
             self.visited_lists
                 .insert((first.span().start, last.span().end));
         }
         for statement in statements {
-            if !self.statement(statement, environment) {
+            if !self.statement(statement, environment) || !self.collect_heap(environment) {
                 environment.clear();
                 return false;
             }
@@ -779,7 +791,18 @@ impl Analyzer<'_> {
             Statement::ExpressionStatement(statement) => {
                 self.expression(&statement.expression, environment);
             }
-            Statement::BlockStatement(block) => return self.statements(&block.body, environment),
+            Statement::BlockStatement(block) => {
+                let normal = self.statements(&block.body, environment);
+                if let Some(scope) = block.scope_id.get() {
+                    if let Err(failure) = environment
+                        .retire_bindings(self.scoping.get_bindings(scope).values(), self.budget)
+                    {
+                        self.failure = Some(failure);
+                        return false;
+                    }
+                }
+                return normal && self.collect_heap(environment);
+            }
             Statement::IfStatement(branch) => {
                 let test = self.expression(&branch.test, environment);
                 if let Some(value) = &test.fact {
@@ -794,11 +817,15 @@ impl Analyzer<'_> {
                 }
                 let mut other = environment.clone();
                 let first_new = self.next_allocation;
+                let previous_floor = environment.protect_before(first_new);
+                other.protect_before(first_new);
                 let left = self.statement(&branch.consequent, environment);
                 let right = branch
                     .alternate
                     .as_ref()
                     .is_none_or(|alternate| self.statement(alternate, &mut other));
+                environment.protect_before(previous_floor);
+                other.protect_before(previous_floor);
                 match (left, right) {
                     (true, true) => environment.join(&other, first_new),
                     (false, true) => *environment = other,
@@ -877,6 +904,40 @@ mod tests {
                 ))
             })
             .collect())
+    }
+
+    #[test]
+    fn heap_collection_keeps_outer_aliases_prototypes_and_expression_temporaries(
+    ) -> Result<(), BudgetExceeded> {
+        let churn = "{let waste={x:1};}".repeat(256);
+        let source = format!(
+            "let holder;{{let p={{x:7}};let a={{__proto__:p}};holder={{a}};}}{churn}holder.a.x;"
+        );
+        assert_eq!(reads(&source)?, vec![("holder.a.x".into(), "7".into())]);
+        let source = format!(
+            "let holder={{x:{{y:7}},self:null}};holder.self=holder;{churn}holder.self.x.y;"
+        );
+        assert_eq!(
+            reads(&source)?,
+            vec![("holder.self.x.y".into(), "7".into())]
+        );
+        let source = format!(
+            "function f(flag){{let holder; if(flag){{let a={{x:7}};holder=a;{churn}}}else{{let b={{x:7}};holder=b;{churn}}}holder.x;}}"
+        );
+        assert_eq!(reads(&source)?, vec![("holder.x".into(), "7".into())]);
+        let source = format!(
+            "function f(flag){{let holder={{x:7}};if(flag){{holder={{x:7}};{churn}}}holder.x;}}"
+        );
+        assert_eq!(reads(&source)?, vec![("holder.x".into(), "7".into())]);
+        let temporaries = "({x:1}),".repeat(256);
+        let source = format!("let a={{x:7}};let b=a; b.x=({temporaries}a={{x:9}},8);b.x;a.x;");
+        assert_eq!(
+            reads(&source)?,
+            vec![("b.x".into(), "8".into()), ("a.x".into(), "9".into())]
+        );
+        let source = format!("let a={{child:{{x:7}},extra:({temporaries}0)}};a.child.x;");
+        assert_eq!(reads(&source)?, vec![("a.child.x".into(), "7".into())]);
+        Ok(())
     }
 
     #[test]
