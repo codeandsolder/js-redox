@@ -273,7 +273,7 @@ fn materialize_entry(
             }
         }
         let desired = output_path_for(&entry.request.url, &kind, &entry.response.content.mime_type);
-        let stored = store.write(desired, &body)?;
+        let stored = store.write(&desired, &body)?;
         let written = stored.path;
         output_path = Some(written.clone());
         reused_body = stored.reused;
