@@ -3,7 +3,7 @@ use anyhow::{ensure, Context, Result};
 use clap::Parser;
 use jsvm_lift::{
     analysis_artifacts::{
-        load_artifact, EXECUTION_COVERAGE, JS_REFERENCES, RUNTIME_SCRIPTS, SOURCE_INDEX,
+        load_optional_artifact, EXECUTION_COVERAGE, JS_REFERENCES, RUNTIME_SCRIPTS, SOURCE_INDEX,
     },
     capture_project::read_manifest,
     document_entrypoints::captured_document_entrypoints,
@@ -125,8 +125,8 @@ fn main() -> Result<()> {
         );
     }
     let module_graph = match (
-        load_artifact(&project, SOURCE_INDEX, true)?,
-        load_artifact(&project, JS_REFERENCES, true)?,
+        load_optional_artifact(&project, SOURCE_INDEX)?,
+        load_optional_artifact(&project, JS_REFERENCES)?,
     ) {
         (Some(source_index), Some(js_references)) => json!({
             "status":"available",
@@ -142,8 +142,8 @@ fn main() -> Result<()> {
         }),
     };
     let execution_correlations = match (
-        load_artifact(&project, EXECUTION_COVERAGE, true)?,
-        load_artifact(&project, RUNTIME_SCRIPTS, true)?,
+        load_optional_artifact(&project, EXECUTION_COVERAGE)?,
+        load_optional_artifact(&project, RUNTIME_SCRIPTS)?,
     ) {
         (Some(coverage), Some(_)) if coverage["mode"] == "none" => json!({
             "status":"disabled",

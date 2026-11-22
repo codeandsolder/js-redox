@@ -5,7 +5,9 @@ mod source_cache;
 use source_cache::{VerifiedSource, VerifiedSources, SOURCE_CACHE_BYTES};
 
 use crate::{
-    analysis_artifacts::{load_artifact, stage_artifact, RUNTIME_SCRIPTS, SELECTIVE_TRACE},
+    analysis_artifacts::{
+        load_artifact, load_optional_artifact, stage_artifact, RUNTIME_SCRIPTS, SELECTIVE_TRACE,
+    },
     analysis_budget::{AnalysisBudgets, AnalysisOperation},
     report_file::stage_text,
     report_markdown::{code_span, fenced_code, literal_text},
@@ -446,11 +448,11 @@ fn remove_obsolete_pages(output: &Path, hits: Option<&[Value]>) -> Result<()> {
 /// filesystem/serialization errors, or when the analysis budget is exhausted.
 pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -> Result<usize> {
     let output = project.join("src/_observed/invocations");
-    let Some(mut trace) = load_artifact(project, SELECTIVE_TRACE, true)? else {
+    let Some(mut trace) = load_optional_artifact(project, SELECTIVE_TRACE)? else {
         remove_obsolete_pages(&output, None)?;
         return Ok(0);
     };
-    let runtime = load_artifact(project, RUNTIME_SCRIPTS, false)?
+    let runtime = load_artifact(project, RUNTIME_SCRIPTS)
         .context("invocation views require the runtime source inventory")?;
     let budget = budgets.operation(
         AnalysisOperation::SourceMaterialization,
@@ -798,7 +800,7 @@ mod tests {
         assert!(path.contains("Step 1"));
         assert!(path.contains("true"));
 
-        let trace = load_artifact(project, SELECTIVE_TRACE, false)?.context("trace")?;
+        let trace = load_artifact(project, SELECTIVE_TRACE).context("trace")?;
         assert_eq!(
             trace["hits"][0]["readable_view_path"],
             "src/_observed/invocations/0000.md"
@@ -827,10 +829,7 @@ mod tests {
         assert_eq!(fs::read_to_string(output.join("0000-path.md"))?, path);
         assert_eq!(fs::read(output.join("README.md"))?, old_index);
         assert_eq!(fs::read_dir(&output)?.count(), 3);
-        assert_eq!(
-            load_artifact(project, SELECTIVE_TRACE, false)?,
-            Some(invalid)
-        );
+        assert_eq!(load_artifact(project, SELECTIVE_TRACE)?, invalid);
 
         let mut unscoped = trace;
         unscoped["hits"][0]["cdpSession"] = Value::Null;
@@ -849,12 +848,12 @@ mod tests {
 
         // Re-running after a capture loses its path must discard both the
         // previous page and its derived artifact fields.
-        let mut trace = load_artifact(project, SELECTIVE_TRACE, false)?.context("trace")?;
+        let mut trace = load_artifact(project, SELECTIVE_TRACE).context("trace")?;
         trace["hits"][0]["steps"] = json!([]);
         trace["hits"][0]["observed_guard_witnesses"] = json!([{"kind":"stale"}]);
         write_artifact(project, SELECTIVE_TRACE, &trace)?;
         materialize_invocation_views(project, &AnalysisBudgets::standard("path removed"))?;
-        let trace = load_artifact(project, SELECTIVE_TRACE, false)?.context("trace")?;
+        let trace = load_artifact(project, SELECTIVE_TRACE).context("trace")?;
         let hit = &trace["hits"][0];
         assert!(hit.get("path_view_path").is_none());
         assert!(hit.get("observed_guard_witnesses").is_none());

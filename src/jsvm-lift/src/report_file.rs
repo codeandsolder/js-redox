@@ -64,15 +64,41 @@ pub(crate) fn read_bytes(path: &Path) -> Result<Vec<u8>> {
     Ok(data)
 }
 
-/// Decode project-owned JSON, retaining IO errors independently of parse failures.
-pub(crate) fn read_json<T: DeserializeOwned>(path: &Path, label: &str) -> Result<T> {
-    let mut file =
-        open_regular(path).with_context(|| format!("failed to read {label} {}", path.display()))?;
+fn decode_json<T: DeserializeOwned>(mut reader: impl Read, path: &Path, label: &str) -> Result<T> {
     let mut text = String::new();
-    file.read_to_string(&mut text)
+    reader
+        .read_to_string(&mut text)
         .with_context(|| format!("failed to read {label} {}", path.display()))?;
     serde_json::from_str(&text)
         .with_context(|| format!("failed to parse {label} {}", path.display()))
+}
+
+/// Decode mandatory project-owned JSON.
+pub(crate) fn read_json<T: DeserializeOwned>(path: &Path, label: &str) -> Result<T> {
+    let file =
+        open_regular(path).with_context(|| format!("failed to open {label} {}", path.display()))?;
+    decode_json(file, path, label)
+}
+
+/// Only an absent file at open time is an optional result. An opened file
+/// whose subsequent read or parse fails is never an absent artifact.
+pub(crate) fn read_optional_json<T: DeserializeOwned>(
+    path: &Path,
+    label: &str,
+) -> Result<Option<T>> {
+    match open_regular(path) {
+        Ok(file) => decode_json(file, path, label).map(Some),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|cause| cause.kind() == ErrorKind::NotFound) =>
+        {
+            Ok(None)
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to open {label} {}", path.display()))
+        }
+    }
 }
 
 /// Prepare a regular-file destination without removing or modifying it.
@@ -232,6 +258,34 @@ mod tests {
         fs::write(&source, "changed")?;
         assert_eq!(fs::read(&destination)?, bytes);
         assert_eq!(fs::read_dir(root.path())?.count(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn missing_during_read_is_an_error_not_optional_absence() -> Result<()> {
+        struct MissingDuringRead;
+        impl Read for MissingDuringRead {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    ErrorKind::NotFound,
+                    "fixture read failure",
+                ))
+            }
+        }
+        let error = decode_json::<serde_json::Value>(
+            MissingDuringRead,
+            Path::new("fixture.json"),
+            "fixture",
+        )
+        .err()
+        .context("post-open read unexpectedly succeeded")?;
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(ErrorKind::NotFound)
+        );
+        assert!(error.to_string().contains("failed to read"));
         Ok(())
     }
 

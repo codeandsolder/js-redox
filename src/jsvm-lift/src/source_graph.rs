@@ -12,8 +12,8 @@ mod wasm_evidence;
 
 use crate::{
     analysis_artifacts::{
-        load_artifact, API_SURFACE, BUNDLES, DEOBFUSCATION, IMPORT_MAPS, JSVM_INDEX, JS_REFERENCES,
-        RUNTIME_SCRIPTS, SELECTIVE_TRACE, SOURCEMAPS, SOURCE_INDEX, WASM_INDEX,
+        load_optional_artifact, API_SURFACE, BUNDLES, DEOBFUSCATION, IMPORT_MAPS, JSVM_INDEX,
+        JS_REFERENCES, RUNTIME_SCRIPTS, SELECTIVE_TRACE, SOURCEMAPS, SOURCE_INDEX, WASM_INDEX,
         WASM_RESOURCE_PROVENANCE,
     },
     analysis_budget::{AnalysisBudgets, AnalysisOperation},
@@ -83,7 +83,7 @@ fn optional_artifact(
     spec: crate::analysis_artifacts::ArtifactSpec,
     fallback: Value,
 ) -> Result<Value> {
-    Ok(load_artifact(project, spec, true)?.unwrap_or(fallback))
+    Ok(load_optional_artifact(project, spec)?.unwrap_or(fallback))
 }
 
 /// Build the project source/provenance graph from indexed capture evidence.
@@ -316,7 +316,7 @@ mod tests {
         let destination = tempfile::tempdir()?;
         let summary = graph.finish(destination.path(), &manifest, &budget)?;
         assert_eq!(summary.external_urls, 1);
-        let artifact = load_artifact(destination.path(), SOURCE_GRAPH, false)?
+        let artifact = load_artifact(destination.path(), SOURCE_GRAPH)
             .context("finalized graph artifact missing")?;
         assert_eq!(artifact["summary"]["edge_kinds"]["redirect"], 2);
         assert_eq!(artifact["summary"]["edge_kinds"]["script_src"], 2);
@@ -557,7 +557,7 @@ mod tests {
         let project = temp.path().join("project");
         std::fs::create_dir_all(&project)?;
         write_contextual_reference_fixture(&project)?;
-        let graph = load_artifact(&project, SOURCE_GRAPH, false)?.context("missing graph")?;
+        let graph = load_artifact(&project, SOURCE_GRAPH).context("missing graph")?;
         let edges = graph["edges"].as_array().context("missing graph edges")?;
         let refs = edges
             .iter()
@@ -694,7 +694,7 @@ mod tests {
             &project,
             &AnalysisBudgets::standard("runtime-origin-graph-test"),
         )?;
-        let graph = load_artifact(&project, SOURCE_GRAPH, false)?.context("missing graph")?;
+        let graph = load_artifact(&project, SOURCE_GRAPH).context("missing graph")?;
         assert!(graph["edges"]
             .as_array()
             .is_some_and(|edges| edges
@@ -760,7 +760,7 @@ mod tests {
         assert_eq!(summary.nodes, 2);
         assert_eq!(summary.edges, 1);
         assert_eq!(summary.external_urls, 0);
-        let artifact = load_artifact(&project, SOURCE_GRAPH, false)?.context("missing graph")?;
+        let artifact = load_artifact(&project, SOURCE_GRAPH).context("missing graph")?;
         assert!(artifact["nodes"]
             .as_array()
             .is_some_and(|nodes| nodes.iter().any(|node| node["id"] == "resource:42")));
@@ -790,8 +790,7 @@ mod tests {
         assert_eq!(summary.nodes, 2);
         assert_eq!(summary.edges, 1);
         assert_eq!(summary.unresolved_edges, 4);
-        let artifact =
-            load_artifact(destination.path(), SOURCE_GRAPH, false)?.context("missing graph")?;
+        let artifact = load_artifact(destination.path(), SOURCE_GRAPH).context("missing graph")?;
         assert_eq!(artifact["schema"], "source-graph/v2");
         assert_eq!(
             artifact["edges"],

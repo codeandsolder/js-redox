@@ -410,8 +410,8 @@ pub fn materialize_bundle_modules(
         project.display().to_string(),
     );
     stage_budget.checkpoint()?;
-    let deob = load_artifact(project, DEOBFUSCATION, false)?
-        .context("safe deobfuscation artifact is missing")?;
+    let deob =
+        load_artifact(project, DEOBFUSCATION).context("safe deobfuscation artifact is missing")?;
     let deob_units = deob
         .get("units")
         .and_then(Value::as_array)
@@ -755,8 +755,7 @@ mod tests {
             assert!(summary.modules >= 2);
             assert_eq!(summary.failures, 0);
             assert!(project.join("src/_modules/README.md").is_file());
-            let bundles =
-                load_artifact(&project, BUNDLES, false)?.context("bundle artifact missing")?;
+            let bundles = load_artifact(&project, BUNDLES).context("bundle artifact missing")?;
             assert_eq!(
                 bundles
                     .get("summary")

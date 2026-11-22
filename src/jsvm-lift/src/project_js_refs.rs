@@ -212,8 +212,7 @@ pub fn scan_project_references(
     );
     stage_budget.checkpoint()?;
     let manifest = load_manifest(project)?;
-    let source_index =
-        load_artifact(project, SOURCE_INDEX, false)?.context("source index missing")?;
+    let source_index = load_artifact(project, SOURCE_INDEX).context("source index missing")?;
     let (import_maps, import_map_analysis) = load_import_maps(project, &manifest)?;
     stage_budget.checkpoint()?;
 

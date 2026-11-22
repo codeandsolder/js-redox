@@ -1,8 +1,8 @@
 use crate::{
     analysis_artifacts::{
-        load_artifact, API_SURFACE, BUNDLES, DEOBFUSCATION, GENERATED_RECOVERY, IMPORT_MAPS,
-        JSVM_INDEX, JS_REFERENCES, RUNTIME_SCRIPTS, SOURCEMAPS, SOURCE_GRAPH, SOURCE_INDEX,
-        WASM_RESOURCE_PROVENANCE,
+        load_optional_artifact, API_SURFACE, BUNDLES, DEOBFUSCATION, GENERATED_RECOVERY,
+        IMPORT_MAPS, JSVM_INDEX, JS_REFERENCES, RUNTIME_SCRIPTS, SOURCEMAPS, SOURCE_GRAPH,
+        SOURCE_INDEX, WASM_RESOURCE_PROVENANCE,
     },
     analysis_budget::{AnalysisBudgets, AnalysisOperation},
     capture_project::load_manifest,
@@ -64,7 +64,7 @@ fn load_or(
     spec: crate::analysis_artifacts::ArtifactSpec,
     fallback: Value,
 ) -> Result<Value> {
-    Ok(load_artifact(project, spec, true)?.unwrap_or(fallback))
+    Ok(load_optional_artifact(project, spec)?.unwrap_or(fallback))
 }
 
 fn compact(value: Option<&Value>) -> String {
@@ -158,7 +158,7 @@ pub fn refresh_project_readme(project: &Path, budgets: &AnalysisBudgets) -> Resu
             ],
         ),
     )?;
-    let api_surface_doc = load_artifact(&project, API_SURFACE, true)?;
+    let api_surface_doc = load_optional_artifact(&project, API_SURFACE)?;
     let api_surface = api_surface_doc.clone().unwrap_or_else(|| {
         default_artifact(
             API_SURFACE.schema,
@@ -204,7 +204,7 @@ pub fn refresh_project_readme(project: &Path, budgets: &AnalysisBudgets) -> Resu
             ],
         ),
     )?;
-    let wasm_resource_provenance = load_artifact(&project, WASM_RESOURCE_PROVENANCE, true)?;
+    let wasm_resource_provenance = load_optional_artifact(&project, WASM_RESOURCE_PROVENANCE)?;
     budget.checkpoint()?;
 
     let resources = array(&manifest_value, "resources");

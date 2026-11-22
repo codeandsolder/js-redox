@@ -79,7 +79,7 @@ pub(super) fn import_selective_trace(
     {
         bail!("invalid or unsupported selective breakpoint trace");
     }
-    let runtime = load_artifact(project, RUNTIME_SCRIPTS, false)?
+    let runtime = load_artifact(project, RUNTIME_SCRIPTS)
         .context("runtime inventory required for breakpoint source verification")?;
     let identities =
         ScriptIdentityIndex::from_runtime_report(&runtime, &budget, |sha, _, _| sha.to_owned())?;
@@ -244,7 +244,7 @@ mod tests {
             }))?,
         )?;
         import_selective_trace(&capture, &project, &AnalysisBudgets::standard("fixture"))?;
-        let result = load_artifact(&project, SELECTIVE_TRACE, false)?.context("missing trace")?;
+        let result = load_artifact(&project, SELECTIVE_TRACE).context("missing trace")?;
         assert_eq!(result["summary"]["verifiedSourceFrames"], 1);
         assert_eq!(result["summary"]["unresolvedSourceFrames"], 2);
         assert_eq!(result["summary"]["verifiedStepFrames"], 1);

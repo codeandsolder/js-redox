@@ -260,35 +260,28 @@ pub fn build_artifact(
     Ok(document)
 }
 
-/// Read, decode and validate a schema-specific analysis artifact.
+/// Load and validate a mandatory project artifact.
 ///
 /// # Errors
-///
-/// Fails on file-read errors, invalid JSON, a mismatched schema or missing/incorrect required fields.
-pub fn read_artifact(path: &Path, spec: ArtifactSpec) -> Result<Value> {
-    let document = crate::report_file::read_json(path, spec.name)?;
+/// Missing files, read/parse failures and schema violations are errors.
+pub fn load_artifact(project: &Path, spec: ArtifactSpec) -> Result<Value> {
+    let path = artifact_path(project, spec);
+    let document = crate::report_file::read_json(&path, spec.name)?;
     validate_artifact(&document, spec, &path.display().to_string())?;
     Ok(document)
 }
 
-/// Load a project artifact, optionally accepting its absence.
+/// Load an optional project artifact without hiding read or parse failures.
 ///
 /// # Errors
-///
-/// Propagates read, parse and validation failures; a missing optional artifact returns `Ok(None)`.
-pub fn load_artifact(project: &Path, spec: ArtifactSpec, optional: bool) -> Result<Option<Value>> {
-    match read_artifact(&artifact_path(project, spec), spec) {
-        Ok(document) => Ok(Some(document)),
-        Err(error)
-            if optional
-                && error
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|cause| cause.kind() == std::io::ErrorKind::NotFound) =>
-        {
-            Ok(None)
-        }
-        Err(error) => Err(error),
-    }
+/// Propagates all errors except an absent file at open time.
+pub fn load_optional_artifact(project: &Path, spec: ArtifactSpec) -> Result<Option<Value>> {
+    let path = artifact_path(project, spec);
+    let Some(document) = crate::report_file::read_optional_json(&path, spec.name)? else {
+        return Ok(None);
+    };
+    validate_artifact(&document, spec, &path.display().to_string())?;
+    Ok(Some(document))
 }
 
 /// Stage a validated artifact without replacing its published file.
@@ -325,18 +318,18 @@ mod tests {
         fs::create_dir_all(project.join("analysis"))?;
         let target = project.join("manifest.json");
         symlink(&target, &path)?;
-        assert!(load_artifact(project, SOURCE_INDEX, true).is_err());
+        assert!(load_optional_artifact(project, SOURCE_INDEX).is_err());
         let valid = json!({"schema":SOURCE_INDEX.schema,"units":[],"summary":{}});
         fs::write(&target, serde_json::to_vec(&valid)?)?;
-        assert!(load_artifact(project, SOURCE_INDEX, true).is_err());
+        assert!(load_optional_artifact(project, SOURCE_INDEX).is_err());
         fs::remove_file(&path)?;
         let socket = UnixListener::bind(&path)?;
-        assert!(load_artifact(project, SOURCE_INDEX, true).is_err());
+        assert!(load_optional_artifact(project, SOURCE_INDEX).is_err());
         drop(socket);
         fs::remove_file(&path)?;
-        assert!(load_artifact(project, SOURCE_INDEX, true)?.is_none());
+        assert!(load_optional_artifact(project, SOURCE_INDEX)?.is_none());
         write_artifact(project, SOURCE_INDEX, &valid)?;
-        assert_eq!(load_artifact(project, SOURCE_INDEX, true)?, Some(valid));
+        assert_eq!(load_optional_artifact(project, SOURCE_INDEX)?, Some(valid));
         Ok(())
     }
 
@@ -344,17 +337,17 @@ mod tests {
     fn optional_artifact_ignores_missing_file_not_other_read_failures() -> Result<()> {
         let temp = tempfile::TempDir::new()?;
         let project = temp.path();
-        assert!(load_artifact(project, SOURCE_INDEX, true)?.is_none());
-        assert!(load_artifact(project, SOURCE_INDEX, false).is_err());
+        assert!(load_optional_artifact(project, SOURCE_INDEX)?.is_none());
+        assert!(load_artifact(project, SOURCE_INDEX).is_err());
         // A non-directory path component makes the requested artifact
         // inaccessible, rather than an optional missing artifact.
         let directory = project.join("analysis");
         fs::write(&directory, "not a directory")?;
-        assert!(load_artifact(project, SOURCE_INDEX, true).is_err());
+        assert!(load_optional_artifact(project, SOURCE_INDEX).is_err());
         fs::remove_file(&directory)?;
         fs::create_dir(&directory)?;
         fs::write(artifact_path(project, SOURCE_INDEX), "invalid JSON")?;
-        assert!(load_artifact(project, SOURCE_INDEX, true).is_err());
+        assert!(load_optional_artifact(project, SOURCE_INDEX).is_err());
         Ok(())
     }
 
