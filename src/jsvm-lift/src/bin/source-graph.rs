@@ -13,8 +13,8 @@ fn main() -> Result<()> {
     let args = Args::parse();
     let summary = build_source_graph(&args.project, &AnalysisBudgets::standard("source-graph"))?;
     println!(
-        "source graph: {} nodes / {} edges / {} external URLs",
-        summary.nodes, summary.edges, summary.external_urls
+        "source graph: {} nodes / {} edges / {} unresolved claims / {} external URLs",
+        summary.nodes, summary.edges, summary.unresolved_edges, summary.external_urls
     );
     Ok(())
 }

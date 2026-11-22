@@ -152,6 +152,7 @@ pub fn refresh_project_readme(project: &Path, budgets: &AnalysisBudgets) -> Resu
             [
                 ("nodes", json!([])),
                 ("edges", json!([])),
+                ("unresolved_edges", json!([])),
                 ("summary", json!({})),
             ],
         ),
@@ -570,6 +571,10 @@ pub fn refresh_project_readme(project: &Path, budgets: &AnalysisBudgets) -> Resu
             String::new(),
             format!("- Nodes: **{}**", usize_field(summary, "nodes")),
             format!("- Edges: **{}**", usize_field(summary, "edges")),
+            format!(
+                "- Unresolved link claims (missing graph endpoints): **{}**",
+                usize_field(summary, "unresolved_edges")
+            ),
             format!(
                 "- External uncaptured URLs: **{}**",
                 usize_field(summary, "external_urls")

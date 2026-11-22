@@ -154,6 +154,7 @@ fn print_summary(
     let runtime_sources = summary_u64(&runtime, "unique_javascript_sources");
     let graph_nodes = summary_u64(&graph, "nodes");
     let graph_edges = summary_u64(&graph, "edges");
+    let graph_unresolved = summary_u64(&graph, "unresolved_edges");
 
     println!("\nProject ready: {}", project.display());
     println!("  input kind:           {}", manifest.source.kind);
@@ -233,7 +234,7 @@ fn print_summary(
             summary_u64(&observed, "formatted_sources")
         );
     }
-    println!("  source graph:         {graph_nodes} nodes / {graph_edges} edges");
+    println!("  source graph:         {graph_nodes} nodes / {graph_edges} edges / {graph_unresolved} unresolved claims");
     Ok(())
 }
 

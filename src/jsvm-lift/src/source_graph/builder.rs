@@ -234,9 +234,27 @@ impl GraphBuilder {
         budget: &WorkBudget,
     ) -> Result<SourceGraphSummary> {
         let mut edge_counts = BTreeMap::<String, usize>::new();
-        for identity in self.edges.keys() {
+        let mut unresolved_edge_counts = BTreeMap::<String, usize>::new();
+        let mut edges = Vec::new();
+        let mut unresolved_edges = Vec::new();
+        // Resolve endpoints only after all stages have populated the inventory.
+        // A partial artifact can retain claims without inventing captured nodes
+        // or publishing dangling relationships as actual graph links.
+        for (identity, edge) in self.edges {
             budget.checkpoint()?;
-            *edge_counts.entry(identity.kind.clone()).or_default() += 1;
+            let from_missing = !self.nodes.contains_key(&identity.from);
+            let to_missing = !self.nodes.contains_key(&identity.to);
+            if from_missing || to_missing {
+                let missing_endpoints = [(from_missing, "from"), (to_missing, "to")]
+                    .into_iter()
+                    .filter_map(|(missing, endpoint)| missing.then_some(endpoint))
+                    .collect::<Vec<_>>();
+                *unresolved_edge_counts.entry(identity.kind).or_default() += 1;
+                unresolved_edges.push(json!({"edge":edge,"missing_endpoints":missing_endpoints}));
+            } else {
+                *edge_counts.entry(identity.kind).or_default() += 1;
+                edges.push(edge);
+            }
         }
         let mut node_counts = BTreeMap::<String, usize>::new();
         for node in self.nodes.values().map(NodeRecord::value) {
@@ -247,7 +265,8 @@ impl GraphBuilder {
         }
         let summary = SourceGraphSummary {
             nodes: self.nodes.len(),
-            edges: self.edges.len(),
+            edges: edges.len(),
+            unresolved_edges: unresolved_edges.len(),
             external_urls: node_counts.get("external_url").copied().unwrap_or(0),
         };
         budget.checkpoint()?;
@@ -256,12 +275,15 @@ impl GraphBuilder {
             "project": project.display().to_string(),
             "capture_salvaged": manifest.source.salvaged,
             "nodes": self.nodes.into_values().map(NodeRecord::into_value).collect::<Vec<_>>(),
-            "edges": self.edges.into_values().collect::<Vec<_>>(),
+            "edges": edges,
+            "unresolved_edges": unresolved_edges,
             "summary": {
                 "nodes": summary.nodes,
                 "edges": summary.edges,
                 "node_types": node_counts,
                 "edge_kinds": edge_counts,
+                "unresolved_edges": summary.unresolved_edges,
+                "unresolved_edge_kinds": unresolved_edge_counts,
                 "external_urls": summary.external_urls,
             },
         });
