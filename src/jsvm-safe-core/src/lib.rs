@@ -13,6 +13,7 @@ mod decoder_encoding;
 mod effect_statements;
 mod effectful_constant;
 mod empty_iife;
+mod fresh_data;
 mod if_ladder_structure;
 mod iteration_history;
 mod numeric;
@@ -625,6 +626,7 @@ struct Collector<'s, 'c> {
     completion: &'c completion::CompletionLiveness,
     scoping: &'c Scoping,
     arrays: &'c HashMap<SymbolId, Vec<Value>>,
+    fresh_data: &'c fresh_data::FreshDataReads,
     decoders: &'c HashMap<SymbolId, Decoder>,
     constants: &'c ProvenConstantEnvironment,
     shorthand_spans: &'c HashSet<(u32, u32)>,
@@ -1666,6 +1668,12 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
                 }
             }
         }
+        if let Some(value) = self.fresh_data.get(it.span) {
+            if let Some(text) = value.render_expression() {
+                self.push(it.span, text, "fresh_own_member");
+                return;
+            }
+        }
         walk::walk_static_member_expression(self, it);
     }
 
@@ -1711,6 +1719,12 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
             ) {
                 self.push(it.span, text, "static_array_lookup");
                 walk::walk_computed_member_expression(self, it);
+                return;
+            }
+        }
+        if let Some(value) = self.fresh_data.get(it.span) {
+            if let Some(text) = value.render_expression() {
+                self.push(it.span, text, "fresh_own_member");
                 return;
             }
         }
@@ -2038,6 +2052,8 @@ fn transform_once(
 
     let constants = ProvenConstantEnvironment::collect(&program, scoping);
     let arrays = static_readonly_arrays(&program, scoping, &constants.initialization);
+    let fresh_data =
+        fresh_data::FreshDataReads::analyze(&program, scoping, &constants.initialization, budget)?;
     budget.checkpoint()?;
     let reference_spans = collect_reference_spans(&program);
     budget.checkpoint()?;
@@ -2084,6 +2100,7 @@ fn transform_once(
         completion: &completion,
         scoping,
         arrays: &arrays,
+        fresh_data: &fresh_data,
         decoders: &decoders,
         constants: &constants,
         shorthand_spans: &shorthand_spans,

@@ -5,7 +5,9 @@ use crate::decoder_encoding::{
 mod fixed_base64_proof;
 
 use crate::rewrite::Replacement;
-use crate::value_eval::{eval, js_to_uint32, render_value_array, same_values, Value};
+use crate::value_eval::{
+    eval, js_to_uint32, literal_property_key, render_value_array, same_values, Value,
+};
 use crate::{
     argument_integer, array_element, decoder_argument_integer, expression_integer, fragment,
     reference_is_statically_resolved_read, statically_resolved_symbol,
@@ -2439,7 +2441,7 @@ fn numeric_object_values(
         {
             return None;
         }
-        let key = property.key.static_name()?.into_cow_str()?.into_owned();
+        let key = literal_property_key(&property.key)?;
         // In an object initializer, a non-computed `__proto__` key mutates the
         // object's prototype rather than defining an ordinary own property.
         if key == "__proto__" {

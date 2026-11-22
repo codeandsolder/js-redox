@@ -907,7 +907,8 @@ fn expose_static_strings_allow_with(
             return Ok(None);
         }
         budget.checkpoint()?;
-        let replacements = static_string_exposure_pass(&program, semantic_ret.semantic.scoping());
+        let replacements =
+            static_string_exposure_pass(&program, semantic_ret.semantic.scoping(), budget)?;
         budget.checkpoint()?;
         if replacements.is_empty() {
             break;

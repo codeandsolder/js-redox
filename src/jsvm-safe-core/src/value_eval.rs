@@ -8,8 +8,8 @@
 //! binding identity, initialization and side-effect-free property access.
 
 use oxc_ast::ast::{
-    ArrayExpressionElement, Expression, LogicalExpression, StringLiteral, TemplateElement,
-    UnaryExpression,
+    ArrayExpressionElement, Expression, LogicalExpression, PropertyKey, StringLiteral,
+    TemplateElement, UnaryExpression,
 };
 use oxc_ecmascript::{StringToNumber, ToInt32, ToUint32};
 use oxc_syntax::number::ToJsString;
@@ -32,6 +32,19 @@ pub fn canonical_array_index(value: &Value) -> Option<u32> {
 #[must_use]
 pub fn string_literal_value(literal: &StringLiteral<'_>) -> Option<String> {
     literal.value.as_str().map(str::to_owned)
+}
+
+/// Exact ToPropertyKey for noncomputed object-literal keys. Oxc's
+/// StaticPropertyName uses Rust float display for numeric literals, which
+/// disagrees with JavaScript at exponential magnitudes and signed zero.
+pub(crate) fn literal_property_key(key: &PropertyKey<'_>) -> Option<String> {
+    match key {
+        PropertyKey::StaticIdentifier(identifier) => Some(identifier.name.to_string()),
+        PropertyKey::StringLiteral(literal) => string_literal_value(literal),
+        PropertyKey::NumericLiteral(literal) => Some(literal.value.to_js_string()),
+        PropertyKey::BigIntLiteral(literal) => Some(literal.value.to_string()),
+        _ => None,
+    }
 }
 
 /// Recover a template quasi with the original AST's cooked/raw semantics.
