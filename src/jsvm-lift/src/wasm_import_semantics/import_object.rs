@@ -1,5 +1,6 @@
 use super::{assignment_property, module_identity::ExactModuleSite, symbol_of, unparenthesized};
 use crate::global_builtin::namespace_member_name;
+use crate::global_builtin::{GlobalAliases, InvocationSite};
 use oxc_ast::ast::{
     Argument, AssignmentTarget, BindingPattern, BlockStatement, CallExpression, Expression,
     Function, Program, Statement, SwitchCase,
@@ -31,6 +32,8 @@ pub struct WasmInstantiationSite {
     pub module_sha256: Option<String>,
     pub module_identity_kind: Option<&'static str>,
     pub standard_module_decode_builtins_required: bool,
+    #[serde(skip)]
+    pub(super) factory_invocation: Option<InvocationSite>,
 }
 
 /// Links an `imports.<module>.<name>` assignment root to later WebAssembly instantiation sites.
@@ -127,12 +130,13 @@ fn site_record(
         module_identity_kind: exact.map(|site| site.identity_kind),
         standard_module_decode_builtins_required: exact
             .is_some_and(|site| site.standard_decode_builtins_required),
+        factory_invocation: None,
     }
 }
 
 struct InstantiationSiteCollector<'c, 'g, 'm> {
     scoping: &'c Scoping,
-    global_aliases: &'g HashMap<SymbolId, String>,
+    global_aliases: &'g GlobalAliases,
     exact_sites: &'m HashMap<(u32, u32), ExactModuleSite>,
     sites: HashMap<SymbolId, Vec<WasmInstantiationSite>>,
 }
@@ -251,7 +255,7 @@ fn fresh_returned_object(
     function: &Function<'_>,
     scoping: &Scoping,
 ) -> Option<FreshReturnedObject> {
-    if !has_exactly_one_function_return(function) {
+    if function.r#async || function.generator || !has_exactly_one_function_return(function) {
         return None;
     }
     let body = function.body.as_ref()?;
@@ -304,8 +308,12 @@ struct ReturnedObjectFunctionCollector<'c> {
 
 impl<'a> Visit<'a> for ReturnedObjectFunctionCollector<'_> {
     fn visit_function(&mut self, function: &Function<'a>, flags: oxc_syntax::scope::ScopeFlags) {
-        if let Some(identifier) = &function.id {
-            if let Some(function_symbol) = identifier.symbol_id.get() {
+        if function.r#type == oxc_ast::ast::FunctionType::FunctionDeclaration {
+            if let Some(function_symbol) = function
+                .id
+                .as_ref()
+                .and_then(|identifier| identifier.symbol_id.get())
+            {
                 if super::symbol_binding_is_stable(self.scoping, function_symbol) {
                     if let Some(object) = fresh_returned_object(function, self.scoping) {
                         self.functions.insert(function_symbol, object);
@@ -344,6 +352,7 @@ struct ReturnedObjectAlias {
     result_symbol: SymbolId,
     object_symbol: SymbolId,
     position: StatementPosition,
+    invocation: InvocationSite,
 }
 
 #[derive(Default)]
@@ -476,22 +485,42 @@ fn record_return_sequence_assignments(
 
 fn returned_object_for_call(
     scoping: &Scoping,
+    global_aliases: &GlobalAliases,
     functions: &HashMap<SymbolId, FreshReturnedObject>,
     expression: &Expression<'_>,
-) -> Option<FreshReturnedObject> {
+) -> Option<(FreshReturnedObject, InvocationSite)> {
     let Expression::CallExpression(call) = unparenthesized(expression) else {
         return None;
     };
     if call.optional || call.arguments.iter().any(Argument::is_spread) {
         return None;
     }
-    functions.get(&symbol_of(scoping, &call.callee)?).copied()
+    let Expression::Identifier(identifier) = unparenthesized(&call.callee) else {
+        return None;
+    };
+    let reference = identifier.reference_id.get()?;
+    let callee = global_aliases.facts().resolved_symbol(scoping, reference)?;
+    if !global_aliases
+        .facts()
+        .binding_has_stable_value(scoping, callee)
+    {
+        return None;
+    }
+    Some((
+        *functions.get(&callee)?,
+        InvocationSite {
+            callee,
+            scope: scoping.get_reference(reference).scope_id(),
+            span: call.span,
+        },
+    ))
 }
 
 fn record_region(
     statements: &[Statement<'_>],
     region: RegionId,
     scoping: &Scoping,
+    global_aliases: &GlobalAliases,
     functions: &HashMap<SymbolId, FreshReturnedObject>,
     facts: &mut DirectExecutionFacts,
 ) {
@@ -516,15 +545,20 @@ fn record_region(
                     let Some(result_symbol) = identifier.symbol_id.get() else {
                         continue;
                     };
-                    let Some(returned) = returned_object_for_call(scoping, functions, initializer)
+                    let Some((returned, invocation)) =
+                        returned_object_for_call(scoping, global_aliases, functions, initializer)
                     else {
                         continue;
                     };
-                    if super::symbol_binding_is_stable(scoping, result_symbol) {
+                    if global_aliases
+                        .facts()
+                        .binding_has_stable_value(scoping, result_symbol)
+                    {
                         facts.aliases.push(ReturnedObjectAlias {
                             result_symbol,
                             object_symbol: returned.object_symbol,
                             position,
+                            invocation,
                         });
                     }
                 }
@@ -541,6 +575,7 @@ fn record_region(
 
 struct FunctionRegionCollector<'c, 'f> {
     scoping: &'c Scoping,
+    global_aliases: &'f GlobalAliases,
     functions: &'f HashMap<SymbolId, FreshReturnedObject>,
     facts: DirectExecutionFacts,
 }
@@ -555,6 +590,7 @@ impl<'a> Visit<'a> for FunctionRegionCollector<'_, '_> {
                     end: function.span.end,
                 },
                 self.scoping,
+                self.global_aliases,
                 self.functions,
                 &mut self.facts,
             );
@@ -570,6 +606,7 @@ impl<'a> Visit<'a> for FunctionRegionCollector<'_, '_> {
                 end: block.span.end,
             },
             self.scoping,
+            self.global_aliases,
             self.functions,
             &mut self.facts,
         );
@@ -584,6 +621,7 @@ impl<'a> Visit<'a> for FunctionRegionCollector<'_, '_> {
                 end: case.span.end,
             },
             self.scoping,
+            self.global_aliases,
             self.functions,
             &mut self.facts,
         );
@@ -594,10 +632,12 @@ impl<'a> Visit<'a> for FunctionRegionCollector<'_, '_> {
 fn collect_direct_execution_facts(
     program: &Program<'_>,
     scoping: &Scoping,
+    global_aliases: &GlobalAliases,
     functions: &HashMap<SymbolId, FreshReturnedObject>,
 ) -> DirectExecutionFacts {
     let mut collector = FunctionRegionCollector {
         scoping,
+        global_aliases,
         functions,
         facts: DirectExecutionFacts::default(),
     };
@@ -608,6 +648,7 @@ fn collect_direct_execution_facts(
             end: program.span.end,
         },
         scoping,
+        global_aliases,
         functions,
         &mut collector.facts,
     );
@@ -637,7 +678,7 @@ fn site_is_later_in_region(
 pub(super) fn collect_instantiation_sites(
     program: &Program<'_>,
     scoping: &Scoping,
-    global_aliases: &HashMap<SymbolId, String>,
+    global_aliases: &GlobalAliases,
     exact_sites: &HashMap<(u32, u32), ExactModuleSite>,
 ) -> HashMap<(u32, u32), Vec<WasmInstantiationSite>> {
     let mut collector = InstantiationSiteCollector {
@@ -649,7 +690,8 @@ pub(super) fn collect_instantiation_sites(
     collector.visit_program(program);
 
     let returned_functions = collect_returned_object_functions(program, scoping);
-    let facts = collect_direct_execution_facts(program, scoping, &returned_functions);
+    let facts =
+        collect_direct_execution_facts(program, scoping, global_aliases, &returned_functions);
     let member_write_counts = collect_import_member_write_counts(program, scoping);
     let factories_by_object = returned_functions
         .values()
@@ -703,6 +745,7 @@ pub(super) fn collect_instantiation_sites(
                         }
                         let mut site = site.clone();
                         site.import_object_identity_kind = "returned_object_call";
+                        site.factory_invocation = Some(alias.invocation);
                         Some(site)
                     }));
                 }

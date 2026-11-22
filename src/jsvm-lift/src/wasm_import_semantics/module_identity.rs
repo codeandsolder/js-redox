@@ -1,4 +1,5 @@
 use super::{symbol_of, unparenthesized};
+use crate::global_builtin::GlobalAliases;
 use crate::{
     global_builtin::namespace_member_name, sha256_hex,
     static_bytes::recover_webassembly_byte_artifacts_from_program,
@@ -26,7 +27,7 @@ enum StaticWasmValue {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum HelperKind {
     Base64ArrayBufferPair,
-    ArrayIdentity,
+    ArrayIdentity { alias: Option<SymbolId> },
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -53,6 +54,7 @@ fn first_parameter_name<'a>(function: &'a Function<'a>) -> Option<&'a str> {
 
 struct RequiredUnresolvedGlobals<'c> {
     scoping: &'c Scoping,
+    global_aliases: &'c GlobalAliases,
     required: HashSet<&'static str>,
     seen: HashSet<&'static str>,
     valid: bool,
@@ -72,11 +74,10 @@ impl<'a> Visit<'a> for RequiredUnresolvedGlobals<'_> {
             self.valid = false;
             return;
         };
-        if self
-            .scoping
-            .get_reference(reference_id)
-            .symbol_id()
-            .is_some()
+        if !self
+            .global_aliases
+            .facts()
+            .proves_global_reference(self.scoping, reference_id)
         {
             self.valid = false;
             return;
@@ -88,10 +89,12 @@ impl<'a> Visit<'a> for RequiredUnresolvedGlobals<'_> {
 fn has_required_unresolved_globals(
     function: &Function<'_>,
     scoping: &Scoping,
+    global_aliases: &GlobalAliases,
     names: &[&'static str],
 ) -> bool {
     let mut probe = RequiredUnresolvedGlobals {
         scoping,
+        global_aliases,
         required: names.iter().copied().collect(),
         seen: HashSet::new(),
         valid: true,
@@ -102,6 +105,7 @@ fn has_required_unresolved_globals(
 
 struct ExactNamedSymbolReferences<'c, 'n> {
     scoping: &'c Scoping,
+    global_aliases: &'c GlobalAliases,
     name: &'n str,
     symbol: SymbolId,
     seen: bool,
@@ -117,7 +121,14 @@ impl<'a> Visit<'a> for ExactNamedSymbolReferences<'_, '_> {
             self.valid = false;
             return;
         };
-        if self.scoping.get_reference(reference_id).symbol_id() != Some(self.symbol) {
+        if self
+            .global_aliases
+            .facts()
+            .resolved_symbol(self.scoping, reference_id)
+            != Some(self.symbol)
+            || !self.scoping.get_reference(reference_id).is_read()
+            || self.scoping.get_reference(reference_id).is_write()
+        {
             self.valid = false;
             return;
         }
@@ -128,11 +139,13 @@ impl<'a> Visit<'a> for ExactNamedSymbolReferences<'_, '_> {
 fn function_references_name_only_as_symbol(
     function: &Function<'_>,
     scoping: &Scoping,
+    global_aliases: &GlobalAliases,
     name: &str,
     symbol: SymbolId,
 ) -> bool {
     let mut probe = ExactNamedSymbolReferences {
         scoping,
+        global_aliases,
         name,
         symbol,
         seen: false,
@@ -160,6 +173,7 @@ fn classify_base64_array_buffer_pair(
     source: &str,
     function: &Function<'_>,
     scoping: &Scoping,
+    global_aliases: &GlobalAliases,
     parameter: &str,
 ) -> bool {
     let Some(body) = &function.body else {
@@ -246,28 +260,24 @@ fn classify_base64_array_buffer_pair(
         return false;
     }
 
-    has_required_unresolved_globals(function, scoping, &["Uint8Array", "atob"])
+    has_required_unresolved_globals(function, scoping, global_aliases, &["Uint8Array", "atob"])
 }
 
 fn classify_array_identity(
     source: &str,
     function: &Function<'_>,
     scoping: &Scoping,
-    global_aliases: &HashMap<SymbolId, String>,
+    global_aliases: &GlobalAliases,
     parameter: &str,
-) -> bool {
-    let Some(body) = &function.body else {
-        return false;
-    };
+) -> Option<HelperKind> {
+    let body = function.body.as_ref()?;
     let [statement] = body.statements.as_slice() else {
-        return false;
+        return None;
     };
     let Statement::ReturnStatement(_) = statement else {
-        return false;
+        return None;
     };
-    let Some(statement) = compact_statement(source, statement) else {
-        return false;
-    };
+    let statement = compact_statement(source, statement)?;
     let prefix = format!("returnfunction({parameter}){{");
     let suffix = format!("}}({parameter})||");
     let suffix_semicolon = format!(";}}({parameter})||");
@@ -275,38 +285,49 @@ fn classify_array_identity(
         statement.starts_with(&format!("{prefix}{guard}"))
             && (statement.contains(&suffix) || statement.contains(&suffix_semicolon))
     };
-    let local_alias_identity = global_aliases.keys().any(|symbol| {
-        let alias = scoping.symbol_name(*symbol);
+    let local_alias_identity = global_aliases.symbols().find(|&symbol| {
+        let alias = scoping.symbol_name(symbol);
         has_shape(&format!(
             "if({alias}.Array.isArray({parameter}))return{parameter}"
-        )) && function_references_name_only_as_symbol(function, scoping, alias, *symbol)
+        )) && function_references_name_only_as_symbol(
+            function,
+            scoping,
+            global_aliases,
+            alias,
+            symbol,
+        )
     });
     let direct_identity = has_shape(&format!("if(Array.isArray({parameter}))return{parameter}"))
-        && has_required_unresolved_globals(function, scoping, &["Array"]);
-    local_alias_identity || direct_identity
+        && has_required_unresolved_globals(function, scoping, global_aliases, &["Array"]);
+    if direct_identity {
+        Some(HelperKind::ArrayIdentity { alias: None })
+    } else {
+        local_alias_identity.map(|symbol| HelperKind::ArrayIdentity {
+            alias: Some(symbol),
+        })
+    }
 }
 
 fn classify_helper(
     source: &str,
     function: &Function<'_>,
     scoping: &Scoping,
-    global_aliases: &HashMap<SymbolId, String>,
+    global_aliases: &GlobalAliases,
 ) -> Option<HelperKind> {
     if function.r#async || function.generator {
         return None;
     }
     let parameter = first_parameter_name(function)?;
-    if classify_base64_array_buffer_pair(source, function, scoping, parameter) {
+    if classify_base64_array_buffer_pair(source, function, scoping, global_aliases, parameter) {
         return Some(HelperKind::Base64ArrayBufferPair);
     }
     classify_array_identity(source, function, scoping, global_aliases, parameter)
-        .then_some(HelperKind::ArrayIdentity)
 }
 
 struct HelperCollector<'c, 's, 'g> {
     source: &'s str,
     scoping: &'c Scoping,
-    global_aliases: &'g HashMap<SymbolId, String>,
+    global_aliases: &'g GlobalAliases,
     helpers: HashMap<SymbolId, HelperKind>,
 }
 
@@ -329,7 +350,7 @@ fn collect_helpers(
     source: &str,
     program: &Program<'_>,
     scoping: &Scoping,
-    global_aliases: &HashMap<SymbolId, String>,
+    global_aliases: &GlobalAliases,
 ) -> HashMap<SymbolId, HelperKind> {
     let mut collector = HelperCollector {
         source,
@@ -355,7 +376,7 @@ struct Evaluator<'c, 'h, 'v, 'g> {
     scoping: &'c Scoping,
     helpers: &'h HashMap<SymbolId, HelperKind>,
     values: &'v HashMap<SymbolId, StaticWasmValue>,
-    global_aliases: &'g HashMap<SymbolId, String>,
+    global_aliases: &'g GlobalAliases,
 }
 
 impl Evaluator<'_, '_, '_, '_> {
@@ -382,13 +403,35 @@ impl Evaluator<'_, '_, '_, '_> {
             Expression::CallExpression(call)
                 if !call.optional && !call.arguments.iter().any(Argument::is_spread) =>
             {
-                let helper = self.helpers.get(&symbol_of(self.scoping, &call.callee)?)?;
+                let Expression::Identifier(callee) = unparenthesized(&call.callee) else {
+                    return None;
+                };
+                let reference = callee.reference_id.get()?;
+                let facts = self.global_aliases.facts();
+                let symbol = facts.resolved_symbol(self.scoping, reference)?;
+                if !facts.binding_has_stable_value(self.scoping, symbol) {
+                    return None;
+                }
+                let helper = self.helpers.get(&symbol)?;
+                // A helper declaration can be hoisted. Its captured alias
+                // identity is checked at discovery; its initialized value
+                // must be available at this particular invocation.
+                if let HelperKind::ArrayIdentity { alias: Some(alias) } = helper {
+                    if !facts.proves_value_initialized(
+                        self.scoping,
+                        *alias,
+                        self.scoping.get_reference(reference).scope_id(),
+                        call.span,
+                    ) {
+                        return None;
+                    }
+                }
                 let first = call.arguments.first()?.as_expression()?;
                 match (helper, self.expression(first)?) {
                     (HelperKind::Base64ArrayBufferPair, StaticWasmValue::Base64Module(sha256)) => {
                         Some(StaticWasmValue::BufferPair(sha256))
                     }
-                    (HelperKind::ArrayIdentity, StaticWasmValue::BufferPair(sha256)) => {
+                    (HelperKind::ArrayIdentity { .. }, StaticWasmValue::BufferPair(sha256)) => {
                         Some(StaticWasmValue::BufferPair(sha256))
                     }
                     _ => None,
@@ -546,7 +589,7 @@ fn collect_static_values(
     program: &Program<'_>,
     scoping: &Scoping,
     helpers: &HashMap<SymbolId, HelperKind>,
-    global_aliases: &HashMap<SymbolId, String>,
+    global_aliases: &GlobalAliases,
 ) -> HashMap<SymbolId, StaticWasmValue> {
     let mut values = HashMap::new();
     for _ in 0..16 {
@@ -677,7 +720,7 @@ pub(super) fn collect_exact_module_sites(
     source: &str,
     program: &Program<'_>,
     scoping: &Scoping,
-    global_aliases: &HashMap<SymbolId, String>,
+    global_aliases: &GlobalAliases,
     budget: &WorkBudget,
 ) -> Result<HashMap<(u32, u32), ExactModuleSite>, BudgetExceeded> {
     let helpers = collect_helpers(source, program, scoping, global_aliases);
@@ -734,6 +777,63 @@ mod tests {
     use rolldown_redox::ecmascript::parse_program;
 
     #[test]
+    fn deferred_alias_proof_is_anchored_to_each_invocation() -> Result<(), BudgetExceeded> {
+        let source = r#"
+            const input = null;
+            const early = identity(input);
+            const host = globalThis;
+            const late = identity(input);
+            function identity(value) {
+                return function(value) {
+                    if (host.Array.isArray(value)) return value;
+                }(value) || fallback(value);
+            }
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new()
+            .with_check_syntax_error(true)
+            .build(&parsed.program);
+        assert!(semantic.diagnostics.is_empty());
+        let scoping = semantic.semantic.scoping();
+        let budget = WorkBudget::unlimited("deferred-alias-test");
+        let aliases =
+            crate::global_builtin::collect_global_aliases(&parsed.program, scoping, &budget)?;
+        let helpers = collect_helpers(source, &parsed.program, scoping, &aliases);
+        let Some(input) = scoping.get_binding(scoping.root_scope_id(), "input".into()) else {
+            unreachable!("input binding");
+        };
+        let abstract_input = StaticWasmValue::BufferPair("synthetic-input".to_string());
+        let values = HashMap::from([(input, abstract_input.clone())]);
+        let evaluator = Evaluator {
+            scoping,
+            helpers: &helpers,
+            values: &values,
+            global_aliases: &aliases,
+        };
+        let mut collector = WriteCollector {
+            evaluator,
+            writes: HashMap::new(),
+        };
+        collector.visit_program(&parsed.program);
+        for (name, expected) in [("early", None), ("late", Some(abstract_input))] {
+            let Some(symbol) = scoping.get_binding(scoping.root_scope_id(), name.into()) else {
+                unreachable!("result binding");
+            };
+            assert_eq!(
+                collector
+                    .writes
+                    .remove(&symbol)
+                    .and_then(WriteState::proven),
+                expected,
+                "{name}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn generic_static_byte_assembly_augments_exact_module_sites() -> Result<(), BudgetExceeded> {
         let source = r#"
             function load(imports) {
@@ -753,13 +853,12 @@ mod tests {
             .with_check_syntax_error(true)
             .build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
-        let sites = collect_exact_module_sites(
-            source,
-            &parsed.program,
-            semantic.semantic.scoping(),
-            &HashMap::new(),
-            &WorkBudget::unlimited("module-identity-test"),
-        )?;
+        let scoping = semantic.semantic.scoping();
+        let budget = WorkBudget::unlimited("module-identity-test");
+        let aliases =
+            crate::global_builtin::collect_global_aliases(&parsed.program, scoping, &budget)?;
+        let sites =
+            collect_exact_module_sites(source, &parsed.program, scoping, &aliases, &budget)?;
         assert_eq!(sites.len(), 1);
         let Some(site) = sites.values().next() else {
             return Ok(());

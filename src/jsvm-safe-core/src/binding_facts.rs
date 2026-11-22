@@ -9,7 +9,7 @@ use oxc_ast::ast::{
 };
 use oxc_ast::AstKind;
 use oxc_ast_visit::{walk, Visit};
-use oxc_semantic::Scoping;
+use oxc_semantic::{ReferenceId, Scoping};
 use oxc_span::{GetSpan, Span};
 use oxc_syntax::{
     scope::{ScopeFlags, ScopeId},
@@ -18,8 +18,25 @@ use oxc_syntax::{
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
-#[derive(Debug, Default)]
-pub(crate) struct BindingFacts {
+/// The result of a lexical identity proof, not a claim about the value
+/// currently stored in a binding or about the integrity of host builtins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReferenceIdentity {
+    Lexical(SymbolId),
+    Global,
+    Dynamic,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EvalSite {
+    scope: ScopeId,
+    span: Span,
+}
+
+/// Binding initialization, dynamic name resolution and eval exposure for
+/// one immutable AST/semantic snapshot.
+#[derive(Debug)]
+pub struct BindingFacts {
     hoisted_vars: HashSet<SymbolId>,
     parameters: HashSet<SymbolId>,
     regions: HashMap<SymbolId, Vec<Span>>,
@@ -27,7 +44,9 @@ pub(crate) struct BindingFacts {
     scope_entries: HashMap<ScopeId, u32>,
     hoisted_functions: HashSet<ScopeId>,
     scopes: Vec<Option<ScopeId>>,
-    dynamic_scopes: HashSet<ScopeId>,
+    eval_sites: Vec<EvalSite>,
+    parameter_regions: HashMap<ScopeId, Span>,
+    named_function_expressions: HashSet<SymbolId>,
     sloppy_eval_var_scopes: HashSet<ScopeId>,
     exported_bindings: HashSet<SymbolId>,
     ambient_root: bool,
@@ -90,10 +109,22 @@ impl BindingFacts {
         }
     }
 
-    pub(crate) fn analyze(program: &oxc_ast::ast::Program<'_>, scoping: &Scoping) -> Self {
+    #[must_use]
+    pub fn analyze(program: &oxc_ast::ast::Program<'_>, scoping: &Scoping) -> Self {
         let mut facts = Self {
+            hoisted_vars: HashSet::new(),
+            parameters: HashSet::new(),
+            regions: HashMap::new(),
+            node_spans: Vec::new(),
+            scope_entries: HashMap::new(),
+            hoisted_functions: HashSet::new(),
+            scopes: Vec::new(),
+            eval_sites: Vec::new(),
+            parameter_regions: HashMap::new(),
+            named_function_expressions: HashSet::new(),
+            sloppy_eval_var_scopes: HashSet::new(),
+            exported_bindings: HashSet::new(),
             ambient_root: !program.source_type.is_module(),
-            ..Self::default()
         };
         facts.visit_program(program);
         // Non-strict direct eval may create var bindings in its caller's
@@ -102,16 +133,69 @@ impl BindingFacts {
         // this with the ordinary DirectEval flag propagated to ancestors:
         // a sibling function's eval cannot introduce bindings here.
         facts.sloppy_eval_var_scopes = facts
-            .dynamic_scopes
+            .eval_sites
             .iter()
-            .filter(|&&scope| !scoping.scope_flags(scope).is_strict_mode())
-            .filter_map(|&scope| {
+            .filter(|site| !scoping.scope_flags(site.scope).is_strict_mode())
+            .filter_map(|site| {
                 scoping
-                    .scope_ancestors(scope)
+                    .scope_ancestors(site.scope)
                     .find(|&ancestor| scoping.scope_flags(ancestor).is_var())
             })
             .collect();
         facts
+    }
+
+    fn resolve_scope(
+        &self,
+        scoping: &Scoping,
+        scope: ScopeId,
+        symbol: Option<SymbolId>,
+    ) -> ReferenceIdentity {
+        let owner = symbol.map(|symbol| scoping.symbol_scope_id(symbol));
+        for ancestor in scoping.scope_ancestors(scope) {
+            if Some(ancestor) == owner {
+                return symbol.map_or(ReferenceIdentity::Dynamic, ReferenceIdentity::Lexical);
+            }
+            if self.sloppy_eval_var_scopes.contains(&ancestor)
+                || scoping.scope_flags(ancestor).is_with()
+            {
+                return ReferenceIdentity::Dynamic;
+            }
+        }
+        if symbol.is_none() {
+            ReferenceIdentity::Global
+        } else {
+            ReferenceIdentity::Dynamic
+        }
+    }
+
+    /// Resolve the identity at this exact reference. A missing static symbol
+    /// is not sufficient evidence of a global lookup.
+    #[must_use]
+    pub fn resolve_reference(
+        &self,
+        scoping: &Scoping,
+        reference_id: ReferenceId,
+    ) -> ReferenceIdentity {
+        let reference = scoping.get_reference(reference_id);
+        self.resolve_scope(scoping, reference.scope_id(), reference.symbol_id())
+    }
+
+    #[must_use]
+    pub fn resolved_symbol(
+        &self,
+        scoping: &Scoping,
+        reference_id: ReferenceId,
+    ) -> Option<SymbolId> {
+        match self.resolve_reference(scoping, reference_id) {
+            ReferenceIdentity::Lexical(symbol) => Some(symbol),
+            ReferenceIdentity::Global | ReferenceIdentity::Dynamic => None,
+        }
+    }
+
+    #[must_use]
+    pub fn proves_global_reference(&self, scoping: &Scoping, reference_id: ReferenceId) -> bool {
+        self.resolve_reference(scoping, reference_id) == ReferenceIdentity::Global
     }
 
     /// A static binding identity is stable only if lookup cannot encounter
@@ -122,25 +206,14 @@ impl BindingFacts {
         symbol: SymbolId,
         scope: ScopeId,
     ) -> bool {
-        let owner = scoping.symbol_scope_id(symbol);
-        for ancestor in scoping.scope_ancestors(scope) {
-            if ancestor == owner {
-                return true;
-            }
-            if self.sloppy_eval_var_scopes.contains(&ancestor)
-                || scoping.scope_flags(ancestor).is_with()
-            {
-                return false;
-            }
-        }
-        false
+        self.resolve_scope(scoping, scope, Some(symbol)) == ReferenceIdentity::Lexical(symbol)
     }
 
     /// Immutable bindings can be read by a later-created closure: once
     /// initialized, their value cannot be changed. A hoisted declaration is
     /// different; the enclosing lexical scope's entry (not the declaration's
     /// text) is its earliest creation site.
-    pub(crate) fn proves_value_initialized(
+    pub fn proves_value_initialized(
         &self,
         scoping: &Scoping,
         symbol: SymbolId,
@@ -191,11 +264,46 @@ impl BindingFacts {
     }
 
     /// Even strict direct eval can change an existing mutable binding.
-    pub(crate) fn is_eval_exposed(&self, scoping: &Scoping, symbol: SymbolId) -> bool {
+    ///
+    /// Oxc combines formal and body bindings in one scope table. A default
+    /// parameter initializer executes in the parameter environment, before
+    /// the separate body variable environment exists. Respect that boundary
+    /// also for a closure created in a parameter initializer.
+    #[must_use]
+    pub fn is_eval_exposed(&self, scoping: &Scoping, symbol: SymbolId) -> bool {
         let name = scoping.symbol_name(symbol);
-        self.dynamic_scopes
-            .iter()
-            .any(|&scope| scoping.find_binding(scope, name.into()) == Some(symbol))
+        self.eval_sites.iter().any(|site| {
+            scoping.scope_ancestors(site.scope).find_map(|scope| {
+                let candidate = scoping.get_binding(scope, name.into())?;
+                let in_parameters = self.parameter_regions.get(&scope).is_some_and(|region| {
+                    region.start <= site.span.start && site.span.end <= region.end
+                });
+                (!in_parameters
+                    || self.parameters.contains(&candidate)
+                    || self.named_function_expressions.contains(&candidate))
+                .then_some(candidate)
+            }) == Some(symbol)
+        })
+    }
+
+    /// Binding value cannot be reassigned by potential direct eval.
+    /// This does not prove the absence of ordinary writes or mutation of
+    /// objects stored in the binding.
+    #[must_use]
+    pub fn binding_unmodified_by_eval(&self, scoping: &Scoping, symbol: SymbolId) -> bool {
+        scoping.symbol_flags(symbol).is_const_variable() || !self.is_eval_exposed(scoping, symbol)
+    }
+
+    /// A single declaration and no known binding reassignment, including
+    /// direct eval. Still requires an initialization proof at each use.
+    #[must_use]
+    pub fn binding_has_stable_value(&self, scoping: &Scoping, symbol: SymbolId) -> bool {
+        scoping.symbol_redeclarations(symbol).is_empty()
+            && self.binding_unmodified_by_eval(scoping, symbol)
+            && scoping
+                .get_resolved_reference_ids(symbol)
+                .iter()
+                .all(|&reference| !scoping.get_reference(reference).is_write())
     }
 
     pub(crate) fn stable_callable_symbol(
@@ -206,16 +314,13 @@ impl BindingFacts {
         let Expression::Identifier(identifier) = expression else {
             return None;
         };
-        let reference_id = identifier.reference_id.get()?;
-        let symbol = crate::statically_resolved_symbol(scoping, reference_id)?;
-        let scope = scoping.get_reference(reference_id).scope_id();
-        (self.proves_reference_identity(scoping, symbol, scope)
-            && (scoping.symbol_flags(symbol).is_const_variable()
-                || !self.is_eval_exposed(scoping, symbol)))
-        .then_some(symbol)
+        let symbol = self.resolved_symbol(scoping, identifier.reference_id.get()?)?;
+        self.binding_unmodified_by_eval(scoping, symbol)
+            .then_some(symbol)
     }
 
-    pub(crate) fn initialized_read(
+    #[must_use]
+    pub fn initialized_read(
         &self,
         scoping: &Scoping,
         expression: &Expression<'_>,
@@ -223,13 +328,27 @@ impl BindingFacts {
         let Expression::Identifier(identifier) = expression else {
             return None;
         };
-        let reference = identifier.reference_id.get()?;
-        let symbol = crate::statically_resolved_symbol(scoping, reference)?;
-        if !crate::reference_is_statically_resolved_read(scoping, reference, symbol) {
+        self.initialized_reference(scoping, identifier.reference_id.get()?, identifier.span)
+    }
+
+    /// The same initialized-read proof for callers already visiting an
+    /// IdentifierReference rather than its containing Expression.
+    #[must_use]
+    pub fn initialized_reference(
+        &self,
+        scoping: &Scoping,
+        reference: ReferenceId,
+        span: Span,
+    ) -> Option<SymbolId> {
+        let symbol = self.resolved_symbol(scoping, reference)?;
+        let reference = scoping.get_reference(reference);
+        if !reference.is_read()
+            || reference.is_write()
+            || reference.flags().is_member_write_target()
+        {
             return None;
         }
-        let scope = scoping.get_reference(reference).scope_id();
-        self.proves_value_initialized(scoping, symbol, scope, identifier.span)
+        self.proves_value_initialized(scoping, symbol, reference.scope_id(), span)
             .then_some(symbol)
     }
 
@@ -286,7 +405,10 @@ impl<'a> Visit<'a> for BindingFacts {
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         if crate::is_potential_direct_eval(call) {
             if let Some(Some(scope)) = self.scopes.last() {
-                self.dynamic_scopes.insert(*scope);
+                self.eval_sites.push(EvalSite {
+                    scope: *scope,
+                    span: call.span,
+                });
             }
         }
         walk::walk_call_expression(self, call);
@@ -347,11 +469,22 @@ impl<'a> Visit<'a> for BindingFacts {
                 self.hoisted_functions.insert(scope);
             }
         }
+        if let Some(scope) = node.scope_id.get() {
+            self.parameter_regions.insert(scope, node.params.span);
+        }
+        if node.r#type == FunctionType::FunctionExpression {
+            if let Some(symbol) = node.id.as_ref().and_then(|id| id.symbol_id.get()) {
+                self.named_function_expressions.insert(symbol);
+            }
+        }
         self.record_parameters(&node.params, node.span.end);
         walk::walk_function(self, node, flags);
     }
 
     fn visit_arrow_function_expression(&mut self, node: &ArrowFunctionExpression<'a>) {
+        if let Some(scope) = node.scope_id.get() {
+            self.parameter_regions.insert(scope, node.params.span);
+        }
         self.record_parameters(&node.params, node.span.end);
         walk::walk_arrow_function_expression(self, node);
     }
@@ -378,5 +511,132 @@ impl<'a> Visit<'a> for BindingFacts {
             self.record_pattern(&parameter.pattern, node.body.span);
         }
         walk::walk_catch_clause(self, node);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxc_allocator::Allocator;
+    use oxc_semantic::SemanticBuilder;
+    use oxc_span::SourceType;
+
+    #[test]
+    fn identity_distinguishes_intercepted_global_and_lexical_references() {
+        use oxc_ast::ast::IdentifierReference;
+        struct Probe<'a> {
+            scoping: &'a Scoping,
+            facts: &'a BindingFacts,
+            identities: Vec<ReferenceIdentity>,
+        }
+        impl<'a> Visit<'a> for Probe<'_> {
+            fn visit_identifier_reference(&mut self, identifier: &IdentifierReference<'a>) {
+                if matches!(identifier.name.as_str(), "missing" | "outer") {
+                    let reference = identifier
+                        .reference_id
+                        .get()
+                        .unwrap_or_else(|| unreachable!());
+                    self.identities
+                        .push(self.facts.resolve_reference(self.scoping, reference));
+                }
+            }
+        }
+        let source = r#"
+            let outer = 1;
+            function exposed() {
+                (eval)("var missing = 3, outer = 2");
+                missing;
+                outer;
+                { const outer = 4; outer; }
+                (() => { "use strict"; missing; outer; })();
+            }
+            function sibling() { missing; outer; }
+            function strict() { "use strict"; eval("var missing = 4"); missing; outer; }
+            function dynamic(scope) { with(scope) { missing; outer; } }
+        "#;
+        let allocator = Allocator::default();
+        let program = crate::parse_as(&allocator, source, SourceType::cjs())
+            .unwrap_or_else(|| unreachable!("valid proof fixture"));
+        let semantic = SemanticBuilder::new()
+            .with_check_syntax_error(true)
+            .build(&program);
+        assert!(semantic.diagnostics.is_empty());
+        let scoping = semantic.semantic.scoping();
+        let facts = BindingFacts::analyze(&program, scoping);
+        let mut probe = Probe {
+            scoping,
+            facts: &facts,
+            identities: Vec::new(),
+        };
+        probe.visit_program(&program);
+        let outer = scoping
+            .get_binding(scoping.root_scope_id(), "outer".into())
+            .unwrap_or_else(|| unreachable!());
+        let ReferenceIdentity::Lexical(block_local) = probe.identities[2] else {
+            unreachable!("block local must retain identity");
+        };
+        assert_ne!(block_local, outer);
+        use ReferenceIdentity::{Dynamic, Global, Lexical};
+        assert_eq!(
+            probe.identities,
+            [
+                Dynamic,
+                Dynamic,
+                Lexical(block_local),
+                Dynamic,
+                Dynamic,
+                Global,
+                Lexical(outer),
+                Global,
+                Lexical(outer),
+                Dynamic,
+                Dynamic,
+            ]
+        );
+    }
+
+    #[test]
+    fn parameter_eval_visibility_is_not_body_scope_visibility() {
+        for (source, outer_exposed, inner_exposed) in [
+            ("let x=1;function f(a=eval('x=2')){let x=3;}", true, false),
+            (
+                "let x=1;function f(a=()=>eval('x=2')){let x=3;return a();}",
+                true,
+                false,
+            ),
+            ("let x=1;function f(a=eval('x=2')){var x=3;}", true, false),
+            ("let x=1;function f(x=1,a=eval('x=2')){}", false, true),
+            ("let x=1;function f(){let x=3;eval('x=2');}", false, true),
+            ("let x=1;function f(a=1){let x=3;eval('x=2');}", false, true),
+            ("let x=1;const f=function x(a=eval('x=2')){};", false, true),
+        ] {
+            let allocator = Allocator::default();
+            let program = crate::parse_as(&allocator, source, SourceType::cjs())
+                .unwrap_or_else(|| unreachable!("{source}"));
+            let semantic = SemanticBuilder::new()
+                .with_check_syntax_error(true)
+                .build(&program);
+            assert!(semantic.diagnostics.is_empty(), "{source}");
+            let scoping = semantic.semantic.scoping();
+            let facts = BindingFacts::analyze(&program, scoping);
+            let mut symbols = scoping
+                .symbol_ids()
+                .filter(|&symbol| scoping.symbol_name(symbol) == "x")
+                .collect::<Vec<_>>();
+            symbols.sort_by_key(|&symbol| scoping.symbol_span(symbol).start);
+            let [outer, inner] = symbols.as_slice() else {
+                unreachable!("{source}");
+            };
+            assert_eq!(
+                facts.is_eval_exposed(scoping, *outer),
+                outer_exposed,
+                "{source}"
+            );
+            assert_eq!(
+                facts.is_eval_exposed(scoping, *inner),
+                inner_exposed,
+                "{source}"
+            );
+        }
     }
 }

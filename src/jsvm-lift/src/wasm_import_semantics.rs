@@ -1,3 +1,4 @@
+use crate::global_builtin::GlobalAliases;
 use crate::global_builtin::{collect_global_aliases, global_constructor};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
@@ -18,7 +19,9 @@ mod import_object;
 mod memory_identity;
 mod module_identity;
 use bulk_import::analyze_import_handler;
-pub use bulk_import::{WasmImportHandlerSemantic, WasmImportHandlerShape};
+pub use bulk_import::{
+    AliasInitializationWitness, WasmImportHandlerSemantic, WasmImportHandlerShape,
+};
 use import_object::{assignment_import_object, collect_instantiation_sites};
 pub use import_object::{WasmImportObjectUsage, WasmInstantiationSite};
 use memory_identity::collect_module_memory_identity_proofs;
@@ -227,7 +230,7 @@ fn static_member_of_symbol(
 
 fn data_view_binding(
     scoping: &Scoping,
-    global_aliases: &HashMap<SymbolId, String>,
+    global_aliases: &GlobalAliases,
     declaration: &VariableDeclaration<'_>,
     memory_param: SymbolId,
 ) -> Option<(SymbolId, String)> {
@@ -485,7 +488,7 @@ fn every_normal_result_is_write(
 fn analyze_direct_write_function(
     function: &Function<'_>,
     scoping: &Scoping,
-    global_aliases: &HashMap<SymbolId, String>,
+    global_aliases: &GlobalAliases,
     offset_value: Option<u32>,
 ) -> Option<String> {
     if function.r#async || function.generator {
@@ -562,7 +565,7 @@ fn unwrap_iife_call<'a>(expression: &'a Expression<'a>) -> Option<&'a CallExpres
 fn analyze_wrapped_write_function(
     function: &Function<'_>,
     scoping: &Scoping,
-    global_aliases: &HashMap<SymbolId, String>,
+    global_aliases: &GlobalAliases,
     offset_value: Option<u32>,
 ) -> Option<String> {
     if function.r#async || function.generator {
@@ -602,16 +605,43 @@ fn analyze_wrapped_write_function(
 fn analyze_handler(
     function: &Function<'_>,
     scoping: &Scoping,
-    global_aliases: &HashMap<SymbolId, String>,
+    global_aliases: &GlobalAliases,
     offset_value: Option<u32>,
 ) -> Option<String> {
     analyze_direct_write_function(function, scoping, global_aliases, offset_value)
         .or_else(|| analyze_wrapped_write_function(function, scoping, global_aliases, offset_value))
 }
 
+fn handler_shape(
+    scoping: &Scoping,
+    assignment: &oxc_ast::ast::AssignmentExpression<'_>,
+    import_module: Option<&str>,
+    import_name: &str,
+    semantic: WasmImportHandlerSemantic,
+    initialization_witnesses: Vec<AliasInitializationWitness>,
+) -> WasmImportHandlerShape {
+    let import_object = assignment_import_object(scoping, &assignment.left).and_then(
+        |(symbol, import_object, module, name)| {
+            (module == import_module.unwrap_or_default()
+                && name == import_name
+                && symbol_binding_is_stable(scoping, symbol))
+            .then_some(import_object)
+        },
+    );
+    WasmImportHandlerShape {
+        import_module: import_module.map(str::to_string),
+        import_name: import_name.to_string(),
+        import_object,
+        assignment_start: assignment.span.start,
+        assignment_end: assignment.span.end,
+        initialization_witnesses,
+        semantic,
+    }
+}
+
 struct HandlerCollector<'c, 'g, 'i, 'f> {
     scoping: &'c Scoping,
-    global_aliases: &'g HashMap<SymbolId, String>,
+    global_aliases: &'g GlobalAliases,
     instantiation_sites: &'i HashMap<(u32, u32), Vec<WasmInstantiationSite>>,
     module_filter: Option<&'f str>,
     import_filter: Option<&'f str>,
@@ -657,26 +687,24 @@ impl<'a> Visit<'a> for HandlerCollector<'_, '_, '_, '_> {
                             }
                         }
                     }
-                    if let Some(semantic) =
-                        analyze_import_handler(function, self.scoping, self.global_aliases)
-                    {
-                        let import_object =
-                            assignment_import_object(self.scoping, &assignment.left).and_then(
-                                |(symbol, import_object, module, name)| {
-                                    (module == import_module.unwrap_or_default()
-                                        && name == import_name
-                                        && symbol_binding_is_stable(self.scoping, symbol))
-                                    .then_some(import_object)
-                                },
-                            );
-                        self.handler_semantics.push(WasmImportHandlerShape {
-                            import_module: import_module.map(str::to_string),
-                            import_name: import_name.to_string(),
-                            import_object,
-                            assignment_start: assignment.span.start,
-                            assignment_end: assignment.span.end,
+                    let linked_sites = self
+                        .instantiation_sites
+                        .get(&(assignment.span.start, assignment.span.end))
+                        .map_or(&[][..], Vec::as_slice);
+                    if let Some((semantic, initialization_witnesses)) = analyze_import_handler(
+                        function,
+                        self.scoping,
+                        self.global_aliases,
+                        linked_sites,
+                    ) {
+                        self.handler_semantics.push(handler_shape(
+                            self.scoping,
+                            assignment,
+                            import_module,
+                            import_name,
                             semantic,
-                        });
+                            initialization_witnesses,
+                        ));
                     }
                     if let Some(global_object) = analyze_handler(
                         function,
@@ -783,7 +811,7 @@ fn analyze_program(
 
 struct NormalizedHandlerSemanticsCollector<'c, 'g> {
     scoping: &'c Scoping,
-    global_aliases: &'g HashMap<SymbolId, String>,
+    global_aliases: &'g GlobalAliases,
     shapes: Vec<WasmImportHandlerShape>,
     assignment_counts: HashMap<(Option<String>, String), usize>,
 }
@@ -798,30 +826,21 @@ impl<'a> Visit<'a> for NormalizedHandlerSemanticsCollector<'_, '_> {
                     .assignment_counts
                     .entry((import_module.map(str::to_string), import_name.to_string()))
                     .or_default() += 1;
-                if let Some(semantic) =
-                    analyze_import_handler(function, self.scoping, self.global_aliases)
+                if let Some((semantic, initialization_witnesses)) =
+                    analyze_import_handler(function, self.scoping, self.global_aliases, &[])
                 {
                     if matches!(
                         semantic,
                         WasmImportHandlerSemantic::TableInitializerOnly { .. }
                     ) {
-                        let import_object =
-                            assignment_import_object(self.scoping, &assignment.left).and_then(
-                                |(symbol, import_object, module, name)| {
-                                    (module == import_module.unwrap_or_default()
-                                        && name == import_name
-                                        && symbol_binding_is_stable(self.scoping, symbol))
-                                    .then_some(import_object)
-                                },
-                            );
-                        self.shapes.push(WasmImportHandlerShape {
-                            import_module: import_module.map(str::to_string),
-                            import_name: import_name.to_string(),
-                            import_object,
-                            assignment_start: assignment.span.start,
-                            assignment_end: assignment.span.end,
+                        self.shapes.push(handler_shape(
+                            self.scoping,
+                            assignment,
+                            import_module,
+                            import_name,
                             semantic,
-                        });
+                            initialization_witnesses,
+                        ));
                     }
                 }
             }
@@ -1617,6 +1636,71 @@ mod tests {
                 standard_builtin_semantics_required: true,
             }
         ));
+    }
+
+    #[test]
+    fn captured_namespace_evidence_is_scoped_to_specific_factory_invocations() {
+        let source = r#"
+            const early = make();
+            WebAssembly.instantiate(bytes, early);
+            const host = globalThis;
+            const late = make();
+            WebAssembly.instantiate(bytes, late);
+            function make() {
+                const imports = {wbg: {}};
+                imports.wbg.ctor = function(value) { return new host.Uint32Array(value); };
+                return imports;
+            }
+        "#;
+        let analysis = proven_wasm_import_semantics(source);
+        let constructor = analysis
+            .handler_semantics
+            .iter()
+            .find(|shape| shape.import_name == "ctor")
+            .unwrap_or_else(|| unreachable!("expected one contextual constructor shape"));
+        let [witness] = constructor.initialization_witnesses.as_slice() else {
+            unreachable!("only the late invocation establishes initialization: {constructor:#?}");
+        };
+        assert_eq!(witness.alias, "host");
+        assert_eq!(
+            &source[witness.invocation_start as usize..witness.invocation_end as usize],
+            "make()"
+        );
+        assert_eq!(
+            &source[witness.site_start as usize..witness.site_end as usize],
+            "WebAssembly.instantiate(bytes, late)"
+        );
+        let usage = analysis
+            .import_object_usages
+            .iter()
+            .find(|usage| usage.import_name == "ctor")
+            .unwrap_or_else(|| {
+                unreachable!("both constructor uses have a lexical assignment identity")
+            });
+        assert_eq!(usage.instantiation_sites.len(), 2);
+        assert!(usage
+            .instantiation_sites
+            .iter()
+            .any(|site| site.start != witness.site_start));
+
+        // Unknown invocation, dynamic reassignment, and nonordinary factory
+        // returns cannot establish the captured initializer.
+        for source in [
+            r#"const host=globalThis; function make(){const imports={wbg:{}};imports.wbg.ctor=function(v){return new host.Uint32Array(v)};return imports} consume(make);"#,
+            r#"let host=globalThis;host=fake;const result=make();WebAssembly.instantiate(bytes,result);function make(){const imports={wbg:{}};imports.wbg.ctor=function(v){return new host.Uint32Array(v)};return imports}"#,
+            r#"const host=globalThis;const result=make();WebAssembly.instantiate(bytes,result);async function make(){const imports={wbg:{}};imports.wbg.ctor=function(v){return new host.Uint32Array(v)};return imports}"#,
+            r#"const host=globalThis;const result=make();WebAssembly.instantiate(bytes,result);function* make(){const imports={wbg:{}};imports.wbg.ctor=function(v){return new host.Uint32Array(v)};return imports}"#,
+            r#"const result=make();WebAssembly.instantiate(bytes,result);const host=globalThis;function make(){const imports={wbg:{}};imports.wbg.ctor=function(v){return new host.Uint32Array(v)};return imports}"#,
+        ] {
+            let analysis = proven_wasm_import_semantics(source);
+            assert!(
+                analysis
+                    .handler_semantics
+                    .iter()
+                    .all(|shape| shape.import_name != "ctor"),
+                "{source}: {analysis:#?}"
+            );
+        }
     }
 
     #[test]
