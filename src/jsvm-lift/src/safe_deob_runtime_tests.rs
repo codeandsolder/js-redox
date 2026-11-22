@@ -5,13 +5,14 @@ use tempfile::TempDir;
 use work_budget::{run_command, BudgetLimits, WorkBudget};
 
 const FIXTURE_DIR: &str = "corpus/generated/reversible-obfuscation";
-const MAIN_FIXTURES: [&str; 41] = [
+const MAIN_FIXTURES: [&str; 42] = [
     "obscura-split-strings.js",
     "obscura-number-expressions.js",
     "obscura-unicode-escape.js",
     "obscura-string-array.js",
     "rotated-base64-string-array.js",
     "direct-rotated-string-array.js",
+    "duplicate-scope-decoder.js",
     "formatted-base64-string-array.js",
     "token-boundaries.js",
     "proxy-literals-unary.js",
@@ -144,6 +145,9 @@ fn assert_main_contract(file: &str, outcome: &SafeDeobOutcome) {
             assert!(count(report, "string_array_decode") >= 2, "{file}");
             assert!(count(report, "materialize_decoder_rotation") >= 1, "{file}");
             assert!(count(report, "remove_decoder_rotation_iife") >= 1, "{file}");
+        }
+        "duplicate-scope-decoder.js" => {
+            assert_eq!(count(report, "string_array_decode"), 2, "{file}");
         }
         "token-boundaries.js" => {
             for merged in ["returnfalse", "returntrue", "throwtrue"] {
@@ -938,6 +942,84 @@ fn depythonify_safe_deob_heap_liveness_runtime_equivalence() -> Result<()> {
     script_runtime_equivalence(&refs, "heap-liveness", false)
 }
 
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_plain_decoder_runtime_equivalence() -> Result<()> {
+    let prefix = "function p(){var t=['a','b'];p=function(){return t;};return p();}";
+    let sources = [
+        "function d(i){i=i-16;const t=p();let v=t[i];return v;}",
+        "function d(i){i-=16;const t=p();return t[i]}",
+        "function d(i){i=(i)-(16);const /*table*/ t=(p)();return (t)[(i)];}",
+        "function d(i){const t=p();return (d=function(x){return t[x-=16]})(i)}",
+        "function d(i){const t=p();return d=function(x){x-=16;return t[x]},d(i)}",
+        "function d(i){const t=p();d=function(x){x-=16;return t[x]};return d(i)}",
+        "function d(i){const t=p();d=function(x){x-=16;return t[x]};events.push(i);return d(i)}",
+        "function d(i){const t=p();return d=function(x){x=x-16;const v=t[x];return v},d(i)}",
+        "function d(i){const t=p();return (d=function named(x){return t[x-=16]})(i)}",
+        "function d(i){i=i-16;const t=p();let v=t[i];events.push(v);return v;}",
+        "function d(i){const t=p();return d=function(x){x=x-16;const v=t[x];events.push(v);return v},d(i)}",
+        "function d(i){const t=p();return (d=function(t){return t[t-=16]})(i)}",
+        "function d(i){const t=p();return (d=function(x){return t[x-=16]})(i+1)}",
+        "function d(i){const t=p();return (d=function(x=events.push(i)){return t[x-=16]})(i)}",
+        "function d(i){const t=p();return (d=function(x){return t[x-=16]})?.(i)}",
+        "function d(i){i=i-16;const t=p();let v=t[i];return 'wrong'}",
+        "function d(i){i=i-16;const t=p();return t?.[i]}",
+    ].into_iter().map(|decoder|format!("{prefix}{decoder}[d(16),d(17)];")).collect::<Vec<_>>();
+    let refs = sources.iter().map(String::as_str).collect::<Vec<_>>();
+    script_runtime_equivalence(&refs, "plain-decoder", false)
+}
+
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_callable_installation_runtime_equivalence() -> Result<()> {
+    let prefix = "function p(){var t=['a','b'];p=function(){return t;};return p();}function d(i){const t=p();return (d=function(x){return t[x-=16]})(i)}";
+    let sources = [
+        "d(16);",
+        "const original=d;original(16);",
+        "const original=d;const alias=original;alias(16);",
+        "const original=d;const value=d(16);[original===d,value];",
+        "const value=d(16);[d.toString(),value];",
+        "const value=d(16);[d.name,value];",
+        "const alias=d;const value=d(16);[alias===d,value];",
+        "let alias;void(alias=d);d(16);",
+        "let alias;(alias=d,0);d(16);",
+        "let alias;for(alias=d;false;){}d(16);",
+        "let alias;alias=d;d(16);",
+        "let alias;d(16);alias=d;",
+        "let alias;d(16);(alias=d,alias);",
+        "function capture(){const alias=d;return alias}const original=capture();[d(16),original===capture()];",
+        "const alias=d;alias.extra=1;[d(16),d.extra];",
+        "function invoke(alias){return alias(16)}[d(16),invoke(d)];",
+    ].into_iter().map(|suffix|format!("{prefix}{suffix}")).collect::<Vec<_>>();
+    let refs = sources.iter().map(String::as_str).collect::<Vec<_>>();
+    script_runtime_equivalence(&refs, "callable-installation", false)
+}
+
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_local_alias_regions_runtime_equivalence() -> Result<()> {
+    let functions = "function p(){var t=['a','b'];p=function(){return t;};return p();}function d(i,t,v){return i=i-16,t=p(),v=t[i],v;}";
+    let sources = [
+        "events.push('before');let a=d;return a(16);",
+        "events.push('before');var a=d;return a(16);",
+        "var before=events.push('before'),a=d;return a(16);",
+        "events.push('before');let a=d;events.push('middle');let b=a;return b(16);",
+        "events.push('before');{let a=d;return a(16);}",
+        "if(flag){var a=d;events.push(a(16));}try{return a(16)}catch(e){return e.name}",
+        "try{a(16)}catch(e){events.push(e.name)}var a=d;return a(16);",
+        "try{a(16)}catch(e){events.push(e.name)}let a=d;return a(16);",
+        "events.push('before');let a=d;a=()=>7;return a(16);",
+        "function inner(){return a(16)}events.push('before');var a=d;return inner();",
+        "function inner(){return a(16)}try{inner()}catch(e){events.push(e.name)}var a=d;return [inner(),a(16)];",
+        "try{if(flag)throw Error('early');var a=d;}catch(error){}try{return a(16)}catch(e){return e.name}",
+        "events.push('before');let a=d;eval('a=()=>7');return a(16);",
+        "events.push('before');var a=d;let f=()=>a(16);return f();",
+        "events.push('before');let a=d;function mutate(){a=()=>7}mutate();return a(16);",
+    ].into_iter().map(|body|format!("function run(flag){{{functions}{body}}}[run(false),run(true)];")).collect::<Vec<_>>();
+    let refs = sources.iter().map(String::as_str).collect::<Vec<_>>();
+    script_runtime_equivalence(&refs, "local-alias-regions", false)
+}
+
 fn script_runtime_equivalence(sources: &[&str], suite: &str, browser_globals: bool) -> Result<()> {
     let scratch = TempDir::new()?;
     // Browser decoders assume standard atob. Node's isolated VM does not
@@ -1462,10 +1544,6 @@ fn depythonify_safe_deob_safety_runtime_equivalence() -> Result<()> {
     }
 
     for (file, kinds) in [
-        (
-            "duplicate-scope-decoder-negative.js",
-            &["string_array_decode"][..],
-        ),
         (
             "mutable-decoder-alias-safety.js",
             &["string_array_decode"][..],

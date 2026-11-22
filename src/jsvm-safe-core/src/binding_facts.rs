@@ -443,10 +443,16 @@ impl BindingFacts {
         Ok(grounded)
     }
 
+    /// Exported declarations and exact default/named export bindings can
+    /// be observed by code outside this source snapshot.
+    pub(crate) fn is_exported_binding(&self, symbol: SymbolId) -> bool {
+        self.exported_bindings.contains(&symbol)
+    }
+
     /// Source-local table proofs do not extend to object-backed script
     /// globals or exported mutable allocations accessed by external code.
     pub(crate) fn source_local_data_binding(&self, scoping: &Scoping, symbol: SymbolId) -> bool {
-        !self.exported_bindings.contains(&symbol)
+        !self.is_exported_binding(symbol)
             && !(self.ambient_root
                 && scoping.symbol_scope_id(symbol) == scoping.root_scope_id()
                 && !scoping.symbol_flags(symbol).is_block_scoped())
@@ -460,7 +466,7 @@ impl BindingFacts {
     /// direct eval can access only bindings visible at its lexical call site.
     pub(crate) fn is_private(&self, scoping: &Scoping, symbol: SymbolId) -> bool {
         if (self.ambient_root && scoping.symbol_scope_id(symbol) == scoping.root_scope_id())
-            || self.exported_bindings.contains(&symbol)
+            || self.is_exported_binding(symbol)
         {
             return false;
         }

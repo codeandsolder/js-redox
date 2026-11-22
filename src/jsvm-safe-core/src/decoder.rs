@@ -2,6 +2,7 @@ use crate::decoder_encoding::{
     decode_fixed_base64_latin1, decode_lower_alphabet_base64_rc4, decode_lower_alphabet_base64_uri,
     decode_standard_base64_latin1,
 };
+mod callable_observation;
 mod fixed_base64_proof;
 mod rotation_proof;
 
@@ -343,10 +344,10 @@ struct LocalStaticArrayInfo {
 }
 
 #[derive(Debug, Clone)]
-struct SequenceDecoderShape {
-    provider: String,
+struct PlainDecoderShape {
     provider_symbol: SymbolId,
     offset: i64,
+    installation: Option<ReferenceId>,
 }
 
 #[derive(Debug)]
@@ -358,7 +359,7 @@ struct FnInfo {
     span: Span,
     provider: Option<LocalStaticArrayInfo>,
     parameters_proven: bool,
-    sequence_decoder: Option<SequenceDecoderShape>,
+    plain_decoder: Option<PlainDecoderShape>,
 }
 
 fn static_string_split(expression: &Expression<'_>) -> Option<LocalStaticArrayInfo> {
@@ -523,7 +524,8 @@ fn self_rewriting_provider(
         return None;
     }
     let provider = function.id.as_ref()?.symbol_id.get()?;
-    if !facts.binding_unmodified_by_eval(scoping, provider)
+    if facts.is_exported_binding(provider)
+        || !facts.binding_unmodified_by_eval(scoping, provider)
         || !scoping.symbol_redeclarations(provider).is_empty()
     {
         return None;
@@ -538,6 +540,9 @@ fn self_rewriting_provider(
             let Statement::VariableDeclaration(declaration) = first else {
                 return None;
             };
+            if !rotation_proof::ordinary_declaration(declaration) {
+                return None;
+            }
             let [declarator] = declaration.declarations.as_slice() else {
                 return None;
             };
@@ -634,39 +639,44 @@ fn self_rewriting_provider(
 
 /// Only the public positional parameter may be adjusted by a fixed
 /// numeric subtraction before any provider-table access.
-fn sequence_decoder_offset(
-    offset_assignment: &Expression<'_>,
-    public_param_symbol: SymbolId,
+fn adjusted_index_offset(
+    expression: &Expression<'_>,
+    index: SymbolId,
     scoping: &Scoping,
+    facts: &BindingFacts,
 ) -> Option<i64> {
-    let (offset_target, offset_value) = assignment_identifier(offset_assignment)?;
-    if statically_resolved_symbol(scoping, offset_target.reference_id.get()?)
-        != Some(public_param_symbol)
-    {
-        return None;
-    }
-    let Expression::BinaryExpression(offset_binary) = unparenthesized(offset_value) else {
+    let Expression::AssignmentExpression(assignment) = unparenthesized(expression) else {
         return None;
     };
-    if offset_binary.operator.as_str() != "-" {
-        return None;
-    }
-    let Expression::Identifier(offset_source) = unparenthesized(&offset_binary.left) else {
+    let oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(target) = &assignment.left
+    else {
         return None;
     };
-    if statically_resolved_symbol(scoping, offset_source.reference_id.get()?)
-        != Some(public_param_symbol)
-    {
+    if facts.fixed_assignment_reference(scoping, target.reference_id.get()?) != Some(index) {
         return None;
     }
-    expression_integer(&offset_binary.right)
+    match assignment.operator.as_str() {
+        "-=" => expression_integer(&assignment.right),
+        "=" => {
+            let Expression::BinaryExpression(binary) = unparenthesized(&assignment.right) else {
+                return None;
+            };
+            if binary.operator.as_str() != "-"
+                || exact_identifier(&binary.left, scoping, facts) != Some(index)
+            {
+                return None;
+            }
+            expression_integer(&binary.right)
+        }
+        _ => None,
+    }
 }
 
 fn sequence_decoder_shape(
     function: &oxc_ast::ast::Function<'_>,
     scoping: &Scoping,
     facts: &BindingFacts,
-) -> Option<SequenceDecoderShape> {
+) -> Option<PlainDecoderShape> {
     if function.r#async || function.generator || function.params.rest.is_some() {
         return None;
     }
@@ -700,7 +710,7 @@ fn sequence_decoder_shape(
         return None;
     };
 
-    let offset = sequence_decoder_offset(offset_assignment, public_param_symbol, scoping)?;
+    let offset = adjusted_index_offset(offset_assignment, public_param_symbol, scoping, facts)?;
 
     let (table_target, table_value) = assignment_identifier(table_assignment)?;
     let table_symbol = facts.resolved_symbol(scoping, table_target.reference_id.get()?)?;
@@ -751,11 +761,208 @@ fn sequence_decoder_shape(
         return None;
     }
 
-    Some(SequenceDecoderShape {
-        provider: provider.name.to_string(),
+    Some(PlainDecoderShape {
         provider_symbol,
         offset,
+        installation: None,
     })
+}
+
+/// Unambiguous local declarations contain one ordinary binding and a
+/// complete initializer. Do not treat resource-disposal declarations as
+/// ordinary data temporaries.
+fn local_initializer<'a>(
+    statement: &'a Statement<'a>,
+    scoping: &Scoping,
+    excluded: &[SymbolId],
+) -> Option<(SymbolId, &'a Expression<'a>)> {
+    let Statement::VariableDeclaration(declaration) = statement else {
+        return None;
+    };
+    if !rotation_proof::ordinary_declaration(declaration) {
+        return None;
+    }
+    let [declarator] = declaration.declarations.as_slice() else {
+        return None;
+    };
+    let symbol = declarator.id.get_binding_identifier()?.symbol_id.get()?;
+    (!excluded.contains(&symbol) && scoping.symbol_redeclarations(symbol).is_empty())
+        .then_some((symbol, declarator.init.as_ref()?))
+}
+
+fn provider_initializer(
+    expression: &Expression<'_>,
+    scoping: &Scoping,
+    facts: &BindingFacts,
+) -> Option<SymbolId> {
+    exact_identifier(zero_argument_call(expression)?, scoping, facts)
+}
+
+/// The exact table/index reference roles are shared across the
+/// return-expression and temporary-variable forms.
+fn table_index<'a>(
+    expression: &'a Expression<'a>,
+    table: SymbolId,
+    scoping: &Scoping,
+    facts: &BindingFacts,
+) -> Option<&'a Expression<'a>> {
+    let Expression::ComputedMemberExpression(member) = unparenthesized(expression) else {
+        return None;
+    };
+    (!member.optional && exact_identifier(&member.object, scoping, facts) == Some(table))
+        .then_some(&member.expression)
+}
+
+fn returned_value(
+    statements: &[Statement<'_>],
+    table: SymbolId,
+    index: SymbolId,
+    scoping: &Scoping,
+    facts: &BindingFacts,
+) -> Option<()> {
+    let expression = match statements {
+        [Statement::ReturnStatement(result)] => result.argument.as_ref()?,
+        [declaration, Statement::ReturnStatement(result)] => {
+            let (value, read) = local_initializer(declaration, scoping, &[table, index])?;
+            if exact_identifier(result.argument.as_ref()?, scoping, facts) != Some(value) {
+                return None;
+            }
+            read
+        }
+        _ => return None,
+    };
+    (exact_identifier(
+        table_index(expression, table, scoping, facts)?,
+        scoping,
+        facts,
+    ) == Some(index))
+    .then_some(())
+}
+
+fn statement_decoder_shape(
+    function: &oxc_ast::ast::Function<'_>,
+    parameters: &[SymbolId],
+    scoping: &Scoping,
+    facts: &BindingFacts,
+) -> Option<PlainDecoderShape> {
+    let index = *parameters.first()?;
+    let [Statement::ExpressionStatement(adjustment), declaration, remaining @ ..] =
+        function.body.as_ref()?.statements.as_slice()
+    else {
+        return None;
+    };
+    let offset = adjusted_index_offset(&adjustment.expression, index, scoping, facts)?;
+    let (table, initializer) = local_initializer(declaration, scoping, parameters)?;
+    let provider_symbol = provider_initializer(initializer, scoping, facts)?;
+    returned_value(remaining, table, index, scoping, facts)?;
+    Some(PlainDecoderShape {
+        provider_symbol,
+        offset,
+        installation: None,
+    })
+}
+
+/// Validate the complete replacement function, not a fragment of its
+/// return expression. Forwarded arguments must be the original positional
+/// bindings; the only persistent write is the function installation.
+fn replacement_decoder_shape(
+    function: &oxc_ast::ast::Function<'_>,
+    parameters: &[SymbolId],
+    scoping: &Scoping,
+    facts: &BindingFacts,
+) -> Option<PlainDecoderShape> {
+    let symbol = function.id.as_ref()?.symbol_id.get()?;
+    let (declaration, tail) = function.body.as_ref()?.statements.split_first()?;
+    let (table, initializer) = local_initializer(declaration, scoping, parameters)?;
+    let provider_symbol = provider_initializer(initializer, scoping, facts)?;
+    let (installation, invocation, named_tail) = match tail {
+        [Statement::ExpressionStatement(install), Statement::ReturnStatement(result)] => {
+            (&install.expression, result.argument.as_ref()?, true)
+        }
+        [Statement::ReturnStatement(result)] => {
+            let returned = unparenthesized(result.argument.as_ref()?);
+            if let Expression::SequenceExpression(sequence) = returned {
+                let [installation, invocation] = sequence.expressions.as_slice() else {
+                    return None;
+                };
+                (installation, invocation, true)
+            } else {
+                let Expression::CallExpression(call) = returned else {
+                    return None;
+                };
+                (&call.callee, returned, false)
+            }
+        }
+        _ => return None,
+    };
+    let (target, value) = assignment_identifier(installation)?;
+    let reference = target.reference_id.get()?;
+    if facts.resolved_symbol(scoping, reference) != Some(symbol)
+        || !scoping.get_reference(reference).is_write()
+    {
+        return None;
+    }
+    let Expression::FunctionExpression(replacement) = unparenthesized(value) else {
+        return None;
+    };
+    let inner_parameters = rotation_proof::simple_parameters(replacement)?;
+    let index = *inner_parameters.first()?;
+    let Expression::CallExpression(call) = unparenthesized(invocation) else {
+        return None;
+    };
+    if call.optional
+        || call.arguments.len() != parameters.len()
+        || inner_parameters.len() != parameters.len()
+    {
+        return None;
+    }
+    if named_tail && exact_identifier(&call.callee, scoping, facts) != Some(symbol) {
+        return None;
+    }
+    if !call
+        .arguments
+        .iter()
+        .zip(parameters)
+        .all(|(argument, &parameter)| {
+            argument
+                .as_expression()
+                .and_then(|expression| exact_identifier(expression, scoping, facts))
+                == Some(parameter)
+        })
+    {
+        return None;
+    }
+    let body = replacement.body.as_ref()?;
+    let offset = match body.statements.as_slice() {
+        [Statement::ReturnStatement(result)] => adjusted_index_offset(
+            table_index(result.argument.as_ref()?, table, scoping, facts)?,
+            index,
+            scoping,
+            facts,
+        )?,
+        [Statement::ExpressionStatement(adjustment), remaining @ ..] => {
+            let offset = adjusted_index_offset(&adjustment.expression, index, scoping, facts)?;
+            returned_value(remaining, table, index, scoping, facts)?;
+            offset
+        }
+        _ => return None,
+    };
+    Some(PlainDecoderShape {
+        provider_symbol,
+        offset,
+        installation: Some(reference),
+    })
+}
+
+fn plain_decoder_shape(
+    function: &oxc_ast::ast::Function<'_>,
+    scoping: &Scoping,
+    facts: &BindingFacts,
+) -> Option<PlainDecoderShape> {
+    let parameters = rotation_proof::simple_parameters(function)?;
+    sequence_decoder_shape(function, scoping, facts)
+        .or_else(|| statement_decoder_shape(function, &parameters, scoping, facts))
+        .or_else(|| replacement_decoder_shape(function, &parameters, scoping, facts))
 }
 
 fn function_info(
@@ -793,8 +1000,8 @@ fn function_info(
         span: f.span,
         provider: self_rewriting_provider(f, scoping, facts),
         parameters_proven,
-        sequence_decoder: parameters_proven
-            .then(|| sequence_decoder_shape(f, scoping, facts))
+        plain_decoder: parameters_proven
+            .then(|| plain_decoder_shape(f, scoping, facts))
             .flatten(),
     })
 }
@@ -1510,7 +1717,7 @@ fn fixed_direct_decoder(
     else {
         return None;
     };
-    let offset = sequence_decoder_offset(&adjust.expression, index, scoping)?;
+    let offset = adjusted_index_offset(&adjust.expression, index, scoping, facts)?;
     if !rotation_proof::ordinary_declaration(declaration) {
         return None;
     }
@@ -1813,38 +2020,6 @@ pub fn static_decoder_pass(
 
 fn compile_regex(pattern: &str) -> Option<regex::Regex> {
     regex::Regex::new(pattern).ok()
-}
-
-fn contains_function_reassignment(body: &str, name: &str) -> bool {
-    if name.is_empty() {
-        return false;
-    }
-    let identifier_byte =
-        |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$') || byte >= 0x80;
-    let mut search_from = 0usize;
-    while let Some(relative) = body[search_from..].find(name) {
-        let start = search_from + relative;
-        let after_name = start + name.len();
-        if start > 0 && identifier_byte(body.as_bytes()[start - 1]) {
-            search_from = after_name;
-            continue;
-        }
-        if after_name < body.len() && identifier_byte(body.as_bytes()[after_name]) {
-            search_from = after_name;
-            continue;
-        }
-        let tail = body[after_name..].trim_start_matches(char::is_whitespace);
-        if let Some(after_equals) = tail.strip_prefix("=") {
-            if after_equals
-                .trim_start_matches(char::is_whitespace)
-                .starts_with("function")
-            {
-                return true;
-            }
-        }
-        search_from = after_name;
-    }
-    false
 }
 
 static RC4_CHAR_CODE_AT_RE: LazyLock<Option<regex::Regex>> = LazyLock::new(|| {
@@ -2844,16 +3019,26 @@ fn function_name_counts(functions: &[FnInfo]) -> HashMap<String, usize> {
     counts
 }
 
-fn decoder_providers(functions: &[FnInfo]) -> HashMap<(ScopeId, String), &FnInfo> {
-    functions
+struct ProviderIndex<'a> {
+    by_symbol: HashMap<SymbolId, &'a FnInfo>,
+    by_scope_name: HashMap<(ScopeId, String), &'a FnInfo>,
+}
+
+fn decoder_providers(functions: &[FnInfo]) -> ProviderIndex<'_> {
+    let mut index = ProviderIndex {
+        by_symbol: HashMap::new(),
+        by_scope_name: HashMap::new(),
+    };
+    for function in functions
         .iter()
-        .filter_map(|function| {
-            Some((
-                (function.scope, function.name.clone()),
-                function.provider.as_ref().map(|_| function)?,
-            ))
-        })
-        .collect()
+        .filter(|function| function.provider.is_some())
+    {
+        index.by_symbol.insert(function.symbol, function);
+        index
+            .by_scope_name
+            .insert((function.scope, function.name.clone()), function);
+    }
+    index
 }
 
 fn decoder_transform(body: &str, keyed_decode_call: bool) -> Option<DecoderTransform> {
@@ -2893,84 +3078,18 @@ fn decoder_transform(body: &str, keyed_decode_call: bool) -> Option<DecoderTrans
     Some(DecoderTransform::LowerAlphabetBase64Uri)
 }
 
-fn inline_self_rewriting_direct_decoder(
-    source: &str,
-    function: &FnInfo,
-    name_counts: &HashMap<String, usize>,
-    providers: &HashMap<(ScopeId, String), &FnInfo>,
-) -> Option<Decoder> {
-    if function.params.is_empty() || name_counts.get(&function.name).copied() != Some(1) {
-        return None;
-    }
-    let body = fragment(source, function.span);
-    // The exact self-rewriting shape below necessarily contains all three of
-    // these tokens. Most application functions contain none of them together;
-    // rejecting those before constructing the function-specific regex avoids
-    // compiling a large automaton for every ordinary named function.
-    if !body.contains("-=")
-        || !body.contains("return")
-        || !contains_function_reassignment(body, &function.name)
-    {
-        return None;
-    }
-    let params = function
-        .params
-        .iter()
-        .map(|param| regex::escape(param))
-        .collect::<Vec<_>>()
-        .join(r"\s*,\s*");
-    let first = regex::escape(function.params.first()?);
-    let identifier = r"[A-Za-z_$][A-Za-z0-9_$]*";
-    let pattern = compile_regex(&format!(
-        r"(?s)^\s*function\s+{}\s*\(\s*{}\s*\)\s*\{{\s*(?:const|let|var)\s+(?P<table>{identifier})\s*=\s*(?P<provider>{identifier})\s*\(\s*\)\s*;\s*return\s*\(\s*{}\s*=\s*function\s*\(\s*{}\s*\)\s*\{{\s*return\s+(?P<lookup>{identifier})\s*\[\s*{}\s*-=\s*(?P<offset>0[xX][0-9A-Fa-f]+|[0-9]+)\s*\]\s*;?\s*\}}\s*\)\s*\(\s*{}\s*\)\s*;?\s*\}}\s*$",
-        regex::escape(&function.name),
-        params,
-        regex::escape(&function.name),
-        params,
-        first,
-        params,
-    ))?;
-    let captures = pattern.captures(body)?;
-    if captures.name("table")?.as_str() != captures.name("lookup")?.as_str() {
-        return None;
-    }
-    let provider = captures.name("provider")?.as_str().to_string();
-    if name_counts.get(&provider).copied() != Some(1) {
-        return None;
-    }
-    let provider = providers.get(&(function.scope, provider))?;
-    let provider_info = provider.provider.as_ref()?;
-    let offset = parse_i64_literal(captures.name("offset")?.as_str())?;
-    Some(Decoder {
-        values: provider_info.values.clone().into(),
-        proven_alias_reads: None,
-        offset,
-        provider: provider.symbol,
-        provider_array_span: provider_info.span,
-        transform: DecoderTransform::Plain,
-    })
-}
-
 fn detect_decoder_candidate(
     source: &str,
     function: &FnInfo,
     patterns: &DecoderPatterns,
     name_counts: &HashMap<String, usize>,
-    providers: &HashMap<(ScopeId, String), &FnInfo>,
+    providers: &ProviderIndex<'_>,
 ) -> Option<Decoder> {
     if !function.parameters_proven || function.params.is_empty() {
         return None;
     }
-    if let Some(shape) = &function.sequence_decoder {
-        if name_counts.get(&function.name).copied() != Some(1)
-            || name_counts.get(&shape.provider).copied() != Some(1)
-        {
-            return None;
-        }
-        let provider = providers.get(&(function.scope, shape.provider.clone()))?;
-        if provider.symbol != shape.provider_symbol {
-            return None;
-        }
+    if let Some(shape) = &function.plain_decoder {
+        let provider = providers.by_symbol.get(&shape.provider_symbol)?;
         let provider_info = provider.provider.as_ref()?;
         return Some(Decoder {
             values: provider_info.values.clone().into(),
@@ -2980,11 +3099,6 @@ fn detect_decoder_candidate(
             provider_array_span: provider_info.span,
             transform: DecoderTransform::Plain,
         });
-    }
-    if let Some(decoder) =
-        inline_self_rewriting_direct_decoder(source, function, name_counts, providers)
-    {
-        return Some(decoder);
     }
     let body = fragment(source, function.span);
     let local = patterns.local.captures(body)?;
@@ -2999,7 +3113,7 @@ fn detect_decoder_candidate(
     {
         return None;
     }
-    let provider = providers.get(&(function.scope, provider))?;
+    let provider = providers.by_scope_name.get(&(function.scope, provider))?;
     let provider_info = provider.provider.as_ref()?;
     let offset_match = patterns.offset.captures(body)?;
     if offset_match[1] != offset_match[2] {
@@ -3030,24 +3144,7 @@ fn detect_decoder_candidate(
     let self_rewriting =
         installs_replacement_re.is_match(body) && tail_calls_public_re.is_match(body);
 
-    // Some javascript-obfuscator-style outputs use a simpler direct static
-    // accessor rather than installing a memoizing replacement. Match the whole
-    // function body so arbitrary application array accessors do not qualify.
-    let direct_re = compile_regex(&format!(
-        r"(?s)^\s*function\s+{}\s*\([^)]*\)\s*\{{\s*{}\s*=\s*{}\s*-\s*(?:0[xX][0-9A-Fa-f]+|[0-9]+)\s*;\s*(?:const|let|var)\s+{}\s*=\s*{}\s*\(\s*\)\s*;\s*(?:const|let|var)\s+{}\s*=\s*{}\s*\[\s*{}\s*\]\s*;\s*return\s+{}\s*;\s*\}}\s*$",
-        regex::escape(&function.name),
-        regex::escape(&param),
-        regex::escape(&param),
-        regex::escape(&local_array),
-        regex::escape(&provider.name),
-        regex::escape(&value_var),
-        regex::escape(&local_array),
-        regex::escape(&param),
-        regex::escape(&value_var),
-    ))?;
-    if !direct_re.is_match(body)
-        && !(self_rewriting && (bare_value_return || sequence_value_return))
-    {
+    if !(self_rewriting && (bare_value_return || sequence_value_return)) {
         return None;
     }
 
@@ -3067,13 +3164,18 @@ fn detect_decoder_candidate(
         .is_some_and(|pattern| pattern.is_match(body))
     });
 
+    let transform = decoder_transform(body, keyed_decode_call)?;
+    // Plain accessors are accepted only by the structural proof above.
+    if matches!(transform, DecoderTransform::Plain) {
+        return None;
+    }
     Some(Decoder {
         values: provider_info.values.clone().into(),
         proven_alias_reads: None,
         offset,
         provider: provider.symbol,
         provider_array_span: provider_info.span,
-        transform: decoder_transform(body, keyed_decode_call)?,
+        transform,
     })
 }
 
@@ -3246,18 +3348,21 @@ fn detect_decoders(
                                     .get_reference(reference)
                                     .flags()
                                     .is_member_write_target())
-                                || reference_spans
-                                    .get(&reference)
-                                    .is_some_and(|span| span_contains(function.span, *span)))
+                                || function.plain_decoder.as_ref().map_or_else(
+                                    || {
+                                        reference_spans
+                                            .get(&reference)
+                                            .is_some_and(|span| span_contains(function.span, *span))
+                                    },
+                                    |shape| shape.installation == Some(reference),
+                                ))
                     })
             {
                 return None;
             }
             let decoder =
                 detect_decoder_candidate(source, function, patterns, &name_counts, &providers)?;
-            let provider = functions.iter().find(|candidate| {
-                candidate.symbol == decoder.provider && candidate.provider.is_some()
-            })?;
+            let provider = providers.by_symbol.get(&decoder.provider)?;
             // Verify the provider referenced by the matched body, not only a
             // name that happens to be declared in its enclosing scope.
             let mut reads = scoping
@@ -3273,6 +3378,27 @@ fn detect_decoders(
             reads.next().is_none().then_some((function.symbol, decoder))
         })
         .collect::<HashMap<_, _>>();
+
+    // Pure return-value semantics do not justify deleting an observable
+    // self-installation. Classify source-local alias/call uses before proving
+    // rotations, because removing the setup can suppress installation too.
+    let installations = functions
+        .iter()
+        .filter_map(|function| {
+            let installation = function.plain_decoder.as_ref()?.installation?;
+            decoders
+                .contains_key(&function.symbol)
+                .then_some((function.symbol, installation))
+        })
+        .collect::<Vec<_>>();
+    if !installations.is_empty() {
+        let uses = callable_observation::CallableUses::collect(program, context);
+        for (symbol, installation) in installations {
+            if !uses.installation_unobservable(symbol, installation)? {
+                decoders.remove(&symbol);
+            }
+        }
+    }
 
     // A self-installing provider returns the same mutable allocation to
     // every caller. A reference outside its own installation, a proved
@@ -3543,6 +3669,18 @@ impl AliasCandidateCollector<'_, '_> {
         if alias == target_symbol || !facts.binding_unmodified_by_eval(scoping, target_symbol) {
             return;
         }
+        // Nonleading declarations need actual execution-region evidence,
+        // not just a declaration offset. Permit mutable local storage when
+        // neither end depends on an ambient object-backed binding whose
+        // value could change during an earlier unknown operation.
+        if matches!(origin, AliasOrigin::Declaration(None))
+            && !scoping.symbol_flags(alias).is_const_variable()
+            && (!facts.source_local_data_binding(scoping, alias)
+                || !(facts.is_private(scoping, target_symbol)
+                    || facts.source_local_data_binding(scoping, target_symbol)))
+        {
+            return;
+        }
         self.by_target
             .entry(target_symbol)
             .or_default()
@@ -3660,7 +3798,7 @@ impl AliasCandidateCollector<'_, '_> {
 
 impl<'a> Visit<'a> for AliasCandidateCollector<'_, '_> {
     fn visit_variable_declaration(&mut self, declaration: &oxc_ast::ast::VariableDeclaration<'a>) {
-        if declaration.kind == VariableDeclarationKind::Const {
+        if rotation_proof::ordinary_declaration(declaration) {
             for declarator in &declaration.declarations {
                 self.declaration(declarator, None);
             }
@@ -3701,21 +3839,6 @@ impl<'a> Visit<'a> for AliasCandidateCollector<'_, '_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn function_reassignment_probe_handles_spacing_without_suffix_matches() {
-        assert!(contains_function_reassignment("f=function(){}", "f"));
-        assert!(contains_function_reassignment(
-            "f   =
- function(){}",
-            "f"
-        ));
-        assert!(!contains_function_reassignment(
-            "other_f = function(){}",
-            "f"
-        ));
-        assert!(!contains_function_reassignment("f == function(){}", "f"));
-    }
 
     #[test]
     fn decoder_rotation_updates_all_views_of_exactly_one_provider() {

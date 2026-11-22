@@ -8118,6 +8118,117 @@ mod tests {
     }
 
     #[test]
+    fn plain_decoder_requires_complete_exact_binding_and_effect_roles() {
+        let prefix = "function p(){var t=['a','b'];p=function(){return t;};return p();}";
+        for (decoder, expected) in [
+            ("function d(i){i=i-16;const t=p();let v=t[i];return v;}",1),
+            ("function d(i){i-=16;const t=p();return t[i]}",1),
+            ("function d(i){i=(i)-(16);const /*table*/ t=(p)();return (t)[(i)];}",1),
+            ("function d(i){const t=p();return (d=function(x){return t[x-=16]})(i)}",1),
+            ("function d(i){const t=p();return d=function(x){x-=16;return t[x]},d(i)}",1),
+            ("function d(i){const t=p();d=function(x){x-=16;return t[x]};return d(i)}",1),
+            ("function d(i){const t=p();d=function(x){x-=16;return t[x]};events.push(i);return d(i)}",0),
+            ("function d(i){const t=p();d=function(x){x-=16;return t[x]};return other(i)}",0),
+            ("function d(i){const t=p();return d=function(x){x=x-16;const v=t[x];return v},d(i)}",1),
+            ("function d(i){const t=p();return (d=function named(x){return t[x-=16]})(i)}",1),
+            ("function d(i){i=i-16;const t=p();let v=t[i];events.push(v);return v;}",0),
+            ("function d(i){const t=p();return d=function(x){x=x-16;const v=t[x];events.push(v);return v},d(i)}",0),
+            ("function d(i){const t=p();return (d=function(t){return t[t-=16]})(i)}",0),
+            ("function d(i){const t=p();return (d=function(x){return t[x-=16]})(i+1)}",0),
+            ("function d(i){const t=p();return (d=function(x=events.push(i)){return t[x-=16]})(i)}",0),
+            ("function d(i){const t=p();return (d=async function(x){return t[x-=16]})(i)}",0),
+            ("function d(i){const t=p();return (d=function*(x){return t[x-=16]})(i)}",0),
+            ("function d(i){const t=p();return (d=function(x){return t[x-=16]})?.(i)}",0),
+            ("function d(i){i=i-16;const t=p();let v=t[i];return 'wrong'}",0),
+            ("function d(i){i=i-16;const t=p();using v=t[i];return v;}",0),
+            ("function d(i){i=i-16;const t=p();return t?.[i]}",0),
+        ] {
+            let source = format!("{prefix}{decoder}sink(d(16));");
+            let result = recover_static_decoders(&source, 4).unwrap_or_else(|| unreachable!("{source}"));
+            assert_eq!(result.transforms.get("string_array_decode").copied().unwrap_or_default(), expected, "{source}: {}",result.source);
+        }
+        let source = format!("{prefix}function d(i){{i-=16;const t=p();return t[i]}}sink(d(16));(function(){{function p(){{var t=['other'];p=function(){{return t}};return p()}}function d(i){{i-=17;const t=p();return t[i]}}sink(d(17));}})();");
+        let result = recover_static_decoders(&source, 4).unwrap_or_else(|| unreachable!());
+        assert_eq!(
+            result.transforms.get("string_array_decode"),
+            Some(&2),
+            "{}",
+            result.source
+        );
+        assert!(
+            result.source.contains("sink(\"a\")") && result.source.contains("sink(\"other\")"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn self_installing_decoder_calls_require_unobservable_function_identity() {
+        let prefix = "function p(){var t=['a','b'];p=function(){return t;};return p();}function d(i){const t=p();return (d=function(x){return t[x-=16]})(i)}";
+        for (suffix, expected) in [
+            ("sink(d(16));", 1),
+            ("const original=d;sink(original(16));", 1),
+            ("const original=d;const alias=original;sink(alias(16));", 1),
+            (
+                "const original=d;const value=d(16);sink(original===d,value);",
+                0,
+            ),
+            ("const value=d(16);sink(d.toString(),value);", 0),
+            ("const value=d(16);sink(d.name,value);", 0),
+            ("const alias=d;const value=d(16);sink(alias,value);", 0),
+            ("const alias=d;const value=d(16);sink(alias===d,value);", 0),
+            ("let alias;void(alias=d);sink(d(16));", 1),
+            ("let alias;(alias=d,0);sink(d(16));", 1),
+            ("let alias;for(alias=d;false;){}sink(d(16));", 1),
+            ("let alias;alias=d;sink(d(16));", 1),
+            ("let alias;sink(d(16));alias=d;", 0),
+            ("let alias;sink(d(16));(alias=d,alias);", 0),
+            (
+                "function capture(){const alias=d;return alias}sink(d(16),capture());",
+                0,
+            ),
+            ("const alias=d;alias.extra=1;sink(d(16));", 0),
+            (
+                "function invoke(alias){return alias(16)}sink(d(16),invoke(d));",
+                0,
+            ),
+            ("const value=d(16);export {d};sink(value);", 0),
+            (
+                "const alias=d;const value=d(16);export {alias};sink(value);",
+                0,
+            ),
+        ] {
+            let source = format!("{prefix}{suffix}");
+            let result =
+                recover_static_decoders(&source, 4).unwrap_or_else(|| unreachable!("{source}"));
+            assert_eq!(
+                result
+                    .transforms
+                    .get("string_array_decode")
+                    .copied()
+                    .unwrap_or_default(),
+                expected,
+                "{source}: {}",
+                result.source
+            );
+        }
+        for provider in [
+            "export function p(){var t=['a'];p=function(){return t};return p()}",
+            "function p(){using t=['a'];p=function(){return t};return p()}",
+        ] {
+            let source =
+                format!("{provider}function d(i){{i-=16;const t=p();return t[i]}}sink(d(16));");
+            let result =
+                recover_static_decoders(&source, 4).unwrap_or_else(|| unreachable!("{source}"));
+            assert!(
+                !result.transforms.contains_key("string_array_decode"),
+                "{source}: {}",
+                result.source
+            );
+        }
+    }
+
+    #[test]
     fn decoder_only_recovery_proves_inline_self_rewriting_plain_decoder() {
         let source = r#"
 function provider() {
@@ -8861,6 +8972,67 @@ use();
             let result = recover_static_decoders(&source, 8).unwrap_or_else(|| unreachable!("{source}"));
             assert_eq!(result.transforms.get("string_array_decode").copied().unwrap_or_default(), expected, "{source}: {}", result.source);
         }
+    }
+
+    #[test]
+    fn nonleading_mutable_decoder_aliases_use_exact_local_initialization_regions() {
+        let functions = "function p(){var t=['a','b'];p=function(){return t;};return p();}function d(i,t,v){return i=i-16,t=p(),v=t[i],v;}";
+        for (body, expected) in [
+            ("side();let a=d;sink(a(16));", 1),
+            ("side();var a=d;sink(a(16));", 1),
+            ("var before=side(),a=d;sink(a(16));", 1),
+            ("side();let a=d;side();let b=a;sink(b(16));", 1),
+            ("side();{let a=d;sink(a(16));}", 1),
+            ("if(flag){var a=d;sink(a(16));}sink(a(16));", 1),
+            ("if(flag){var a=d;}sink(a(16));", 0),
+            ("try{a(16)}catch(e){}var a=d;sink(a(16));", 1),
+            ("try{a(16)}catch(e){}let a=d;sink(a(16));", 1),
+            ("side();let a=d;a=replacement;sink(a(16));", 0),
+            (
+                "function inner(){return a(16)}side();var a=d;sink(inner());",
+                1,
+            ),
+            (
+                "function inner(){return a(16)}try{inner()}catch(e){}var a=d;sink(inner(),a(16));",
+                1,
+            ),
+            ("try{side();var a=d;}catch(error){}sink(a(16));", 0),
+            ("side();let a=d;eval('a=replacement');sink(a(16));", 0),
+            ("side();var a=d;let f=()=>a(16);sink(f());", 1),
+            (
+                "side();let a=d;function mutate(){a=replacement}sink(a(16));",
+                0,
+            ),
+        ] {
+            let source = format!("(function(){{{functions}{body}}})();");
+            let result =
+                recover_static_decoders(&source, 4).unwrap_or_else(|| unreachable!("{source}"));
+            assert_eq!(
+                result
+                    .transforms
+                    .get("string_array_decode")
+                    .copied()
+                    .unwrap_or_default(),
+                expected,
+                "{source}: {}",
+                result.source
+            );
+        }
+        let source = format!("{functions}const a=d;side();let b=a;sink(b(16));");
+        let result = recover_static_decoders(&source, 4).unwrap_or_else(|| unreachable!());
+        assert_eq!(
+            result.transforms.get("string_array_decode"),
+            Some(&1),
+            "{}",
+            result.source
+        );
+        let source = format!("{functions}var a=d;side();let b=a;sink(b(16));");
+        let result = recover_static_decoders(&source, 4).unwrap_or_else(|| unreachable!());
+        assert!(
+            !result.transforms.contains_key("string_array_decode"),
+            "{}",
+            result.source
+        );
     }
 
     #[test]
