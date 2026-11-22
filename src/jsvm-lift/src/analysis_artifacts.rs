@@ -1,25 +1,24 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use serde_json::Value;
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArtifactSpec {
     pub name: &'static str,
     pub relative_path: &'static str,
     pub schema: &'static str,
+    pub record_fields: &'static [&'static str],
     pub array_fields: &'static [&'static str],
     pub object_fields: &'static [&'static str],
 }
 
 macro_rules! artifact {
-    ($name:ident, $label:literal, $path:literal, $schema:literal $(, arrays = [$($array:literal),* $(,)?])? $(, objects = [$($object:literal),* $(,)?])? ) => {
+    ($name:ident, $label:literal, $path:literal, $schema:literal $(, records = [$($record:literal),* $(,)?])? $(, arrays = [$($array:literal),* $(,)?])? $(, objects = [$($object:literal),* $(,)?])? ) => {
         pub const $name: ArtifactSpec = ArtifactSpec {
             name: $label,
             relative_path: $path,
             schema: $schema,
+            record_fields: &[$($($record),*)?],
             array_fields: &[$($($array),*)?],
             object_fields: &[$($($object),*)?],
         };
@@ -31,7 +30,7 @@ artifact!(
     "source index",
     "analysis/source-index.json",
     "capture-source-index/v1",
-    arrays = ["units"],
+    records = ["units"],
     objects = ["summary"]
 );
 artifact!(
@@ -39,14 +38,14 @@ artifact!(
     "source-map recovery",
     "analysis/sourcemaps.json",
     "capture-sourcemap-recovery/v1",
-    arrays = ["source_maps"]
+    records = ["source_maps"]
 );
 artifact!(
     IMPORT_MAPS,
     "import maps",
     "analysis/import-maps.json",
     "capture-import-maps/v1",
-    arrays = ["maps"],
+    records = ["maps"],
     objects = ["documents", "summary"]
 );
 artifact!(
@@ -54,7 +53,7 @@ artifact!(
     "JavaScript references",
     "analysis/js-references.json",
     "capture-js-references/v1",
-    arrays = ["code_units"],
+    records = ["code_units"],
     objects = ["summary"]
 );
 artifact!(
@@ -62,7 +61,7 @@ artifact!(
     "static string recovery",
     "analysis/string-recovery.json",
     "capture-static-string-recovery/v1",
-    arrays = ["units"],
+    records = ["units"],
     objects = ["summary"]
 );
 artifact!(
@@ -70,7 +69,7 @@ artifact!(
     "safe deobfuscation",
     "analysis/deobfuscation.json",
     "capture-safe-deobfuscation/v1",
-    arrays = ["units"],
+    records = ["units"],
     objects = ["summary"]
 );
 artifact!(
@@ -78,7 +77,7 @@ artifact!(
     "bundle modules",
     "analysis/bundles.json",
     "capture-bundle-modules/v1",
-    arrays = ["bundles", "modules", "failures"],
+    records = ["bundles", "modules", "failures"],
     objects = ["summary"]
 );
 artifact!(
@@ -86,7 +85,7 @@ artifact!(
     "WASM capture index",
     "analysis/wasm/index.json",
     "wasm-redox/capture-v1",
-    arrays = ["modules"],
+    records = ["modules"],
     objects = ["summary"]
 );
 artifact!(
@@ -94,7 +93,7 @@ artifact!(
     "WASM/JavaScript boundary correlation",
     "analysis/wasm-js-boundary.json",
     "wasm-js-boundary-correlation/v7",
-    arrays = ["host_effect_rows", "copied_input_rows", "skipped_modules"],
+    records = ["host_effect_rows", "copied_input_rows", "skipped_modules"],
     objects = ["summary"]
 );
 artifact!(
@@ -102,7 +101,7 @@ artifact!(
     "WASM runtime resource provenance",
     "analysis/wasm-resource-provenance.json",
     "wasm-runtime-resource-provenance/v2",
-    arrays = ["observations", "unmatched", "ignored_non_body"],
+    records = ["observations", "unmatched", "ignored_non_body"],
     objects = ["summary"]
 );
 artifact!(
@@ -110,7 +109,7 @@ artifact!(
     "generated-code recovery",
     "analysis/generated-recovery.json",
     "generated-code-safe-recovery/v1",
-    arrays = ["units"],
+    records = ["units"],
     objects = ["summary"]
 );
 artifact!(
@@ -118,14 +117,14 @@ artifact!(
     "JS VM analysis",
     "analysis/jsvm/index.json",
     "capture-jsvm-analysis/v1",
-    arrays = ["code_units", "dynamic_code_units"]
+    records = ["code_units", "dynamic_code_units"]
 );
 artifact!(
     SOURCE_GRAPH,
     "source graph",
     "analysis/source-graph.json",
     "source-graph/v2",
-    arrays = ["nodes", "edges", "unresolved_edges"],
+    records = ["nodes", "edges", "unresolved_edges"],
     objects = ["summary"]
 );
 artifact!(
@@ -133,7 +132,7 @@ artifact!(
     "observed runtime source tree",
     "analysis/observed-source.json",
     "capture-observed-sources/v1",
-    arrays = ["sources"],
+    records = ["sources"],
     objects = ["summary"]
 );
 artifact!(
@@ -141,7 +140,7 @@ artifact!(
     "browser execution coverage with explicit observation mode",
     "analysis/execution-coverage.json",
     "capture-execution-coverage/v2",
-    arrays = ["scripts"],
+    records = ["scripts"],
     objects = ["summary"]
 );
 artifact!(
@@ -149,7 +148,8 @@ artifact!(
     "concrete debugger invocation witnesses",
     "analysis/selective-trace.json",
     "capture-selective-trace/v1",
-    arrays = ["hits", "errors"],
+    records = ["hits"],
+    arrays = ["errors"],
     objects = ["summary"]
 );
 artifact!(
@@ -157,7 +157,7 @@ artifact!(
     "runtime scripts",
     "analysis/runtime-scripts.json",
     "js-redox-runtime-scripts/v2",
-    arrays = [
+    records = [
         "alpine_families",
         "gtm_families",
         "sources",
@@ -170,7 +170,7 @@ artifact!(
     "static API surface",
     "analysis/api-surface.json",
     "capture-api-surface/v10",
-    arrays = ["callsites", "mutation_sites", "failures"],
+    records = ["callsites", "mutation_sites", "failures"],
     objects = ["summary"]
 );
 
@@ -204,7 +204,7 @@ pub fn artifact_path(project: &Path, spec: ArtifactSpec) -> PathBuf {
 ///
 /// # Errors
 ///
-/// Fails when the root is not an object, its schema does not match the artifact contract, or a required array/object field is missing or incorrectly typed.
+/// Fails when the root is not an object, its schema does not match the artifact contract, or a required field or record row is missing or incorrectly typed.
 pub fn validate_artifact<'a>(
     document: &'a Value,
     spec: ArtifactSpec,
@@ -220,6 +220,14 @@ pub fn validate_artifact<'a>(
             spec.schema,
             schema
         );
+    }
+    for &field in spec.record_fields {
+        let Some(rows) = object.get(field).and_then(Value::as_array) else {
+            bail!("{label}: {field} must be an array of records");
+        };
+        if let Some(index) = rows.iter().position(|row| !row.is_object()) {
+            bail!("{label}: {field}[{index}] must be an object");
+        }
     }
     for &field in spec.array_fields {
         if !object.get(field).is_some_and(Value::is_array) {
@@ -258,10 +266,7 @@ pub fn build_artifact(
 ///
 /// Fails on file-read errors, invalid JSON, a mismatched schema or missing/incorrect required fields.
 pub fn read_artifact(path: &Path, spec: ArtifactSpec) -> Result<Value> {
-    let text = fs::read_to_string(path)
-        .with_context(|| format!("failed to read {} {}", spec.name, path.display()))?;
-    let document: Value = serde_json::from_str(&text)
-        .with_context(|| format!("failed to parse {} {}", spec.name, path.display()))?;
+    let document = crate::report_file::read_json(path, spec.name)?;
     validate_artifact(&document, spec, &path.display().to_string())?;
     Ok(document)
 }
@@ -308,7 +313,32 @@ pub fn write_artifact(project: &Path, spec: ArtifactSpec, document: &Value) -> R
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::collections::BTreeSet;
+    use std::{collections::BTreeSet, fs};
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_links_and_nonregular_files_are_not_optional_absence() -> Result<()> {
+        use std::os::unix::{fs::symlink, net::UnixListener};
+        let root = tempfile::tempdir()?;
+        let project = root.path();
+        let path = artifact_path(project, SOURCE_INDEX);
+        fs::create_dir_all(project.join("analysis"))?;
+        let target = project.join("manifest.json");
+        symlink(&target, &path)?;
+        assert!(load_artifact(project, SOURCE_INDEX, true).is_err());
+        let valid = json!({"schema":SOURCE_INDEX.schema,"units":[],"summary":{}});
+        fs::write(&target, serde_json::to_vec(&valid)?)?;
+        assert!(load_artifact(project, SOURCE_INDEX, true).is_err());
+        fs::remove_file(&path)?;
+        let socket = UnixListener::bind(&path)?;
+        assert!(load_artifact(project, SOURCE_INDEX, true).is_err());
+        drop(socket);
+        fs::remove_file(&path)?;
+        assert!(load_artifact(project, SOURCE_INDEX, true)?.is_none());
+        write_artifact(project, SOURCE_INDEX, &valid)?;
+        assert_eq!(load_artifact(project, SOURCE_INDEX, true)?, Some(valid));
+        Ok(())
+    }
 
     #[test]
     fn optional_artifact_ignores_missing_file_not_other_read_failures() -> Result<()> {
@@ -325,6 +355,36 @@ mod tests {
         fs::create_dir(&directory)?;
         fs::write(artifact_path(project, SOURCE_INDEX), "invalid JSON")?;
         assert!(load_artifact(project, SOURCE_INDEX, true).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn record_array_contracts_reject_malformed_rows_in_every_artifact() -> Result<()> {
+        for &spec in ALL_ARTIFACTS {
+            let mut payload = serde_json::Map::new();
+            for &field in spec.record_fields.iter().chain(spec.array_fields) {
+                payload.insert(field.into(), json!([]));
+            }
+            for &field in spec.object_fields {
+                payload.insert(field.into(), json!({}));
+            }
+            let mut document = build_artifact(spec, payload)?;
+            for &field in spec.record_fields {
+                document[field] = json!([{}, null]);
+                let error = validate_artifact(&document, spec, "fixture")
+                    .err()
+                    .ok_or_else(|| anyhow::anyhow!("{} accepts non-record {field}", spec.name))?;
+                assert!(error.to_string().contains(&format!("{field}[1]")));
+                document[field] = json!([{}]);
+                validate_artifact(&document, spec, "fixture")?;
+            }
+        }
+        // Recorder diagnostic payloads remain opaque; they are not record rows.
+        validate_artifact(
+            &json!({"schema":SELECTIVE_TRACE.schema,"hits":[],"errors":["diagnostic",{"message":"other"}],"summary":{}}),
+            SELECTIVE_TRACE,
+            "fixture",
+        )?;
         Ok(())
     }
 
