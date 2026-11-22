@@ -1512,6 +1512,53 @@ fn parse<'a>(
     parse_program(allocator, source, source_type)
 }
 
+impl Collector<'_, '_> {
+    fn finish_named_modules(&mut self) {
+        if !self.amd_modules.is_empty() {
+            let start = self.amd_start.unwrap_or_default();
+            let end = self.amd_end.unwrap_or(start);
+            self.bundles.push(BundleRecord {
+                kind: "amd_named_modules".into(),
+                start,
+                end,
+                callee: "define".into(),
+                chunk_ids: Vec::new(),
+                module_table_start: start,
+                module_table_end: end,
+                modules: std::mem::take(&mut self.amd_modules),
+            });
+        }
+        let mut member_groups = std::mem::take(&mut self.amd_member_groups)
+            .into_iter()
+            .filter_map(|(receiver, group)| {
+                let proven = match receiver {
+                    MemberReceiverKey::Global(_) => group.explicit_dependency_arrays > 0,
+                    MemberReceiverKey::Local(symbol) => self
+                        .amd_loader_evidence
+                        .get(&symbol)
+                        .is_some_and(|evidence| {
+                            evidence.supports_named_modules(group.modules.len())
+                        }),
+                };
+                proven.then_some(group)
+            })
+            .collect::<Vec<_>>();
+        member_groups.sort_by_key(|group| group.start);
+        for group in member_groups {
+            self.bundles.push(BundleRecord {
+                kind: "member_named_modules".into(),
+                start: group.start,
+                end: group.end,
+                callee: group.callee,
+                chunk_ids: Vec::new(),
+                module_table_start: group.start,
+                module_table_end: group.end,
+                modules: group.modules,
+            });
+        }
+    }
+}
+
 /// Analyze one JavaScript source body for statically explicit bundle/module tables.
 ///
 /// # Errors
@@ -1557,48 +1604,7 @@ pub fn analyze_bundle_source(
         collector.visit_program(&parsed.program);
         collector.budget_poller.finish()?;
         budget.checkpoint()?;
-        if !collector.amd_modules.is_empty() {
-            let start = collector.amd_start.unwrap_or_default();
-            let end = collector.amd_end.unwrap_or(start);
-            collector.bundles.push(BundleRecord {
-                kind: "amd_named_modules".into(),
-                start,
-                end,
-                callee: "define".into(),
-                chunk_ids: Vec::new(),
-                module_table_start: start,
-                module_table_end: end,
-                modules: std::mem::take(&mut collector.amd_modules),
-            });
-        }
-        let mut member_groups = std::mem::take(&mut collector.amd_member_groups)
-            .into_iter()
-            .filter_map(|(receiver, group)| {
-                let proven = match receiver {
-                    MemberReceiverKey::Global(_) => group.explicit_dependency_arrays > 0,
-                    MemberReceiverKey::Local(symbol) => collector
-                        .amd_loader_evidence
-                        .get(&symbol)
-                        .is_some_and(|evidence| {
-                            evidence.supports_named_modules(group.modules.len())
-                        }),
-                };
-                proven.then_some(group)
-            })
-            .collect::<Vec<_>>();
-        member_groups.sort_by_key(|group| group.start);
-        for group in member_groups {
-            collector.bundles.push(BundleRecord {
-                kind: "member_named_modules".into(),
-                start: group.start,
-                end: group.end,
-                callee: group.callee,
-                chunk_ids: Vec::new(),
-                module_table_start: group.start,
-                module_table_end: group.end,
-                modules: group.modules,
-            });
-        }
+        collector.finish_named_modules();
         collector.bundles
     };
 

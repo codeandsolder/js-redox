@@ -1,21 +1,22 @@
 use crate::{
     analysis_artifacts::{load_artifact, write_artifact, BUNDLES, DEOBFUSCATION},
     analysis_budget::{recoverable_unit_error, AnalysisBudgets, AnalysisOperation},
-    bundle_unpack::{analyze_bundle_source, BundleInventoryReport, ModuleRecord},
+    bundle_unpack::{analyze_bundle_source, BundleInventoryReport, BundleRecord, ModuleRecord},
     content_dedup::{default_jobs, sha256_path},
     js_format::format_source,
     report_markdown::{code_span, link_destination, literal_text},
     sha256_hex,
 };
 use anyhow::{bail, Context, Result};
-use rayon::{prelude::*, ThreadPoolBuilder};
-use serde_json::{json, Map, Value};
+use rayon::{prelude::*, ThreadPool, ThreadPoolBuilder};
+use serde_json::{json, Value};
 use std::fmt::Write as _;
 use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
 };
+use work_budget::WorkBudget;
 
 const PROVENANCE_PLACEHOLDER: &str = "__JSVM_CAPTURE_PROVENANCE__";
 
@@ -239,6 +240,79 @@ fn bool_field(value: &Value, key: &str) -> bool {
     value.get(key).and_then(Value::as_bool).unwrap_or(false)
 }
 
+fn append_bundle_readme(
+    lines: &mut Vec<String>,
+    bundle: &Value,
+    bundle_id: u64,
+    rows: &[&Value],
+) -> Result<()> {
+    let named_export_rows = rows
+        .iter()
+        .filter(|row| array_len(row, "export_names") > 0)
+        .copied()
+        .collect::<Vec<_>>();
+    let commonjs_only = rows
+        .iter()
+        .filter(|row| bool_field(row, "commonjs_export") && array_len(row, "export_names") == 0)
+        .count();
+    let anonymous = rows
+        .len()
+        .saturating_sub(named_export_rows.len() + commonjs_only);
+    let kind = string_field(bundle, "kind").unwrap_or_default();
+    let chunk_ids = bundle
+        .get("chunk_ids")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let identity = match kind {
+        "amd_named_modules" => "named AMD modules".to_owned(),
+        "member_named_modules" => "member-loader named modules".to_owned(),
+        "browserify_module_table" => "Browserify module table".to_owned(),
+        _ if !chunk_ids.is_empty() => format!(
+            "chunk {}",
+            chunk_ids
+                .iter()
+                .filter_map(Value::as_str)
+                .map(code_span)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        _ => "direct module table".to_owned(),
+    };
+    lines.extend([
+        format!("## Bundle {:02} — {identity}", bundle_id + 1),
+        String::new(),
+        format!("- Parent: {}", code_span(string_field(bundle, "parent_path").unwrap_or_default())),
+        format!("- Modules: **{}**; named: **{}**; CommonJS-only: **{commonjs_only}**; unlabeled: **{anonymous}**", rows.len(), named_export_rows.len()),
+    ]);
+    if !named_export_rows.is_empty() {
+        lines.extend([String::new(), "Named-export modules:".to_owned()]);
+        for row in named_export_rows {
+            let source_path = string_field(row, "source_path").unwrap_or_default();
+            let relative = Path::new(source_path)
+                .strip_prefix("src/_modules")
+                .with_context(|| format!("module path is outside src/_modules: {source_path}"))?;
+            let export_name_list = row
+                .get("export_names")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(code_span)
+                .collect::<Vec<_>>()
+                .join(", ");
+            lines.push(format!(
+                "- [module {}]({}): {export_name_list} — {} literal dep(s)",
+                literal_text(string_field(row, "module_id").unwrap_or_default()),
+                link_destination(&relative.to_string_lossy()),
+                array_len(row, "dependencies")
+            ));
+        }
+    }
+    lines.push(String::new());
+    Ok(())
+}
+
 fn write_module_readme(module_root: &Path, bundles: &[Value], modules: &[Value]) -> Result<()> {
     fs::create_dir_all(module_root)
         .with_context(|| format!("creating {}", module_root.display()))?;
@@ -274,73 +348,8 @@ fn write_module_readme(module_root: &Path, bundles: &[Value], modules: &[Value])
             .get("bundle_id")
             .and_then(Value::as_u64)
             .context("bundle_id must be a non-negative integer")?;
-        let rows = by_bundle.get(&bundle_id).cloned().unwrap_or_default();
-        let named_export_rows = rows
-            .iter()
-            .filter(|row| array_len(row, "export_names") > 0)
-            .copied()
-            .collect::<Vec<_>>();
-        let commonjs_only = rows
-            .iter()
-            .filter(|row| bool_field(row, "commonjs_export") && array_len(row, "export_names") == 0)
-            .count();
-        let anonymous = rows
-            .len()
-            .saturating_sub(named_export_rows.len() + commonjs_only);
-        let kind = string_field(bundle, "kind").unwrap_or_default();
-        let chunk_ids = bundle
-            .get("chunk_ids")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let identity = match kind {
-            "amd_named_modules" => "named AMD modules".to_owned(),
-            "member_named_modules" => "member-loader named modules".to_owned(),
-            "browserify_module_table" => "Browserify module table".to_owned(),
-            _ if !chunk_ids.is_empty() => format!(
-                "chunk {}",
-                chunk_ids
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(code_span)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-            _ => "direct module table".to_owned(),
-        };
-        lines.extend([
-            format!("## Bundle {:02} — {identity}", bundle_id + 1),
-            String::new(),
-            format!("- Parent: {}", code_span(string_field(bundle, "parent_path").unwrap_or_default())),
-            format!("- Modules: **{}**; named: **{}**; CommonJS-only: **{commonjs_only}**; unlabeled: **{anonymous}**", rows.len(), named_export_rows.len()),
-        ]);
-        if !named_export_rows.is_empty() {
-            lines.extend([String::new(), "Named-export modules:".to_owned()]);
-            for row in named_export_rows {
-                let source_path = string_field(row, "source_path").unwrap_or_default();
-                let relative = Path::new(source_path)
-                    .strip_prefix("src/_modules")
-                    .with_context(|| {
-                        format!("module path is outside src/_modules: {source_path}")
-                    })?;
-                let export_name_list = row
-                    .get("export_names")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_str)
-                    .map(code_span)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                lines.push(format!(
-                    "- [module {}]({}): {export_name_list} — {} literal dep(s)",
-                    literal_text(string_field(row, "module_id").unwrap_or_default()),
-                    link_destination(&relative.to_string_lossy()),
-                    array_len(row, "dependencies")
-                ));
-            }
-        }
-        lines.push(String::new());
+        let rows = by_bundle.get(&bundle_id).map_or(&[][..], Vec::as_slice);
+        append_bundle_readme(&mut lines, bundle, bundle_id, rows)?;
     }
     crate::report_file::write_text(&module_root.join("README.md"), &lines.join("\n"))
         .with_context(|| format!("writing {}/README.md", module_root.display()))
@@ -356,14 +365,9 @@ fn remove_tree_if_present(path: &Path) -> Result<()> {
 
 fn report_for_group(
     digest: &str,
-    group: &[usize],
-    units: &[EligibleUnit],
+    unit: &EligibleUnit,
     parent_budget: &work_budget::WorkBudget,
 ) -> Result<(String, Result<BundleInventoryReport, String>)> {
-    let Some(&index) = group.first() else {
-        return Ok((digest.to_owned(), Err("empty inventory group".to_owned())));
-    };
-    let unit = &units[index];
     let budget = AnalysisOperation::BundleMaterialization
         .under(parent_budget, unit.parent.display().to_string());
     if let Err(error) = budget.checkpoint() {
@@ -387,6 +391,384 @@ fn report_for_group(
         }
     };
     Ok((digest.to_owned(), result))
+}
+
+struct ContentGroup {
+    first: usize,
+    size: usize,
+}
+
+type BundleReports = BTreeMap<String, Result<BundleInventoryReport, String>>;
+
+struct BundleInputs {
+    units: Vec<EligibleUnit>,
+    groups: BTreeMap<String, ContentGroup>,
+}
+
+impl BundleInputs {
+    fn collect(project: &Path, deob_units: &[Value]) -> Result<Self> {
+        let mut units = Vec::new();
+        let mut groups = BTreeMap::<String, ContentGroup>::new();
+        for unit in deob_units {
+            let exit = unit.get("exit").and_then(Value::as_i64).unwrap_or(0);
+            if exit != 0 {
+                continue;
+            }
+            let Some(parent_rel) = unit.get("output_path").and_then(Value::as_str) else {
+                continue;
+            };
+            let parent = project.join(parent_rel);
+            if !parent.is_file() {
+                continue;
+            }
+            let digest = match unit.get("output_sha256").and_then(Value::as_str) {
+                Some(value) => value.to_owned(),
+                None => sha256_path(&parent)?,
+            };
+            let index = units.len();
+            units.push(EligibleUnit {
+                ordinal: unit.get("ordinal").cloned().unwrap_or(Value::Null),
+                resource_id: unit.get("resource_id").cloned().unwrap_or(Value::Null),
+                parent_rel: PathBuf::from(parent_rel),
+                parent,
+                content_sha256: digest.clone(),
+            });
+            groups
+                .entry(digest)
+                .or_insert(ContentGroup {
+                    first: index,
+                    size: 0,
+                })
+                .size += 1;
+        }
+
+        Ok(Self { units, groups })
+    }
+
+    fn analyze(&self, pool: &ThreadPool, stage_budget: &WorkBudget) -> Result<BundleReports> {
+        let grouped = self.groups.iter().collect::<Vec<_>>();
+        let inventory_rows = pool.install(|| {
+            grouped
+                .par_iter()
+                .map(|(digest, group)| {
+                    report_for_group(digest, &self.units[group.first], stage_budget)
+                })
+                .collect::<Vec<_>>()
+        });
+        let inventory = inventory_rows
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        stage_budget.checkpoint()?;
+
+        Ok(inventory)
+    }
+}
+
+#[derive(Default)]
+struct BundleOutputs {
+    bundles: Vec<Value>,
+    modules: Vec<Value>,
+    tasks: Vec<ModuleTask>,
+    failures: Vec<Value>,
+}
+
+#[derive(Clone, Copy)]
+struct BundleOccurrence<'a> {
+    unit: &'a EligibleUnit,
+    group_size: usize,
+    ordinal: usize,
+}
+
+impl BundleOutputs {
+    fn collect(
+        project: &Path,
+        inputs: &BundleInputs,
+        inventory: &BundleReports,
+        stage_budget: &WorkBudget,
+    ) -> Result<Self> {
+        let mut output = Self::default();
+        let mut seen_digest = BTreeMap::<&str, usize>::new();
+        for unit in &inputs.units {
+            stage_budget.checkpoint()?;
+            let count = seen_digest.entry(&unit.content_sha256).or_default();
+            let occurrence = BundleOccurrence {
+                unit,
+                group_size: inputs
+                    .groups
+                    .get(&unit.content_sha256)
+                    .map_or(0, |group| group.size),
+                ordinal: *count,
+            };
+            *count += 1;
+            let report = inventory
+                .get(&unit.content_sha256)
+                .with_context(|| format!("missing inventory result for {}", unit.content_sha256))?;
+            output.record_unit(project, occurrence, report)?;
+        }
+        Ok(output)
+    }
+
+    fn record_unit(
+        &mut self,
+        project: &Path,
+        occurrence: BundleOccurrence<'_>,
+        report: &Result<BundleInventoryReport, String>,
+    ) -> Result<()> {
+        let BundleOccurrence {
+            unit,
+            group_size,
+            ordinal,
+        } = occurrence;
+        let report = match report {
+            Ok(report) => report,
+            Err(error) => {
+                self.failures.push(json!({
+                    "ordinal": unit.ordinal, "path": unit.parent_rel.to_string_lossy(),
+                    "content_sha256": unit.content_sha256, "content_group_size": group_size,
+                    "deduplicated": ordinal > 0, "error": error,
+                }));
+                return Ok(());
+            }
+        };
+        let source = fs::read_to_string(&unit.parent)
+            .with_context(|| format!("reading {}", unit.parent.display()))?;
+        for (bundle_ordinal, bundle) in report.bundles.iter().enumerate() {
+            self.record_bundle(project, &source, occurrence, bundle_ordinal, bundle)?;
+        }
+        Ok(())
+    }
+
+    fn record_bundle(
+        &mut self,
+        project: &Path,
+        source: &str,
+        occurrence: BundleOccurrence<'_>,
+        bundle_ordinal: usize,
+        bundle: &BundleRecord,
+    ) -> Result<()> {
+        let BundleOccurrence {
+            unit,
+            group_size,
+            ordinal,
+        } = occurrence;
+        let bundle_id = self.bundles.len();
+        self.bundles.push(json!({
+            "bundle_id": bundle_id, "parent_ordinal": unit.ordinal, "resource_id": unit.resource_id,
+            "parent_path": unit.parent_rel.to_string_lossy(), "parent_content_sha256": unit.content_sha256,
+            "inventory_group_size": group_size, "inventory_deduplicated": ordinal > 0,
+            "kind": bundle.kind, "chunk_ids": bundle.chunk_ids, "start": bundle.start, "end": bundle.end,
+            "module_table_start": bundle.module_table_start, "module_table_end": bundle.module_table_end,
+            "module_count": bundle.modules.len(),
+            "module_ids": bundle.modules.iter().map(|module| module.id.clone()).collect::<Vec<_>>(),
+        }));
+        for (module_ordinal, module) in bundle.modules.iter().enumerate() {
+            let rel = module_output_path(
+                &unit.parent_rel,
+                &bundle.kind,
+                &bundle.chunk_ids,
+                &module.id,
+                bundle_ordinal,
+            )?;
+            let provenance = format!(
+                "parent={} bundle_span={}..{} module={} property_span={}..{}",
+                unit.parent_rel.display(),
+                bundle.start,
+                bundle.end,
+                module.id,
+                module.property_start,
+                module.property_end
+            );
+            let raw = build_module_source(source, module, PROVENANCE_PLACEHOLDER, &bundle.kind)?;
+            let raw_sha = sha256_hex(raw.as_bytes());
+            let module_index = self.modules.len();
+            self.modules.push(json!({
+                "bundle_id": bundle_id, "module_ordinal": module_ordinal, "parent_ordinal": unit.ordinal,
+                "resource_id": unit.resource_id, "parent_path": unit.parent_rel.to_string_lossy(),
+                "parent_content_sha256": unit.content_sha256, "bundle_kind": bundle.kind,
+                "chunk_ids": bundle.chunk_ids, "module_id": module.id, "property_start": module.property_start,
+                "property_end": module.property_end, "value_start": module.value_start, "value_end": module.value_end,
+                "value_kind": module.value_kind, "method": module.method, "dependencies": module.dependencies,
+                "dependency_map": module.dependency_map, "export_names": module.export_names,
+                "commonjs_export": module.commonjs_export, "source_path": rel.to_string_lossy(),
+                "module_input_sha256": raw_sha,
+            }));
+            self.tasks.push(ModuleTask {
+                module_index,
+                raw,
+                raw_sha256: raw_sha,
+                provenance,
+                dest: project.join(rel),
+            });
+        }
+        Ok(())
+    }
+
+    fn format_groups(&self) -> BTreeMap<String, Vec<usize>> {
+        let mut format_groups = BTreeMap::<String, Vec<usize>>::new();
+        for (index, task) in self.tasks.iter().enumerate() {
+            format_groups
+                .entry(task.raw_sha256.clone())
+                .or_default()
+                .push(index);
+        }
+        format_groups
+    }
+
+    fn format_templates(
+        &self,
+        pool: &ThreadPool,
+        format_groups: &BTreeMap<String, Vec<usize>>,
+        stage_budget: &WorkBudget,
+    ) -> Result<BTreeMap<String, (String, bool)>> {
+        let grouped_formats = format_groups.iter().collect::<Vec<_>>();
+        let formatted = pool.install(|| {
+            grouped_formats
+                .par_iter()
+                .map(|(digest, group)| {
+                    let Some(&index) = group.first() else {
+                        return Ok::<_, anyhow::Error>(((*digest).clone(), String::new(), false));
+                    };
+                    let task = &self.tasks[index];
+                    let budget = AnalysisOperation::Format
+                        .under(stage_budget, task.dest.display().to_string());
+                    let raw = &task.raw;
+                    let result = match format_source(raw, &budget) {
+                        Ok(formatted) => ((*digest).clone(), formatted, true),
+                        Err(error) => {
+                            let _error = recoverable_unit_error(error)?;
+                            ((*digest).clone(), raw.clone(), false)
+                        }
+                    };
+                    Ok(result)
+                })
+                .collect::<Vec<_>>()
+        });
+        let formatted = formatted
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .map(|(digest, source, ok)| (digest, (source, ok)))
+            .collect::<BTreeMap<_, _>>();
+        stage_budget.checkpoint()?;
+
+        Ok(formatted)
+    }
+
+    fn publish_templates(
+        &mut self,
+        format_groups: &BTreeMap<String, Vec<usize>>,
+        formatted: &BTreeMap<String, (String, bool)>,
+        stage_budget: &WorkBudget,
+    ) -> Result<()> {
+        for group in format_groups.values() {
+            stage_budget.checkpoint()?;
+            let Some(&canonical_task) = group.first() else {
+                continue;
+            };
+            let digest = &self.tasks[canonical_task].raw_sha256;
+            let (template, did_format) = formatted
+                .get(digest)
+                .with_context(|| format!("missing format result for {digest}"))?;
+            if !template.contains(PROVENANCE_PLACEHOLDER) {
+                bail!("formatter dropped module provenance placeholder for {digest}");
+            }
+            let canonical_module_index = self.tasks[canonical_task].module_index;
+            for &task_index in group {
+                let task = &self.tasks[task_index];
+                let rendered = template.replacen(PROVENANCE_PLACEHOLDER, &task.provenance, 1);
+                if let Some(parent) = task.dest.parent() {
+                    fs::create_dir_all(parent)
+                        .with_context(|| format!("creating {}", parent.display()))?;
+                }
+                fs::write(&task.dest, &rendered)
+                    .with_context(|| format!("writing {}", task.dest.display()))?;
+                let record = self
+                    .modules
+                    .get_mut(task.module_index)
+                    .and_then(Value::as_object_mut)
+                    .context("module record is not an object")?;
+                record.insert("formatted".into(), Value::Bool(*did_format));
+                record.insert(
+                    "sha256".into(),
+                    Value::String(sha256_hex(rendered.as_bytes())),
+                );
+                record.insert("format_group_size".into(), Value::from(group.len()));
+                record.insert(
+                    "format_deduplicated".into(),
+                    Value::Bool(task.module_index != canonical_module_index),
+                );
+                record.insert(
+                    "materialization".into(),
+                    Value::String("rendered_content_template".into()),
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    fn publish(
+        self,
+        project: &Path,
+        module_root: &Path,
+        inputs: &BundleInputs,
+        jobs: usize,
+        format_group_count: usize,
+    ) -> Result<BundleMaterializeSummary> {
+        let Self {
+            bundles,
+            modules,
+            tasks,
+            failures,
+        } = self;
+        let kind_modules = |kind: &str| -> usize {
+            bundles
+                .iter()
+                .filter(|bundle| string_field(bundle, "kind") == Some(kind))
+                .map(|bundle| array_len(bundle, "module_ids"))
+                .sum()
+        };
+        let webpack_modules = bundles
+            .iter()
+            .filter(|bundle| {
+                !matches!(
+                    string_field(bundle, "kind"),
+                    Some("amd_named_modules" | "member_named_modules" | "browserify_module_table")
+                )
+            })
+            .map(|bundle| array_len(bundle, "module_ids"))
+            .sum::<usize>();
+        let summary = json!({
+            "eligible_units": inputs.units.len(), "unique_input_bodies": inputs.groups.len(),
+            "deduplicated_units": inputs.units.len().saturating_sub(inputs.groups.len()), "inventory_invocations": inputs.groups.len(),
+            "module_format_invocations": format_group_count, "deduplicated_module_formats": tasks.len().saturating_sub(format_group_count),
+            "jobs": jobs, "bundles": bundles.len(), "modules": modules.len(),
+            "amd_named_modules": kind_modules("amd_named_modules"), "member_named_modules": kind_modules("member_named_modules"),
+            "browserify_modules": kind_modules("browserify_module_table"), "webpack_modules": webpack_modules,
+            "literal_module_dependencies": modules.iter().map(|module| array_len(module, "dependencies")).sum::<usize>(),
+            "modules_with_named_exports": modules.iter().filter(|module| array_len(module, "export_names") > 0).count(),
+            "named_exports": modules.iter().map(|module| array_len(module, "export_names")).sum::<usize>(),
+            "commonjs_export_modules": modules.iter().filter(|module| bool_field(module, "commonjs_export")).count(),
+            "failed_units": failures.len(),
+        });
+        let result = BundleMaterializeSummary {
+            eligible_units: inputs.units.len(),
+            unique_input_bodies: inputs.groups.len(),
+            bundles: bundles.len(),
+            modules: modules.len(),
+            failures: failures.len(),
+            jobs,
+        };
+        let document = json!({
+            "schema": BUNDLES.schema, "safe_static_only": true, "inventory": "jsvm_lift::bundle_unpack",
+            "bundles": bundles, "modules": modules, "failures": failures, "summary": summary,
+        });
+        write_artifact(project, BUNDLES, &document)?;
+        write_module_readme(module_root, &bundles, &modules)?;
+        Ok(result)
+    }
 }
 
 /// Materialize recovered bundle modules from verified deobfuscation evidence.
@@ -415,283 +797,23 @@ pub fn materialize_bundle_modules(
     let module_root = project.join("src/_modules");
     remove_tree_if_present(&module_root)?;
 
-    let mut units = Vec::new();
-    let mut groups = BTreeMap::<String, Vec<usize>>::new();
-    for unit in deob_units {
-        let exit = unit.get("exit").and_then(Value::as_i64).unwrap_or(0);
-        if exit != 0 {
-            continue;
-        }
-        let Some(parent_rel) = unit.get("output_path").and_then(Value::as_str) else {
-            continue;
-        };
-        let parent = project.join(parent_rel);
-        if !parent.is_file() {
-            continue;
-        }
-        let digest = match unit.get("output_sha256").and_then(Value::as_str) {
-            Some(value) => value.to_owned(),
-            None => sha256_path(&parent)?,
-        };
-        let index = units.len();
-        units.push(EligibleUnit {
-            ordinal: unit.get("ordinal").cloned().unwrap_or(Value::Null),
-            resource_id: unit.get("resource_id").cloned().unwrap_or(Value::Null),
-            parent_rel: PathBuf::from(parent_rel),
-            parent,
-            content_sha256: digest.clone(),
-        });
-        groups.entry(digest).or_default().push(index);
-    }
-
+    let inputs = BundleInputs::collect(project, deob_units)?;
     let pool = ThreadPoolBuilder::new()
         .num_threads(jobs)
         .build()
         .context("building bundle-analysis thread pool")?;
-    let grouped = groups.iter().collect::<Vec<_>>();
-    let inventory_rows = pool.install(|| {
-        grouped
-            .par_iter()
-            .map(|(digest, group)| report_for_group(digest, group, &units, &stage_budget))
-            .collect::<Vec<_>>()
-    });
-    let inventory = inventory_rows
-        .into_iter()
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .collect::<BTreeMap<_, _>>();
-    stage_budget.checkpoint()?;
-
-    let mut bundles = Vec::<Value>::new();
-    let mut modules = Vec::<Value>::new();
-    let mut tasks = Vec::<ModuleTask>::new();
-    let mut failures = Vec::<Value>::new();
-    let mut seen_digest = BTreeMap::<String, usize>::new();
-
-    for unit in &units {
-        stage_budget.checkpoint()?;
-        let occurrence = *seen_digest.get(&unit.content_sha256).unwrap_or(&0);
-        seen_digest.insert(unit.content_sha256.clone(), occurrence + 1);
-        let group_size = groups.get(&unit.content_sha256).map_or(0, Vec::len);
-        let report = inventory
-            .get(&unit.content_sha256)
-            .with_context(|| format!("missing inventory result for {}", unit.content_sha256))?;
-        let report = match report {
-            Ok(report) => report,
-            Err(error) => {
-                failures.push(json!({
-                    "ordinal": unit.ordinal, "path": unit.parent_rel.to_string_lossy(),
-                    "content_sha256": unit.content_sha256, "content_group_size": group_size,
-                    "deduplicated": occurrence > 0, "error": error,
-                }));
-                continue;
-            }
-        };
-        let source = fs::read_to_string(&unit.parent)
-            .with_context(|| format!("reading {}", unit.parent.display()))?;
-        for (bundle_ordinal, bundle) in report.bundles.iter().enumerate() {
-            let bundle_id = bundles.len();
-            bundles.push(json!({
-                "bundle_id": bundle_id, "parent_ordinal": unit.ordinal, "resource_id": unit.resource_id,
-                "parent_path": unit.parent_rel.to_string_lossy(), "parent_content_sha256": unit.content_sha256,
-                "inventory_group_size": group_size, "inventory_deduplicated": occurrence > 0,
-                "kind": bundle.kind, "chunk_ids": bundle.chunk_ids, "start": bundle.start, "end": bundle.end,
-                "module_table_start": bundle.module_table_start, "module_table_end": bundle.module_table_end,
-                "module_count": bundle.modules.len(),
-                "module_ids": bundle.modules.iter().map(|module| module.id.clone()).collect::<Vec<_>>(),
-            }));
-            for (module_ordinal, module) in bundle.modules.iter().enumerate() {
-                let rel = module_output_path(
-                    &unit.parent_rel,
-                    &bundle.kind,
-                    &bundle.chunk_ids,
-                    &module.id,
-                    bundle_ordinal,
-                )?;
-                let provenance = format!(
-                    "parent={} bundle_span={}..{} module={} property_span={}..{}",
-                    unit.parent_rel.display(),
-                    bundle.start,
-                    bundle.end,
-                    module.id,
-                    module.property_start,
-                    module.property_end
-                );
-                let raw =
-                    build_module_source(&source, module, PROVENANCE_PLACEHOLDER, &bundle.kind)?;
-                let raw_sha = sha256_hex(raw.as_bytes());
-                let module_index = modules.len();
-                modules.push(json!({
-                    "bundle_id": bundle_id, "module_ordinal": module_ordinal, "parent_ordinal": unit.ordinal,
-                    "resource_id": unit.resource_id, "parent_path": unit.parent_rel.to_string_lossy(),
-                    "parent_content_sha256": unit.content_sha256, "bundle_kind": bundle.kind,
-                    "chunk_ids": bundle.chunk_ids, "module_id": module.id, "property_start": module.property_start,
-                    "property_end": module.property_end, "value_start": module.value_start, "value_end": module.value_end,
-                    "value_kind": module.value_kind, "method": module.method, "dependencies": module.dependencies,
-                    "dependency_map": module.dependency_map, "export_names": module.export_names,
-                    "commonjs_export": module.commonjs_export, "source_path": rel.to_string_lossy(),
-                    "module_input_sha256": raw_sha,
-                }));
-                tasks.push(ModuleTask {
-                    module_index,
-                    raw,
-                    raw_sha256: raw_sha,
-                    provenance,
-                    dest: project.join(rel),
-                });
-            }
-        }
-    }
-
-    let mut format_groups = BTreeMap::<String, Vec<usize>>::new();
-    for (index, task) in tasks.iter().enumerate() {
-        format_groups
-            .entry(task.raw_sha256.clone())
-            .or_default()
-            .push(index);
-    }
-    let grouped_formats = format_groups.iter().collect::<Vec<_>>();
-    let formatted = pool.install(|| {
-        grouped_formats
-            .par_iter()
-            .map(|(digest, group)| {
-                let Some(&index) = group.first() else {
-                    return Ok::<_, anyhow::Error>(((*digest).clone(), String::new(), false));
-                };
-                let task = &tasks[index];
-                let budget =
-                    AnalysisOperation::Format.under(&stage_budget, task.dest.display().to_string());
-                let raw = &task.raw;
-                let result = match format_source(raw, &budget) {
-                    Ok(formatted) => ((*digest).clone(), formatted, true),
-                    Err(error) => {
-                        let _error = recoverable_unit_error(error)?;
-                        ((*digest).clone(), raw.clone(), false)
-                    }
-                };
-                Ok(result)
-            })
-            .collect::<Vec<_>>()
-    });
-    let formatted = formatted
-        .into_iter()
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .map(|(digest, source, ok)| (digest, (source, ok)))
-        .collect::<BTreeMap<_, _>>();
-    stage_budget.checkpoint()?;
-
-    for group in format_groups.values() {
-        stage_budget.checkpoint()?;
-        let Some(&canonical_task) = group.first() else {
-            continue;
-        };
-        let digest = &tasks[canonical_task].raw_sha256;
-        let (template, did_format) = formatted
-            .get(digest)
-            .with_context(|| format!("missing format result for {digest}"))?;
-        if !template.contains(PROVENANCE_PLACEHOLDER) {
-            bail!("formatter dropped module provenance placeholder for {digest}");
-        }
-        let canonical_module_index = tasks[canonical_task].module_index;
-        for &task_index in group {
-            let task = &tasks[task_index];
-            let rendered = template.replacen(PROVENANCE_PLACEHOLDER, &task.provenance, 1);
-            if let Some(parent) = task.dest.parent() {
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("creating {}", parent.display()))?;
-            }
-            fs::write(&task.dest, &rendered)
-                .with_context(|| format!("writing {}", task.dest.display()))?;
-            let record = modules
-                .get_mut(task.module_index)
-                .and_then(Value::as_object_mut)
-                .context("module record is not an object")?;
-            record.insert("formatted".into(), Value::Bool(*did_format));
-            record.insert(
-                "sha256".into(),
-                Value::String(sha256_hex(rendered.as_bytes())),
-            );
-            record.insert("format_group_size".into(), Value::from(group.len()));
-            record.insert(
-                "format_deduplicated".into(),
-                Value::Bool(task.module_index != canonical_module_index),
-            );
-            record.insert(
-                "materialization".into(),
-                Value::String("rendered_content_template".into()),
-            );
-        }
-    }
-
-    let kind_modules = |kind: &str| -> usize {
-        bundles
-            .iter()
-            .filter(|bundle| string_field(bundle, "kind") == Some(kind))
-            .map(|bundle| array_len(bundle, "module_ids"))
-            .sum()
-    };
-    let webpack_modules = bundles
-        .iter()
-        .filter(|bundle| {
-            !matches!(
-                string_field(bundle, "kind"),
-                Some("amd_named_modules" | "member_named_modules" | "browserify_module_table")
-            )
-        })
-        .map(|bundle| array_len(bundle, "module_ids"))
-        .sum::<usize>();
-    let summary = json!({
-        "eligible_units": units.len(), "unique_input_bodies": groups.len(),
-        "deduplicated_units": units.len().saturating_sub(groups.len()), "inventory_invocations": groups.len(),
-        "module_format_invocations": format_groups.len(), "deduplicated_module_formats": tasks.len().saturating_sub(format_groups.len()),
-        "jobs": jobs, "bundles": bundles.len(), "modules": modules.len(),
-        "amd_named_modules": kind_modules("amd_named_modules"), "member_named_modules": kind_modules("member_named_modules"),
-        "browserify_modules": kind_modules("browserify_module_table"), "webpack_modules": webpack_modules,
-        "literal_module_dependencies": modules.iter().map(|module| array_len(module, "dependencies")).sum::<usize>(),
-        "modules_with_named_exports": modules.iter().filter(|module| array_len(module, "export_names") > 0).count(),
-        "named_exports": modules.iter().map(|module| array_len(module, "export_names")).sum::<usize>(),
-        "commonjs_export_modules": modules.iter().filter(|module| bool_field(module, "commonjs_export")).count(),
-        "failed_units": failures.len(),
-    });
-    let mut document = Map::new();
-    document.insert("schema".into(), Value::String(BUNDLES.schema.into()));
-    document.insert("safe_static_only".into(), Value::Bool(true));
-    document.insert(
-        "inventory".into(),
-        Value::String("jsvm_lift::bundle_unpack".into()),
-    );
-    document.insert("bundles".into(), Value::Array(bundles.clone()));
-    document.insert("modules".into(), Value::Array(modules.clone()));
-    document.insert("failures".into(), Value::Array(failures.clone()));
-    document.insert("summary".into(), summary);
-    write_artifact(project, BUNDLES, &Value::Object(document))?;
-    write_module_readme(&module_root, &bundles, &modules)?;
-
-    Ok(BundleMaterializeSummary {
-        eligible_units: units.len(),
-        unique_input_bodies: groups.len(),
-        bundles: bundles.len(),
-        modules: modules.len(),
-        failures: failures.len(),
-        jobs,
-    })
+    let inventory = inputs.analyze(&pool, &stage_budget)?;
+    let mut outputs = BundleOutputs::collect(project, &inputs, &inventory, &stage_budget)?;
+    let groups = outputs.format_groups();
+    let templates = outputs.format_templates(&pool, &groups, &stage_budget)?;
+    outputs.publish_templates(&groups, &templates, &stage_budget)?;
+    outputs.publish(project, &module_root, &inputs, jobs, groups.len())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::analysis_artifacts::{load_artifact, write_artifact, BUNDLES, DEOBFUSCATION};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn test_project() -> Result<PathBuf> {
-        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("bundle-materialize-{}-{nonce}", std::process::id()));
-        fs::create_dir_all(path.join("src/_deobfuscated"))?;
-        Ok(path)
-    }
-
     #[test]
     fn bundle_index_preserves_literal_names_and_encodes_paths() -> Result<()> {
         let temp = tempfile::tempdir()?;
@@ -716,147 +838,184 @@ mod tests {
         Ok(())
     }
 
+    fn write_bundle_fixture(project: &Path) -> Result<()> {
+        fs::create_dir_all(project.join("src/_deobfuscated"))?;
+        let source = include_str!(
+            "../../../corpus/generated/reversible-obfuscation/bundle-module-tables.js"
+        );
+        let first = project.join("src/_deobfuscated/a.js");
+        let second = project.join("src/_deobfuscated/b.js");
+        fs::write(&first, source)?;
+        fs::write(&second, source)?;
+        let digest = sha256_hex(source.as_bytes());
+        let artifact = json!({
+            "schema": DEOBFUSCATION.schema,
+            "units": [
+                {"ordinal": 0, "resource_id": 10, "output_path": "src/_deobfuscated/a.js", "output_sha256": digest, "exit": 0},
+                {"ordinal": 1, "resource_id": 11, "output_path": "src/_deobfuscated/b.js", "output_sha256": digest, "exit": 0}
+            ],
+            "summary": {}
+        });
+        write_artifact(project, DEOBFUSCATION, &artifact)?;
+        Ok(())
+    }
+
+    fn assert_webpack_and_browserify(module_rows: &[Value]) -> Result<()> {
+        let module = |id: &str| {
+            module_rows
+                .iter()
+                .find(|row| row.get("module_id").and_then(Value::as_str) == Some(id))
+        };
+        let module_20001 = module("20001").context("webpack module 20001 missing")?;
+        assert_eq!(
+            module_20001.get("dependencies"),
+            Some(&json!(["20002", "40000"]))
+        );
+        assert_eq!(
+            module_20001.get("export_names"),
+            Some(&json!(["name", "named"]))
+        );
+        assert!(module_rows.iter().all(|row| {
+            row.get("module_id").and_then(Value::as_str) != Some("29999")
+                && row.get("module_id").and_then(Value::as_str) != Some("29996")
+        }));
+
+        let browserify = module("50001").context("Browserify module missing")?;
+        assert_eq!(
+            browserify.get("bundle_kind").and_then(Value::as_str),
+            Some("browserify_module_table")
+        );
+        assert_eq!(browserify.get("dependencies"), Some(&json!(["50002"])));
+        assert_eq!(
+            browserify.get("dependency_map"),
+            Some(&json!({"./beta": "50002", "external-package": "external-package"}))
+        );
+        assert_eq!(
+            module("51001").and_then(|row| row.get("dependencies")),
+            Some(&json!(["51002"]))
+        );
+        assert!(module("52001").is_none() && module("52002").is_none());
+
+        let rspack = module("rspA").context("Rspack module missing")?;
+        assert_eq!(
+            rspack.get("bundle_kind").and_then(Value::as_str),
+            Some("webpack_modules_binding")
+        );
+        assert_eq!(rspack.get("dependencies"), Some(&json!(["rspB"])));
+        let runtime = module("runA").context("webpack runtime module missing")?;
+        assert_eq!(
+            runtime.get("bundle_kind").and_then(Value::as_str),
+            Some("webpack_runtime_module_table")
+        );
+        assert_eq!(runtime.get("dependencies"), Some(&json!(["runB"])));
+
+        let jsonp = module("jsonpA").context("webpack JSONP module missing")?;
+        assert_eq!(
+            jsonp.get("bundle_kind").and_then(Value::as_str),
+            Some("webpack_jsonp_call")
+        );
+        assert_eq!(jsonp.get("chunk_ids"), Some(&json!(["91"])));
+        assert_eq!(jsonp.get("dependencies"), Some(&json!(["jsonpB"])));
+        assert!(module("jsonpShadow").is_none());
+
+        let object_bootstrap =
+            module("objectBootstrapA").context("object bootstrap module missing")?;
+        assert_eq!(
+            object_bootstrap.get("bundle_kind").and_then(Value::as_str),
+            Some("webpack_object_bootstrap")
+        );
+        assert_eq!(
+            object_bootstrap.get("dependencies"),
+            Some(&json!(["objectBootstrapB"]))
+        );
+        let firebase = module("firebaseA").context("firebase JSONP module missing")?;
+        assert_eq!(firebase.get("dependencies"), Some(&json!(["firebaseB"])));
+        assert!(module("firebaseShadow").is_none());
+
+        Ok(())
+    }
+
+    fn assert_named_loaders(module_rows: &[Value]) -> Result<()> {
+        let module = |id: &str| {
+            module_rows
+                .iter()
+                .find(|row| row.get("module_id").and_then(Value::as_str) == Some(id))
+        };
+        let amd = module("amd/alpha").context("AMD module missing")?;
+        assert_eq!(
+            amd.get("bundle_kind").and_then(Value::as_str),
+            Some("amd_named_modules")
+        );
+        assert_eq!(amd.get("dependencies"), Some(&json!(["amd/beta"])));
+        assert!(module("amd/local").is_some());
+        let member = module("embedded/alpha").context("member-loader module missing")?;
+        assert_eq!(
+            member.get("bundle_kind").and_then(Value::as_str),
+            Some("member_named_modules")
+        );
+        assert_eq!(member.get("dependencies"), Some(&json!(["embedded/beta"])));
+        assert!(module("not-amd/local-helper").is_none());
+        assert!(module("not-amd/member-helper").is_none());
+        assert!(module("not-module-inline-function").is_none());
+        Ok(())
+    }
+
     #[test]
     fn materializes_generated_bundle_fixture_and_deduplicates_identical_units() -> Result<()> {
-        let project = test_project()?;
-        let result = (|| -> Result<()> {
-            let source = include_str!(
-                "../../../corpus/generated/reversible-obfuscation/bundle-module-tables.js"
-            );
-            let first = project.join("src/_deobfuscated/a.js");
-            let second = project.join("src/_deobfuscated/b.js");
-            fs::write(&first, source)?;
-            fs::write(&second, source)?;
-            let digest = sha256_hex(source.as_bytes());
-            let artifact = json!({
-                "schema": DEOBFUSCATION.schema,
-                "units": [
-                    {"ordinal": 0, "resource_id": 10, "output_path": "src/_deobfuscated/a.js", "output_sha256": digest, "exit": 0},
-                    {"ordinal": 1, "resource_id": 11, "output_path": "src/_deobfuscated/b.js", "output_sha256": digest, "exit": 0}
-                ],
-                "summary": {}
-            });
-            write_artifact(&project, DEOBFUSCATION, &artifact)?;
-            let summary = materialize_bundle_modules(
-                &project,
-                Some(2),
-                &AnalysisBudgets::standard("bundle-materialize-test"),
-            )?;
-            assert_eq!(summary.eligible_units, 2);
-            assert_eq!(summary.unique_input_bodies, 1);
-            assert!(summary.bundles >= 2);
-            assert!(summary.modules >= 2);
-            assert_eq!(summary.failures, 0);
-            assert!(project.join("src/_modules/README.md").is_file());
-            let bundles = load_artifact(&project, BUNDLES).context("bundle artifact missing")?;
-            assert_eq!(
-                bundles
-                    .get("summary")
-                    .and_then(|summary| summary.get("inventory_invocations"))
-                    .and_then(Value::as_u64),
-                Some(1)
-            );
-            let module_rows = bundles
-                .get("modules")
-                .and_then(Value::as_array)
-                .context("bundle modules missing")?;
-            assert!(module_rows.iter().all(|module| module
-                .get("source_path")
-                .and_then(Value::as_str)
-                .is_some_and(|path| project.join(path).is_file())));
+        let temp = tempfile::tempdir()?;
+        let project = temp.path();
+        write_bundle_fixture(project)?;
+        let summary = materialize_bundle_modules(
+            project,
+            Some(2),
+            &AnalysisBudgets::standard("bundle-materialize-test"),
+        )?;
+        assert_eq!(summary.eligible_units, 2);
+        assert_eq!(summary.unique_input_bodies, 1);
+        assert!(summary.bundles >= 2);
+        assert!(summary.modules >= 2);
+        assert_eq!(summary.failures, 0);
+        assert!(project.join("src/_modules/README.md").is_file());
+        let bundles = load_artifact(project, BUNDLES).context("bundle artifact missing")?;
+        assert_eq!(
+            bundles
+                .get("summary")
+                .and_then(|summary| summary.get("inventory_invocations"))
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        let module_rows = bundles
+            .get("modules")
+            .and_then(Value::as_array)
+            .context("bundle modules missing")?;
+        assert!(module_rows.iter().all(|module| module
+            .get("source_path")
+            .and_then(Value::as_str)
+            .is_some_and(|path| project.join(path).is_file())));
 
-            let module = |id: &str| {
-                module_rows
-                    .iter()
-                    .find(|row| row.get("module_id").and_then(Value::as_str) == Some(id))
-            };
-            let module_20001 = module("20001").context("webpack module 20001 missing")?;
-            assert_eq!(
-                module_20001.get("dependencies"),
-                Some(&json!(["20002", "40000"]))
-            );
-            assert_eq!(
-                module_20001.get("export_names"),
-                Some(&json!(["name", "named"]))
-            );
-            assert!(module_rows.iter().all(|row| {
-                row.get("module_id").and_then(Value::as_str) != Some("29999")
-                    && row.get("module_id").and_then(Value::as_str) != Some("29996")
-            }));
-
-            let browserify = module("50001").context("Browserify module missing")?;
-            assert_eq!(
-                browserify.get("bundle_kind").and_then(Value::as_str),
-                Some("browserify_module_table")
-            );
-            assert_eq!(browserify.get("dependencies"), Some(&json!(["50002"])));
-            assert_eq!(
-                browserify.get("dependency_map"),
-                Some(&json!({"./beta": "50002", "external-package": "external-package"}))
-            );
-            assert_eq!(
-                module("51001").and_then(|row| row.get("dependencies")),
-                Some(&json!(["51002"]))
-            );
-            assert!(module("52001").is_none() && module("52002").is_none());
-
-            let rspack = module("rspA").context("Rspack module missing")?;
-            assert_eq!(
-                rspack.get("bundle_kind").and_then(Value::as_str),
-                Some("webpack_modules_binding")
-            );
-            assert_eq!(rspack.get("dependencies"), Some(&json!(["rspB"])));
-            let runtime = module("runA").context("webpack runtime module missing")?;
-            assert_eq!(
-                runtime.get("bundle_kind").and_then(Value::as_str),
-                Some("webpack_runtime_module_table")
-            );
-            assert_eq!(runtime.get("dependencies"), Some(&json!(["runB"])));
-
-            let jsonp = module("jsonpA").context("webpack JSONP module missing")?;
-            assert_eq!(
-                jsonp.get("bundle_kind").and_then(Value::as_str),
-                Some("webpack_jsonp_call")
-            );
-            assert_eq!(jsonp.get("chunk_ids"), Some(&json!(["91"])));
-            assert_eq!(jsonp.get("dependencies"), Some(&json!(["jsonpB"])));
-            assert!(module("jsonpShadow").is_none());
-
-            let object_bootstrap =
-                module("objectBootstrapA").context("object bootstrap module missing")?;
-            assert_eq!(
-                object_bootstrap.get("bundle_kind").and_then(Value::as_str),
-                Some("webpack_object_bootstrap")
-            );
-            assert_eq!(
-                object_bootstrap.get("dependencies"),
-                Some(&json!(["objectBootstrapB"]))
-            );
-            let firebase = module("firebaseA").context("firebase JSONP module missing")?;
-            assert_eq!(firebase.get("dependencies"), Some(&json!(["firebaseB"])));
-            assert!(module("firebaseShadow").is_none());
-
-            let amd = module("amd/alpha").context("AMD module missing")?;
-            assert_eq!(
-                amd.get("bundle_kind").and_then(Value::as_str),
-                Some("amd_named_modules")
-            );
-            assert_eq!(amd.get("dependencies"), Some(&json!(["amd/beta"])));
-            assert!(module("amd/local").is_some());
-            let member = module("embedded/alpha").context("member-loader module missing")?;
-            assert_eq!(
-                member.get("bundle_kind").and_then(Value::as_str),
-                Some("member_named_modules")
-            );
-            assert_eq!(member.get("dependencies"), Some(&json!(["embedded/beta"])));
-            assert!(module("not-amd/local-helper").is_none());
-            assert!(module("not-amd/member-helper").is_none());
-            assert!(module("not-module-inline-function").is_none());
-            Ok(())
-        })();
-        let cleanup = fs::remove_dir_all(&project);
-        result?;
-        cleanup?;
+        assert_webpack_and_browserify(module_rows)?;
+        assert_named_loaders(module_rows)?;
+        // Both occurrences retain their distinct parent provenance even
+        // when all analysis and formatting are deduplicated.
+        for (resource_id, parent) in [
+            (10, "src/_deobfuscated/a.js"),
+            (11, "src/_deobfuscated/b.js"),
+        ] {
+            let rows: Vec<_> = module_rows
+                .iter()
+                .filter(|row| row["resource_id"] == resource_id && row["module_id"] == "20001")
+                .collect();
+            assert_eq!(rows.len(), 1);
+            for row in rows {
+                assert_eq!(row["parent_path"], parent);
+                assert_eq!(row["format_group_size"], 2);
+                assert_eq!(row["format_deduplicated"], resource_id == 11);
+                let path = row["source_path"].as_str().context("module source path")?;
+                assert!(
+                    fs::read_to_string(project.join(path))?.contains(&format!("parent={parent} "))
+                );
+            }
+        }
         Ok(())
     }
 }

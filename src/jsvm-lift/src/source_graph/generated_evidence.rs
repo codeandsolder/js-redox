@@ -17,132 +17,153 @@ struct DynamicSource {
     child_scan_id: Option<u64>,
 }
 
-/// Add generated source and recovered source nodes, then attach proven
-/// generated-code and devirtualization edges by exact scan identity.
-pub(super) fn seed_generated_and_vm_evidence(
-    graph: &mut GraphBuilder,
-    jsvm: &Value,
-    deob_nodes: &BTreeMap<u64, String>,
-    budget: &WorkBudget,
-) -> Result<()> {
-    // Static Function(...) recovery is a generated-code provenance edge.
-    let mut sources = BTreeMap::<(u64, u64), DynamicSource>::new();
-    let mut child_claims = BTreeMap::<u64, (u64, u64)>::new();
-    for dynamic in array_field(jsvm, "dynamic_code_units") {
-        budget.checkpoint()?;
-        let parent_scan_id = required_u64(dynamic, "parent_scan_id", "dynamic code unit")?;
-        let ordinal = required_u64(dynamic, "ordinal", "dynamic code unit")?;
-        let node_id = format!("dynamic:{parent_scan_id}:{ordinal}");
-        anyhow::ensure!(
-            !sources.contains_key(&(parent_scan_id, ordinal)),
-            "duplicate dynamic source identity ({parent_scan_id}, {ordinal})"
-        );
-        graph.insert_node(
-            node_id.clone(),
-            json!({
-                "type":"generated_dynamic_code",
-                "parent_scan_id":parent_scan_id,
-                "ordinal":ordinal,
-                "depth":field(dynamic,"depth"),
-                "generated_kind":field(dynamic,"kind"),
-                "outer_start":field(dynamic,"outer_start"),
-                "outer_end":field(dynamic,"outer_end"),
-                "body_bytes":field(dynamic,"body_bytes"),
-                "raw_dump":field(dynamic,"raw_dump"),
-                "source_path":field(dynamic,"source_path"),
-                "analysis_path":field(dynamic,"analysis_path"),
-                "analysis_stage":field(dynamic,"analysis_stage"),
-                "recovery_report":field(dynamic,"recovery_report"),
-                "formatted":field(dynamic,"formatted"),
-                "child_scan_id":field(dynamic,"child_scan_id"),
-            }),
-        )?;
-        let mut analysis_parent = node_id.clone();
-        if let Some(analysis_path) = nonempty_string_field(dynamic, "analysis_path") {
-            if string_field(dynamic, "raw_dump") != Some(analysis_path) {
-                let recovery_node = format!("generated-recovery:{parent_scan_id}:{ordinal}");
-                graph.insert_node(
-                    recovery_node.clone(),
-                    json!({
-                        "type":"generated_recovered_source",
-                        "parent_scan_id":parent_scan_id,
-                        "ordinal":ordinal,
-                        "recovery_stage":field(dynamic,"analysis_stage"),
-                        "source_path":analysis_path,
-                        "readable_source_path":field(dynamic,"source_path"),
-                        "recovery_report":field(dynamic,"recovery_report"),
-                    }),
-                )?;
-                graph.add_edge(
-                    &node_id,
-                    &recovery_node,
-                    "generated_safe_recovery",
-                    json!({"recovery_stage":field(dynamic,"analysis_stage")}),
-                )?;
-                analysis_parent = recovery_node;
-            }
-        }
-        let child_scan_id = u64_field(dynamic, "child_scan_id");
-        if let Some(child_scan_id) = child_scan_id {
+type GeneratedIdentity = (u64, u64);
+
+#[derive(Default)]
+struct GeneratedSources {
+    sources: BTreeMap<GeneratedIdentity, DynamicSource>,
+    child_claims: BTreeMap<u64, GeneratedIdentity>,
+}
+
+impl GeneratedSources {
+    fn seed(graph: &mut GraphBuilder, jsvm: &Value, budget: &WorkBudget) -> Result<Self> {
+        // Static Function(...) recovery is a generated-code provenance edge.
+        let mut result = Self::default();
+        for dynamic in array_field(jsvm, "dynamic_code_units") {
+            budget.checkpoint()?;
+            let parent_scan_id = required_u64(dynamic, "parent_scan_id", "dynamic code unit")?;
+            let ordinal = required_u64(dynamic, "ordinal", "dynamic code unit")?;
+            let node_id = format!("dynamic:{parent_scan_id}:{ordinal}");
             anyhow::ensure!(
-                child_claims
-                    .insert(child_scan_id, (parent_scan_id, ordinal))
-                    .is_none(),
-                "multiple generated sources claim child scan id {child_scan_id}"
+                !result.sources.contains_key(&(parent_scan_id, ordinal)),
+                "duplicate dynamic source identity ({parent_scan_id}, {ordinal})"
+            );
+            graph.insert_node(
+                node_id.clone(),
+                json!({
+                    "type":"generated_dynamic_code",
+                    "parent_scan_id":parent_scan_id,
+                    "ordinal":ordinal,
+                    "depth":field(dynamic,"depth"),
+                    "generated_kind":field(dynamic,"kind"),
+                    "outer_start":field(dynamic,"outer_start"),
+                    "outer_end":field(dynamic,"outer_end"),
+                    "body_bytes":field(dynamic,"body_bytes"),
+                    "raw_dump":field(dynamic,"raw_dump"),
+                    "source_path":field(dynamic,"source_path"),
+                    "analysis_path":field(dynamic,"analysis_path"),
+                    "analysis_stage":field(dynamic,"analysis_stage"),
+                    "recovery_report":field(dynamic,"recovery_report"),
+                    "formatted":field(dynamic,"formatted"),
+                    "child_scan_id":field(dynamic,"child_scan_id"),
+                }),
+            )?;
+            let mut analysis_parent = node_id.clone();
+            if let Some(analysis_path) = nonempty_string_field(dynamic, "analysis_path") {
+                if string_field(dynamic, "raw_dump") != Some(analysis_path) {
+                    let recovery_node = format!("generated-recovery:{parent_scan_id}:{ordinal}");
+                    graph.insert_node(
+                        recovery_node.clone(),
+                        json!({
+                            "type":"generated_recovered_source",
+                            "parent_scan_id":parent_scan_id,
+                            "ordinal":ordinal,
+                            "recovery_stage":field(dynamic,"analysis_stage"),
+                            "source_path":analysis_path,
+                            "readable_source_path":field(dynamic,"source_path"),
+                            "recovery_report":field(dynamic,"recovery_report"),
+                        }),
+                    )?;
+                    graph.add_edge(
+                        &node_id,
+                        &recovery_node,
+                        "generated_safe_recovery",
+                        json!({"recovery_stage":field(dynamic,"analysis_stage")}),
+                    )?;
+                    analysis_parent = recovery_node;
+                }
+            }
+            let child_scan_id = u64_field(dynamic, "child_scan_id");
+            if let Some(child_scan_id) = child_scan_id {
+                anyhow::ensure!(
+                    result
+                        .child_claims
+                        .insert(child_scan_id, (parent_scan_id, ordinal))
+                        .is_none(),
+                    "multiple generated sources claim child scan id {child_scan_id}"
+                );
+            }
+            result.sources.insert(
+                (parent_scan_id, ordinal),
+                DynamicSource {
+                    analysis_parent,
+                    child_scan_id,
+                },
             );
         }
-        sources.insert(
-            (parent_scan_id, ordinal),
-            DynamicSource {
-                analysis_parent,
-                child_scan_id,
-            },
-        );
+
+        Ok(result)
     }
 
-    let mut scan_to_parent = BTreeMap::<u64, String>::new();
-    let mut scan_ids = BTreeSet::<u64>::new();
-    for unit in array_field(jsvm, "code_units") {
-        budget.checkpoint()?;
-        let Some(scan_id) = u64_field(unit, "scan_id") else {
-            continue;
-        };
-        anyhow::ensure!(
-            scan_ids.insert(scan_id),
-            "duplicate code unit scan id {scan_id}"
-        );
-        // A generated site can claim a child scan ID only for that exact
-        // generated code-unit row. An inconsistent capture must not allow a
-        // resource-root row with that ID to parent nested generated evidence.
-        if let Some(&claimed_identity) = child_claims.get(&scan_id) {
-            let actual_identity =
-                u64_field(unit, "parent_scan_id").zip(u64_field(unit, "parent_dynamic_ordinal"));
-            if string_field(unit, "origin") != Some("generated_dynamic_code")
-                || actual_identity != Some(claimed_identity)
-            {
+    fn scan_parents(
+        &self,
+        jsvm: &Value,
+        deob_nodes: &BTreeMap<u64, String>,
+        budget: &WorkBudget,
+    ) -> Result<BTreeMap<u64, String>> {
+        let mut scan_to_parent = BTreeMap::<u64, String>::new();
+        let mut scan_ids = BTreeSet::<u64>::new();
+        for unit in array_field(jsvm, "code_units") {
+            budget.checkpoint()?;
+            let Some(scan_id) = u64_field(unit, "scan_id") else {
                 continue;
+            };
+            anyhow::ensure!(
+                scan_ids.insert(scan_id),
+                "duplicate code unit scan id {scan_id}"
+            );
+            // A generated site can claim a child scan ID only for that exact
+            // generated code-unit row. An inconsistent capture must not allow a
+            // resource-root row with that ID to parent nested generated evidence.
+            if let Some(&claimed_identity) = self.child_claims.get(&scan_id) {
+                let actual_identity = u64_field(unit, "parent_scan_id")
+                    .zip(u64_field(unit, "parent_dynamic_ordinal"));
+                if string_field(unit, "origin") != Some("generated_dynamic_code")
+                    || actual_identity != Some(claimed_identity)
+                {
+                    continue;
+                }
+            }
+            let parent = if string_field(unit, "origin") == Some("generated_dynamic_code") {
+                // Both sides must agree on the exact generated-site identity and
+                // scan linkage. Never synthesize a parent node for missing or stale
+                // evidence, nor accept the last claimant of a shared scan ID.
+                let identity = u64_field(unit, "parent_scan_id")
+                    .zip(u64_field(unit, "parent_dynamic_ordinal"));
+                identity
+                    .and_then(|identity| self.sources.get(&identity))
+                    .filter(|source| source.child_scan_id == Some(scan_id))
+                    .map(|source| source.analysis_parent.clone())
+            } else if let Some(deob_ordinal) = u64_field(unit, "deobfuscation_ordinal") {
+                deob_nodes.get(&deob_ordinal).cloned()
+            } else {
+                u64_field(unit, "resource_id").map(|resource_id| format!("resource:{resource_id}"))
+            };
+            if let Some(parent) = parent {
+                scan_to_parent.insert(scan_id, parent);
             }
         }
-        let parent = if string_field(unit, "origin") == Some("generated_dynamic_code") {
-            // Both sides must agree on the exact generated-site identity and
-            // scan linkage. Never synthesize a parent node for missing or stale
-            // evidence, nor accept the last claimant of a shared scan ID.
-            let identity =
-                u64_field(unit, "parent_scan_id").zip(u64_field(unit, "parent_dynamic_ordinal"));
-            identity
-                .and_then(|identity| sources.get(&identity))
-                .filter(|source| source.child_scan_id == Some(scan_id))
-                .map(|source| source.analysis_parent.clone())
-        } else if let Some(deob_ordinal) = u64_field(unit, "deobfuscation_ordinal") {
-            deob_nodes.get(&deob_ordinal).cloned()
-        } else {
-            u64_field(unit, "resource_id").map(|resource_id| format!("resource:{resource_id}"))
-        };
-        if let Some(parent) = parent {
-            scan_to_parent.insert(scan_id, parent);
-        }
-    }
 
+        Ok(scan_to_parent)
+    }
+}
+
+fn attach_generated_edges(
+    graph: &mut GraphBuilder,
+    jsvm: &Value,
+    scan_to_parent: &BTreeMap<u64, String>,
+    budget: &WorkBudget,
+) -> Result<()> {
     for dynamic in array_field(jsvm, "dynamic_code_units") {
         budget.checkpoint()?;
         let parent_scan_id = required_u64(dynamic, "parent_scan_id", "dynamic code unit")?;
@@ -162,6 +183,15 @@ pub(super) fn seed_generated_and_vm_evidence(
         }
     }
 
+    Ok(())
+}
+
+fn attach_vm_evidence(
+    graph: &mut GraphBuilder,
+    jsvm: &Value,
+    scan_to_parent: &BTreeMap<u64, String>,
+    budget: &WorkBudget,
+) -> Result<()> {
     let mut vm_identities = BTreeSet::new();
     for unit in array_field(jsvm, "devirtualized_units") {
         budget.checkpoint()?;
@@ -213,6 +243,20 @@ pub(super) fn seed_generated_and_vm_evidence(
     }
 
     Ok(())
+}
+
+/// Add generated source and recovered source nodes, then attach proven
+/// generated-code and devirtualization edges by exact scan identity.
+pub(super) fn seed_generated_and_vm_evidence(
+    graph: &mut GraphBuilder,
+    jsvm: &Value,
+    deob_nodes: &BTreeMap<u64, String>,
+    budget: &WorkBudget,
+) -> Result<()> {
+    let generated = GeneratedSources::seed(graph, jsvm, budget)?;
+    let scan_parents = generated.scan_parents(jsvm, deob_nodes, budget)?;
+    attach_generated_edges(graph, jsvm, &scan_parents, budget)?;
+    attach_vm_evidence(graph, jsvm, &scan_parents, budget)
 }
 
 #[cfg(test)]

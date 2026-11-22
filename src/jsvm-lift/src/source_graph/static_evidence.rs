@@ -193,6 +193,39 @@ fn link_api_mutation_evidence(
     Ok(())
 }
 
+fn link_api_targets(
+    graph: &mut GraphBuilder,
+    row: &Value,
+    node_id: &str,
+    budget: &WorkBudget,
+) -> Result<()> {
+    if bool_field(row, "absolute_network_url")
+        && !string_field(row, "kind").is_some_and(|kind| kind.ends_with("_candidate"))
+        && string_field(row, "binding_status") != Some("candidate")
+        && !matches!(
+            string_field(row, "method_status"),
+            Some("invalid" | "conditional")
+        )
+    {
+        if let Some(url) = string_field(row, "url") {
+            for target in graph.targets_for(url, budget)? {
+                graph.add_edge(
+                    node_id,
+                    &target,
+                    "api_target",
+                    json!({
+                        "sink_kind":field(row,"kind"),
+                        "method":field(row,"method"),
+                        "method_status":field(row,"method_status"),
+                        "standard_browser_api_semantics_required":bool_field(row,"standard_browser_api_semantics_required"),
+                    }),
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Attach browser API callsites and exact local mutation-site provenance to
 /// the selected source derivative. Static graph edges do not prove execution.
 pub(super) fn seed_browser_api_callsites(
@@ -277,30 +310,7 @@ pub(super) fn seed_browser_api_callsites(
             &mutation_nodes,
             budget,
         )?;
-        if bool_field(row, "absolute_network_url")
-            && !string_field(row, "kind").is_some_and(|kind| kind.ends_with("_candidate"))
-            && string_field(row, "binding_status") != Some("candidate")
-            && !matches!(
-                string_field(row, "method_status"),
-                Some("invalid" | "conditional")
-            )
-        {
-            if let Some(url) = string_field(row, "url") {
-                for target in graph.targets_for(url, budget)? {
-                    graph.add_edge(
-                        &node_id,
-                        &target,
-                        "api_target",
-                        json!({
-                            "sink_kind":field(row,"kind"),
-                            "method":field(row,"method"),
-                            "method_status":field(row,"method_status"),
-                            "standard_browser_api_semantics_required":bool_field(row,"standard_browser_api_semantics_required"),
-                        }),
-                    )?;
-                }
-            }
-        }
+        link_api_targets(graph, row, &node_id, budget)?;
     }
 
     for (key, node_id) in forwarded_sites {
