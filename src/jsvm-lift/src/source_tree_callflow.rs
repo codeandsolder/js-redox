@@ -5,7 +5,10 @@
 //! original lexical symbol identity. Forwarded parameters are traced only
 //! when the referring binding is not written; other expressions are retained
 //! as unknown/dynamic, not guessed as constant values.
-use crate::source_text::clip_chars;
+use crate::{
+    report_markdown::{code_span, fenced_code, literal_text},
+    source_text::clip_chars,
+};
 use anyhow::{ensure, Result};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
@@ -803,34 +806,42 @@ impl CallerView {
 }
 
 fn format_view(view: &CallerView, original: &str) -> String {
-    let mut output = format!("# Caller-oriented lexical forwarding: `{}`\n\n", view.entry);
+    let mut output = format!(
+        "# Caller-oriented lexical forwarding: {}\n\n",
+        code_span(&view.entry)
+    );
     output.push_str("This is a **source-derived reading view**, not a rewritten executable. ");
     output.push_str("Edges resolve original lexical symbols, direct calls, constructors and eligible Function.call invocations. ");
     output.push_str("Parameter arrows trace unchanged, directly forwarded bindings only. ");
     output.push_str("Potential indirect `eval`, mapped `arguments`, or dynamic mutations require runtime analysis before claiming values are invariant.\n\n");
     for path in &view.paths {
-        let _ = write!(output, "## `{}`\n\n", path.functions.join(" → "));
+        let _ = write!(output, "## {}\n\n", code_span(&path.functions.join(" → ")));
         for edge in &path.links {
             let _ = writeln!(
                 output,
-                "- `{}` → `{}` (**{}** at source bytes {}..{})",
-                edge.caller, edge.callee, edge.kind, edge.span[0], edge.span[1]
+                "- {} → {} (**{}** at source bytes {}..{})",
+                code_span(&edge.caller),
+                code_span(&edge.callee),
+                edge.kind,
+                edge.span[0],
+                edge.span[1]
             );
             if let Some(receiver) = &edge.this_argument {
                 let _ = writeln!(
                     output,
-                    "  - this receiver: {receiver} (not a formal parameter)"
+                    "  - this receiver: {} (not a formal parameter)",
+                    code_span(receiver)
                 );
             }
             for (idx, arg) in edge.arguments.iter().enumerate() {
                 let prefix = arg.caller_param.as_ref().map_or_else(
                     || "dynamic expression".to_owned(),
-                    |param| format!("caller parameter `{param}`"),
+                    |param| format!("caller parameter {}", code_span(param)),
                 );
                 let _ = writeln!(
                     output,
-                    "  - argument {idx}: `{}` ← {prefix}",
-                    arg.expression
+                    "  - argument {idx}: {} ← {prefix}",
+                    code_span(&arg.expression)
                 );
             }
         }
@@ -839,7 +850,7 @@ fn format_view(view: &CallerView, original: &str) -> String {
             if let Some(receiver) = &param.constructed_receiver {
                 let _ = writeln!(output,
                     "- {} (parameter {}) comes from fresh receiver of new {} at source bytes {}..{}; inherited property behavior remains dynamic",
-                    param.param, param.index, receiver.constructor,
+                    literal_text(&param.param), param.index, literal_text(&receiver.constructor),
                     receiver.new_call_span[0], receiver.new_call_span[1]
                 );
                 continue;
@@ -848,15 +859,20 @@ fn format_view(view: &CallerView, original: &str) -> String {
                 (Some(name), Some(index)) => {
                     let _ = writeln!(
                         output,
-                        "- `{}` (parameter {}) ← entry `{}` (parameter {})",
-                        param.param, param.index, name, index
+                        "- {} (parameter {}) ← entry {} (parameter {})",
+                        code_span(&param.param),
+                        param.index,
+                        code_span(name),
+                        index
                     );
                 }
                 _ => {
                     let _ = writeln!(
                         output,
-                        "- `{}` (parameter {}) ← dynamic/unknown (`{}`)",
-                        param.param, param.index, param.input_expression
+                        "- {} (parameter {}) ← dynamic/unknown ({})",
+                        code_span(&param.param),
+                        param.index,
+                        code_span(&param.input_expression)
                     );
                 }
             }
@@ -872,10 +888,10 @@ fn format_view(view: &CallerView, original: &str) -> String {
         let _ = writeln!(
             output,
             "- {} ({}..{}) to {} ({}..{}) via {} at {}..{}",
-            edge.call.caller,
+            literal_text(&edge.call.caller),
             edge.from_span[0],
             edge.from_span[1],
-            edge.call.callee,
+            literal_text(&edge.call.callee),
             edge.to_span[0],
             edge.to_span[1],
             edge.call.kind,
@@ -889,7 +905,10 @@ fn format_view(view: &CallerView, original: &str) -> String {
         let _ = write!(
             output,
             "- **{}** ({}..{}, shortest call depth {})",
-            function.name, function.span[0], function.span[1], function.shortest_call_depth
+            literal_text(&function.name),
+            function.span[0],
+            function.span[1],
+            function.shortest_call_depth
         );
         if function.parameters.is_empty() {
             output.push_str(" — no parameters\n");
@@ -908,7 +927,7 @@ fn format_view(view: &CallerView, original: &str) -> String {
             let _ = writeln!(
                 output,
                 "  - {} (parameter {}) ← {}",
-                parameter.name,
+                literal_text(&parameter.name),
                 parameter.index,
                 names.join(" or ")
             );
@@ -930,19 +949,13 @@ fn format_view(view: &CallerView, original: &str) -> String {
                 .get(span[0] as usize..span[1] as usize)
                 .unwrap_or("");
             let (excerpt, clipped) = clip_chars(raw, 1600);
-            // Embedded source may contain Markdown fences inside JS strings
-            // or comments. Always choose a fence longer than any original
-            // backtick run, keeping the browsing view structurally intact.
-            let max_run = excerpt
-                .split(|ch| ch != '`')
-                .map(str::len)
-                .max()
-                .unwrap_or(0);
-            let fence = "`".repeat(3.max(max_run + 1));
             let _ = write!(
                 output,
-                "### `{label}` — bytes {}..{}\n\n{fence}js\n{excerpt}\n{fence}\n\n",
-                span[0], span[1]
+                "### {} — bytes {}..{}\n\n{}\n",
+                code_span(label),
+                span[0],
+                span[1],
+                fenced_code(excerpt, "js")
             );
             if clipped {
                 output.push_str("*Excerpt truncated; follow the original source / helper implementation link for the complete function.*\n\n");
@@ -1126,6 +1139,26 @@ pub fn reconstruct_caller_views(
 #[cfg(test)]
 mod tests {
     use super::reconstruct_caller_views;
+
+    #[test]
+    fn caller_report_keeps_multiline_template_arguments_inside_literal_spans() -> anyhow::Result<()>
+    {
+        let source="const leaf=x=>x;const api={};api.run=()=>leaf(\u{60}one\n# not a heading\nthree\u{60});";
+        let view = reconstruct_caller_views(source, Some("run"))?.remove(0);
+        let report = &view.source;
+        assert!(
+            report.contains("argument 0: `` `one\\n# not a heading\\nthree` ``"),
+            "{report}"
+        );
+        assert!(report.contains("```js\n") || report.contains("````js\n"));
+        // The exact multiline expression remains in the machine-readable path.
+        assert!(view.paths.iter().any(|path| path
+            .links
+            .iter()
+            .flat_map(|link| &link.arguments)
+            .any(|arg| arg.expression.contains("\n# not a heading\n"))));
+        Ok(())
+    }
 
     #[test]
     fn unrelated_dynamic_eval_does_not_suppress_other_lexical_call_wrappers() -> anyhow::Result<()>

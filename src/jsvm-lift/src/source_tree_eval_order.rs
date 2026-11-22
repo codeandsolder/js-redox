@@ -12,6 +12,7 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 use crate::{
+    report_markdown::literal_text,
     source_text::{collapsed_whitespace, SourceLineIndex},
     source_tree_navigation::long_assignment_roots,
 };
@@ -519,11 +520,6 @@ impl<'a> Visit<'a> for Collector<'_> {
         walk::walk_assignment_expression(self, assign);
     }
 }
-fn cell(s: &str) -> String {
-    s.replace('|', "\\|")
-        .replace(['\n', '\r'], " ")
-        .replace(char::from(96), "'")
-}
 pub(crate) fn ordered_assignment_phases(
     source: &str,
     program: &Program<'_>,
@@ -588,9 +584,9 @@ pub(crate) fn ordered_assignment_phases(
                 out,
                 "| {} | {} | {} | {} | {}–{} |",
                 i + 1,
-                cell(&guard),
+                literal_text(&guard),
                 phase.kind,
-                cell(&phase.detail),
+                literal_text(&phase.detail),
                 phase.span.start,
                 phase.span.end
             );
@@ -602,7 +598,7 @@ pub(crate) fn ordered_assignment_phases(
 
 #[cfg(test)]
 mod tests {
-    use super::{ordered_assignment_phases, SourceLineIndex};
+    use super::{literal_text, ordered_assignment_phases, SourceLineIndex};
     use oxc_allocator::Allocator;
     use oxc_span::SourceType;
     use rolldown_redox::ecmascript::parse_program;
@@ -643,7 +639,7 @@ mod tests {
         let nested_target = position(&phases, "static property .x");
         let rhs_call = position(&phases, "| Call | rhs;");
         let nested_write = position(&phases, "inner.x = (setter may run)");
-        let outer_write = position(&phases, "obj[key()] = (setter may run)");
+        let outer_write = position(&phases, &literal_text("obj[key()] = (setter may run)"));
         assert!(
             key_call < nested_target
                 && nested_target < rhs_call
@@ -735,10 +731,16 @@ mod tests {
             let key_call = position(&phases, "| Call | key;");
             let to_object = position(&phases, "| ToObject base |");
             let key_coercion = position(&phases, "| ToPropertyKey |");
-            let target_get = position(&phases, "obj[key()]; getter/dynamic resolution");
+            let target_get = position(
+                &phases,
+                &literal_text("obj[key()]; getter/dynamic resolution"),
+            );
             let rhs = position(&phases, "side.effect = (setter may run)");
             let second_key_coercion = phases.rfind("| ToPropertyKey |").unwrap_or(usize::MAX);
-            let put = position(&phases, &format!("obj[key()] {operator} (setter may run)"));
+            let put = position(
+                &phases,
+                &literal_text(&format!("obj[key()] {operator} (setter may run)")),
+            );
             assert!(
                 key_call < to_object
                     && to_object < key_coercion

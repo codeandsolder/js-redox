@@ -4,6 +4,7 @@ use crate::{
     bundle_unpack::{analyze_bundle_source, BundleInventoryReport, ModuleRecord},
     content_dedup::{default_jobs, sha256_path},
     js_format::format_source,
+    report_markdown::{code_span, link_destination, literal_text},
     sha256_hex,
 };
 use anyhow::{bail, Context, Result};
@@ -226,13 +227,6 @@ fn build_module_source(
     }
 }
 
-fn markdown_text(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('|', "\\|")
-        .replace('`', "\\`")
-}
-
 fn string_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value.get(key).and_then(Value::as_str)
 }
@@ -308,7 +302,7 @@ fn write_module_readme(module_root: &Path, bundles: &[Value], modules: &[Value])
                 chunk_ids
                     .iter()
                     .filter_map(Value::as_str)
-                    .map(markdown_text)
+                    .map(code_span)
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
@@ -317,7 +311,7 @@ fn write_module_readme(module_root: &Path, bundles: &[Value], modules: &[Value])
         lines.extend([
             format!("## Bundle {:02} — {identity}", bundle_id + 1),
             String::new(),
-            format!("- Parent: `{}`", markdown_text(string_field(bundle, "parent_path").unwrap_or_default())),
+            format!("- Parent: {}", code_span(string_field(bundle, "parent_path").unwrap_or_default())),
             format!("- Modules: **{}**; named: **{}**; CommonJS-only: **{commonjs_only}**; unlabeled: **{anonymous}**", rows.len(), named_export_rows.len()),
         ]);
         if !named_export_rows.is_empty() {
@@ -335,13 +329,13 @@ fn write_module_readme(module_root: &Path, bundles: &[Value], modules: &[Value])
                     .into_iter()
                     .flatten()
                     .filter_map(Value::as_str)
-                    .map(markdown_text)
+                    .map(code_span)
                     .collect::<Vec<_>>()
                     .join(", ");
                 lines.push(format!(
                     "- [module {}]({}): {export_name_list} — {} literal dep(s)",
-                    markdown_text(string_field(row, "module_id").unwrap_or_default()),
-                    relative.to_string_lossy(),
+                    literal_text(string_field(row, "module_id").unwrap_or_default()),
+                    link_destination(&relative.to_string_lossy()),
                     array_len(row, "dependencies")
                 ));
             }
@@ -703,6 +697,30 @@ mod tests {
             std::env::temp_dir().join(format!("bundle-materialize-{}-{nonce}", std::process::id()));
         fs::create_dir_all(path.join("src/_deobfuscated"))?;
         Ok(path)
+    }
+
+    #[test]
+    fn bundle_index_preserves_literal_names_and_encodes_paths() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let bundles = [
+            json!({"bundle_id":0,"kind":"webpack_chunk","chunk_ids":["x\n# headline"],"parent_path":"src/_deobfuscated/a\u{60}b.js"}),
+        ];
+        let modules = [
+            json!({"bundle_id":0,"module_id":"name](/somewhere)","source_path":"src/_modules/a (draft)#.js","export_names":["export\u{60}name\nnext"],"dependencies":[]}),
+        ];
+        write_module_readme(temp.path(), &bundles, &modules)?;
+        let markdown = fs::read_to_string(temp.path().join("README.md"))?;
+        assert!(markdown.contains("chunk `x\\n# headline`"), "{markdown}");
+        assert!(
+            markdown.contains("Parent: `` src/_deobfuscated/a`b.js ``"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains(r"[module name\](/somewhere)](a%20%28draft%29%23.js)"),
+            "{markdown}"
+        );
+        assert!(markdown.contains("`` export`name\\nnext ``"), "{markdown}");
+        Ok(())
     }
 
     #[test]
