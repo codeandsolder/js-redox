@@ -1818,29 +1818,6 @@ fn argument_integer(arg: &Argument<'_>) -> Option<i64> {
     }
 }
 
-fn decoder_argument_integer(arg: &Argument<'_>) -> Option<i64> {
-    if let Some(value) = argument_integer(arg) {
-        return Some(value);
-    }
-    let Argument::StringLiteral(literal) = arg else {
-        return None;
-    };
-    let text = literal.value.as_str()?.trim();
-    let (negative, text) = text.strip_prefix('-').map_or_else(
-        || (false, text.strip_prefix('+').unwrap_or(text)),
-        |rest| (true, rest),
-    );
-    let value = if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
-        i64::from_str_radix(hex, 16).ok()?
-    } else {
-        text.parse::<i64>().ok()?
-    };
-    value
-        .checked_neg()
-        .filter(|_| negative)
-        .or_else(|| (!negative).then_some(value))
-}
-
 /// Whether a call's syntax permits intrinsic eval to access its caller's
 /// lexical environment. Parentheses preserve the reference; optional calls,
 /// sequences and member calls do not. A shadowed binding may still hold the
@@ -8086,6 +8063,58 @@ mod tests {
             let result = recover_static_decoders(&source, 4).unwrap_or_else(|| unreachable!("{source}"));
             assert_eq!(result.transforms.get("string_array_decode").copied().unwrap_or_default(), expected, "{source}: {}", result.source);
         }
+    }
+
+    #[test]
+    fn decoder_arguments_use_ecmascript_number_coercion_before_subtraction() {
+        let prefix = "function p(){var t=['a','b','c'];p=function(){return t;};return p();}";
+        for (offset, argument, expected) in [
+            ("16", "'0x10'", Some("a")),
+            ("16", "'+0x10'", None),
+            ("-16", "'-0x10'", None),
+            ("16", "'0b10000'", Some("a")),
+            ("16", "'0o20'", Some("a")),
+            ("16", "'1.6e1'", Some("a")),
+            ("16", "'16.00'", Some("a")),
+            ("16", "'16.5'", None),
+            ("16", "'Infinity'", None),
+            ("16", "'NaN'", None),
+            ("0", "null", Some("a")),
+            ("0", "true", Some("b")),
+            ("0", "false", Some("a")),
+            ("0", "''", Some("a")),
+            ("0", "'  '", Some("a")),
+            ("0", "void 0", None),
+            ("0", "-0", Some("a")),
+            ("0", "1+1", Some("c")),
+            ("9007199254740992", "'9007199254740993'", Some("a")),
+            ("9007199254740992", "9007199254740994", Some("c")),
+        ] {
+            let source = format!("{prefix}function d(i,t,v){{return i=i-({offset}),t=p(),v=t[i],v;}}sink(d({argument}));");
+            let result =
+                recover_static_decoders(&source, 4).unwrap_or_else(|| unreachable!("{source}"));
+            assert_eq!(
+                result.transforms.get("string_array_decode").copied(),
+                expected.map(|_| 1),
+                "{source}: {}",
+                result.source
+            );
+            if let Some(value) = expected {
+                assert!(
+                    result.source.contains(&format!("sink(\"{value}\")")),
+                    "{source}: {}",
+                    result.source
+                );
+            }
+        }
+        let source = format!("{prefix}function d(i,t,v){{return i=i-16,t=p(),v=t[i],v;}}sink(d(flag?'0x10':'17.0'));");
+        let result = recover_static_decoders(&source, 4).unwrap_or_else(|| unreachable!());
+        assert_eq!(result.transforms.get("string_array_decode"), Some(&1));
+        assert!(
+            result.source.contains("flag")
+                && result.source.contains("\"a\"")
+                && result.source.contains("\"b\"")
+        );
     }
 
     #[test]

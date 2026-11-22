@@ -87,8 +87,11 @@ impl ChecksumExpression {
                 if decoder.provider != provider {
                     return None;
                 }
-                let value =
-                    decoder.value_for_raw_rotated_with_key(*raw, rotation, key.as_deref())?;
+                let value = decoder.value_for_raw_rotated_with_key(
+                    js_number_from_i64(*raw),
+                    rotation,
+                    key.as_deref(),
+                )?;
                 js_parse_int(&value.js_string()?, *radix)
             }
         }

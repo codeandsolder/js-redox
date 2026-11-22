@@ -6,15 +6,16 @@ mod fixed_base64_proof;
 mod rotation_proof;
 
 use crate::binding_facts::{BindingFacts, ReferenceIdentity};
+use crate::numeric::exact_usize;
 use crate::rewrite::Replacement;
 use crate::value_eval::{
     canonical_array_index_key, eval, exact_computed_property_key, js_to_uint32,
     literal_property_key, render_value_array, same_values, Value,
 };
 use crate::{
-    argument_integer, array_element, decoder_argument_integer, expression_integer, fragment,
-    statically_resolved_symbol, statically_unresolved_global_reference, string_literal_value,
-    symbol_has_only_read_references, symbol_of, template_element_value,
+    argument_integer, array_element, expression_integer, fragment, statically_resolved_symbol,
+    statically_unresolved_global_reference, string_literal_value, symbol_has_only_read_references,
+    symbol_of, template_element_value,
 };
 use fixed_base64_proof::fixed_base64_algorithm_proven;
 use oxc_ast::ast::{
@@ -1646,15 +1647,14 @@ impl Decoder {
 
     fn value_for_raw_rotated_with_key(
         &self,
-        raw: i64,
+        raw: f64,
         rotation: usize,
         key: Option<&str>,
     ) -> Option<Value> {
-        let index = raw.checked_sub(self.offset)?;
-        if index < 0 || self.values.is_empty() {
-            return None;
-        }
-        let index = usize::try_from(index).ok()?;
+        // Both operands inhabit the ECMAScript Number domain before the
+        // subtraction. Only an exact nonnegative integral result indexes
+        // this dense table; fractional, NaN and infinite keys are unknown.
+        let index = exact_usize(raw - js_number_from_i64(self.offset))?;
         // Array indexing never wraps. Rotation only maps an already-valid
         // logical table index onto the physically rotated backing array.
         if index >= self.values.len() {
@@ -1665,7 +1665,7 @@ impl Decoder {
             .transform_value(self.values.get(index)?.clone(), key)
     }
 
-    pub(super) fn value_for_call(&self, raw: i64, key: Option<&str>) -> Option<Value> {
+    pub(super) fn value_for_call(&self, raw: f64, key: Option<&str>) -> Option<Value> {
         self.value_for_raw_rotated_with_key(raw, 0, key)
     }
 }
@@ -1704,11 +1704,12 @@ pub fn decoder_call_rewrite(
         None => None,
     };
     let argument = call.arguments.first()?;
-    if let Some(raw) = decoder_argument_integer(argument) {
+    let primitive_number = |expression: &Expression<'_>| eval(expression)?.number();
+    if let Some(raw) = argument.as_expression().and_then(primitive_number) {
         return literal_decoder_rewrite(decoder.value_for_call(raw, key.as_deref())?);
     }
     conditional_decoder_rewrite(source, argument, |expression| {
-        decoder.value_for_call(expression_integer(expression)?, key.as_deref())
+        decoder.value_for_call(primitive_number(expression)?, key.as_deref())
     })
 }
 
@@ -3760,11 +3761,11 @@ mod tests {
         assert!(prove_rotation_iife(&iife, &mut decoders, &budget).unwrap_or(false));
         for symbol in [first, second] {
             assert!(
-                matches!(decoders[&symbol].value_for_call(0, None), Some(Value::String(value)) if value == "22")
+                matches!(decoders[&symbol].value_for_call(0.0, None), Some(Value::String(value)) if value == "22")
             );
         }
         assert!(
-            matches!(decoders[&unrelated].value_for_call(0,None),Some(Value::String(value)) if value == "11")
+            matches!(decoders[&unrelated].value_for_call(0.0,None),Some(Value::String(value)) if value == "11")
         );
         let mut invalid = decoders.clone();
         Rc::make_mut(
@@ -3776,7 +3777,7 @@ mod tests {
         .rotate_left(1);
         assert!(!prove_rotation_iife(&iife, &mut invalid, &budget).unwrap_or(true));
         assert!(
-            matches!(invalid[&first].value_for_call(0,None),Some(Value::String(value)) if value == "22")
+            matches!(invalid[&first].value_for_call(0.0,None),Some(Value::String(value)) if value == "22")
         );
     }
 
