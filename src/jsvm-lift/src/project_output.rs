@@ -52,13 +52,7 @@ fn resolve_destination(path: &Path) -> Result<PathBuf> {
 }
 
 fn validate_project_directory(path: &Path) -> Result<()> {
-    let manifest = path.join(MANIFEST_NAME);
-    ensure!(
-        fs::symlink_metadata(&manifest)?.is_file(),
-        "capture manifest is not a regular file: {}",
-        manifest.display()
-    );
-    read_manifest(&manifest)?;
+    read_manifest(&path.join(MANIFEST_NAME))?;
     Ok(())
 }
 

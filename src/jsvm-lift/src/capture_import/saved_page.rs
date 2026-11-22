@@ -16,6 +16,7 @@ use html_escape::decode_html_entities;
 use regex::Regex;
 use serde_json::{json, Map, Value};
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     ffi::OsStr,
     fs,
@@ -80,7 +81,7 @@ fn guess_mime(path: &Path) -> String {
 }
 
 fn read_text_lossless(path: &Path) -> Result<Option<String>> {
-    let data = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let data = crate::report_file::read_bytes(path)?;
     if let Some((encoding, bom_len)) = Encoding::for_bom(&data) {
         let (decoded, _, had_errors) = encoding.decode(&data[bom_len..]);
         return Ok((!had_errors).then(|| decoded.into_owned()));
@@ -294,17 +295,14 @@ fn discover_assets_dir(page: &Path) -> Result<Option<PathBuf>> {
 }
 
 fn collect_asset_files(root: &Path, budget: &WorkBudget) -> Result<Vec<(PathBuf, PathBuf)>> {
-    fn visit(
-        root: &Path,
-        directory: &Path,
-        output: &mut Vec<(PathBuf, PathBuf)>,
-        budget: &WorkBudget,
-    ) -> Result<()> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut output = Vec::new();
+    while let Some(directory) = pending.pop() {
         budget.checkpoint()?;
         for entry in
-            fs::read_dir(directory).with_context(|| format!("reading {}", directory.display()))?
+            fs::read_dir(&directory).with_context(|| format!("reading {}", directory.display()))?
         {
-            budget.checkpoint()?;
+            budget.consume(1)?;
             let entry = entry?;
             let file_type = entry.file_type()?;
             if file_type.is_symlink() {
@@ -312,7 +310,7 @@ fn collect_asset_files(root: &Path, budget: &WorkBudget) -> Result<Vec<(PathBuf,
             }
             let path = entry.path();
             if file_type.is_dir() {
-                visit(root, &path, output, budget)?;
+                pending.push(path);
             } else if file_type.is_file() {
                 let resolved = path.canonicalize()?;
                 let Ok(relative) = resolved.strip_prefix(root) else {
@@ -321,21 +319,9 @@ fn collect_asset_files(root: &Path, budget: &WorkBudget) -> Result<Vec<(PathBuf,
                 output.push((resolved.clone(), relative.to_owned()));
             }
         }
-        Ok(())
     }
-    let mut output = Vec::new();
-    visit(root, root, &mut output, budget)?;
     output.sort_by(|left, right| left.1.cmp(&right.1));
     Ok(output)
-}
-
-fn write_copy(source: &Path, destination: &Path) -> Result<Vec<u8>> {
-    let data = fs::read(source).with_context(|| format!("reading {}", source.display()))?;
-    if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(destination, &data).with_context(|| format!("writing {}", destination.display()))?;
-    Ok(data)
 }
 
 fn index_saved_urls(resources: &[Value]) -> Result<HashMap<String, usize>> {
@@ -380,6 +366,7 @@ fn collect_saved_page_files(
 
 fn materialize_saved_resources(
     page: &Path,
+    page_bytes: &[u8],
     output: &Path,
     files: &[(PathBuf, PathBuf)],
     decoded: &DecodedHtml,
@@ -397,7 +384,14 @@ fn materialize_saved_resources(
         })?;
         let output_rel = PathBuf::from("resources").join(capture_rel);
         let url = canonical_url(capture_rel)?;
-        let data = write_copy(source, &output.join(&output_rel))?;
+        // The page body is exactly the snapshot decoded by the importer.
+        // Other assets are read once into the staged capture.
+        let data = if source == page {
+            Cow::Borrowed(page_bytes)
+        } else {
+            Cow::Owned(crate::report_file::read_bytes(source)?)
+        };
+        crate::report_file::write_bytes(&output.join(&output_rel), &data)?;
         let mime = guess_mime(source);
         let kind = resource_kind(&url, &mime);
         let mut object = Map::new();
@@ -501,7 +495,11 @@ fn saved_reference_key(item: &Value) -> (String, String, String) {
     (field("kind"), field("raw"), field("resolved_url"))
 }
 
-fn collect_saved_resource_references(resources: &mut [Value], budget: &WorkBudget) -> Result<()> {
+fn collect_saved_resource_references(
+    output: &Path,
+    resources: &mut [Value],
+    budget: &WorkBudget,
+) -> Result<()> {
     for resource in resources.iter_mut() {
         budget.checkpoint()?;
         let Some(kind) = resource.get("kind").and_then(Value::as_str) else {
@@ -515,10 +513,14 @@ fn collect_saved_resource_references(resources: &mut [Value], budget: &WorkBudge
         if !parse_javascript && !parse_css {
             continue;
         }
-        let Some(source_path) = resource.get("saved_source_path").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some(source) = read_text_lossless(Path::new(source_path))? else {
+        let source_path = resource["output_path"]
+            .as_str()
+            .context("saved resource output path missing")?;
+        crate::capture_project::validate_project_relative_path(
+            source_path,
+            "saved resource output",
+        )?;
+        let Some(source) = read_text_lossless(&output.join(source_path))? else {
             continue;
         };
         let Some(base_url) = resource.get("url").and_then(Value::as_str) else {
@@ -719,7 +721,7 @@ pub(super) fn import_saved_page(
     if !page.is_file() {
         bail!("saved page HTML does not exist: {}", page.display());
     }
-    let page_bytes = fs::read(&page)?;
+    let page_bytes = crate::report_file::read_bytes(&page)?;
     let decoded = decode_html(&page_bytes, None, None);
     budget.checkpoint()?;
     let page_text = &decoded.source;
@@ -750,7 +752,7 @@ pub(super) fn import_saved_page(
     let output = staged.path();
     let (page_rel, files) = collect_saved_page_files(&page, assets.as_deref(), budget)?;
     let (mut resources, rel_to_id) =
-        materialize_saved_resources(&page, output, &files, &decoded, budget)?;
+        materialize_saved_resources(&page, &page_bytes, output, &files, &decoded, budget)?;
     let page_id = *rel_to_id
         .get(&page_rel)
         .context("saved page resource disappeared")?;
@@ -766,7 +768,7 @@ pub(super) fn import_saved_page(
     resources[page_index]["references"] = Value::Array(page_refs.clone());
 
     reconcile_saved_reference_roles(&mut resources, &page_refs, budget)?;
-    collect_saved_resource_references(&mut resources, budget)?;
+    collect_saved_resource_references(output, &mut resources, budget)?;
     let inline_scripts = materialize_saved_inline_scripts(
         page_text, &page_rel, &page_url, page_id, &decoded, output, budget,
     )?;
@@ -799,6 +801,68 @@ pub(super) fn import_saved_page(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_metadata_uses_archived_bytes_even_when_inputs_change() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let page = root.join("Example.html");
+        let assets = root.join("Example_files");
+        fs::create_dir(&assets)?;
+        let asset = assets.join("style.css");
+        let original_page = b"<title>original page</title>";
+        let original_asset = b"/*# sourceMappingURL=original.css.map */";
+        fs::write(&page, original_page)?;
+        fs::write(&asset, original_asset)?;
+        let output = root.join("project");
+        let budget = WorkBudget::unlimited("snapshot fixture");
+        let bytes = crate::report_file::read_bytes(&page)?;
+        let decoded = decode_html(&bytes, None, None);
+        fs::write(&page, "<title>changed page</title>")?;
+        let (_, files) = collect_saved_page_files(&page, Some(&assets), &budget)?;
+        let (mut resources, _) =
+            materialize_saved_resources(&page, &bytes, &output, &files, &decoded, &budget)?;
+        fs::write(&asset, "/*# sourceMappingURL=changed.css.map */")?;
+        collect_saved_resource_references(&output, &mut resources, &budget)?;
+        let page_record = &resources[0];
+        let asset_record = &resources[1];
+        for (record, expected) in [
+            (page_record, original_page.as_slice()),
+            (asset_record, original_asset.as_slice()),
+        ] {
+            let path = record["output_path"].as_str().context("captured path")?;
+            assert_eq!(fs::read(output.join(path))?, expected);
+            assert_eq!(record["sha256"], sha256_hex(expected));
+        }
+        assert_eq!(asset_record["references"][0]["raw"], "original.css.map");
+        assert_eq!(
+            asset_record["references"]
+                .as_array()
+                .context("references")?
+                .len(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn saved_asset_traversal_charges_directory_entries_and_is_sorted() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        fs::create_dir(root.join("z"))?;
+        fs::write(root.join("z/last.txt"), "last")?;
+        fs::write(root.join("first.txt"), "first")?;
+        let budget = WorkBudget::new("asset limit", work_budget::BudgetLimits::work(2));
+        assert!(collect_asset_files(&root, &budget).is_err());
+        let rows = collect_asset_files(&root, &WorkBudget::unlimited("asset tree"))?;
+        assert_eq!(
+            rows.iter()
+                .map(|(_, relative)| relative.clone())
+                .collect::<Vec<_>>(),
+            [PathBuf::from("first.txt"), PathBuf::from("z/last.txt")]
+        );
+        Ok(())
+    }
 
     #[test]
     fn reference_cleaning_rejects_non_network_inline_schemes() {

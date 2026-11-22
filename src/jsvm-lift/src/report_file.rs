@@ -53,6 +53,15 @@ fn open_regular(path: &Path) -> Result<File> {
     Ok(file)
 }
 
+/// Read a single regular-file snapshot without following final-component links.
+pub(crate) fn read_bytes(path: &Path) -> Result<Vec<u8>> {
+    let mut file = open_regular(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut data = Vec::new();
+    file.read_to_end(&mut data)
+        .with_context(|| format!("reading {}", path.display()))?;
+    Ok(data)
+}
+
 /// Decode project-owned JSON, retaining IO errors independently of parse failures.
 pub(crate) fn read_json<T: DeserializeOwned>(path: &Path, label: &str) -> Result<T> {
     let mut file =
