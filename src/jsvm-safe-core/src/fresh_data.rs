@@ -248,7 +248,36 @@ impl Analyzer<'_> {
         Evaluation { fact, inert }
     }
 
-    fn member_reference(object: Evaluation, key: Evaluation) -> Option<Reference> {
+    /// Evaluate the receiver before the key, for reads, assignment targets,
+    /// updates and delete alike. Never evaluate an optional member as an
+    /// unconditional reference, or a private member as a public own key.
+    fn member_components(
+        &mut self,
+        member: &MemberExpression<'_>,
+        environment: &mut Environment,
+    ) -> Option<(Evaluation, Evaluation)> {
+        if member.optional() {
+            return None;
+        }
+        let object = self.expression(member.object(), environment);
+        let key = match member {
+            MemberExpression::StaticMemberExpression(member) => {
+                Evaluation::primitive(Value::String(member.property.name.to_string()), true)
+            }
+            MemberExpression::ComputedMemberExpression(member) => {
+                self.key(&member.expression, environment)
+            }
+            MemberExpression::PrivateFieldExpression(_) => return None,
+        };
+        Some((object, key))
+    }
+
+    fn member_reference(
+        &mut self,
+        member: &MemberExpression<'_>,
+        environment: &mut Environment,
+    ) -> Option<Reference> {
+        let (object, key) = self.member_components(member, environment)?;
         let key = key.primitive_value()?.js_string()?;
         let Fact::Objects(locations) = object.fact? else {
             return None;
@@ -261,26 +290,13 @@ impl Analyzer<'_> {
         target: &SimpleAssignmentTarget<'_>,
         environment: &mut Environment,
     ) -> Option<Reference> {
-        match target {
-            SimpleAssignmentTarget::AssignmentTargetIdentifier(identifier) => {
-                let symbol = self.lexical_reference(identifier)?;
-                let flags = self.scoping.symbol_flags(symbol);
-                (flags.is_block_scoped() && !flags.is_const_variable())
-                    .then_some(Reference::Binding(symbol))
-            }
-            SimpleAssignmentTarget::StaticMemberExpression(member) if !member.optional => {
-                let object = self.expression(&member.object, environment);
-                let key =
-                    Evaluation::primitive(Value::String(member.property.name.to_string()), true);
-                Self::member_reference(object, key)
-            }
-            SimpleAssignmentTarget::ComputedMemberExpression(member) if !member.optional => {
-                let object = self.expression(&member.object, environment);
-                let key = self.key(&member.expression, environment);
-                Self::member_reference(object, key)
-            }
-            _ => None,
+        if let SimpleAssignmentTarget::AssignmentTargetIdentifier(identifier) = target {
+            let symbol = self.lexical_reference(identifier)?;
+            let flags = self.scoping.symbol_flags(symbol);
+            return (flags.is_block_scoped() && !flags.is_const_variable())
+                .then_some(Reference::Binding(symbol));
         }
+        self.member_reference(target.as_member_expression()?, environment)
     }
 
     fn logical_decision(operator: &str, fact: &Fact) -> Option<bool> {
@@ -401,20 +417,10 @@ impl Analyzer<'_> {
         argument: &Expression<'_>,
         environment: &mut Environment,
     ) -> Evaluation {
-        let reference = match argument.without_parentheses() {
-            Expression::StaticMemberExpression(member) if !member.optional => {
-                let object = self.expression(&member.object, environment);
-                let key =
-                    Evaluation::primitive(Value::String(member.property.name.to_string()), true);
-                Self::member_reference(object, key)
-            }
-            Expression::ComputedMemberExpression(member) if !member.optional => {
-                let object = self.expression(&member.object, environment);
-                let key = self.key(&member.expression, environment);
-                Self::member_reference(object, key)
-            }
-            _ => None,
-        };
+        let reference = argument
+            .without_parentheses()
+            .as_member_expression()
+            .and_then(|member| self.member_reference(member, environment));
         let Some(Reference::Member { locations, key }) = reference else {
             return Self::barrier(environment);
         };
@@ -438,16 +444,14 @@ impl Analyzer<'_> {
             Expression::ParenthesizedExpression(paren) => {
                 self.expression(&paren.expression, environment)
             }
-            Expression::StaticMemberExpression(member) if !member.optional => {
-                let object = self.expression(&member.object, environment);
-                let key =
-                    Evaluation::primitive(Value::String(member.property.name.to_string()), true);
-                self.member(member.span, object, key, environment)
-            }
-            Expression::ComputedMemberExpression(member) if !member.optional => {
-                let object = self.expression(&member.object, environment);
-                let key = self.key(&member.expression, environment);
-                self.member(member.span, object, key, environment)
+            expression if expression.is_member_expression() => {
+                let Some((object, key)) = expression
+                    .as_member_expression()
+                    .and_then(|member| self.member_components(member, environment))
+                else {
+                    return Self::barrier(environment);
+                };
+                self.member(expression.span(), object, key, environment)
             }
             Expression::SequenceExpression(sequence) => {
                 let mut result = Evaluation::unknown_inert();
