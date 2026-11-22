@@ -351,132 +351,97 @@ mod tests {
     #[test]
     fn runtime_network_execution_requires_unique_hash_url_and_positive_matching_instance(
     ) -> Result<()> {
-        let (mut graph, hashes) = runtime_match_test_graph()?;
-        let runtime = json!({
-            "sha256":"alpha","urls":["https://fixture.invalid/app.js"],
-            "observed_executed":true,
-            "coverage_mode":"best-effort",
-            "script_instances":[{
-                "cdp_session":"main","script_id":"1","script_url":"https://fixture.invalid/copy.js",
-                "execution":{"status":"positive","positive_functions":1,"positive_ranges":1}
-            }]
-        });
         let budget = work_budget::WorkBudget::unlimited("runtime-network-test");
-        let coverage = RuntimeCoverageIndex::build(&json!({"sources":[runtime]}), &budget)?;
-        add_runtime_network_source_edges(
-            &mut graph,
-            &runtime,
-            "runtime:parsed",
-            &hashes,
-            coverage.witnesses(runtime["sha256"].as_str().unwrap_or_default()),
-            &budget,
-        )?;
-        let parsed = graph
-            .edges()
-            .values()
-            .filter(|edge| edge["to"] == "runtime:parsed")
-            .collect::<Vec<_>>();
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0]["from"], "resource:1");
-        assert_eq!(parsed[0]["kind"], "runtime_source_match");
-        assert_eq!(parsed[0]["identity_basis"], "sha256_and_url");
-        assert_eq!(parsed[0]["exact_response_identity"], true);
-        assert_eq!(parsed[0]["runtime_execution_observed"], false);
-        assert_eq!(parsed[0]["coverage_mode"], "best-effort");
-
-        let mut confirmed = runtime;
-        confirmed["script_instances"][0]["script_url"] = json!("https://fixture.invalid/app.js");
-        let budget = work_budget::WorkBudget::unlimited("runtime-network-test");
-        let coverage = RuntimeCoverageIndex::build(&json!({"sources":[confirmed]}), &budget)?;
-        add_runtime_network_source_edges(
-            &mut graph,
-            &confirmed,
-            "runtime:executed",
-            &hashes,
-            coverage.witnesses(confirmed["sha256"].as_str().unwrap_or_default()),
-            &budget,
-        )?;
-        let executed = graph
-            .edges()
-            .values()
-            .filter(|edge| edge["to"] == "runtime:executed")
-            .collect::<Vec<_>>();
-        assert_eq!(executed.len(), 1);
-        assert_eq!(executed[0]["from"], "resource:1");
-        assert_eq!(executed[0]["kind"], "runtime_execution");
-        assert_eq!(executed[0]["runtime_execution_observed"], true);
-        assert_eq!(executed[0]["coverage_mode"], "best-effort");
+        for (instance_url, conflict, executed) in [
+            ("https://fixture.invalid/copy.js", false, false),
+            ("https://fixture.invalid/app.js", false, true),
+            ("https://fixture.invalid/app.js", true, false),
+        ] {
+            let (mut graph, hashes) = runtime_match_test_graph()?;
+            let runtime = json!({"sha256":"alpha","urls":["https://fixture.invalid/app.js"],"observed_executed":true,"coverage_mode":"best-effort","script_instances":[{"cdp_session":"main","script_id":"1","script_url":instance_url,"execution":{"status":"positive","positive_functions":1,"positive_ranges":1}}]});
+            let conflicts = if conflict {
+                json!([{"cdp_session":"main","script_id":"1","sha256_claims":["alpha","missing"]}])
+            } else {
+                json!([])
+            };
+            let coverage = RuntimeCoverageIndex::build(
+                &json!({"sources":[runtime],"script_identity_conflicts":conflicts}),
+                &budget,
+            )?;
+            add_runtime_network_source_edges(
+                &mut graph,
+                &runtime,
+                "runtime:source",
+                &hashes,
+                coverage.witnesses("alpha"),
+                &budget,
+            )?;
+            let edges = graph
+                .edges()
+                .values()
+                .filter(|edge| edge["to"] == "runtime:source")
+                .collect::<Vec<_>>();
+            assert_eq!(edges.len(), 1);
+            let edge = edges[0];
+            assert_eq!(edge["from"], "resource:1");
+            assert_eq!(
+                edge["kind"],
+                if executed {
+                    "runtime_execution"
+                } else {
+                    "runtime_source_match"
+                }
+            );
+            assert_eq!(edge["identity_basis"], "sha256_and_url");
+            assert_eq!(edge["exact_response_identity"], true);
+            assert_eq!(edge["runtime_execution_observed"], executed);
+            assert_eq!(edge["coverage_mode"], "best-effort");
+        }
         Ok(())
     }
 
     #[test]
     fn runtime_url_and_hash_only_matches_remain_ambiguous_candidates() -> Result<()> {
-        let (mut graph, hashes) = runtime_match_test_graph()?;
-        let runtime = json!({
-            "sha256":"missing","urls":["https://fixture.invalid/app.js"],
-            "observed_executed":true,
-            "script_instances":[{
-                "cdp_session":"main","script_id":"1","script_url":"https://fixture.invalid/app.js",
-                "execution":{"status":"positive","positive_functions":1,"positive_ranges":1}
-            }]
-        });
         let budget = work_budget::WorkBudget::unlimited("runtime-network-test");
-        let coverage = RuntimeCoverageIndex::build(&json!({"sources":[runtime]}), &budget)?;
-        add_runtime_network_source_edges(
-            &mut graph,
-            &runtime,
-            "runtime:url-only",
-            &hashes,
-            coverage.witnesses(runtime["sha256"].as_str().unwrap_or_default()),
-            &budget,
-        )?;
-        let url_edges = graph
-            .edges()
-            .values()
-            .filter(|edge| edge["to"] == "runtime:url-only")
-            .collect::<Vec<_>>();
-        assert_eq!(url_edges.len(), 2);
-        assert_eq!(
-            url_edges
-                .iter()
-                .map(|edge| edge["from"].as_str().unwrap_or(""))
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::from(["resource:1", "resource:2"])
-        );
-        for edge in url_edges {
-            assert_eq!(edge["kind"], "runtime_source_candidate");
-            assert_eq!(edge["identity_basis"], "url_only");
-            assert_eq!(edge["candidate_count"], 2);
-            assert_eq!(edge["exact_response_identity"], false);
-        }
-        let sha_only = json!({"sha256":"alpha","urls":[],"observed_executed":true});
-        let budget = work_budget::WorkBudget::unlimited("runtime-network-test");
-        let coverage = RuntimeCoverageIndex::build(&json!({"sources":[sha_only]}), &budget)?;
-        add_runtime_network_source_edges(
-            &mut graph,
-            &sha_only,
-            "runtime:sha-only",
-            &hashes,
-            coverage.witnesses(sha_only["sha256"].as_str().unwrap_or_default()),
-            &budget,
-        )?;
-        let hash_edges = graph
-            .edges()
-            .values()
-            .filter(|edge| edge["to"] == "runtime:sha-only")
-            .collect::<Vec<_>>();
-        assert_eq!(hash_edges.len(), 2);
-        assert_eq!(
-            hash_edges
-                .iter()
-                .map(|edge| edge["from"].as_str().unwrap_or(""))
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::from(["resource:1", "resource:3"])
-        );
-        for edge in hash_edges {
-            assert_eq!(edge["kind"], "runtime_source_candidate");
-            assert_eq!(edge["identity_basis"], "sha256_only");
-            assert_eq!(edge["exact_response_identity"], false);
+        for (digest, urls, basis, second_resource) in [
+            (
+                "missing",
+                json!(["https://fixture.invalid/app.js"]),
+                "url_only",
+                "resource:2",
+            ),
+            ("alpha", json!([]), "sha256_only", "resource:3"),
+        ] {
+            let (mut graph, hashes) = runtime_match_test_graph()?;
+            let runtime = json!({"sha256":digest,"urls":urls,"observed_executed":true,"script_instances":[{"cdp_session":"main","script_id":"1","script_url":"https://fixture.invalid/app.js","execution":{"status":"positive","positive_functions":1,"positive_ranges":1}}]});
+            let coverage = RuntimeCoverageIndex::build(&json!({"sources":[runtime]}), &budget)?;
+            add_runtime_network_source_edges(
+                &mut graph,
+                &runtime,
+                "runtime:candidate",
+                &hashes,
+                coverage.witnesses(digest),
+                &budget,
+            )?;
+            let edges = graph
+                .edges()
+                .values()
+                .filter(|edge| edge["to"] == "runtime:candidate")
+                .collect::<Vec<_>>();
+            assert_eq!(edges.len(), 2);
+            assert_eq!(
+                edges
+                    .iter()
+                    .filter_map(|edge| edge["from"].as_str())
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from(["resource:1", second_resource])
+            );
+            for edge in edges {
+                assert_eq!(edge["kind"], "runtime_source_candidate");
+                assert_eq!(edge["identity_basis"], basis);
+                assert_eq!(edge["candidate_count"], 2);
+                assert_eq!(edge["exact_response_identity"], false);
+            }
         }
         Ok(())
     }
