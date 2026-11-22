@@ -17,6 +17,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
     path::{Path, PathBuf},
+    rc::Rc,
 };
 use work_budget::WorkBudget;
 
@@ -412,34 +413,42 @@ fn reuse_generated_unit(
     Ok(row)
 }
 
-fn queue_unit(
-    queue: &mut VecDeque<Value>,
-    seen_paths: &mut BTreeSet<String>,
-    unit: Value,
-    max_code_units: usize,
+struct ScanQueue {
+    pending: VecDeque<Value>,
+    seen: BTreeSet<String>,
     accepted: usize,
-) -> Option<usize> {
-    let path = value_string(&unit, "path")?;
-    if seen_paths.contains(&path) || accepted + queue.len() >= max_code_units {
-        return None;
-    }
-    seen_paths.insert(path);
-    let scan_id = accepted + queue.len();
-    queue.push_back(unit);
-    Some(scan_id)
+    limit: usize,
 }
 
-/// Scan indexed project sources for supported VM forms and persist their findings.
-///
-/// # Errors
-///
-/// Fails if the source index is unavailable, source files or metadata cannot be read, analysis
-/// output cannot be created or written, or an analysis budget is exceeded.
-pub fn scan_project(project: &Path, options: &ProjectScanOptions) -> Result<ProjectScanSummary> {
-    let stage_budget = options
-        .budgets
-        .scope(format!("project-scan:{}", project.display()));
-    stage_budget.checkpoint()?;
+impl ScanQueue {
+    const fn new(limit: usize) -> Self {
+        Self {
+            pending: VecDeque::new(),
+            seen: BTreeSet::new(),
+            accepted: 0,
+            limit,
+        }
+    }
+
+    fn enqueue(&mut self, unit: Value) -> Option<usize> {
+        let path = value_string(&unit, "path")?;
+        if self.accepted + self.pending.len() >= self.limit || !self.seen.insert(path) {
+            return None;
+        }
+        let id = self.accepted + self.pending.len();
+        self.pending.push_back(unit);
+        Some(id)
+    }
+
+    fn pop(&mut self) -> Option<(usize, Value)> {
+        let unit = self.pending.pop_front()?;
+        let id = self.accepted;
+        self.accepted += 1;
+        Some((id, unit))
+    }
+}
+
+fn load_scan_queue(project: &Path, limit: usize) -> Result<ScanQueue> {
     let source_index = load_artifact(project, SOURCE_INDEX)
         .context("source index is required for VM project scanning")?;
     let deob =
@@ -460,34 +469,7 @@ pub fn scan_project(project: &Path, options: &ProjectScanOptions) -> Result<Proj
         })
         .collect::<BTreeMap<_, _>>();
 
-    let mut bundle_spans_by_parent = BTreeMap::<String, BTreeSet<(i64, i64)>>::new();
-    if let Some(bundles) = load_optional_artifact(project, BUNDLES)? {
-        for bundle in bundles
-            .get("bundles")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            let Some(parent) = value_string(bundle, "parent_path") else {
-                continue;
-            };
-            let Some(start) = bundle.get("module_table_start").and_then(Value::as_i64) else {
-                continue;
-            };
-            let Some(end) = bundle.get("module_table_end").and_then(Value::as_i64) else {
-                continue;
-            };
-            bundle_spans_by_parent
-                .entry(parent)
-                .or_default()
-                .insert((start, end));
-        }
-    }
-
-    let outdir = project.join("analysis/jsvm");
-    fs::create_dir_all(&outdir)?;
-    let mut queue = VecDeque::<Value>::new();
-    let mut seen_paths = BTreeSet::<String>::new();
+    let mut queue = ScanQueue::new(limit);
     let source_units = source_index
         .get("units")
         .and_then(Value::as_array)
@@ -517,59 +499,193 @@ pub fn scan_project(project: &Path, options: &ProjectScanOptions) -> Result<Proj
         if let Some(ordinal) = source_unit.get("ordinal") {
             unit["ordinal"] = ordinal.clone();
         }
-        let _ = queue_unit(&mut queue, &mut seen_paths, unit, options.max_code_units, 0);
+        let _ = queue.enqueue(unit);
     }
 
-    let mut rows = Vec::<Value>::new();
-    let mut dynamic_units = Vec::<Value>::new();
-    let mut generated_recovery = Vec::<Value>::new();
-    let mut generated_recovery_cache = BTreeMap::<String, Value>::new();
-    let mut scanner_cache = BTreeMap::<String, (usize, ScanReport)>::new();
-    let mut scanner_invocations = 0usize;
-    let mut deduplicated_scans = 0usize;
+    Ok(queue)
+}
 
-    while let Some(unit) = queue.pop_front() {
-        stage_budget.checkpoint()?;
-        let scan_id = rows.len();
+type BundleSpans = BTreeMap<String, BTreeSet<(i64, i64)>>;
+
+fn bundle_spans(project: &Path) -> Result<BundleSpans> {
+    let mut bundle_spans_by_parent = BTreeMap::<String, BTreeSet<(i64, i64)>>::new();
+    if let Some(bundles) = load_optional_artifact(project, BUNDLES)? {
+        for bundle in bundles
+            .get("bundles")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(parent) = value_string(bundle, "parent_path") else {
+                continue;
+            };
+            let Some(start) = bundle.get("module_table_start").and_then(Value::as_i64) else {
+                continue;
+            };
+            let Some(end) = bundle.get("module_table_end").and_then(Value::as_i64) else {
+                continue;
+            };
+            bundle_spans_by_parent
+                .entry(parent)
+                .or_default()
+                .insert((start, end));
+        }
+    }
+
+    Ok(bundle_spans_by_parent)
+}
+
+fn summarize_handler_tables(
+    row: &mut Value,
+    report: &ScanReport,
+    known_bundle_spans: Option<&BTreeSet<(i64, i64)>>,
+) {
+    let large_handler_tables = report
+        .handler_function_tables
+        .iter()
+        .filter(|table| table.function_values >= 32)
+        .collect::<Vec<_>>();
+    let dense_large_handler_tables = large_handler_tables
+        .iter()
+        .copied()
+        .filter(|table| table.entries > 0 && table.function_values * 4 >= table.entries * 3)
+        .collect::<Vec<_>>();
+    let bundle_handler_tables = dense_large_handler_tables
+        .iter()
+        .copied()
+        .filter(|table| {
+            known_bundle_spans.is_some_and(|spans| {
+                spans.contains(&(i64::from(table.start), i64::from(table.end)))
+            })
+        })
+        .count();
+    let non_bundle_handler_tables = dense_large_handler_tables
+        .iter()
+        .copied()
+        .filter(|table| {
+            !known_bundle_spans.is_some_and(|spans| {
+                spans.contains(&(i64::from(table.start), i64::from(table.end)))
+            })
+        })
+        .collect::<Vec<_>>();
+    let looped_dynamic_handler_tables = non_bundle_handler_tables
+        .iter()
+        .copied()
+        .filter(|table| table.looped_dynamic_call_sites > 0)
+        .collect::<Vec<_>>();
+    row["large_handler_tables"] = large_handler_tables.len().into();
+    row["dense_large_handler_tables"] = dense_large_handler_tables.len().into();
+    row["bundle_module_table_handler_tables"] = bundle_handler_tables.into();
+    row["largest_non_bundle_handler_table"] = non_bundle_handler_tables
+        .iter()
+        .map(|table| table.function_values)
+        .max()
+        .unwrap_or(0)
+        .into();
+    row["looped_dynamic_handler_tables"] = looped_dynamic_handler_tables.len().into();
+    row["largest_looped_dynamic_handler_table"] = looped_dynamic_handler_tables
+        .iter()
+        .map(|table| table.function_values)
+        .max()
+        .unwrap_or(0)
+        .into();
+}
+
+fn classify_vm_signal(row: &mut Value) {
+    let confirmed_vm_signal = [
+        "confirmed_dispatchers",
+        "opcode_maps",
+        "confirmed_direct_switch_maps",
+        "table_vms",
+        "byte_transducers",
+    ]
+    .iter()
+    .any(|field| value_usize(row, field) > 0);
+    let large_handler_table_candidate =
+        !confirmed_vm_signal && value_usize(row, "largest_looped_dynamic_handler_table") >= 32;
+    let vm_signal = confirmed_vm_signal
+        || value_usize(row, "weak_direct_switch_maps") > 0
+        || large_handler_table_candidate;
+    row["confirmed_vm_signal"] = confirmed_vm_signal.into();
+    row["large_handler_table_candidate"] = large_handler_table_candidate.into();
+    row["vm_signal"] = vm_signal.into();
+}
+
+#[derive(Clone, Copy)]
+enum IrKind {
+    Switch,
+    Table,
+}
+
+impl IrKind {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Switch => "switch",
+            Self::Table => "table",
+        }
+    }
+}
+
+struct ProjectScanner<'a> {
+    project: &'a Path,
+    budget: &'a WorkBudget,
+    max_depth: usize,
+    outdir: PathBuf,
+    queue: ScanQueue,
+    bundle_spans: BundleSpans,
+    rows: Vec<Value>,
+    dynamic_units: Vec<Value>,
+    generated_recovery: Vec<Value>,
+    generated_cache: BTreeMap<String, Value>,
+    scanner_cache: BTreeMap<String, (usize, Rc<ScanReport>)>,
+    scanner_invocations: usize,
+    deduplicated_scans: usize,
+}
+
+impl ProjectScanner<'_> {
+    fn scan_report(
+        &mut self,
+        source: &Path,
+        source_sha: String,
+        scan_id: usize,
+    ) -> Result<(Rc<ScanReport>, Option<usize>)> {
+        if let Some((cached_id, report)) = self.scanner_cache.get(&source_sha) {
+            self.deduplicated_scans += 1;
+            return Ok((Rc::clone(report), Some(*cached_id)));
+        }
+        let dump_dir = self.outdir.join("embedded").join(format!("{scan_id:04}"));
+        self.scanner_invocations += 1;
+        let budget =
+            AnalysisOperation::StructuralScan.under(self.budget, source.display().to_string());
+        let report = Rc::new(scan_file(source, Some(&dump_dir), &budget)?);
+        if report.embedded.is_empty() {
+            self.scanner_cache
+                .insert(source_sha, (scan_id, Rc::clone(&report)));
+        }
+        Ok((report, None))
+    }
+
+    fn scan_unit(&mut self, scan_id: usize, unit: Value) -> Result<Value> {
         let path = value_string(&unit, "path").context("queued unit path missing")?;
-        let source = project.join(&path);
-        let mut row = unit.clone();
+        let source = self.project.join(&path);
+        let mut row = unit;
         row["scan_id"] = scan_id.into();
         if !source.is_file() {
             row["scanner_exit"] = 1.into();
             row["error"] = format!("missing source path: {}", source.display()).into();
-            rows.push(row);
-            continue;
+            return Ok(row);
         }
 
         let source_sha = sha256_path(&source)?;
         row["analysis_sha256"] = source_sha.clone().into();
-        let cached = scanner_cache.get(&source_sha);
-        let (report, deduplicated_from) = match cached {
-            Some((cached_scan_id, cached_report)) if cached_report.embedded.is_empty() => {
-                deduplicated_scans += 1;
-                (cached_report.clone(), Some(*cached_scan_id))
-            }
-            _ => {
-                let dump_dir = outdir.join("embedded").join(format!("{scan_id:04}"));
-                scanner_invocations += 1;
-                let scan_budget = AnalysisOperation::StructuralScan
-                    .under(&stage_budget, source.display().to_string());
-                let report = match scan_file(&source, Some(&dump_dir), &scan_budget) {
-                    Ok(report) => report,
-                    Err(error) => {
-                        let error = recoverable_unit_error(error)?;
-                        row["scanner_exit"] = 1.into();
-                        row["scanner_deduplicated"] = false.into();
-                        row["error"] = error.to_string().into();
-                        rows.push(row);
-                        continue;
-                    }
-                };
-                if report.embedded.is_empty() {
-                    scanner_cache.insert(source_sha, (scan_id, report.clone()));
-                }
-                (report, None)
+        let (report, deduplicated_from) = match self.scan_report(&source, source_sha, scan_id) {
+            Ok(result) => result,
+            Err(error) => {
+                let error = recoverable_unit_error(error)?;
+                row["scanner_exit"] = 1.into();
+                row["scanner_deduplicated"] = false.into();
+                row["error"] = error.to_string().into();
+                return Ok(row);
             }
         };
         row["scanner_exit"] = 0.into();
@@ -578,65 +694,27 @@ pub fn scan_project(project: &Path, options: &ProjectScanOptions) -> Result<Proj
             row["scanner_deduplicated_from_scan_id"] = cached_scan_id.into();
         }
         row["bytes"] = fs::metadata(&source)?.len().into();
-        let report_path = outdir.join(format!("{scan_id:04}.json"));
-        write_json(&report_path, &report)?;
-        row["report"] = relative_string(project, &report_path)?.into();
+        let report_path = self.outdir.join(format!("{scan_id:04}.json"));
+        write_json(&report_path, report.as_ref())?;
+        row["report"] = relative_string(self.project, &report_path)?.into();
         for (key, value) in direct_summary(&report) {
             row[key] = value;
         }
 
-        let known_bundle_spans = bundle_spans_by_parent.get(&path);
-        let large_handler_tables = report
-            .handler_function_tables
-            .iter()
-            .filter(|table| table.function_values >= 32)
-            .collect::<Vec<_>>();
-        let dense_large_handler_tables = large_handler_tables
-            .iter()
-            .copied()
-            .filter(|table| table.entries > 0 && table.function_values * 4 >= table.entries * 3)
-            .collect::<Vec<_>>();
-        let bundle_handler_tables = dense_large_handler_tables
-            .iter()
-            .copied()
-            .filter(|table| {
-                known_bundle_spans.is_some_and(|spans| {
-                    spans.contains(&(i64::from(table.start), i64::from(table.end)))
-                })
-            })
-            .count();
-        let non_bundle_handler_tables = dense_large_handler_tables
-            .iter()
-            .copied()
-            .filter(|table| {
-                !known_bundle_spans.is_some_and(|spans| {
-                    spans.contains(&(i64::from(table.start), i64::from(table.end)))
-                })
-            })
-            .collect::<Vec<_>>();
-        let looped_dynamic_handler_tables = non_bundle_handler_tables
-            .iter()
-            .copied()
-            .filter(|table| table.looped_dynamic_call_sites > 0)
-            .collect::<Vec<_>>();
-        row["large_handler_tables"] = large_handler_tables.len().into();
-        row["dense_large_handler_tables"] = dense_large_handler_tables.len().into();
-        row["bundle_module_table_handler_tables"] = bundle_handler_tables.into();
-        row["largest_non_bundle_handler_table"] = non_bundle_handler_tables
-            .iter()
-            .map(|table| table.function_values)
-            .max()
-            .unwrap_or(0)
-            .into();
-        row["looped_dynamic_handler_tables"] = looped_dynamic_handler_tables.len().into();
-        row["largest_looped_dynamic_handler_table"] = looped_dynamic_handler_tables
-            .iter()
-            .map(|table| table.function_values)
-            .max()
-            .unwrap_or(0)
-            .into();
+        summarize_handler_tables(&mut row, &report, self.bundle_spans.get(&path));
+        row["embedded_units"] = Value::Array(self.recover_embedded(scan_id, &row, &report)?);
+        self.materialize_ir(scan_id, &source, &report_path, &mut row)?;
+        classify_vm_signal(&mut row);
+        Ok(row)
+    }
 
-        let parent_depth = value_usize(&unit, "generated_depth");
+    fn recover_embedded(
+        &mut self,
+        scan_id: usize,
+        unit: &Value,
+        report: &ScanReport,
+    ) -> Result<Vec<Value>> {
+        let parent_depth = value_usize(unit, "generated_depth");
         let mut embedded_units = Vec::<Value>::new();
         for (offset, node) in report.embedded.iter().enumerate() {
             let ordinal = offset + 1;
@@ -644,26 +722,26 @@ pub fn scan_project(project: &Path, options: &ProjectScanOptions) -> Result<Proj
                 continue;
             };
             let raw = PathBuf::from(dumped);
-            let raw_rel = relative_string(project, &raw)?;
+            let raw_rel = relative_string(self.project, &raw)?;
             let depth = parent_depth + 1;
             let raw_sha = sha256_path(&raw)?;
-            let recovery = if let Some(cached) = generated_recovery_cache.get(&raw_sha) {
-                reuse_generated_unit(project, &raw_rel, scan_id, ordinal, cached)?
+            let recovery = if let Some(cached) = self.generated_cache.get(&raw_sha) {
+                reuse_generated_unit(self.project, &raw_rel, scan_id, ordinal, cached)?
             } else {
                 let mut recovery = recover_generated_unit(
-                    project,
+                    self.project,
                     &raw,
                     &raw_rel,
                     scan_id,
                     ordinal,
-                    &stage_budget,
+                    self.budget,
                 )?;
                 recovery["deduplicated"] = false.into();
-                generated_recovery_cache.insert(raw_sha, recovery.clone());
+                self.generated_cache.insert(raw_sha, recovery.clone());
                 recovery
             };
-            let recovery_ordinal = generated_recovery.len();
-            generated_recovery.push(recovery.clone());
+            let recovery_ordinal = self.generated_recovery.len();
+            self.generated_recovery.push(recovery.clone());
             let mut item = json!({
                 "parent_scan_id": scan_id,
                 "ordinal": ordinal,
@@ -682,7 +760,7 @@ pub fn scan_project(project: &Path, options: &ProjectScanOptions) -> Result<Proj
                 "table_vms": node.table_vms.len(),
                 "opcode_maps": node.opcode_maps.len(),
             });
-            let child_scan_id = if depth <= options.max_generated_depth {
+            let child_scan_id = if depth <= self.max_depth {
                 let child = json!({
                     "origin": "generated_dynamic_code",
                     "resource_id": unit.get("resource_id").cloned().unwrap_or(Value::Null),
@@ -696,154 +774,201 @@ pub fn scan_project(project: &Path, options: &ProjectScanOptions) -> Result<Proj
                     "parent_dynamic_ordinal": ordinal,
                     "generated_depth": depth,
                 });
-                queue_unit(
-                    &mut queue,
-                    &mut seen_paths,
-                    child,
-                    options.max_code_units,
-                    rows.len() + 1,
-                )
+                self.queue.enqueue(child)
             } else {
                 None
             };
             item["child_scan_id"] = child_scan_id.map_or(Value::Null, Value::from);
             embedded_units.push(item.clone());
-            dynamic_units.push(item);
+            self.dynamic_units.push(item);
         }
-        row["embedded_units"] = Value::Array(embedded_units);
-
-        if value_usize(&row, "confirmed_direct_switch_maps") > 0 {
-            let output_path = outdir.join(format!("{scan_id:04}.switch-ir.json"));
-            let ir_budget = AnalysisOperation::IrMaterialization
-                .under(&stage_budget, format!("switch-ir:{}", source.display()));
-            match crate::switch_ir::materialize(&source, &report_path, &output_path, &ir_budget) {
-                Ok(()) => {
-                    row["switch_ir_exit"] = 0.into();
-                    row["switch_ir"] = relative_string(project, &output_path)?.into();
-                }
-                Err(error) => {
-                    let error = recoverable_unit_error(error)?;
-                    row["switch_ir_exit"] = 1.into();
-                    row["switch_ir_error"] = error.to_string().into();
-                }
-            }
-        }
-        if value_usize(&row, "table_vms") > 0 {
-            let output_path = outdir.join(format!("{scan_id:04}.table-ir.json"));
-            let ir_budget = AnalysisOperation::IrMaterialization
-                .under(&stage_budget, format!("table-ir:{}", source.display()));
-            match crate::table_ir::materialize(&source, &report_path, &output_path, &ir_budget) {
-                Ok(()) => {
-                    row["table_ir_exit"] = 0.into();
-                    row["table_ir"] = relative_string(project, &output_path)?.into();
-                }
-                Err(error) => {
-                    let error = recoverable_unit_error(error)?;
-                    row["table_ir_exit"] = 1.into();
-                    row["table_ir_error"] = error.to_string().into();
-                }
-            }
-        }
-
-        let confirmed_vm_signal = [
-            "confirmed_dispatchers",
-            "opcode_maps",
-            "confirmed_direct_switch_maps",
-            "table_vms",
-            "byte_transducers",
-        ]
-        .iter()
-        .any(|field| value_usize(&row, field) > 0);
-        let large_handler_table_candidate =
-            !confirmed_vm_signal && value_usize(&row, "largest_looped_dynamic_handler_table") >= 32;
-        let vm_signal = confirmed_vm_signal
-            || value_usize(&row, "weak_direct_switch_maps") > 0
-            || large_handler_table_candidate;
-        row["confirmed_vm_signal"] = confirmed_vm_signal.into();
-        row["large_handler_table_candidate"] = large_handler_table_candidate.into();
-        row["vm_signal"] = vm_signal.into();
-        rows.push(row);
+        Ok(embedded_units)
     }
 
-    let safe_deobfuscation = generated_recovery
-        .iter()
-        .filter(|row| {
-            row.get("selected_stage").and_then(Value::as_str) == Some("safe_deobfuscation")
-        })
-        .count();
-    let string_recovery_only = generated_recovery
-        .iter()
-        .filter(|row| {
-            row.get("selected_stage").and_then(Value::as_str) == Some("string_recovery_only")
-        })
-        .count();
-    let exact_fallback = generated_recovery
-        .iter()
-        .filter(|row| row.get("selected_stage").and_then(Value::as_str) == Some("exact_fallback"))
-        .count();
-    let deduplicated_units = generated_recovery
-        .iter()
-        .filter(|row| row.get("deduplicated").and_then(Value::as_bool) == Some(true))
-        .count();
-    let recovery_index = json!({
-        "schema": GENERATED_RECOVERY.schema,
-        "safe_static_only": true,
-        "units": generated_recovery,
-        "summary": {
-            "generated_units": generated_recovery.len(),
-            "unique_raw_inputs": generated_recovery_cache.len(),
-            "deduplicated_units": deduplicated_units,
-            "safe_deobfuscation": safe_deobfuscation,
-            "string_recovery_only": string_recovery_only,
-            "exact_fallback": exact_fallback,
-        },
-    });
-    write_artifact(project, GENERATED_RECOVERY, &recovery_index)?;
+    fn materialize_ir(
+        &self,
+        scan_id: usize,
+        source: &Path,
+        report_path: &Path,
+        row: &mut Value,
+    ) -> Result<()> {
+        if value_usize(row, "confirmed_direct_switch_maps") > 0 {
+            self.write_ir(scan_id, source, report_path, row, IrKind::Switch)?;
+        }
+        if value_usize(row, "table_vms") > 0 {
+            self.write_ir(scan_id, source, report_path, row, IrKind::Table)?;
+        }
+        Ok(())
+    }
 
-    let index = json!({
-        "schema": JSVM_INDEX.schema,
-        "recursive_generated_code": true,
-        "generated_recovery": GENERATED_RECOVERY.relative_path,
-        "max_generated_depth": options.max_generated_depth,
-        "max_code_units": options.max_code_units,
-        "scanner_invocations": scanner_invocations,
-        "deduplicated_scans": deduplicated_scans,
-        "code_units": rows,
-        "dynamic_code_units": dynamic_units,
-    });
-    write_artifact(project, JSVM_INDEX, &index)?;
+    fn write_ir(
+        &self,
+        scan_id: usize,
+        source: &Path,
+        report_path: &Path,
+        row: &mut Value,
+        kind: IrKind,
+    ) -> Result<()> {
+        let name = kind.name();
+        let output_path = self.outdir.join(format!("{scan_id:04}.{name}-ir.json"));
+        let budget = AnalysisOperation::IrMaterialization
+            .under(self.budget, format!("{name}-ir:{}", source.display()));
+        let (exit, path, error, result) = match kind {
+            IrKind::Switch => (
+                "switch_ir_exit",
+                "switch_ir",
+                "switch_ir_error",
+                crate::switch_ir::materialize(source, report_path, &output_path, &budget),
+            ),
+            IrKind::Table => (
+                "table_ir_exit",
+                "table_ir",
+                "table_ir_error",
+                crate::table_ir::materialize(source, report_path, &output_path, &budget),
+            ),
+        };
+        match result {
+            Ok(()) => {
+                row[exit] = 0.into();
+                row[path] = relative_string(self.project, &output_path)?.into();
+            }
+            Err(failure) => {
+                let failure = recoverable_unit_error(failure)?;
+                row[exit] = 1.into();
+                row[error] = failure.to_string().into();
+            }
+        }
+        Ok(())
+    }
 
-    let rows = index["code_units"]
-        .as_array()
-        .context("code_units missing")?;
-    let confirmed_vm_units = rows
-        .iter()
-        .filter(|row| row.get("confirmed_vm_signal").and_then(Value::as_bool) == Some(true))
-        .count();
-    let handler_table_candidates = rows
-        .iter()
-        .filter(|row| {
-            row.get("large_handler_table_candidate")
-                .and_then(Value::as_bool)
-                == Some(true)
+    fn publish_generated_recovery(&self) -> Result<()> {
+        let safe_deobfuscation = self
+            .generated_recovery
+            .iter()
+            .filter(|row| {
+                row.get("selected_stage").and_then(Value::as_str) == Some("safe_deobfuscation")
+            })
+            .count();
+        let string_recovery_only = self
+            .generated_recovery
+            .iter()
+            .filter(|row| {
+                row.get("selected_stage").and_then(Value::as_str) == Some("string_recovery_only")
+            })
+            .count();
+        let exact_fallback = self
+            .generated_recovery
+            .iter()
+            .filter(|row| {
+                row.get("selected_stage").and_then(Value::as_str) == Some("exact_fallback")
+            })
+            .count();
+        let deduplicated_units = self
+            .generated_recovery
+            .iter()
+            .filter(|row| row.get("deduplicated").and_then(Value::as_bool) == Some(true))
+            .count();
+        let recovery_index = json!({
+            "schema": GENERATED_RECOVERY.schema,
+            "safe_static_only": true,
+            "units": self.generated_recovery,
+            "summary": {
+                "generated_units": self.generated_recovery.len(),
+                "unique_raw_inputs": self.generated_cache.len(),
+                "deduplicated_units": deduplicated_units,
+                "safe_deobfuscation": safe_deobfuscation,
+                "string_recovery_only": string_recovery_only,
+                "exact_fallback": exact_fallback,
+            },
+        });
+        write_artifact(self.project, GENERATED_RECOVERY, &recovery_index)
+    }
+
+    fn publish(&self) -> Result<ProjectScanSummary> {
+        self.publish_generated_recovery()?;
+        let index = json!({
+            "schema": JSVM_INDEX.schema,
+            "recursive_generated_code": true,
+            "generated_recovery": GENERATED_RECOVERY.relative_path,
+            "max_generated_depth": self.max_depth,
+            "max_code_units": self.queue.limit,
+            "scanner_invocations": self.scanner_invocations,
+            "deduplicated_scans": self.deduplicated_scans,
+            "code_units": self.rows,
+            "dynamic_code_units": self.dynamic_units,
+        });
+        write_artifact(self.project, JSVM_INDEX, &index)?;
+
+        let rows = index["code_units"]
+            .as_array()
+            .context("code_units missing")?;
+        let confirmed_vm_units = rows
+            .iter()
+            .filter(|row| row.get("confirmed_vm_signal").and_then(Value::as_bool) == Some(true))
+            .count();
+        let handler_table_candidates = rows
+            .iter()
+            .filter(|row| {
+                row.get("large_handler_table_candidate")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+            })
+            .count();
+        let failures = rows
+            .iter()
+            .filter(|row| {
+                value_usize(row, "scanner_exit") != 0
+                    || row.get("error").is_some()
+                    || value_usize(row, "switch_ir_exit") != 0
+                    || value_usize(row, "table_ir_exit") != 0
+            })
+            .count();
+        Ok(ProjectScanSummary {
+            code_units: rows.len(),
+            scanner_invocations: self.scanner_invocations,
+            deduplicated_scans: self.deduplicated_scans,
+            dynamic_units: index["dynamic_code_units"].as_array().map_or(0, Vec::len),
+            confirmed_vm_units,
+            handler_table_candidates,
+            failures,
         })
-        .count();
-    let failures = rows
-        .iter()
-        .filter(|row| {
-            value_usize(row, "scanner_exit") != 0
-                || row.get("error").is_some()
-                || value_usize(row, "switch_ir_exit") != 0
-                || value_usize(row, "table_ir_exit") != 0
-        })
-        .count();
-    Ok(ProjectScanSummary {
-        code_units: rows.len(),
-        scanner_invocations,
-        deduplicated_scans,
-        dynamic_units: index["dynamic_code_units"].as_array().map_or(0, Vec::len),
-        confirmed_vm_units,
-        handler_table_candidates,
-        failures,
-    })
+    }
+}
+
+/// Scan indexed project sources for supported VM forms and persist their findings.
+///
+/// # Errors
+///
+/// Fails if the source index is unavailable, source files or metadata cannot be read, analysis
+/// output cannot be created or written, or an analysis budget is exceeded.
+pub fn scan_project(project: &Path, options: &ProjectScanOptions) -> Result<ProjectScanSummary> {
+    let stage_budget = options
+        .budgets
+        .scope(format!("project-scan:{}", project.display()));
+    stage_budget.checkpoint()?;
+    let queue = load_scan_queue(project, options.max_code_units)?;
+    let bundle_spans = bundle_spans(project)?;
+    let outdir = project.join("analysis/jsvm");
+    fs::create_dir_all(&outdir)?;
+    let mut scanner = ProjectScanner {
+        project,
+        budget: &stage_budget,
+        max_depth: options.max_generated_depth,
+        outdir,
+        queue,
+        bundle_spans,
+        rows: Vec::new(),
+        dynamic_units: Vec::new(),
+        generated_recovery: Vec::new(),
+        generated_cache: BTreeMap::new(),
+        scanner_cache: BTreeMap::new(),
+        scanner_invocations: 0,
+        deduplicated_scans: 0,
+    };
+    while let Some((scan_id, unit)) = scanner.queue.pop() {
+        stage_budget.checkpoint()?;
+        let row = scanner.scan_unit(scan_id, unit)?;
+        scanner.rows.push(row);
+    }
+    scanner.publish()
 }

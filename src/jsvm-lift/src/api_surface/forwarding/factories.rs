@@ -1,6 +1,10 @@
 //! Source-local factory results and allocation-site provenance.
 use super::super::callables::BindingSite;
-use super::*;
+use super::{
+    append_local_witnesses, instantiate, member_parts, unparenthesized, ApiBindingWitness, AstKind,
+    BTreeSet, CallExpression, Callable, CallableIndex, Expression, FrameContext, GetSpan,
+    ProvenConstantEnvironment, Result, Semantic, ValueBuilder, WorkBudget, WrapperIndex,
+};
 
 pub(super) struct ReturnedCallable {
     pub(super) callable: Callable,
@@ -74,7 +78,7 @@ fn resolve_factory_chain<'a>(
             _ if wrapper.invocation().is_some() => return Ok(None),
             _ => None,
         };
-        let sink = bind.map_or(wrapper.body.span(), |(call, _)| call.span);
+        let sink = bind.map_or_else(|| wrapper.body.span(), |(call, _)| call.span);
         let mut arguments = ValueBuilder::new(
             None,
             collector.scoping,
@@ -206,7 +210,7 @@ pub(in crate::api_surface) fn collect_returned_values<'a>(
             AstKind::CallExpression(call)
                 if !call.optional && wrappers.may_resolve(&call.callee, scoping) =>
             {
-                events.push((call.span.end, call.span.start, node.kind()))
+                events.push((call.span.end, call.span.start, node.kind()));
             }
             AstKind::VariableDeclarator(decl)
                 if decl
@@ -215,7 +219,7 @@ pub(in crate::api_surface) fn collect_returned_values<'a>(
                     .and_then(|id| id.symbol_id.get())
                     .is_some_and(|symbol| wrappers.bindings.contains_key(&symbol)) =>
             {
-                events.push((decl.span.end, decl.span.start, node.kind()))
+                events.push((decl.span.end, decl.span.start, node.kind()));
             }
             _ => {}
         }

@@ -729,6 +729,10 @@ pub(super) struct DispatchOperands<'s, 'e, 'a> {
     pub(super) span: Span,
 }
 
+/// The argument is neither a recognized receiver expression nor a
+/// receiver-independent value for this callable.
+struct UnsupportedReceiver;
+
 struct DispatchHead {
     mode: DispatchMode,
     reflective_namespace: Option<Namespace>,
@@ -962,7 +966,7 @@ impl CallableIndex {
         constants: &ProvenConstantEnvironment,
     ) -> Option<Callable> {
         let receiver_value = args.value(0);
-        let receiver = self.receiver_expression(&callable, &receiver_value)?;
+        let receiver = Self::receiver_expression(&callable, &receiver_value).ok()?;
         if !self.valid_receiver(&callable, receiver, scoping, constants) {
             return None;
         }
@@ -982,23 +986,22 @@ impl CallableIndex {
     }
 
     fn receiver_expression<'e, 'a>(
-        &self,
         callable: &Callable,
         value: &ForwardedValue<'e, 'a>,
-    ) -> Option<Option<&'e Expression<'a>>> {
+    ) -> std::result::Result<Option<&'e Expression<'a>>, UnsupportedReceiver> {
         match value {
-            ForwardedValue::Expression(expr) => Some(Some(expr)),
-            ForwardedValue::Missing => Some(None),
+            ForwardedValue::Expression(expr) => Ok(Some(expr)),
+            ForwardedValue::Missing => Ok(None),
             ForwardedValue::Primitive { value, .. }
                 if matches!(
                     value.as_ref(),
                     StaticPrimitiveValue::Null | StaticPrimitiveValue::Undefined
                 ) =>
             {
-                Some(None)
+                Ok(None)
             }
-            _ if callable.is_bound() || callable.kind.is_constructor() => Some(None),
-            _ => None,
+            _ if callable.is_bound() || callable.kind.is_constructor() => Ok(None),
+            _ => Err(UnsupportedReceiver),
         }
     }
 
@@ -1149,7 +1152,7 @@ impl CallableIndex {
         }
         let offset = mode.receiver_index();
         let receiver_value = operands.args.value(offset);
-        let receiver = self.receiver_expression(&callable, &receiver_value)?;
+        let receiver = Self::receiver_expression(&callable, &receiver_value).ok()?;
         let mut dispatch =
             self.prepare_dispatch(head, callable, receiver, operands.span, scoping, constants)?;
         if mode == DispatchMode::Call {

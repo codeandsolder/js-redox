@@ -7,8 +7,8 @@ mod values;
 use super::{
     callables::{member_parts, DispatchOperands},
     expression_symbol, unparenthesized, xhr_binding_is_not_reassigned, ApiBindingWitness, BTreeSet,
-    CallExpression, Callable, Collector, Expression, GetSpan, Result, Scoping, Span, SymbolId,
-    WorkBudget,
+    CallExpression, Callable, CallableIndex, Collector, Expression, GetSpan,
+    ProvenConstantEnvironment, Result, Scoping, Span, SymbolId, WorkBudget,
 };
 pub(super) use factories::collect_returned_values;
 use factories::resolve_returned_callable;
@@ -465,9 +465,10 @@ pub(super) fn specialize<'a>(
     let mut indexed = indexed;
     loop {
         budget.consume(1)?;
-        let callable = if let Some(callable) = indexed.take() {
-            Some(callable)
-        } else if !visited.is_empty() {
+        let callable = indexed.take().or_else(|| {
+            if visited.is_empty() {
+                return None;
+            }
             context
                 .callables
                 .resolve(callee, context.source, scoping, context.constants)
@@ -477,9 +478,7 @@ pub(super) fn specialize<'a>(
                     }
                     callable
                 })
-        } else {
-            None
-        };
+        });
         let callable = if callable.is_some() {
             callable
         } else if let Some(returned) =

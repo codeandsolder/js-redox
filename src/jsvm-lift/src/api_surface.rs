@@ -1802,7 +1802,10 @@ request.call(window, "/call");
                 .affected_families
                 .iter()
                 .any(|family| family.starts_with("wrapper_global:"))));
-        assert!(analysis.callsites[1].mutation_site_ordinals.is_empty());
+        assert_eq!(
+            analysis.callsites[1].mutation_site_ordinals,
+            [] as [usize; 0]
+        );
         assert_eq!(
             analysis.callsites[2].method_status.as_deref(),
             Some("conditional")
