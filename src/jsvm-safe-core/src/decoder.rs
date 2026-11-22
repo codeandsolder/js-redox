@@ -3255,10 +3255,11 @@ fn prove_rotation_iife(
             };
             // Exact JavaScript numeric equality, not an epsilon that may
             // match a nearby but observably different checksum.
-            if value.is_finite() && (value - js_number_from_i64(iife.target)).abs() <= 0.0 {
-                if matched.replace(rotation).is_some() {
-                    return false;
-                }
+            if value.is_finite()
+                && (value - js_number_from_i64(iife.target)).abs() <= 0.0
+                && matched.replace(rotation).is_some()
+            {
+                return false;
             }
         }
         if let Some(matched) = matched {
