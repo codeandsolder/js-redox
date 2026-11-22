@@ -354,10 +354,94 @@ fn join_lookup(result: &mut Option<Option<Fact>>, value: Option<Fact>) {
     });
 }
 
-#[derive(Clone, Default)]
+/// Bound dead allocation retention without tracing the entire live heap
+/// after every statement. Collection is amortized against heap growth;
+/// the first threshold avoids overhead on ordinary short functions.
+const MIN_COLLECTION_SIZE: usize = 64;
+
+#[derive(Clone)]
 pub(super) struct Environment {
     bindings: HashMap<SymbolId, Fact>,
     allocations: HashMap<AllocationId, Rc<OwnData>>,
+    collection_threshold: usize,
+    collection_floor: AllocationId,
+}
+
+impl Default for Environment {
+    fn default() -> Self {
+        Self {
+            bindings: HashMap::new(),
+            allocations: HashMap::new(),
+            collection_threshold: MIN_COLLECTION_SIZE,
+            collection_floor: 0,
+        }
+    }
+}
+
+/// One trace owns its frontier and marks. Charge all traversed edges,
+/// including location unions, rather than merely charging visited nodes.
+struct Reachability<'b> {
+    marked: HashSet<AllocationId>,
+    pending: Vec<AllocationId>,
+    weight: usize,
+    budget: &'b WorkBudget,
+}
+
+impl<'b> Reachability<'b> {
+    fn new(budget: &'b WorkBudget) -> Self {
+        Self {
+            marked: HashSet::new(),
+            pending: Vec::new(),
+            weight: 0,
+            budget,
+        }
+    }
+
+    fn charge(&mut self, weight: usize) -> Result<(), BudgetExceeded> {
+        self.budget
+            .consume(u64::try_from(weight).unwrap_or(u64::MAX))?;
+        self.weight = self.weight.saturating_add(weight);
+        Ok(())
+    }
+
+    fn mark(&mut self, id: AllocationId) {
+        if self.marked.insert(id) {
+            self.pending.push(id);
+        }
+    }
+
+    fn locations(&mut self, locations: &Locations) -> Result<(), BudgetExceeded> {
+        self.charge(locations.len())?;
+        for &id in locations.iter() {
+            self.mark(id);
+        }
+        Ok(())
+    }
+
+    fn fact(&mut self, fact: &Fact) -> Result<(), BudgetExceeded> {
+        if let Fact::Objects(locations) = fact {
+            self.locations(locations)?;
+        }
+        Ok(())
+    }
+
+    fn property(&mut self, property: &Property) -> Result<(), BudgetExceeded> {
+        if let Property::Data(Some(fact)) | Property::MaybeData(Some(fact)) = property {
+            self.fact(fact)?;
+        }
+        Ok(())
+    }
+
+    fn object(&mut self, data: &OwnData) -> Result<(), BudgetExceeded> {
+        self.charge(data.properties.listed.capacity().saturating_add(1))?;
+        if let Prototype::Objects(locations) = &data.prototype {
+            self.locations(locations)?;
+        }
+        for property in data.properties.listed.values() {
+            self.property(property)?;
+        }
+        self.property(&data.properties.unlisted)
+    }
 }
 
 impl Environment {
@@ -368,6 +452,9 @@ impl Environment {
     pub(super) fn clear(&mut self) {
         self.bindings.clear();
         self.allocations.clear();
+        self.bindings.shrink_to(MIN_COLLECTION_SIZE);
+        self.allocations.shrink_to(MIN_COLLECTION_SIZE);
+        self.collection_threshold = MIN_COLLECTION_SIZE;
     }
 
     pub(super) fn get(&self, symbol: &SymbolId) -> Option<&Fact> {
@@ -385,6 +472,99 @@ impl Environment {
     pub(super) fn allocate(&mut self, id: AllocationId, data: OwnData) -> Fact {
         self.allocations.insert(id, Rc::new(data));
         Fact::Objects(Rc::from([id]))
+    }
+
+    pub(super) fn retire_bindings<'a>(
+        &mut self,
+        symbols: impl Iterator<Item = &'a SymbolId>,
+        budget: &WorkBudget,
+    ) -> Result<(), BudgetExceeded> {
+        let mut retired = 0usize;
+        for symbol in symbols {
+            if let Some(Fact::Objects(locations)) = self.bindings.remove(symbol) {
+                retired = retired.saturating_add(locations.len());
+            }
+        }
+        if self.bindings.is_empty() && self.collection_floor == 0 {
+            self.clear();
+        } else if self.allocations.len() >= MIN_COLLECTION_SIZE
+            && retired >= self.allocations.len().div_ceil(2)
+        {
+            self.collect(budget)?;
+        }
+        Ok(())
+    }
+
+    /// Preserve allocations that existed before an outstanding branch
+    /// fork. The join interprets an absent pre-fork entry as invalidation,
+    /// so ordinary unreachability must not erase that distinction.
+    pub(super) fn protect_before(&mut self, first_new: AllocationId) -> AllocationId {
+        std::mem::replace(&mut self.collection_floor, first_new)
+    }
+
+    /// This may run only at statement boundaries, when no caller-held
+    /// expression temporaries, pending assignment receivers or in-progress
+    /// object literals need to be kept alive. Lexical bindings and their
+    /// transitive (own-property and prototype) edges are the roots.
+    pub(super) fn collect_if_needed(&mut self, budget: &WorkBudget) -> Result<(), BudgetExceeded> {
+        if self.allocations.len() < self.collection_threshold {
+            return Ok(());
+        }
+        self.collect(budget)
+    }
+
+    fn collect(&mut self, budget: &WorkBudget) -> Result<(), BudgetExceeded> {
+        let mut trace = Reachability::new(budget);
+        trace.charge(self.bindings.capacity())?;
+        if self.collection_floor != 0 {
+            budget.consume(u64::try_from(self.allocations.capacity()).unwrap_or(u64::MAX))?;
+            for &id in self.allocations.keys() {
+                if id < self.collection_floor {
+                    trace.mark(id);
+                }
+            }
+        }
+        for fact in self.bindings.values() {
+            trace.fact(fact)?;
+        }
+        while let Some(id) = trace.pending.pop() {
+            // A captured identity can survive the invalidation of its
+            // descriptor proof. Missing objects have no traversable edges.
+            if let Some(data) = self.allocations.get(&id) {
+                trace.object(data)?;
+            }
+        }
+        budget.consume(u64::try_from(self.allocations.capacity()).unwrap_or(u64::MAX))?;
+        self.allocations.retain(|id, _| trace.marked.contains(id));
+        // HashMap iteration follows capacity, not just length. Release
+        // excess capacity after a large transient expression or scope.
+        if self.allocations.capacity()
+            > self
+                .allocations
+                .len()
+                .saturating_mul(4)
+                .max(MIN_COLLECTION_SIZE)
+        {
+            self.allocations.shrink_to_fit();
+        }
+        if self.bindings.capacity()
+            > self
+                .bindings
+                .len()
+                .saturating_mul(4)
+                .max(MIN_COLLECTION_SIZE)
+        {
+            self.bindings.shrink_to_fit();
+        }
+        // Make the next trace proportional to the surviving graph, not
+        // just the number of nodes. A single large object or many live
+        // primitive bindings must not incur a full scan every 64 literals.
+        self.collection_threshold = self
+            .allocations
+            .len()
+            .saturating_add(trace.weight.max(self.allocations.len()))
+            .max(MIN_COLLECTION_SIZE);
+        Ok(())
     }
 
     /// Join normal reaching paths. Allocations created after the fork exist
@@ -572,5 +752,102 @@ impl Environment {
             |data| !data.is_length(key),
             |data| data.delete_own(key),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collection_bounds_churn_and_preserves_reachable_cycles() -> Result<(), BudgetExceeded> {
+        let budget = WorkBudget::unlimited("heap-collection");
+        let mut heap = Environment::new();
+        let mut parent = OwnData::new(AllocationKind::Ordinary);
+        parent.define_data("next".into(), None);
+        let root = heap.allocate(0, parent);
+        let child = heap.allocate(1, OwnData::new(AllocationKind::Ordinary));
+        let Fact::Objects(root_locations) = &root else {
+            unreachable!()
+        };
+        assert!(heap.write(root_locations, "next", Some(child)));
+        let mut child_data = OwnData::new(AllocationKind::Ordinary);
+        child_data.set_literal_prototype(Some(root.clone()));
+        heap.allocations.insert(1, Rc::new(child_data));
+        heap.insert(SymbolId::new(0), root);
+        let mut uncollected = heap.clone();
+        let mut peak = 0usize;
+        let (mut collected_entries, mut original_entries) = (0usize, 0usize);
+        for id in 2..4096 {
+            heap.allocate(id, OwnData::new(AllocationKind::Ordinary));
+            uncollected.allocate(id, OwnData::new(AllocationKind::Ordinary));
+            heap.collect_if_needed(&budget)?;
+            peak = peak.max(heap.allocations.len());
+            // Both maps would be copied at an unknown conditional branch.
+            collected_entries += heap.allocations.len();
+            original_entries += uncollected.allocations.len();
+        }
+        assert!(peak < MIN_COLLECTION_SIZE);
+        assert!(collected_entries < original_entries / 32);
+        eprintln!("peak retained allocations: {peak} vs {}; cumulative fork entries: {collected_entries} vs {original_entries}", uncollected.allocations.len());
+        heap.collect(&budget)?;
+        assert_eq!(heap.allocations.len(), 2);
+        heap.remove(&SymbolId::new(0));
+        heap.collect(&budget)?;
+        assert!(heap.allocations.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn retiring_entire_scope_releases_large_allocation_graph() -> Result<(), BudgetExceeded> {
+        let budget = WorkBudget::unlimited("heap-collection");
+        let mut heap = Environment::new();
+        let symbols = (0..256).map(SymbolId::new).collect::<Vec<_>>();
+        for (id, &symbol) in symbols.iter().enumerate() {
+            let object = heap.allocate(id, OwnData::new(AllocationKind::Ordinary));
+            heap.insert(symbol, object);
+            heap.collect_if_needed(&budget)?;
+        }
+        assert_eq!(heap.allocations.len(), symbols.len());
+        heap.retire_bindings(symbols.iter(), &budget)?;
+        assert!(heap.allocations.is_empty());
+        assert_eq!(heap.collection_threshold, MIN_COLLECTION_SIZE);
+        Ok(())
+    }
+
+    #[test]
+    fn collection_distinguishes_unreachable_branch_data_from_invalidation(
+    ) -> Result<(), BudgetExceeded> {
+        let budget = WorkBudget::unlimited("heap-collection");
+        let symbol = SymbolId::new(0);
+        let mut heap = Environment::new();
+        let mut data = OwnData::new(AllocationKind::Ordinary);
+        data.define_data("x".into(), Some(Fact::Primitive(Value::Number(7.0))));
+        let root = heap.allocate(0, data.clone());
+        heap.insert(symbol, root.clone());
+        let mut other = heap.clone();
+        let first_new = 1;
+        heap.protect_before(first_new);
+        other.protect_before(first_new);
+        let replacement = heap.allocate(first_new, data);
+        heap.insert(symbol, replacement);
+        heap.collect(&budget)?;
+        assert!(heap.allocations.contains_key(&0));
+        heap.protect_before(0);
+        other.protect_before(0);
+        heap.join(&other, first_new);
+        let Some(Fact::Objects(locations)) = heap.get(&symbol) else {
+            unreachable!()
+        };
+        assert!(matches!(
+            heap.read(locations, "x"),
+            Some(Some(Fact::Primitive(Value::Number(7.0))))
+        ));
+        let mut invalidated = other.clone();
+        invalidated.clear();
+        invalidated.insert(symbol, root);
+        other.join(&invalidated, first_new);
+        assert!(!other.allocations.contains_key(&0));
+        Ok(())
     }
 }
