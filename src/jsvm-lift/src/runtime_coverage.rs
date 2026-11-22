@@ -1,6 +1,6 @@
 //! Positive coverage of exact captured source bytes. Raw profiles and event
 //! occurrences remain separate from deduplicated session/script witnesses.
-use crate::runtime_identity::ScriptIdentityIndex;
+use crate::runtime_identity::{ScriptIdentityIndex, ScriptOriginContext};
 use anyhow::Result;
 use serde::Serialize;
 use serde_json::Value;
@@ -61,37 +61,36 @@ impl RuntimeCoverageIndex {
     pub(crate) fn build(runtime: &Value, budget: &WorkBudget) -> Result<Self> {
         // Register negative/missing profiles as well: disagreement is not a
         // positive witness. The global raw-event conflict list also applies.
-        let profiles =
-            ScriptIdentityIndex::from_runtime_report(runtime, budget, |sha, source, instance| {
+        let profiles = ScriptIdentityIndex::from_runtime_report_with(
+            runtime,
+            budget,
+            |sha, source, instance| {
+                let mut origin = ScriptOriginContext::from_instance(instance);
+                if origin.url.is_none() {
+                    origin.url = instance
+                        .pointer("/execution/source_url")
+                        .and_then(Value::as_str)
+                        .filter(|url| !url.is_empty())
+                        .map(ToOwned::to_owned);
+                }
                 Some((
                     sha.to_owned(),
                     PositiveCounters::from_instance(instance),
                     source["classification"] == "capture_instrumentation",
+                    origin,
                 ))
-            })?;
-        // Contextual disagreement must not erase agreement on executed bytes.
-        // Conversely, never pick an arbitrary URL or context from aliases.
-        let urls = ScriptIdentityIndex::from_runtime_report(runtime, budget, |_, _, instance| {
-            Some(
-                instance
-                    .get("script_url")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
-                    .or_else(|| {
-                        instance
-                            .pointer("/execution/source_url")
-                            .and_then(Value::as_str)
-                            .filter(|url| !url.is_empty())
-                    })
-                    .map(ToOwned::to_owned),
-            )
-        })?;
-        let contexts =
-            ScriptIdentityIndex::from_runtime_report(runtime, budget, |_, _, instance| {
-                Some(instance.get("execution_context_id").and_then(Value::as_u64))
-            })?;
+            },
+            |previous, next| {
+                if previous.0 != next.0 || previous.1 != next.1 || previous.2 != next.2 {
+                    return false;
+                }
+                previous.3.retain_agreed(next.3);
+                true
+            },
+        )?;
         let mut by_digest = BTreeMap::<String, Vec<PositiveCoverageWitness>>::new();
-        for (session, script, (sha, profile, instrumentation)) in profiles.unique_entries() {
+        for (session, script, (sha, profile, instrumentation, origin)) in profiles.unique_entries()
+        {
             budget.consume(1)?;
             let Some(profile) = profile else {
                 continue;
@@ -102,8 +101,8 @@ impl RuntimeCoverageIndex {
                 .push(PositiveCoverageWitness {
                     cdp_session: session.to_owned(),
                     script_id: script.to_owned(),
-                    execution_context_id: contexts.get(session, script).copied().flatten(),
-                    script_url: urls.get(session, script).cloned().flatten(),
+                    execution_context_id: origin.execution_context_id,
+                    script_url: origin.url.clone(),
                     positive_functions: profile.positive_functions,
                     positive_ranges: profile.positive_ranges,
                     counter_offset_units: profile.offset_units.clone(),

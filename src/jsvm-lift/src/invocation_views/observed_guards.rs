@@ -161,10 +161,11 @@ pub(super) fn observe(
         let Some(identity) = identities.get(session, &script) else {
             continue;
         };
-        if identity.sha256 != sha || identity.capture_instrumentation {
+        if identity.sha256 != sha || identity.capture_instrumentation != Some(false) {
             continue;
         }
-        let Some(start_line) = identity.start_line else {
+        let (Some(start_line), Some(start_column)) = (identity.start_line, identity.start_column)
+        else {
             continue;
         };
         let (Some(line), Some(column)) = (
@@ -192,13 +193,7 @@ pub(super) fn observe(
         let Some(Some((source, guards))) = by_sha.get(sha) else {
             continue;
         };
-        let Some(position) = cdp_byte_offset(
-            source,
-            line,
-            column,
-            start_line,
-            identity.start_column.unwrap_or(0),
-        ) else {
+        let Some(position) = cdp_byte_offset(source, line, column, start_line, start_column) else {
             continue;
         };
         for expression in step
@@ -253,13 +248,9 @@ pub(super) fn observe(
                         .and_then(Value::as_u64);
                     if next_script.as_deref() == Some(script.as_ref()) && next_sha == Some(sha) {
                         if let (Some(line), Some(column)) = (next_line, next_column) {
-                            if let Some(at) = cdp_byte_offset(
-                                source,
-                                line,
-                                column,
-                                start_line,
-                                identity.start_column.unwrap_or(0),
-                            ) {
+                            if let Some(at) =
+                                cdp_byte_offset(source, line, column, start_line, start_column)
+                            {
                                 let arm = if value {
                                     guard.consequent
                                 } else {
@@ -328,7 +319,11 @@ mod tests {
                 sha256: sha.clone(),
                 start_line: Some(10),
                 start_column: Some(0),
-                capture_instrumentation: false,
+                capture_instrumentation: Some(false),
+                origin: crate::runtime_identity::ScriptOriginContext {
+                    url: None,
+                    execution_context_id: None,
+                },
             },
         );
         let frame = |col| {

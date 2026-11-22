@@ -41,6 +41,18 @@ impl<T> Default for ScriptIdentityIndex<T> {
 
 impl<T: Eq> ScriptIdentityIndex<T> {
     pub(crate) fn register(&mut self, session: &str, script: &str, identity: T) {
+        self.register_with(session, script, identity, |previous, next| {
+            *previous == next
+        });
+    }
+
+    fn register_with(
+        &mut self,
+        session: &str,
+        script: &str,
+        identity: T,
+        merge: impl FnOnce(&mut T, T) -> bool,
+    ) {
         match self
             .sessions
             .entry(session.to_owned())
@@ -51,8 +63,10 @@ impl<T: Eq> ScriptIdentityIndex<T> {
                 entry.insert(IdentityState::Unique(identity));
             }
             Entry::Occupied(mut entry) => {
-                if matches!(entry.get(), IdentityState::Unique(previous) if previous != &identity) {
-                    entry.insert(IdentityState::Conflict);
+                if let IdentityState::Unique(previous) = entry.get_mut() {
+                    if !merge(previous, identity) {
+                        entry.insert(IdentityState::Conflict);
+                    }
                 }
             }
         }
@@ -96,7 +110,17 @@ impl<T: Eq> ScriptIdentityIndex<T> {
     pub(crate) fn from_runtime_report(
         report: &Value,
         budget: &WorkBudget,
+        identity: impl FnMut(&str, &Value, &Value) -> Option<T>,
+    ) -> Result<Self> {
+        Self::from_runtime_report_with(report, budget, identity, |previous, next| *previous == next)
+    }
+
+    /// Merge independent contextual claims while rejecting incompatible identities.
+    pub(crate) fn from_runtime_report_with(
+        report: &Value,
+        budget: &WorkBudget,
         mut identity: impl FnMut(&str, &Value, &Value) -> Option<T>,
+        merge: impl Fn(&mut T, T) -> bool,
     ) -> Result<Self> {
         let mut index = Self::default();
         for source in rows(report, "sources") {
@@ -113,7 +137,7 @@ impl<T: Eq> ScriptIdentityIndex<T> {
                     continue;
                 };
                 if let Some(value) = identity(sha, source, instance) {
-                    index.register(session, &script, value);
+                    index.register_with(session, &script, value, &merge);
                 }
             }
         }
@@ -128,6 +152,33 @@ impl<T: Eq> ScriptIdentityIndex<T> {
             index.invalidate(session, &script);
         }
         Ok(index)
+    }
+}
+
+/// Retain only fields on which all inventory occurrences agree. Unknown or
+/// contradictory values remain unknown when more occurrences are merged.
+pub(crate) fn retain_agreed<T: Eq>(current: &mut Option<T>, next: Option<T>) {
+    if *current != next {
+        *current = None;
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ScriptOriginContext {
+    pub(crate) url: Option<String>,
+    pub(crate) execution_context_id: Option<u64>,
+}
+
+impl ScriptOriginContext {
+    pub(crate) fn from_instance(instance: &Value) -> Self {
+        Self {
+            url: nonempty_text(instance.get("script_url")).map(ToOwned::to_owned),
+            execution_context_id: instance.get("execution_context_id").and_then(Value::as_u64),
+        }
+    }
+    pub(crate) fn retain_agreed(&mut self, other: Self) {
+        retain_agreed(&mut self.url, other.url);
+        retain_agreed(&mut self.execution_context_id, other.execution_context_id);
     }
 }
 
