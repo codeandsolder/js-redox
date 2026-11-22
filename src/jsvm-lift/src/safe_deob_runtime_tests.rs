@@ -338,7 +338,6 @@ fn assert_main_contract(file: &str, outcome: &SafeDeobOutcome) {
 #[test]
 #[ignore = "requires Node; semantic CI invokes explicitly"]
 fn depythonify_safe_deob_script_completion_runtime_equivalence() -> Result<()> {
-    let scratch = TempDir::new()?;
     let sources = [
         "let x=0;function f(){x=(eval('var x=1'),2);return x;}[f(),x];",
         "let x=0;function f(){x=eval('var x=1;true')?2:3;return x;}[f(),x];",
@@ -715,6 +714,14 @@ fn depythonify_safe_deob_script_completion_runtime_equivalence() -> Result<()> {
         "Array.prototype[Symbol.iterator]=function*(){yield 99;};let a=[7,8];let b={...a};b[0];",
         "let a=[7,8];let b={...a};[b[0],b[1],b.length];",
         "let a={__proto__:null,[Symbol('a')]:7};let b={...a};Reflect.ownKeys(b).length;",
+    ];
+    script_runtime_equivalence(&sources, "script-completion", false)
+}
+
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_direct_decoder_runtime_equivalence() -> Result<()> {
+    let sources = [
         "const t=['YQ==','Yg=='];function d(i){return atob(t[i])}Array.prototype['00']='Yw==';Array.prototype['0x0']='ZA==';[d(0),d('1'),d(-0),d(1n),d('00'),d('0x0')];",
         "const t=['YQ==',,'Yg=='];function d(i){return atob(t[i])}Array.prototype[1]='Yw==';[d(0),d(1),d(2)];",
         "const t=['YQ==',(()=>{events.push('init');return 'Yg=='})()];function d(i){return atob(t[i])}[d(0),d(1)];",
@@ -731,14 +738,26 @@ fn depythonify_safe_deob_script_completion_runtime_equivalence() -> Result<()> {
         "const t=['YQ=='];function d(i){return d=t[i],atob(d)}[d(0),typeof d];",
         "var t=['YQ=='];function d(i){return atob(t[i])}globalThis.t[0]='Yg==';d(0);",
     ];
+    script_runtime_equivalence(&sources, "direct-decoder", true)
+}
+
+fn script_runtime_equivalence(sources: &[&str], suite: &str, browser_globals: bool) -> Result<()> {
+    let scratch = TempDir::new()?;
+    // Browser decoders assume standard atob. Node's isolated VM does not
+    // populate it by default; expose it explicitly only for that suite.
+    let globals = if browser_globals {
+        "events,atob"
+    } else {
+        "events"
+    };
     for (index, source) in sources.iter().enumerate() {
-        let label = format!("script-completion-{index}");
+        let label = format!("{suite}-{index}");
         let result =
             deobfuscate_source(source, &label, SourceMode::Auto, 48, false, &budget(&label))?;
         let runner = |text: &str| -> Result<String> {
             let encoded = serde_json::to_string(text)?;
             Ok(format!(
-                r#"const vm=require('node:vm');const events=[];try{{const value=vm.runInNewContext({encoded},{{events}},{{timeout:1000}});console.log(JSON.stringify([typeof value,String(value),events]));}}catch(e){{console.log(JSON.stringify(['throw',String(e),events]));}}"#
+                r#"const vm=require('node:vm');const events=[];try{{const value=vm.runInNewContext({encoded},{{{globals}}},{{timeout:1000}});console.log(JSON.stringify([typeof value,String(value),events]));}}catch(e){{console.log(JSON.stringify(['throw',String(e),events]));}}"#
             ))
         };
         runtime_equivalent(
