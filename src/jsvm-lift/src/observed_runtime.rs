@@ -407,7 +407,7 @@ mod tests {
         assert_eq!(again.witnessed_sources, 0);
         assert!(!project.join(format!("src/_observed/{digest}.js")).is_file());
         let runtime = load_artifact(&project, RUNTIME_SCRIPTS).context("index")?;
-        assert_eq!(runtime["sources"][0]["observed_executed"]);
+        assert_eq!(runtime["sources"][0]["observed_executed"], false);
         assert!(runtime["sources"][0].get("observed_source_path").is_none());
         assert!(
             load_artifact(&project, OBSERVED_SOURCE).context("observed report")?["sources"]
