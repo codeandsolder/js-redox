@@ -12,7 +12,7 @@ use crate::value_eval::{
 };
 use oxc_ast::ast::{
     Argument, ArrayExpressionElement, BindingPattern, Declaration, Expression, IdentifierReference,
-    ObjectPropertyKind, Program, PropertyKind, SimpleAssignmentTarget, Statement,
+    MemberExpression, ObjectPropertyKind, Program, PropertyKind, SimpleAssignmentTarget, Statement,
     VariableDeclaration, VariableDeclarationKind,
 };
 use oxc_ast_visit::{walk, Visit};
