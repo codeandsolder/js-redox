@@ -14,16 +14,53 @@ pub const fn js_number_equal(left: f64, right: f64) -> bool {
     left_bits == right_bits || ((left_bits & ABS_MASK) == 0 && (right_bits & ABS_MASK) == 0)
 }
 
-/// ECMAScript `Number::exponentiate` differs from IEEE 754 pow at NaN
-/// exponents and infinite exponents with a unit-magnitude base. Delegate
-/// the remaining (implementation-approximated) finite computation to powf.
-#[must_use = "Use the computed result with ECMAScript exponentiation semantics"]
-pub fn js_number_exponentiate(base: f64, exponent: f64) -> f64 {
-    if exponent.is_nan() || (exponent.is_infinite() && js_number_equal(base.abs(), 1.0)) {
-        f64::NAN
-    } else {
-        base.powf(exponent)
+/// The engine-independent cases of ECMAScript `Number::exponentiate`.
+///
+/// ECMA-262 6.1.6.1.3 specifies exact exceptional results but leaves
+/// ordinary finite nonzero powers implementation-approximated. An exact
+/// mathematical answer, even when representable, is not a proof that every
+/// JavaScript implementation returns that particular IEEE-754 encoding.
+///
+/// Return `None` rather than importing the host libm approximation into a
+/// portable JavaScript rewrite.
+#[must_use = "Use the result only when exponentiation has engine-independent semantics"]
+pub fn js_number_exponentiate(base: f64, exponent: f64) -> Option<f64> {
+    if exponent.is_nan() {
+        return Some(f64::NAN);
     }
+    if exponent == 0.0 {
+        return Some(1.0);
+    }
+    if base.is_nan() {
+        return Some(f64::NAN);
+    }
+    if base == 0.0 || base.is_infinite() {
+        let odd = js_number_equal(exponent % 2.0, 1.0) || js_number_equal(exponent % 2.0, -1.0);
+        let magnitude = if base.is_infinite() == (exponent > 0.0) {
+            f64::INFINITY
+        } else {
+            0.0
+        };
+        return Some(if base.is_sign_negative() && odd {
+            -magnitude
+        } else {
+            magnitude
+        });
+    }
+    if exponent.is_infinite() {
+        if js_number_equal(base.abs(), 1.0) {
+            return Some(f64::NAN);
+        }
+        return Some(if (base.abs() > 1.0) == exponent.is_sign_positive() {
+            f64::INFINITY
+        } else {
+            0.0
+        });
+    }
+    if base < 0.0 && exponent.fract() != 0.0 {
+        return Some(f64::NAN);
+    }
+    None
 }
 
 #[must_use = "Use the integer only when conversion is exact"]
@@ -102,23 +139,52 @@ mod tests {
 
     #[test]
     fn exponentiation_preserves_ecmascript_exceptional_values() {
-        for exponent in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            for base in [1.0, -1.0] {
-                assert!(js_number_exponentiate(base, exponent).is_nan());
-            }
+        let cases = [
+            (1.0, f64::NAN, f64::NAN),
+            (-1.0, f64::INFINITY, f64::NAN),
+            (1.0, f64::NEG_INFINITY, f64::NAN),
+            (0.0, f64::NAN, f64::NAN),
+            (f64::NAN, -0.0, 1.0),
+            (f64::NAN, 2.0, f64::NAN),
+            (-0.0, 3.0, -0.0),
+            (-0.0, -3.0, f64::NEG_INFINITY),
+            (-0.0, 2.0, 0.0),
+            (-0.0, -2.0, f64::INFINITY),
+            (-0.0, f64::NEG_INFINITY, f64::INFINITY),
+            (0.0, -0.5, f64::INFINITY),
+            (f64::NEG_INFINITY, 3.0, f64::NEG_INFINITY),
+            (f64::NEG_INFINITY, -3.0, -0.0),
+            (f64::NEG_INFINITY, 2.0, f64::INFINITY),
+            (f64::NEG_INFINITY, -2.0, 0.0),
+            (f64::NEG_INFINITY, f64::INFINITY, f64::INFINITY),
+            (f64::INFINITY, -0.5, 0.0),
+            (-0.0, 9_007_199_254_740_991.0, -0.0),
+            (-0.0, 9_007_199_254_740_992.0, 0.0),
+            (2.0, f64::INFINITY, f64::INFINITY),
+            (2.0, f64::NEG_INFINITY, 0.0),
+            (0.5, f64::INFINITY, 0.0),
+            (0.5, f64::NEG_INFINITY, f64::INFINITY),
+            (-2.0, 0.5, f64::NAN),
+        ];
+        for (base, exponent, expected) in cases {
+            assert!(
+                js_number_exponentiate(base, exponent).is_some_and(|actual| {
+                    if expected.is_nan() {
+                        actual.is_nan()
+                    } else {
+                        actual.to_bits() == expected.to_bits()
+                    }
+                }),
+                "{base:?} ** {exponent:?} must yield {expected:?}"
+            );
         }
-        assert!(js_number_exponentiate(0.0, f64::NAN).is_nan());
-        assert!(js_number_equal(js_number_exponentiate(f64::NAN, -0.0), 1.0));
-        assert_eq!(
-            js_number_exponentiate(-0.0, 3.0).to_bits(),
-            (-0.0_f64).to_bits()
-        );
-        assert_eq!(
-            js_number_exponentiate(-0.0, -3.0).to_bits(),
-            f64::NEG_INFINITY.to_bits()
-        );
-        assert!(js_number_equal(js_number_exponentiate(-2.0, 3.0), -8.0));
-        assert!(js_number_exponentiate(-2.0, 0.5).is_nan());
+    }
+
+    #[test]
+    fn exponentiation_does_not_guess_implementation_approximated_values() {
+        for (base, exponent) in [(2.0, 1.5), (-2.0, 3.0), (1.0, 2.0), (2.0, 1.0), (0.5, -2.0)] {
+            assert!(js_number_exponentiate(base, exponent).is_none());
+        }
     }
 
     #[test]

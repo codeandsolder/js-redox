@@ -1,3 +1,6 @@
+#[path = "safe_deob_runtime_tests/matrices.rs"]
+mod matrices;
+
 use super::*;
 use anyhow::{anyhow, Context, Result};
 use std::{collections::BTreeMap, fs, path::Path, process::Command};
