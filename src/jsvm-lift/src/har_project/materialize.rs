@@ -8,9 +8,14 @@ use super::resource::{
     write_resource,
 };
 use super::{HarProjectOptions, HarProjectSummary};
-use crate::{browser_decode::decode_html, sha256_hex};
+use crate::{
+    browser_decode::decode_html,
+    capture_project::{write_manifest, CaptureManifest, CaptureSource, MANIFEST_NAME, SCHEMA},
+    sha256_hex,
+};
 use anyhow::{Context, Result};
 use serde::Serialize;
+use serde_json::{Map, Value};
 use std::{
     collections::{BTreeMap, HashMap},
     fmt::Write as _,
@@ -107,28 +112,6 @@ struct InlineScriptMeta {
     parent_decode_source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     parent_decode_uncertain: Option<bool>,
-}
-
-#[derive(Debug, Serialize)]
-struct CaptureSource {
-    kind: &'static str,
-    input: String,
-    har_version: String,
-    salvaged: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    parse_error: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    parse_warnings: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct ProjectManifest {
-    schema: &'static str,
-    source: CaptureSource,
-    pages: Vec<PageMeta>,
-    resources: Vec<ResourceMeta>,
-    inline_scripts: Vec<InlineScriptMeta>,
-    counts: BTreeMap<String, usize>,
 }
 
 fn headers(src: &[NameValue]) -> Vec<HeaderMeta> {
@@ -390,52 +373,64 @@ fn build_manifest(
     parse_error: Option<String>,
     parse_warnings: Vec<String>,
     budget: &WorkBudget,
-) -> Result<ProjectManifest> {
+) -> Result<CaptureManifest> {
     budget.checkpoint()?;
-    let pages = page_metadata(&har);
+    let pages = page_metadata(&har)
+        .into_iter()
+        .map(serde_json::to_value)
+        .collect::<serde_json::Result<Vec<_>>>()?;
     let mut seen = HashMap::new();
     let mut counts = BTreeMap::new();
     let mut inline_scripts = Vec::new();
     let mut resources = Vec::with_capacity(har.log.entries.len());
     let har_root = args.har.parent().unwrap_or_else(|| Path::new("."));
-    for (id, entry) in har.log.entries.iter().enumerate() {
+    for (id, entry) in har.log.entries.into_iter().enumerate() {
         budget.checkpoint()?;
-        resources.push(materialize_entry(
+        resources.push(serde_json::to_value(materialize_entry(
             id,
-            entry,
+            &entry,
             har_root,
             &args.output,
             &mut seen,
             &mut counts,
             &mut inline_scripts,
-        )?);
+        )?)?);
     }
     counts.insert("resources_total".into(), resources.len());
     counts.insert("pages".into(), pages.len());
-    Ok(ProjectManifest {
-        schema: "capture-project/v1",
+    let inline_scripts = inline_scripts
+        .into_iter()
+        .map(serde_json::to_value)
+        .collect::<serde_json::Result<Vec<_>>>()?;
+    let mut extra = Map::new();
+    extra.insert("har_version".into(), Value::String(har.log.version));
+    if let Some(error) = parse_error {
+        extra.insert("parse_error".into(), Value::String(error));
+    }
+    if !parse_warnings.is_empty() {
+        extra.insert(
+            "parse_warnings".into(),
+            serde_json::to_value(parse_warnings)?,
+        );
+    }
+    Ok(CaptureManifest {
+        schema: SCHEMA.into(),
         source: CaptureSource {
-            kind: "har",
+            kind: "har".into(),
             input: args.har.display().to_string(),
-            har_version: har.log.version,
             salvaged,
-            parse_error,
-            parse_warnings,
+            extra,
         },
         pages,
         resources,
         inline_scripts,
         counts,
+        extra: Map::new(),
     })
 }
 
-fn write_project_metadata(args: &HarProjectOptions, manifest: &ProjectManifest) -> Result<()> {
-    let manifest_value = serde_json::to_value(manifest)?;
-    crate::capture_project::validate_manifest_value(&manifest_value, "HAR capture manifest")?;
-    crate::report_file::write_json(
-        &args.output.join(crate::capture_project::MANIFEST_NAME),
-        &manifest_value,
-    )?;
+fn write_project_metadata(args: &HarProjectOptions, manifest: &CaptureManifest) -> Result<()> {
+    write_manifest(&args.output.join(MANIFEST_NAME), manifest)?;
     fs::create_dir_all(args.output.join(".vscode"))?;
     fs::write(
         args.output.join(".vscode/settings.json"),
