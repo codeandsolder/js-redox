@@ -6,7 +6,7 @@ use crate::{
     },
     analysis_budget::{AnalysisBudgets, AnalysisOperation},
     capture_project::load_manifest,
-    project_entrypoints::write_entrypoint_index,
+    project_entrypoints::render_entrypoint_index,
     report_markdown::{code_span, literal_text},
 };
 use anyhow::{Context, Result};
@@ -297,14 +297,9 @@ pub fn refresh_project_readme(project: &Path, budgets: &AnalysisBudgets) -> Resu
         .map(|unit| array(unit, "arithmetic_state_proofs").len())
         .sum::<usize>();
 
-    let declared_scripts = write_entrypoint_index(
-        &project,
-        &manifest_value,
-        &source_index,
-        &deob,
-        &jsrefs,
-        &budget,
-    )?;
+    let entrypoints =
+        render_entrypoint_index(&manifest_value, &source_index, &deob, &jsrefs, &budget)?;
+    let declared_scripts = entrypoints.declared_scripts;
     let source = manifest_value
         .get("source")
         .context("capture manifest source missing")?;
@@ -617,8 +612,14 @@ pub fn refresh_project_readme(project: &Path, budgets: &AnalysisBudgets) -> Resu
         String::new(),
     ]);
 
-    crate::report_file::write_text(&project.join("README.md"), &lines.join("\n"))
-        .with_context(|| format!("writing {}/README.md", project.display()))?;
+    // Both documents describe this generation. Render and stage both before
+    // either is published, including failures at the second destination.
+    let index =
+        crate::report_file::stage_text(&project.join("src/ENTRYPOINTS.md"), &entrypoints.markdown)?;
+    let readme = crate::report_file::stage_text(&project.join("README.md"), &lines.join("\n"))?;
+    budget.checkpoint()?;
+    index.publish()?;
+    readme.publish()?;
     Ok(())
 }
 
@@ -669,6 +670,23 @@ mod tests {
         let entrypoints = fs::read_to_string(project.join("src/ENTRYPOINTS.md"))?;
         assert!(entrypoints.contains("https://fixture.invalid/app/main.js"));
         assert!(entrypoints.contains("Source body not present in this capture"));
+
+        // The new entrypoint report is valid and different, but the second
+        // destination cannot be published. Do not expose the first report.
+        let mut changed = manifest;
+        changed.inline_scripts[0]["resolved_src"] = json!("https://fixture.invalid/changed.js");
+        write_manifest(&project.join("capture-manifest.json"), &changed)?;
+        fs::remove_file(project.join("README.md"))?;
+        fs::create_dir(project.join("README.md"))?;
+        assert!(
+            refresh_project_readme(project, &AnalysisBudgets::standard("unwritable readme"))
+                .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(project.join("src/ENTRYPOINTS.md"))?,
+            entrypoints
+        );
+        assert_eq!(fs::read_dir(project.join("src"))?.count(), 1);
         Ok(())
     }
 
