@@ -191,7 +191,13 @@ impl Analyzer<'_> {
         {
             return None;
         }
-        Some(symbol)
+        self.bindings
+            .proves_reference_identity(
+                self.scoping,
+                symbol,
+                self.scoping.get_reference(reference).scope_id(),
+            )
+            .then_some(symbol)
     }
 
     fn identifier(
@@ -695,7 +701,7 @@ mod tests {
             .build(&program);
         assert!(semantic.diagnostics.is_empty(), "{source}");
         let scoping = semantic.semantic.scoping();
-        let bindings = BindingFacts::analyze(&program);
+        let bindings = BindingFacts::analyze(&program, scoping);
         let analysis = FreshDataReads::analyze(
             &program,
             scoping,
