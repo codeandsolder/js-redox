@@ -183,7 +183,10 @@ impl Property {
     }
 
     const fn clone_weight(&self) -> usize {
-        self.fact().map_or(1, Fact::clone_weight)
+        match self.fact() {
+            Some(fact) => fact.clone_weight(),
+            None => 1,
+        }
     }
 
     fn charge_pair(&self, other: &Self, budget: &WorkBudget) -> Result<(), BudgetExceeded> {
