@@ -347,6 +347,7 @@ struct LocalStaticArrayInfo {
 #[derive(Debug, Clone)]
 struct SequenceDecoderShape {
     provider: String,
+    provider_symbol: SymbolId,
     offset: i64,
 }
 
@@ -666,6 +667,7 @@ fn sequence_decoder_offset(
 fn sequence_decoder_shape(
     function: &oxc_ast::ast::Function<'_>,
     scoping: &Scoping,
+    facts: &BindingFacts,
 ) -> Option<SequenceDecoderShape> {
     if function.r#async || function.generator || function.params.rest.is_some() {
         return None;
@@ -703,7 +705,7 @@ fn sequence_decoder_shape(
     let offset = sequence_decoder_offset(offset_assignment, public_param_symbol, scoping)?;
 
     let (table_target, table_value) = assignment_identifier(table_assignment)?;
-    let table_symbol = statically_resolved_symbol(scoping, table_target.reference_id.get()?)?;
+    let table_symbol = facts.resolved_symbol(scoping, table_target.reference_id.get()?)?;
     if !parameter_symbols.contains(&table_symbol) || table_symbol == public_param_symbol {
         return None;
     }
@@ -716,10 +718,10 @@ fn sequence_decoder_shape(
     let Expression::Identifier(provider) = unparenthesized(&provider_call.callee) else {
         return None;
     };
-    statically_resolved_symbol(scoping, provider.reference_id.get()?)?;
+    let provider_symbol = facts.resolved_symbol(scoping, provider.reference_id.get()?)?;
 
     let (value_target, value_expression) = assignment_identifier(value_assignment)?;
-    let value_symbol = statically_resolved_symbol(scoping, value_target.reference_id.get()?)?;
+    let value_symbol = facts.resolved_symbol(scoping, value_target.reference_id.get()?)?;
     if !parameter_symbols.contains(&value_symbol)
         || value_symbol == public_param_symbol
         || value_symbol == table_symbol
@@ -738,8 +740,8 @@ fn sequence_decoder_shape(
     let Expression::Identifier(index_read) = unparenthesized(&member.expression) else {
         return None;
     };
-    if statically_resolved_symbol(scoping, table_read.reference_id.get()?) != Some(table_symbol)
-        || statically_resolved_symbol(scoping, index_read.reference_id.get()?)
+    if facts.resolved_symbol(scoping, table_read.reference_id.get()?) != Some(table_symbol)
+        || facts.resolved_symbol(scoping, index_read.reference_id.get()?)
             != Some(public_param_symbol)
     {
         return None;
@@ -747,12 +749,13 @@ fn sequence_decoder_shape(
     let Expression::Identifier(returned) = unparenthesized(returned) else {
         return None;
     };
-    if statically_resolved_symbol(scoping, returned.reference_id.get()?) != Some(value_symbol) {
+    if facts.resolved_symbol(scoping, returned.reference_id.get()?) != Some(value_symbol) {
         return None;
     }
 
     Some(SequenceDecoderShape {
         provider: provider.name.to_string(),
+        provider_symbol,
         offset,
     })
 }
@@ -793,7 +796,7 @@ fn function_info(
         provider: self_rewriting_provider(f, scoping, facts),
         parameters_proven,
         sequence_decoder: parameters_proven
-            .then(|| sequence_decoder_shape(f, scoping))
+            .then(|| sequence_decoder_shape(f, scoping, facts))
             .flatten(),
     })
 }
@@ -1549,7 +1552,7 @@ enum DecoderTransform {
 pub struct Decoder {
     values: Vec<Value>,
     offset: i64,
-    provider: String,
+    provider: SymbolId,
     provider_array_span: Span,
     transform: DecoderTransform,
 }
@@ -2206,12 +2209,13 @@ fn eval_rotation_checksum(
 
 #[derive(Debug, Clone)]
 struct RotationIife {
-    provider: String,
+    provider: SymbolId,
+    provider_reference: ReferenceId,
     target: i64,
     array_param: String,
     count_param: String,
     numeric_members: HashMap<(String, String), i64>,
-    stable_aliases: HashMap<String, String>,
+    stable_aliases: HashMap<SymbolId, String>,
     checksum_expression: Option<String>,
     proof_eligible: bool,
     body_span: Span,
@@ -2356,15 +2360,22 @@ fn rotation_parse_int_references_are_global(
 }
 
 fn stable_rotation_alias(
-    alias_symbol: SymbolId,
-    alias_name: &str,
+    alias: (SymbolId, &str),
     target_reference_id: ReferenceId,
     initialization_end: u32,
     initialization_write: Option<ReferenceId>,
     scoping: &Scoping,
+    facts: &BindingFacts,
     reference_spans: &HashMap<ReferenceId, Span>,
-) -> Option<(String, String)> {
-    let target_symbol = statically_resolved_symbol(scoping, target_reference_id)?;
+) -> Option<(SymbolId, String)> {
+    let (alias_symbol, alias_name) = alias;
+    let target_symbol = facts.resolved_symbol(scoping, target_reference_id)?;
+    if !facts.binding_unmodified_by_eval(scoping, alias_symbol)
+        || !facts.binding_unmodified_by_eval(scoping, target_symbol)
+        || !scoping.symbol_redeclarations(alias_symbol).is_empty()
+    {
+        return None;
+    }
     if target_symbol == alias_symbol || !scoping.symbol_flags(target_symbol).is_function() {
         return None;
     }
@@ -2378,21 +2389,18 @@ fn stable_rotation_alias(
             reference_spans.get(reference_id).is_some_and(|span| {
                 span.start >= initialization_end
                     && reference_is_statically_resolved_read(scoping, *reference_id, alias_symbol)
+                    && facts.resolved_symbol(scoping, *reference_id) == Some(alias_symbol)
             })
         });
-    stable.then(|| {
-        (
-            scoping.symbol_name(target_symbol).to_string(),
-            alias_name.to_string(),
-        )
-    })
+    stable.then(|| (target_symbol, alias_name.to_string()))
 }
 
 fn rotation_stable_aliases(
     function: &oxc_ast::ast::Function<'_>,
     scoping: &Scoping,
+    facts: &BindingFacts,
     reference_spans: &HashMap<ReferenceId, Span>,
-) -> HashMap<String, String> {
+) -> HashMap<SymbolId, String> {
     let Some(body) = &function.body else {
         return HashMap::new();
     };
@@ -2413,12 +2421,12 @@ fn rotation_stable_aliases(
                     continue;
                 };
                 if let Some((target_name, alias_name)) = stable_rotation_alias(
-                    alias_symbol,
-                    alias.name.as_str(),
+                    (alias_symbol, alias.name.as_str()),
                     target_reference_id,
                     target.span.end,
                     None,
                     scoping,
+                    facts,
                     reference_spans,
                 ) {
                     aliases.insert(target_name, alias_name);
@@ -2471,12 +2479,12 @@ fn rotation_stable_aliases(
                 continue;
             };
             if let Some((target_name, alias_name)) = stable_rotation_alias(
-                alias_symbol,
-                alias.name.as_str(),
+                (alias_symbol, alias.name.as_str()),
                 target_reference_id,
                 assignment.span.end,
                 Some(alias_reference_id),
                 scoping,
+                facts,
                 reference_spans,
             ) {
                 aliases.insert(target_name, alias_name);
@@ -2642,10 +2650,11 @@ fn rotation_statement_matches(source: &str, statement: &Statement<'_>, array_ali
 
 /// A closed-over rotation table must come from one statically resolved,
 /// zero-argument provider function; dynamic calls cannot establish the table.
-fn closed_rotation_provider_name(
+fn closed_rotation_provider_symbol(
     table_decl: &oxc_ast::ast::VariableDeclarator<'_>,
     scoping: &Scoping,
-) -> Option<String> {
+    facts: &BindingFacts,
+) -> Option<(SymbolId, ReferenceId)> {
     let Some(Expression::CallExpression(provider_call)) = &table_decl.init else {
         return None;
     };
@@ -2656,11 +2665,11 @@ fn closed_rotation_provider_name(
         return None;
     };
     let provider_reference = provider.reference_id.get()?;
-    let provider_symbol = statically_resolved_symbol(scoping, provider_reference)?;
+    let provider_symbol = facts.resolved_symbol(scoping, provider_reference)?;
     scoping
         .symbol_flags(provider_symbol)
         .is_function()
-        .then(|| provider.name.to_string())
+        .then_some((provider_symbol, provider_reference))
 }
 
 fn closed_over_rotation_iife(
@@ -2668,6 +2677,7 @@ fn closed_over_rotation_iife(
     call: &CallExpression<'_>,
     function: &oxc_ast::ast::Function<'_>,
     scoping: &Scoping,
+    facts: &BindingFacts,
     statement_span: Option<Span>,
 ) -> Option<RotationIife> {
     if call.optional
@@ -2701,7 +2711,7 @@ fn closed_over_rotation_iife(
         return None;
     };
     let decoder_reference = decoder.reference_id.get()?;
-    let decoder_symbol = statically_resolved_symbol(scoping, decoder_reference)?;
+    let decoder_symbol = facts.resolved_symbol(scoping, decoder_reference)?;
     if !scoping.symbol_flags(decoder_symbol).is_function() {
         return None;
     }
@@ -2709,7 +2719,8 @@ fn closed_over_rotation_iife(
     let BindingPattern::BindingIdentifier(array_alias) = &table_decl.id else {
         return None;
     };
-    let provider_name = closed_rotation_provider_name(table_decl, scoping)?;
+    let (provider, provider_reference) =
+        closed_rotation_provider_symbol(table_decl, scoping, facts)?;
 
     let Statement::TryStatement(try_statement) = &for_statement.body else {
         return None;
@@ -2750,10 +2761,11 @@ fn closed_over_rotation_iife(
     };
 
     let mut stable_aliases = HashMap::new();
-    stable_aliases.insert(decoder.name.to_string(), decoder_alias.name.to_string());
+    stable_aliases.insert(decoder_symbol, decoder_alias.name.to_string());
     let standalone = statement_span.is_some();
     Some(RotationIife {
-        provider: provider_name,
+        provider,
+        provider_reference,
         target,
         array_param: array_alias.name.to_string(),
         count_param: String::new(),
@@ -2770,6 +2782,7 @@ fn closed_over_rotation_iife(
 struct RotationIifeCollector<'c, 's> {
     source: &'s str,
     scoping: &'c Scoping,
+    facts: &'c BindingFacts,
     statement_spans: &'s HashMap<(u32, u32), Span>,
     reference_spans: &'s HashMap<ReferenceId, Span>,
     out: Vec<RotationIife>,
@@ -2788,6 +2801,7 @@ impl<'a> Visit<'a> for RotationIifeCollector<'_, '_> {
                     call,
                     function,
                     self.scoping,
+                    self.facts,
                     statement_span,
                 ) {
                     self.out.push(rotation);
@@ -2802,7 +2816,15 @@ impl<'a> Visit<'a> for RotationIifeCollector<'_, '_> {
             let target = argument_integer(&call.arguments[1]);
             let function = rotation_iife_function(&call.callee);
             if let (Some(provider), Some(target), Some(function)) = (provider, target, function) {
-                if let Some(body) = &function.body {
+                if let (Some(body), Some(provider_reference)) =
+                    (&function.body, provider.reference_id.get())
+                {
+                    let Some(provider_symbol) =
+                        self.scoping.get_reference(provider_reference).symbol_id()
+                    else {
+                        walk::walk_call_expression(self, call);
+                        return;
+                    };
                     let local_params = function
                         .params
                         .items
@@ -2812,28 +2834,34 @@ impl<'a> Visit<'a> for RotationIifeCollector<'_, '_> {
                             _ => None,
                         })
                         .collect::<Option<Vec<_>>>();
-                    let provider_is_function = provider
-                        .reference_id
-                        .get()
-                        .and_then(|reference_id| {
-                            statically_resolved_symbol(self.scoping, reference_id)
-                        })
-                        .is_some_and(|symbol| self.scoping.symbol_flags(symbol).is_function());
+                    let mut references = ExactBodyReferences {
+                        scoping: self.scoping,
+                        facts: self.facts,
+                        valid: true,
+                    };
+                    references.visit_function(function, ScopeFlags::Function);
                     let proof_eligible = !function.r#async
                         && !function.generator
                         && function.params.rest.is_none()
+                        && function_parameters_have_no_runtime_effects(function)
                         && local_params
                             .as_ref()
                             .is_some_and(|params| params.len() >= 2)
-                        && provider_is_function
+                        && self.facts.resolved_symbol(self.scoping, provider_reference)
+                            == Some(provider_symbol)
+                        && references.valid
                         && rotation_parameter_names_unshadowed(function, self.scoping)
                         && rotation_parse_int_references_are_global(function, self.scoping)
                         && !rotation_has_dynamic_scope(function);
                     let local_params = local_params.unwrap_or_default();
                     let array_param = local_params.first().cloned().unwrap_or_default();
                     let count_param = local_params.get(1).cloned().unwrap_or_default();
-                    let stable_aliases =
-                        rotation_stable_aliases(function, self.scoping, self.reference_spans);
+                    let stable_aliases = rotation_stable_aliases(
+                        function,
+                        self.scoping,
+                        self.facts,
+                        self.reference_spans,
+                    );
                     let numeric_members = if proof_eligible {
                         rotation_numeric_members(function, self.scoping)
                     } else {
@@ -2844,7 +2872,8 @@ impl<'a> Visit<'a> for RotationIifeCollector<'_, '_> {
                         .get(&(call.span.start, call.span.end))
                         .copied();
                     self.out.push(RotationIife {
-                        provider: provider.name.to_string(),
+                        provider: provider_symbol,
+                        provider_reference,
                         target,
                         array_param,
                         count_param,
@@ -2867,6 +2896,7 @@ fn collect_rotation_iifes(
     source: &str,
     program: &oxc_ast::ast::Program<'_>,
     scoping: &Scoping,
+    facts: &BindingFacts,
     reference_spans: &HashMap<ReferenceId, Span>,
 ) -> Vec<RotationIife> {
     let mut statement_spans = RotationStatementSpanCollector::default();
@@ -2874,6 +2904,7 @@ fn collect_rotation_iifes(
     let mut collector = RotationIifeCollector {
         source,
         scoping,
+        facts,
         statement_spans: &statement_spans.spans,
         reference_spans,
         out: Vec::new(),
@@ -2883,7 +2914,7 @@ fn collect_rotation_iifes(
 }
 
 fn fixed_count_rotation(source: &str, iife: &RotationIife, table_len: usize) -> Option<usize> {
-    if iife.target < 0 || table_len == 0 {
+    if !iife.proof_eligible || iife.target < 0 || table_len == 0 {
         return None;
     }
     let identifier = r"[A-Za-z_$][A-Za-z0-9_$]*";
@@ -2998,11 +3029,12 @@ fn detect_fixed_rotated_direct_decoders(
     source: &str,
     program: &oxc_ast::ast::Program<'_>,
     scoping: &Scoping,
+    facts: &BindingFacts,
     reference_spans: &HashMap<ReferenceId, Span>,
+    rotations: &[RotationIife],
 ) -> DecoderDetection {
     let arrays = all_static_arrays(program);
     let functions = variable_functions(program);
-    let rotations = collect_rotation_iifes(source, program, scoping, reference_spans);
     let mut arrays_by_name: HashMap<&str, Vec<&StaticArrayInfo>> = HashMap::new();
     for array in &arrays {
         arrays_by_name
@@ -3023,19 +3055,35 @@ fn detect_fixed_rotated_direct_decoders(
             continue;
         }
 
+        if !scoping
+            .get_resolved_reference_ids(function.symbol)
+            .iter()
+            .all(|&reference| {
+                reference_spans.get(&reference).is_some_and(|span| {
+                    facts.initialized_reference(scoping, reference, *span) == Some(function.symbol)
+                })
+            })
+        {
+            continue;
+        }
         let candidate_names = fixed_rotated_candidate_names(source, function);
         for array in candidate_names
             .into_iter()
             .filter_map(|name| arrays_by_name.get(name.as_str()))
             .flat_map(|candidates| candidates.iter().copied())
         {
+            if !facts.source_local_data_binding(scoping, array.symbol)
+                || !facts.binding_has_stable_value(scoping, function.symbol)
+            {
+                continue;
+            }
             let Some(offset) = simple_direct_decoder_offset(source, function, array) else {
                 continue;
             };
             let matching_rotations = rotations
                 .iter()
                 .filter(|rotation| {
-                    rotation.provider == array.name
+                    rotation.provider == array.symbol
                         && rotation.statement_span.end <= function.span.start
                 })
                 .collect::<Vec<_>>();
@@ -3098,7 +3146,7 @@ fn detect_fixed_rotated_direct_decoders(
                 Decoder {
                     values,
                     offset,
-                    provider: array.name.clone(),
+                    provider: array.symbol,
                     provider_array_span: array.span,
                     transform: DecoderTransform::Plain,
                 },
@@ -3112,7 +3160,7 @@ fn detect_fixed_rotated_direct_decoders(
 
 #[derive(Debug, Clone)]
 struct ProvenRotationIife {
-    provider: String,
+    provider: SymbolId,
     start: usize,
     end: usize,
     standalone_statement: bool,
@@ -3154,14 +3202,17 @@ fn rotation_checksum_expression(source: &str, iife: &RotationIife) -> Option<Str
     None
 }
 
-fn rotation_decoder_alias(iife: &RotationIife, decoder_name: &str) -> Option<String> {
-    iife.stable_aliases.get(decoder_name).cloned()
+fn rotation_decoder_alias(iife: &RotationIife, decoder: SymbolId) -> Option<&str> {
+    iife.stable_aliases.get(&decoder).map(String::as_str)
 }
 
+/// Rotation is a physical mutation of one provider table, not a separate
+/// property of each decoder that happens to read it. Find a unique shift
+/// before changing any decoder, then apply it to every equivalent view.
 fn prove_rotation_iife(
     source: &str,
     iife: &RotationIife,
-    decoders: &mut HashMap<String, Decoder>,
+    decoders: &mut HashMap<SymbolId, Decoder>,
 ) -> bool {
     if !iife.proof_eligible {
         return false;
@@ -3173,49 +3224,68 @@ fn prove_rotation_iife(
     let Some(expression) = rotation_checksum_expression(source, iife) else {
         return false;
     };
-    let mut proven = false;
-
-    for (decoder_name, decoder) in decoders.iter_mut() {
-        if decoder.provider != iife.provider || decoder.values.is_empty() {
+    let mut amount = None;
+    let mut table: Option<&Decoder> = None;
+    for (&symbol, decoder) in decoders.iter() {
+        if decoder.provider != iife.provider {
             continue;
         }
-        let Some(alias) = rotation_decoder_alias(iife, decoder_name) else {
+        if decoder.values.is_empty()
+            || table.is_some_and(|previous| {
+                previous.provider_array_span != decoder.provider_array_span
+                    || !same_values(&previous.values, &decoder.values)
+            })
+        {
+            return false;
+        }
+        table = Some(decoder);
+        let Some(alias) = rotation_decoder_alias(iife, symbol) else {
             continue;
         };
-
-        let mut matches = Vec::new();
+        let mut matched = None;
         for rotation in 0..decoder.values.len() {
             let Some(value) = eval_rotation_checksum(
                 &expression,
-                &alias,
+                alias,
                 decoder,
                 &iife.numeric_members,
                 rotation,
             ) else {
                 continue;
             };
-            if value.is_finite() && (value - js_number_from_i64(iife.target)).abs() < 1e-9 {
-                matches.push(rotation);
-                if matches.len() > 1 {
-                    break;
+            // Exact JavaScript numeric equality, not an epsilon that may
+            // match a nearby but observably different checksum.
+            if value.is_finite() && (value - js_number_from_i64(iife.target)).abs() <= 0.0 {
+                if matched.replace(rotation).is_some() {
+                    return false;
                 }
             }
         }
-        if matches.len() == 1 {
-            proven = true;
-            if matches[0] != 0 {
-                decoder.values.rotate_left(matches[0]);
+        if let Some(matched) = matched {
+            if amount
+                .replace(matched)
+                .is_some_and(|previous| previous != matched)
+            {
+                return false;
             }
         }
     }
-
-    proven
+    let Some(amount) = amount else {
+        return false;
+    };
+    for decoder in decoders
+        .values_mut()
+        .filter(|decoder| decoder.provider == iife.provider)
+    {
+        decoder.values.rotate_left(amount);
+    }
+    true
 }
 
 fn prove_rotation_iifes(
     source: &str,
     rotation_iifes: &[RotationIife],
-    decoders: &mut HashMap<String, Decoder>,
+    decoders: &mut HashMap<SymbolId, Decoder>,
 ) -> Vec<ProvenRotationIife> {
     let mut proven_iifes = Vec::new();
     for iife in rotation_iifes {
@@ -3223,7 +3293,7 @@ fn prove_rotation_iifes(
             continue;
         }
         proven_iifes.push(ProvenRotationIife {
-            provider: iife.provider.clone(),
+            provider: iife.provider,
             start: iife.statement_span.start as usize,
             end: iife.statement_span.end as usize,
             standalone_statement: iife.standalone_statement,
@@ -3233,16 +3303,16 @@ fn prove_rotation_iifes(
 }
 
 fn materializable_rotated_providers(
-    decoders: &HashMap<String, Decoder>,
+    decoders: &HashMap<SymbolId, Decoder>,
     proven_iifes: &[ProvenRotationIife],
-) -> HashMap<String, (Span, Vec<Value>)> {
+) -> HashMap<SymbolId, (Span, Vec<Value>)> {
     // Materialization is stricter than decoding. Every detected decoder sharing
     // a provider must agree on the same final rotated table and literal array.
     let proven_providers = proven_iifes
         .iter()
-        .map(|iife| iife.provider.clone())
+        .map(|iife| iife.provider)
         .collect::<HashSet<_>>();
-    let mut materialized: HashMap<String, (Span, Vec<Value>)> = HashMap::new();
+    let mut materialized: HashMap<SymbolId, (Span, Vec<Value>)> = HashMap::new();
     let mut inconsistent = HashSet::new();
     for decoder in decoders.values() {
         if !proven_providers.contains(&decoder.provider) {
@@ -3251,7 +3321,7 @@ fn materializable_rotated_providers(
         match materialized.get(&decoder.provider) {
             None => {
                 materialized.insert(
-                    decoder.provider.clone(),
+                    decoder.provider,
                     (decoder.provider_array_span, decoder.values.clone()),
                 );
             }
@@ -3259,7 +3329,7 @@ fn materializable_rotated_providers(
                 if *span == decoder.provider_array_span && same_values(values, &decoder.values) => {
             }
             Some(_) => {
-                inconsistent.insert(decoder.provider.clone());
+                inconsistent.insert(decoder.provider);
             }
         }
     }
@@ -3270,7 +3340,7 @@ fn materializable_rotated_providers(
 }
 
 fn rotation_replacements(
-    materialized: HashMap<String, (Span, Vec<Value>)>,
+    materialized: HashMap<SymbolId, (Span, Vec<Value>)>,
     proven_iifes: &[ProvenRotationIife],
 ) -> Vec<Replacement> {
     let mut replacements = Vec::new();
@@ -3307,18 +3377,18 @@ fn rotation_replacements(
 
 fn apply_proven_decoder_rotations(
     source: &str,
-    decoders: &mut HashMap<String, Decoder>,
+    decoders: &mut HashMap<SymbolId, Decoder>,
     rotation_iifes: &[RotationIife],
 ) -> (Vec<(usize, usize)>, Vec<Replacement>) {
     let mut proven_iifes = prove_rotation_iifes(source, rotation_iifes, decoders);
 
-    let mut required = HashMap::<String, usize>::new();
+    let mut required = HashMap::<SymbolId, usize>::new();
     for iife in rotation_iifes {
-        *required.entry(iife.provider.clone()).or_default() += 1;
+        *required.entry(iife.provider).or_default() += 1;
     }
-    let mut proven = HashMap::<String, usize>::new();
+    let mut proven = HashMap::<SymbolId, usize>::new();
     for iife in &proven_iifes {
-        *proven.entry(iife.provider.clone()).or_default() += 1;
+        *proven.entry(iife.provider).or_default() += 1;
     }
     let unproven_providers = required
         .into_iter()
@@ -3376,13 +3446,13 @@ fn function_name_counts(functions: &[FnInfo]) -> HashMap<String, usize> {
     counts
 }
 
-fn decoder_providers(functions: &[FnInfo]) -> HashMap<(ScopeId, String), LocalStaticArrayInfo> {
+fn decoder_providers(functions: &[FnInfo]) -> HashMap<(ScopeId, String), &FnInfo> {
     functions
         .iter()
         .filter_map(|function| {
             Some((
                 (function.scope, function.name.clone()),
-                function.provider.clone()?,
+                function.provider.as_ref().map(|_| function)?,
             ))
         })
         .collect()
@@ -3429,7 +3499,7 @@ fn inline_self_rewriting_direct_decoder(
     source: &str,
     function: &FnInfo,
     name_counts: &HashMap<String, usize>,
-    providers: &HashMap<(ScopeId, String), LocalStaticArrayInfo>,
+    providers: &HashMap<(ScopeId, String), &FnInfo>,
 ) -> Option<Decoder> {
     if function.params.is_empty() || name_counts.get(&function.name).copied() != Some(1) {
         return None;
@@ -3470,12 +3540,13 @@ fn inline_self_rewriting_direct_decoder(
     if name_counts.get(&provider).copied() != Some(1) {
         return None;
     }
-    let provider_info = providers.get(&(function.scope, provider.clone()))?;
+    let provider = providers.get(&(function.scope, provider))?;
+    let provider_info = provider.provider.as_ref()?;
     let offset = parse_i64_literal(captures.name("offset")?.as_str())?;
     Some(Decoder {
         values: provider_info.values.clone(),
         offset,
-        provider,
+        provider: provider.symbol,
         provider_array_span: provider_info.span,
         transform: DecoderTransform::Plain,
     })
@@ -3486,7 +3557,7 @@ fn detect_decoder_candidate(
     function: &FnInfo,
     patterns: &DecoderPatterns,
     name_counts: &HashMap<String, usize>,
-    providers: &HashMap<(ScopeId, String), LocalStaticArrayInfo>,
+    providers: &HashMap<(ScopeId, String), &FnInfo>,
 ) -> Option<Decoder> {
     if !function.parameters_proven || function.params.is_empty() {
         return None;
@@ -3497,11 +3568,15 @@ fn detect_decoder_candidate(
         {
             return None;
         }
-        let provider_info = providers.get(&(function.scope, shape.provider.clone()))?;
+        let provider = providers.get(&(function.scope, shape.provider.clone()))?;
+        if provider.symbol != shape.provider_symbol {
+            return None;
+        }
+        let provider_info = provider.provider.as_ref()?;
         return Some(Decoder {
             values: provider_info.values.clone(),
             offset: shape.offset,
-            provider: shape.provider.clone(),
+            provider: provider.symbol,
             provider_array_span: provider_info.span,
             transform: DecoderTransform::Plain,
         });
@@ -3524,7 +3599,8 @@ fn detect_decoder_candidate(
     {
         return None;
     }
-    let provider_info = providers.get(&(function.scope, provider.clone()))?;
+    let provider = providers.get(&(function.scope, provider))?;
+    let provider_info = provider.provider.as_ref()?;
     let offset_match = patterns.offset.captures(body)?;
     if offset_match[1] != offset_match[2] {
         return None;
@@ -3563,7 +3639,7 @@ fn detect_decoder_candidate(
         regex::escape(&param),
         regex::escape(&param),
         regex::escape(&local_array),
-        regex::escape(&provider),
+        regex::escape(&provider.name),
         regex::escape(&value_var),
         regex::escape(&local_array),
         regex::escape(&param),
@@ -3594,7 +3670,7 @@ fn detect_decoder_candidate(
     Some(Decoder {
         values: provider_info.values.clone(),
         offset,
-        provider,
+        provider: provider.symbol,
         provider_array_span: provider_info.span,
         transform: decoder_transform(body, keyed_decode_call)?,
     })
@@ -3631,13 +3707,14 @@ fn detect_decoders(
     scoping: &Scoping,
     facts: &BindingFacts,
     reference_spans: &HashMap<ReferenceId, Span>,
+    rotations: &[RotationIife],
 ) -> DecoderDetection {
     let Some(patterns) = decoder_patterns() else {
         return (HashMap::new(), Vec::new(), Vec::new());
     };
     let name_counts = function_name_counts(functions);
     let providers = decoder_providers(functions);
-    let mut by_name = functions
+    let mut decoders = functions
         .iter()
         .filter_map(|function| {
             if !facts.binding_unmodified_by_eval(scoping, function.symbol)
@@ -3662,41 +3739,66 @@ fn detect_decoders(
             let decoder =
                 detect_decoder_candidate(source, function, patterns, &name_counts, &providers)?;
             let provider = functions.iter().find(|candidate| {
-                candidate.scope == function.scope
-                    && candidate.name == decoder.provider
-                    && candidate.provider.is_some()
+                candidate.symbol == decoder.provider && candidate.provider.is_some()
             })?;
             // Verify the provider referenced by the matched body, not only a
             // name that happens to be declared in its enclosing scope.
-            scoping
+            let mut reads = scoping
                 .get_resolved_reference_ids(provider.symbol)
                 .iter()
-                .any(|&reference| {
+                .filter(|&&reference| {
                     facts.resolved_symbol(scoping, reference) == Some(provider.symbol)
                         && reference_spans
                             .get(&reference)
                             .is_some_and(|span| span_contains(function.span, *span))
-                })
-                .then_some((function.name.clone(), decoder))
+                });
+            reads.next()?;
+            reads.next().is_none().then_some((function.symbol, decoder))
         })
         .collect::<HashMap<_, _>>();
 
-    let rotation_iifes = collect_rotation_iifes(source, program, scoping, reference_spans);
-    let (protected_spans, rotation_replacements) =
-        apply_proven_decoder_rotations(source, &mut by_name, &rotation_iifes);
-
-    let mut out = functions
+    // A self-installing provider returns the same mutable allocation to
+    // every caller. A reference outside its own installation, a proved
+    // decoder, or a recorded rotation can expose or mutate that table.
+    let mut allowed: HashMap<SymbolId, Vec<Span>> = HashMap::new();
+    for function in functions {
+        if function.provider.is_some() {
+            allowed
+                .entry(function.symbol)
+                .or_default()
+                .push(function.span);
+        }
+        if let Some(decoder) = decoders.get(&function.symbol) {
+            allowed
+                .entry(decoder.provider)
+                .or_default()
+                .push(function.span);
+        }
+    }
+    let rotation_references: HashSet<_> = rotations
         .iter()
-        .filter_map(|function| {
-            by_name
-                .get(&function.name)
-                .cloned()
-                .map(|decoder| (function.symbol, decoder))
+        .map(|rotation| rotation.provider_reference)
+        .collect();
+    let invalid: HashSet<_> = allowed
+        .iter()
+        .filter_map(|(&provider, spans)| {
+            scoping
+                .get_resolved_reference_ids(provider)
+                .iter()
+                .any(|reference| {
+                    !rotation_references.contains(reference)
+                        && !reference_spans.get(reference).is_some_and(|span| {
+                            spans.iter().any(|region| span_contains(*region, *span))
+                        })
+                })
+                .then_some(provider)
         })
-        .collect::<HashMap<_, _>>();
-    propagate_decoder_aliases(&mut out, program, scoping, reference_spans);
-
-    (out, protected_spans, rotation_replacements)
+        .collect();
+    decoders.retain(|_, decoder| !invalid.contains(&decoder.provider));
+    let (protected_spans, rotation_replacements) =
+        apply_proven_decoder_rotations(source, &mut decoders, rotations);
+    propagate_decoder_aliases(&mut decoders, program, scoping, reference_spans);
+    (decoders, protected_spans, rotation_replacements)
 }
 
 pub struct DecoderAnalysis {
@@ -3725,10 +3827,25 @@ pub fn analyze_decoders(
     );
     let functions = all_function_declarations(program, scoping, facts);
 
-    let (mut decoders, mut protected_spans, mut replacements) =
-        detect_decoders(source, &functions, program, scoping, facts, reference_spans);
+    let rotations = collect_rotation_iifes(source, program, scoping, facts, reference_spans);
+    let (mut decoders, mut protected_spans, mut replacements) = detect_decoders(
+        source,
+        &functions,
+        program,
+        scoping,
+        facts,
+        reference_spans,
+        &rotations,
+    );
     let (fixed_decoders, fixed_protected, fixed_replacements) =
-        detect_fixed_rotated_direct_decoders(source, program, scoping, reference_spans);
+        detect_fixed_rotated_direct_decoders(
+            source,
+            program,
+            scoping,
+            facts,
+            reference_spans,
+            &rotations,
+        );
     for (symbol, decoder) in fixed_decoders {
         decoders.entry(symbol).or_insert(decoder);
     }
@@ -4095,12 +4212,13 @@ mod tests {
     #[test]
     fn rotation_decoder_alias_requires_proven_binding() {
         let base = RotationIife {
-            provider: "provider".into(),
+            provider: SymbolId::new(0),
+            provider_reference: ReferenceId::new(0),
             target: 1,
             array_param: "array".into(),
             count_param: "target".into(),
             numeric_members: HashMap::new(),
-            stable_aliases: HashMap::from([("decode".into(), "alias".into())]),
+            stable_aliases: HashMap::from([(SymbolId::new(1), "alias".into())]),
             checksum_expression: None,
             proof_eligible: true,
             body_span: Span::new(0, 0),
@@ -4108,13 +4226,76 @@ mod tests {
             standalone_statement: true,
         };
         assert_eq!(
-            rotation_decoder_alias(&base, "decode"),
-            Some("alias".into())
+            rotation_decoder_alias(&base, SymbolId::new(1)),
+            Some("alias")
         );
 
         let mut unproven_alias = base;
         unproven_alias.stable_aliases.clear();
-        assert_eq!(rotation_decoder_alias(&unproven_alias, "decode"), None);
+        assert_eq!(
+            rotation_decoder_alias(&unproven_alias, SymbolId::new(1)),
+            None
+        );
+    }
+
+    #[test]
+    fn decoder_rotation_updates_all_views_of_exactly_one_provider() {
+        let provider = SymbolId::new(0);
+        let first = SymbolId::new(1);
+        let second = SymbolId::new(2);
+        let unrelated = SymbolId::new(3);
+        let decoder = Decoder {
+            values: vec![
+                Value::String("11".into()),
+                Value::String("22".into()),
+                Value::String("33".into()),
+            ],
+            offset: 0,
+            provider,
+            provider_array_span: Span::new(0, 1),
+            transform: DecoderTransform::Plain,
+        };
+        let mut other = decoder.clone();
+        other.provider = SymbolId::new(4);
+        let mut decoders = HashMap::from([
+            (first, decoder.clone()),
+            (second, decoder),
+            (unrelated, other),
+        ]);
+        let source = "push shift";
+        let iife = RotationIife {
+            provider,
+            provider_reference: ReferenceId::new(0),
+            target: 22,
+            array_param: "array".into(),
+            count_param: "target".into(),
+            numeric_members: HashMap::new(),
+            stable_aliases: HashMap::from([(first, "alias".into())]),
+            checksum_expression: Some("parseInt(alias(0))".into()),
+            proof_eligible: true,
+            body_span: Span::new(0, 10),
+            statement_span: Span::new(0, 10),
+            standalone_statement: true,
+        };
+        assert!(prove_rotation_iife(source, &iife, &mut decoders));
+        for symbol in [first, second] {
+            assert!(
+                matches!(decoders[&symbol].value_for_call(0, None), Some(Value::String(value)) if value == "22")
+            );
+        }
+        assert!(
+            matches!(decoders[&unrelated].value_for_call(0,None),Some(Value::String(value)) if value == "11")
+        );
+        let mut invalid = decoders.clone();
+        invalid
+            .get_mut(&second)
+            .unwrap_or_else(|| unreachable!())
+            .values
+            .rotate_left(1);
+        assert!(!prove_rotation_iife(source, &iife, &mut invalid));
+        assert!(
+            matches!(invalid[&first].value_for_call(0,None),Some(Value::String(value)) if value == "22")
+        );
     }
 
     #[test]
@@ -4128,7 +4309,7 @@ mod tests {
                 Value::String("xSov".into()),
             ],
             offset: 0x10,
-            provider: "p".into(),
+            provider: SymbolId::new(0),
             provider_array_span: Span::new(0, 0),
             transform: DecoderTransform::LowerAlphabetBase64Rc4,
         };

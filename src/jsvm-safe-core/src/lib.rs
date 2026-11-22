@@ -8282,6 +8282,52 @@ sink(decode(0x10), decode(0x11));
     }
 
     #[test]
+    fn decoder_provider_identity_and_confinement_are_shared_across_all_views() {
+        let source = SPLIT_PROVIDER_ROTATION_SOURCE.replace(
+            "let setup, after;",
+            "function second(index, table, value) { return index = index - 0x10, table = provider(), value = table[index], value; }\nlet setup, after;",
+        ).replace(
+            "sink(decode(0x10), decode(0x11));",
+            "sink(decode(0x10), second(0x10), second(0x11));",
+        );
+        let result = recover_static_decoders(&source, 8).unwrap_or_else(|| unreachable!());
+        assert_eq!(
+            result.transforms.get("string_array_decode"),
+            Some(&3),
+            "{}",
+            result.source
+        );
+        assert_eq!(
+            result.transforms.get("materialize_decoder_rotation"),
+            Some(&1)
+        );
+        assert!(result.source.contains(r#"sink("34", "34", "56")"#));
+
+        let plain = "function p(){var t=['a','b'];p=function(){return t;};return p();}function d(i,t,v){return i=i-16,t=p(),v=t[i],v;}";
+        for (suffix, expected) in [
+            ("sink(d(16));", 1),
+            ("{let p=[];(function(a,n){return n})(p,4);}sink(d(16));", 1),
+            ("p()[0]='z';sink(d(16));", 0),
+            ("const escaped=p;escaped()[0]='z';sink(d(16));", 0),
+            ("sink(p());sink(d(16));", 0),
+            ("function mutate(){p()[0]='z';}mutate();sink(d(16));", 0),
+        ] {
+            let source = format!("{plain}{suffix}");
+            let result = recover_static_decoders(&source, 8).unwrap_or_else(|| unreachable!());
+            assert_eq!(
+                result
+                    .transforms
+                    .get("string_array_decode")
+                    .copied()
+                    .unwrap_or_default(),
+                expected,
+                "{source}: {}",
+                result.source
+            );
+        }
+    }
+
+    #[test]
     fn decoder_only_recovery_rejects_shadowed_parse_int_mismatched_checksum_and_proto() {
         let source = SPLIT_PROVIDER_ROTATION_SOURCE;
         let shadowed_parse_int = source.replace(
