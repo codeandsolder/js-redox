@@ -83,146 +83,306 @@ fn fetchable_url(url: Url) -> Option<Url> {
     matches!(url.scheme(), "http" | "https").then_some(url)
 }
 
-fn queue_url(
-    queue: &mut VecDeque<Pending>,
-    known: &mut BTreeSet<String>,
-    url: Url,
-    referer: &Url,
-    kind: Kind,
-) {
-    let Some(mut url) = fetchable_url(url) else {
-        return;
-    };
-    url.set_fragment(None);
-    if known.insert(url.as_str().to_owned()) {
-        queue.push_back(Pending {
-            url,
-            referer: Some(referer.clone()),
-            kind,
-        });
-    }
+struct CaptureGraph {
+    queue: VecDeque<Pending>,
+    known: BTreeSet<String>,
+    import_map: ImportMap,
+    warnings: Vec<String>,
+    budgets: AnalysisBudgets,
 }
 
-fn add_code_references(
-    source: &str,
-    from: &Url,
-    import_map: &ImportMap,
-    queue: &mut VecDeque<Pending>,
-    known: &mut BTreeSet<String>,
-    warnings: &mut Vec<String>,
-    budgets: &AnalysisBudgets,
-) {
-    let budget = budgets.operation(AnalysisOperation::ReferenceScan, from.as_str());
-    let references = match extract_js_references(source, &budget) {
-        Ok(refs) => refs,
-        Err(error) => {
-            warnings.push(format!("{from}: JavaScript reference parse: {error}"));
+impl CaptureGraph {
+    fn new(root: &Url) -> Self {
+        Self {
+            queue: VecDeque::from([Pending {
+                url: root.clone(),
+                referer: None,
+                kind: Kind::Document,
+            }]),
+            known: BTreeSet::from([root.as_str().to_owned()]),
+            import_map: ImportMap::default(),
+            warnings: Vec::new(),
+            budgets: AnalysisBudgets::standard("http-static-capture"),
+        }
+    }
+
+    fn enqueue(&mut self, url: Url, referer: &Url, kind: Kind) {
+        let Some(mut url) = fetchable_url(url) else {
             return;
-        }
-    };
-    for reference in references {
-        let kind = match reference.kind.as_str() {
-            "import_static"
-            | "import_dynamic"
-            | "reexport_named"
-            | "reexport_all"
-            | "worker"
-            | "shared_worker"
-            | "service_worker_register"
-            | "import_scripts"
-            | "require" => Kind::Script,
-            "module_url" => Kind::Asset,
-            _ => continue,
         };
-        let resolved =
-            resolve_with_import_map(Some(from.as_str()), &reference.specifier, Some(import_map));
-        if let Some(raw_url) = resolved.get("resolved_url").and_then(Value::as_str) {
-            if let Ok(url) = Url::parse(raw_url) {
-                queue_url(queue, known, url, from, kind);
-            }
-        } else if reference.kind != "require" {
-            warnings.push(format!(
-                "{from}: unresolved {} {}",
-                reference.kind, reference.specifier
-            ));
+        url.set_fragment(None);
+        if self.known.insert(url.as_str().to_owned()) {
+            self.queue.push_back(Pending {
+                url,
+                referer: Some(referer.clone()),
+                kind,
+            });
         }
     }
-}
 
-fn add_document_references(
-    html: &str,
-    final_url: &Url,
-    queue: &mut VecDeque<Pending>,
-    known: &mut BTreeSet<String>,
-    import_map: &mut ImportMap,
-    warnings: &mut Vec<String>,
-    budgets: &AnalysisBudgets,
-) {
-    let base = document_base(html, final_url);
-    let tags = extract_script_tags(html);
-    // Import maps are document-level, including maps following module tags.
-    for tag in &tags {
-        if tag
-            .attrs
-            .get("type")
-            .is_some_and(|ty| ty.trim().eq_ignore_ascii_case("importmap"))
-        {
-            match serde_json::from_str::<Value>(&tag.body) {
-                Ok(payload) => {
-                    let parsed = parse_import_map(base.as_str(), &payload, warnings);
-                    *import_map = merge_import_map(import_map, &parsed);
-                }
-                Err(error) => warnings.push(format!("{final_url}: import map: {error}")),
+    fn discover_code(&mut self, source: &str, from: &Url) {
+        let budget = self
+            .budgets
+            .operation(AnalysisOperation::ReferenceScan, from.as_str());
+        let references = match extract_js_references(source, &budget) {
+            Ok(refs) => refs,
+            Err(error) => {
+                self.warnings
+                    .push(format!("{from}: JavaScript reference parse: {error}"));
+                return;
             }
-        }
-    }
-    for tag in tags {
-        if !is_executable_script(tag.attrs.get("type").map(String::as_str)) {
-            continue;
-        }
-        if let Some(src) = tag.attrs.get("src") {
-            if let Ok(url) = base.join(src) {
-                queue_url(queue, known, url, final_url, Kind::Script);
-            }
-        } else if !tag.body.trim().is_empty() {
-            add_code_references(
-                &tag.body, &base, import_map, queue, known, warnings, budgets,
+        };
+        for reference in references {
+            let kind = match reference.kind.as_str() {
+                "import_static"
+                | "import_dynamic"
+                | "reexport_named"
+                | "reexport_all"
+                | "worker"
+                | "shared_worker"
+                | "service_worker_register"
+                | "import_scripts"
+                | "require" => Kind::Script,
+                "module_url" => Kind::Asset,
+                _ => continue,
+            };
+            let resolved = resolve_with_import_map(
+                Some(from.as_str()),
+                &reference.specifier,
+                Some(&self.import_map),
             );
+            if let Some(raw_url) = resolved.get("resolved_url").and_then(Value::as_str) {
+                if let Ok(url) = Url::parse(raw_url) {
+                    self.enqueue(url, from, kind);
+                }
+            } else if reference.kind != "require" {
+                self.warnings.push(format!(
+                    "{from}: unresolved {} {}",
+                    reference.kind, reference.specifier
+                ));
+            }
         }
     }
-    for (href, _) in script_preload_links(html) {
-        if let Ok(url) = base.join(&href) {
-            queue_url(queue, known, url, final_url, Kind::Script);
+
+    fn discover_document(&mut self, html: &str, final_url: &Url) {
+        let base = document_base(html, final_url);
+        let tags = extract_script_tags(html);
+        // Import maps are document-level, including maps following module tags.
+        for tag in &tags {
+            if tag
+                .attrs
+                .get("type")
+                .is_some_and(|ty| ty.trim().eq_ignore_ascii_case("importmap"))
+            {
+                match serde_json::from_str::<Value>(&tag.body) {
+                    Ok(payload) => {
+                        let parsed = parse_import_map(base.as_str(), &payload, &mut self.warnings);
+                        self.import_map = merge_import_map(&self.import_map, &parsed);
+                    }
+                    Err(error) => self
+                        .warnings
+                        .push(format!("{final_url}: import map: {error}")),
+                }
+            }
+        }
+        for tag in tags {
+            if !is_executable_script(tag.attrs.get("type").map(String::as_str)) {
+                continue;
+            }
+            if let Some(src) = tag.attrs.get("src") {
+                if let Ok(url) = base.join(src) {
+                    self.enqueue(url, final_url, Kind::Script);
+                }
+            } else if !tag.body.trim().is_empty() {
+                self.discover_code(&tag.body, &base);
+            }
+        }
+        for (href, _) in script_preload_links(html) {
+            if let Ok(url) = base.join(&href) {
+                self.enqueue(url, final_url, Kind::Script);
+            }
         }
     }
 }
 
-fn har_entry(
-    requested_url: &Url,
-    actual_url: &Url,
-    kind: Kind,
+struct CapturedResponse {
+    url: Url,
     status: u16,
-    mime: &str,
-    body: &[u8],
-    referer: Option<&Url>,
-) -> Value {
-    let request_headers = referer.map_or_else(Vec::new, |url| {
-        vec![json!({"name":"Referer","value":url.as_str()})]
-    });
-    json!({
-        "pageref": "page_0",
-        "_resourceType": kind.resource_type(),
-        "request": {"method":"GET","url":actual_url.as_str(),"headers":request_headers,
-            "_requestedUrl":requested_url.as_str()},
-        "response": {
-            "status":status,
-            "statusText":"",
-            "headers":[{"name":"Content-Type","value":mime}],
-            "content":{"size":body.len(),"mimeType":mime,
-                "encoding":"base64",
-                "text":base64::engine::general_purpose::STANDARD.encode(body)}
-        }
+    mime: String,
+    body: Vec<u8>,
+}
+
+impl CapturedResponse {
+    fn har_entry(&self, pending: &Pending) -> Value {
+        let request_headers = pending.referer.as_ref().map_or_else(Vec::new, |url| {
+            vec![json!({"name":"Referer","value":url.as_str()})]
+        });
+        json!({
+            "pageref": "page_0",
+            "_resourceType": pending.kind.resource_type(),
+            "request": {"method":"GET","url":self.url.as_str(),"headers":request_headers,
+                "_requestedUrl":pending.url.as_str()},
+            "response": {
+                "status":self.status,
+                "statusText":"",
+                "headers":[{"name":"Content-Type","value":self.mime}],
+                "content":{"size":self.body.len(),"mimeType":self.mime,
+                    "encoding":"base64",
+                    "text":base64::engine::general_purpose::STANDARD.encode(&self.body)}
+            }
+        })
+    }
+}
+
+fn fetch_response(client: &Client, pending: &Pending, cap: usize) -> Result<CapturedResponse> {
+    let mut request = client
+        .get(pending.url.clone())
+        .header(
+            ACCEPT,
+            if pending.kind == Kind::Document {
+                "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8"
+            } else {
+                "*/*"
+            },
+        )
+        .header(ACCEPT_LANGUAGE, "en-US,en;q=0.8");
+    if let Some(referrer) = &pending.referer {
+        request = request.header(REFERER, referrer.as_str());
+    }
+    let response = request
+        .send()
+        .with_context(|| format!("GET {}", pending.url))?;
+    let final_url = response.url().clone();
+    let status = response.status().as_u16();
+    let mime = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or(match pending.kind {
+            Kind::Document => "text/html",
+            Kind::Script => "application/javascript",
+            Kind::Asset => "application/octet-stream",
+        })
+        .to_owned();
+    let mut body = Vec::new();
+    response
+        .take(u64::try_from(cap)?.saturating_add(1))
+        .read_to_end(&mut body)?;
+    ensure!(
+        body.len() <= cap,
+        "response exceeds HTTP capture byte limit"
+    );
+    Ok(CapturedResponse {
+        url: final_url,
+        status,
+        mime,
+        body,
     })
+}
+
+struct Acquisition {
+    graph: CaptureGraph,
+    entries: Vec<Value>,
+    failures: usize,
+    total_bytes: usize,
+    final_root: Option<Url>,
+}
+
+impl Acquisition {
+    fn new(root: &Url) -> Self {
+        Self {
+            graph: CaptureGraph::new(root),
+            entries: Vec::new(),
+            failures: 0,
+            total_bytes: 0,
+            final_root: None,
+        }
+    }
+
+    fn run(&mut self, client: &Client, limits: HttpCaptureLimits) -> Result<()> {
+        while let Some(pending) = self.graph.queue.pop_front() {
+            if self.entries.len() >= limits.resources || self.total_bytes >= limits.total_bytes {
+                self.graph.queue.push_front(pending);
+                break;
+            }
+            let cap = limits
+                .per_resource_bytes
+                .min(limits.total_bytes.saturating_sub(self.total_bytes));
+            match fetch_response(client, &pending, cap) {
+                Ok(response) => self.record_response(&pending, &response)?,
+                Err(error) => self.record_failure(&pending, error)?,
+            }
+        }
+        Ok(())
+    }
+
+    fn record_response(&mut self, pending: &Pending, response: &CapturedResponse) -> Result<()> {
+        self.graph.known.insert(response.url.as_str().to_owned());
+        if pending.kind == Kind::Document {
+            self.final_root = Some(response.url.clone());
+            ensure!(
+                (200..300).contains(&response.status),
+                "root document returned HTTP {}",
+                response.status
+            );
+            let decoded = decode_html(&response.body, Some(&response.mime), None);
+            self.graph.discover_document(&decoded.source, &response.url);
+        } else if (200..300).contains(&response.status) && pending.kind == Kind::Script {
+            // Browser JS text decoder handles BOMs and legacy charset responses.
+            let decoded = crate::browser_decode::decode_script(
+                &response.body,
+                crate::browser_decode::ScriptDecodeContext::classic_unknown(),
+            );
+            self.graph.discover_code(&decoded.source, &response.url);
+        }
+        self.total_bytes += response.body.len();
+        self.entries.push(response.har_entry(pending));
+        Ok(())
+    }
+
+    fn record_failure(&mut self, pending: &Pending, error: anyhow::Error) -> Result<()> {
+        if pending.kind == Kind::Document {
+            return Err(error).context("could not acquire root document");
+        }
+        self.failures += 1;
+        self.graph
+            .warnings
+            .push(format!("{}: {error:#}", pending.url));
+        let response = CapturedResponse {
+            url: pending.url.clone(),
+            status: 0,
+            mime: String::new(),
+            body: Vec::new(),
+        };
+        let mut failure = response.har_entry(pending);
+        failure["response"]["content"]["text"] = Value::Null;
+        failure["_failure"] = json!({"errorText": error.to_string()});
+        self.entries.push(failure);
+        Ok(())
+    }
+
+    fn publish(self, root: &Url, har_path: &Path) -> Result<HttpCaptureSummary> {
+        let final_url = self.final_root.context("root document missing")?;
+        let summary = HttpCaptureSummary {
+            requested_url: root.to_string(),
+            final_url: final_url.to_string(),
+            resources: self.entries.len(),
+            failed_resources: self.failures,
+            bytes: self.total_bytes,
+            pending_resources: self.graph.queue.len(),
+            warnings: self.graph.warnings,
+        };
+        let har = json!({"log":{"version":"1.2","creator":{"name":"js-redox","version":"1"},
+            "pages":[{"id":"page_0","title":final_url.as_str(),"startedDateTime":""}],
+            "entries":self.entries,
+            "_httpStaticCapture":&summary}});
+        if let Some(parent) = har_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(har_path, serde_json::to_vec_pretty(&har)?)
+            .with_context(|| format!("writing {}", har_path.display()))?;
+        Ok(summary)
+    }
 }
 
 /// Obtain a static HTTP graph and write its captured responses in standard HAR form.
@@ -256,155 +416,9 @@ pub fn capture_url_to_har(
         .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
         .timeout(Duration::from_secs(15))
         .build()?;
-    let mut queue = VecDeque::from([Pending {
-        url: root.clone(),
-        referer: None,
-        kind: Kind::Document,
-    }]);
-    let mut known = BTreeSet::from([root.as_str().to_owned()]);
-    let mut entries = Vec::new();
-    let mut warnings = Vec::new();
-    let mut failures = 0_usize;
-    let mut total_bytes = 0_usize;
-    let mut final_root = None;
-    let mut import_map = ImportMap::default();
-    let budgets = AnalysisBudgets::standard("http-static-capture");
-
-    while let Some(pending) = queue.pop_front() {
-        if entries.len() >= limits.resources || total_bytes >= limits.total_bytes {
-            queue.push_front(pending);
-            break;
-        }
-        let mut request = client
-            .get(pending.url.clone())
-            .header(
-                ACCEPT,
-                if pending.kind == Kind::Document {
-                    "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8"
-                } else {
-                    "*/*"
-                },
-            )
-            .header(ACCEPT_LANGUAGE, "en-US,en;q=0.8");
-        if let Some(referrer) = &pending.referer {
-            request = request.header(REFERER, referrer.as_str());
-        }
-        let outcome: Result<(Url, u16, String, Vec<u8>)> = (|| {
-            let response = request
-                .send()
-                .with_context(|| format!("GET {}", pending.url))?;
-            let final_url = response.url().clone();
-            let status = response.status().as_u16();
-            let mime = response
-                .headers()
-                .get(CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or(match pending.kind {
-                    Kind::Document => "text/html",
-                    Kind::Script => "application/javascript",
-                    Kind::Asset => "application/octet-stream",
-                })
-                .to_owned();
-            let left = limits.total_bytes.saturating_sub(total_bytes);
-            let cap = limits.per_resource_bytes.min(left);
-            let mut body = Vec::new();
-            response
-                .take(u64::try_from(cap)?.saturating_add(1))
-                .read_to_end(&mut body)?;
-            ensure!(
-                body.len() <= cap,
-                "response exceeds HTTP capture byte limit"
-            );
-            Ok((final_url, status, mime, body))
-        })();
-
-        match outcome {
-            Ok((actual_url, status, mime, body)) => {
-                known.insert(actual_url.as_str().to_owned());
-                if pending.kind == Kind::Document {
-                    final_root = Some(actual_url.clone());
-                    ensure!(
-                        (200..300).contains(&status),
-                        "root document returned HTTP {status}"
-                    );
-                    let decoded = decode_html(&body, Some(&mime), None);
-                    add_document_references(
-                        &decoded.source,
-                        &actual_url,
-                        &mut queue,
-                        &mut known,
-                        &mut import_map,
-                        &mut warnings,
-                        &budgets,
-                    );
-                } else if (200..300).contains(&status) && pending.kind == Kind::Script {
-                    // Browser JS text decoder handles BOMs and legacy charset responses.
-                    let decoded = crate::browser_decode::decode_script(
-                        &body,
-                        crate::browser_decode::ScriptDecodeContext::classic_unknown(),
-                    );
-                    add_code_references(
-                        &decoded.source,
-                        &actual_url,
-                        &import_map,
-                        &mut queue,
-                        &mut known,
-                        &mut warnings,
-                        &budgets,
-                    );
-                }
-                total_bytes += body.len();
-                entries.push(har_entry(
-                    &pending.url,
-                    &actual_url,
-                    pending.kind,
-                    status,
-                    &mime,
-                    &body,
-                    pending.referer.as_ref(),
-                ));
-            }
-            Err(error) => {
-                if pending.kind == Kind::Document {
-                    return Err(error).context("could not acquire root document");
-                }
-                failures += 1;
-                warnings.push(format!("{}: {error:#}", pending.url));
-                let mut failure = har_entry(
-                    &pending.url,
-                    &pending.url,
-                    pending.kind,
-                    0,
-                    "",
-                    &[],
-                    pending.referer.as_ref(),
-                );
-                failure["response"]["content"]["text"] = Value::Null;
-                failure["_failure"] = json!({"errorText":error.to_string()});
-                entries.push(failure);
-            }
-        }
-    }
-    let final_url = final_root.context("root document missing")?;
-    let summary = HttpCaptureSummary {
-        requested_url: root.to_string(),
-        final_url: final_url.to_string(),
-        resources: entries.len(),
-        failed_resources: failures,
-        bytes: total_bytes,
-        pending_resources: queue.len(),
-        warnings,
-    };
-    let har = json!({"log":{"version":"1.2","creator":{"name":"js-redox","version":"1"},
-        "pages":[{"id":"page_0","title":final_url.as_str(),"startedDateTime":""}],
-        "entries":entries,
-        "_httpStaticCapture":&summary}});
-    if let Some(parent) = har_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(har_path, serde_json::to_vec_pretty(&har)?)
-        .with_context(|| format!("writing {}", har_path.display()))?;
-    Ok(summary)
+    let mut acquisition = Acquisition::new(&root);
+    acquisition.run(&client, limits)?;
+    acquisition.publish(&root, har_path)
 }
 
 #[cfg(test)]
@@ -475,6 +489,46 @@ mod tests {
     }
 
     #[test]
+    fn dependency_failure_preserves_har_identity_and_does_not_charge_body_bytes() -> Result<()> {
+        let root = Url::parse("https://example.test/")?;
+        let mut capture = Acquisition::new(&root);
+        let document = capture.graph.queue.pop_front().context("root request")?;
+        let response = CapturedResponse {
+            url: root.clone(),
+            status: 200,
+            mime: "text/html".into(),
+            body: b"<script src='missing.js'></script>".to_vec(),
+        };
+        capture.record_response(&document, &response)?;
+        let dependency = capture
+            .graph
+            .queue
+            .pop_front()
+            .context("dependency request")?;
+        capture.record_failure(&dependency, anyhow::anyhow!("fixture read failure"))?;
+        assert_eq!(capture.total_bytes, response.body.len());
+        assert_eq!(capture.failures, 1);
+        let failure = &capture.entries[1];
+        assert_eq!(failure["request"]["url"], "https://example.test/missing.js");
+        assert_eq!(failure["request"]["headers"][0]["value"], root.as_str());
+        assert_eq!(failure["response"]["status"], 0);
+        assert_eq!(failure["response"]["content"]["text"], Value::Null);
+        assert_eq!(failure["_failure"]["errorText"], "fixture read failure");
+        assert_eq!(capture.graph.warnings.len(), 1);
+        let mut root_failure = Acquisition::new(&root);
+        let document = root_failure
+            .graph
+            .queue
+            .pop_front()
+            .context("root request")?;
+        assert!(root_failure
+            .record_failure(&document, anyhow::anyhow!("fixture root failure"))
+            .is_err());
+        assert_eq!(root_failure.entries, [] as [Value; 0]);
+        Ok(())
+    }
+
+    #[test]
     fn html_base_links_and_import_maps() {
         let html = r#"<base href="/app/"><link rel="modulepreload" href="chunk.js">
           <script type="importmap">{"imports":{"lib":"./lib.js"}}</script>
@@ -482,24 +536,14 @@ mod tests {
           <script src="main.js"></script>"#;
         let page =
             Url::parse("https://example.test/original/").unwrap_or_else(|e| unreachable!("{e}"));
-        let mut queue = VecDeque::new();
-        let mut known = BTreeSet::new();
-        let mut map = ImportMap::default();
-        let mut warnings = Vec::new();
-        add_document_references(
-            html,
-            &page,
-            &mut queue,
-            &mut known,
-            &mut map,
-            &mut warnings,
-            &AnalysisBudgets::standard("http-test"),
-        );
-        let urls: BTreeSet<_> = queue.iter().map(|p| p.url.as_str()).collect();
+        let mut graph = CaptureGraph::new(&page);
+        graph.queue.clear();
+        graph.discover_document(html, &page);
+        let urls: BTreeSet<_> = graph.queue.iter().map(|p| p.url.as_str()).collect();
         assert!(urls.contains("https://example.test/app/chunk.js"));
         assert!(urls.contains("https://example.test/app/lib.js"));
         assert!(urls.contains("https://example.test/app/later.js"));
         assert!(urls.contains("https://example.test/app/main.js"));
-        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(graph.warnings.is_empty(), "{:?}", graph.warnings);
     }
 }
