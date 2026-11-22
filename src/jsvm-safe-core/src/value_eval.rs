@@ -95,17 +95,14 @@ pub fn is_prototype_setter(property: &oxc_ast::ast::ObjectProperty<'_>, name: &s
         && !property.shorthand
 }
 
-/// Recover a template quasi with the original AST's cooked/raw semantics.
+/// Recover the cooked value of a template quasi.
 ///
-/// Prefer cooked text, falling back to raw spelling when cooked is absent.
-/// A lone surrogate in cooked text cannot be represented in Rust's string
-/// proof domain, so the recovery fails closed.
+/// A tagged template with an invalid escape has an undefined cooked slot,
+/// not its raw spelling. A cooked lone surrogate cannot be represented in
+/// the UTF-8 string proof domain either.
 #[must_use = "Use the returned template value only when decoding succeeds"]
 pub fn template_element_value(quasi: &TemplateElement<'_>) -> Option<String> {
-    quasi.value.cooked.as_ref().map_or_else(
-        || Some(quasi.value.raw.as_str().to_owned()),
-        |cooked| (*cooked).as_str().map(str::to_owned),
-    )
+    quasi.value.cooked.as_ref()?.as_str().map(str::to_owned)
 }
 
 #[derive(Debug, Clone)]
@@ -271,6 +268,19 @@ where
         Expression::ConditionalExpression(v) => {
             let test = known_bool_with_resolver(&v.test, resolve)?;
             eval_with_resolver(if test { &v.consequent } else { &v.alternate }, resolve)
+        }
+        Expression::SequenceExpression(sequence) => {
+            let (last, prefixes) = sequence.expressions.split_last()?;
+            // The comma operator discards each prefix's value, but every
+            // prefix must still complete normally without observable effects.
+            // A resolver may only supply independently proven inert reads.
+            if prefixes.iter().all(|prefix| {
+                inert_literal_value(prefix) || eval_with_resolver(prefix, resolve).is_some()
+            }) {
+                eval_with_resolver(last, resolve)
+            } else {
+                None
+            }
         }
         _ => None,
     }
@@ -819,6 +829,71 @@ mod tests {
             let actual = super::eval(&statement.expression).and_then(|value| value.render());
             assert_eq!(actual.as_deref(), expected, "{expression}");
         }
+    }
+
+    #[test]
+    fn primitive_sequence_requires_normal_inert_prefix_evaluation() {
+        use oxc_allocator::Allocator;
+        use oxc_ast::ast::Statement;
+        use oxc_span::SourceType;
+
+        for (expression, expected) in [
+            ("(2 ** 1.5, 3)", Some("3")),
+            ("(([], {}), 'result')", Some(r#""result""#)),
+            ("(false && effect(), 7)", Some("7")),
+            ("((2 ** 1.5, 4) + 1)", Some("5")),
+            ("((1n, 2), 4)", Some("4")),
+            ("(effect(), 7)", None),
+            ("(1n/0n, 7)", None),
+            ("(obj.property, 7)", None),
+            ("(missing, 7)", None),
+            ("([1, ...unknown], 7)", None),
+            ("(2 ** 1.5, unknown)", None),
+        ] {
+            let allocator = Allocator::default();
+            let source = format!("({expression});");
+            let program = crate::parse_as(&allocator, &source, SourceType::cjs())
+                .unwrap_or_else(|| unreachable!("{source}"));
+            let [Statement::ExpressionStatement(statement)] = program.body.as_slice() else {
+                unreachable!("one expression");
+            };
+            let actual = super::eval(&statement.expression).and_then(|value| value.render());
+            assert_eq!(actual.as_deref(), expected, "{expression}");
+        }
+    }
+
+    #[test]
+    fn invalid_tagged_escape_is_not_the_raw_template_value() {
+        use oxc_allocator::Allocator;
+        use oxc_ast::ast::{Expression, Statement};
+        use oxc_span::SourceType;
+
+        let allocator = Allocator::default();
+        let program = crate::parse_as(
+            &allocator,
+            r"tag`\xZ`; tag`\n`; tag`\ud800`;",
+            SourceType::cjs(),
+        )
+        .unwrap_or_else(|| unreachable!("valid tagged templates"));
+        let values = program
+            .body
+            .iter()
+            .map(|statement| {
+                let Statement::ExpressionStatement(statement) = statement else {
+                    unreachable!("expression statement");
+                };
+                let Expression::TaggedTemplateExpression(tagged) = &statement.expression else {
+                    unreachable!("tagged template");
+                };
+                let quasi = tagged
+                    .quasi
+                    .quasis
+                    .first()
+                    .unwrap_or_else(|| unreachable!("quasi"));
+                super::template_element_value(quasi)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, [None, Some("\n".into()), None]);
     }
 
     #[test]
