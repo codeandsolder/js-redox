@@ -84,20 +84,23 @@ impl SourceLineIndex {
                 .ok()?;
         let range = self.ranges.get(local_line)?;
         let text = source.get(range.clone())?;
-        Some(range.start + utf16_byte_offset(text, units)?)
+        Some(range.start + utf16_byte_offset(text, units).ok()?)
     }
 }
 
 /// Exact boundary conversion, including EOF and rejecting surrogate midpoints.
-fn utf16_byte_offset(text: &str, offset: usize) -> Option<usize> {
+pub(crate) fn utf16_byte_offset(text: &str, offset: usize) -> anyhow::Result<usize> {
     let mut remaining = offset;
     for (index, ch) in text.char_indices() {
         if remaining == 0 {
-            return Some(index);
+            return Ok(index);
         }
-        remaining = remaining.checked_sub(ch.len_utf16())?;
+        remaining = remaining
+            .checked_sub(ch.len_utf16())
+            .ok_or_else(|| anyhow::anyhow!("UTF-16 offset falls inside a surrogate pair"))?;
     }
-    (remaining == 0).then_some(text.len())
+    anyhow::ensure!(remaining == 0, "UTF-16 offset exceeds source length");
+    Ok(text.len())
 }
 
 #[cfg(test)]
