@@ -2,10 +2,11 @@
 //! Lexical containment alone does not establish execution order:
 //! hoisted function declarations may be invoked before their textual site.
 use oxc_ast::ast::{
-    ArrowFunctionExpression, BindingPattern, CallExpression, CatchClause, Declaration, Expression,
-    ForInStatement, ForOfStatement, ForStatement, ForStatementInit, ForStatementLeft,
-    FormalParameters, Function, FunctionType, Statement, VariableDeclaration,
-    VariableDeclarationKind,
+    ArrowFunctionExpression, BindingPattern, CallExpression, CatchClause, Declaration,
+    ExportDeclaration, ExportDefaultDeclaration, ExportDefaultDeclarationKind,
+    ExportNamedDeclaration, Expression, ForInStatement, ForOfStatement, ForStatement,
+    ForStatementInit, ForStatementLeft, FormalParameters, Function, FunctionType, ModuleExportName,
+    Statement, VariableDeclaration, VariableDeclarationKind,
 };
 use oxc_ast::AstKind;
 use oxc_ast_visit::{walk, Visit};
@@ -51,6 +52,7 @@ pub struct BindingFacts {
     named_function_expressions: HashSet<SymbolId>,
     sloppy_eval_var_scopes: HashSet<ScopeId>,
     exported_bindings: HashSet<SymbolId>,
+    exported_references: Vec<ReferenceId>,
     ambient_root: bool,
 }
 
@@ -128,9 +130,15 @@ impl BindingFacts {
             named_function_expressions: HashSet::new(),
             sloppy_eval_var_scopes: HashSet::new(),
             exported_bindings: HashSet::new(),
+            exported_references: Vec::new(),
             ambient_root: !program.source_type.is_module(),
         };
         facts.visit_program(program);
+        facts.exported_bindings.extend(
+            std::mem::take(&mut facts.exported_references)
+                .into_iter()
+                .filter_map(|reference| scoping.get_reference(reference).symbol_id()),
+        );
         // Non-strict direct eval may create var bindings in its caller's
         // variable environment. These bindings can shadow outer variables
         // even when the static symbol itself is immutable. Do not confuse
@@ -545,18 +553,7 @@ impl<'a> Visit<'a> for BindingFacts {
             let declaration = match statement {
                 Statement::VariableDeclaration(declaration) => Some(declaration.as_ref()),
                 Statement::ExportDeclaration(export) => match &export.declaration {
-                    Declaration::VariableDeclaration(declaration) => {
-                        for declarator in &declaration.declarations {
-                            self.exported_bindings.extend(
-                                declarator
-                                    .id
-                                    .get_binding_identifiers()
-                                    .into_iter()
-                                    .filter_map(|id| id.symbol_id.get()),
-                            );
-                        }
-                        Some(declaration.as_ref())
-                    }
+                    Declaration::VariableDeclaration(declaration) => Some(declaration.as_ref()),
                     _ => None,
                 },
                 _ => None,
@@ -566,6 +563,70 @@ impl<'a> Visit<'a> for BindingFacts {
             }
             self.visit_statement(statement);
         }
+    }
+
+    fn visit_export_declaration(&mut self, export: &ExportDeclaration<'a>) {
+        match &export.declaration {
+            Declaration::VariableDeclaration(declaration) => {
+                for declarator in &declaration.declarations {
+                    self.exported_bindings.extend(
+                        declarator
+                            .id
+                            .get_binding_identifiers()
+                            .into_iter()
+                            .filter_map(|identifier| identifier.symbol_id.get()),
+                    );
+                }
+            }
+            Declaration::FunctionDeclaration(function) => {
+                self.exported_bindings
+                    .extend(function.id.as_ref().and_then(|id| id.symbol_id.get()));
+            }
+            Declaration::ClassDeclaration(class) => {
+                self.exported_bindings
+                    .extend(class.id.as_ref().and_then(|id| id.symbol_id.get()));
+            }
+            _ => {}
+        }
+        walk::walk_export_declaration(self, export);
+    }
+
+    fn visit_export_named_declaration(&mut self, export: &ExportNamedDeclaration<'a>) {
+        // Local named exports use IdentifierReference; re-exports from
+        // another module are a different AST node and expose no local symbol.
+        for specifier in &export.specifiers {
+            if let ModuleExportName::IdentifierReference(identifier) = &specifier.local {
+                self.exported_references
+                    .extend(identifier.reference_id.get());
+            }
+        }
+        walk::walk_export_named_declaration(self, export);
+    }
+
+    fn visit_export_default_declaration(&mut self, export: &ExportDefaultDeclaration<'a>) {
+        match &export.declaration {
+            ExportDefaultDeclarationKind::FunctionDeclaration(function) => {
+                self.exported_bindings
+                    .extend(function.id.as_ref().and_then(|id| id.symbol_id.get()));
+            }
+            ExportDefaultDeclarationKind::ClassDeclaration(class) => {
+                self.exported_bindings
+                    .extend(class.id.as_ref().and_then(|id| id.symbol_id.get()));
+            }
+            declaration => {
+                // A default expression exports a value rather than a live
+                // binding, but an exact identifier value still exposes the
+                // referenced object or callable to importers.
+                if let Some(Expression::Identifier(identifier)) = declaration
+                    .as_expression()
+                    .map(Expression::without_parentheses)
+                {
+                    self.exported_references
+                        .extend(identifier.reference_id.get());
+                }
+            }
+        }
+        walk::walk_export_default_declaration(self, export);
     }
 
     fn visit_variable_declaration(&mut self, declaration: &VariableDeclaration<'a>) {
@@ -716,6 +777,46 @@ mod tests {
                 Dynamic,
             ]
         );
+    }
+
+    #[test]
+    fn module_export_forms_mark_exact_externally_observable_bindings() {
+        for (source, exposed) in [
+            ("export const x=1;const y=2;", true),
+            ("export let x=1;const y=2;", true),
+            ("export var x=1;const y=2;", true),
+            ("export const {x}={x:1};const y=2;", true),
+            ("export function x(){}const y=2;", true),
+            ("export class x{}const y=2;", true),
+            ("export default function x(){}const y=2;", true),
+            ("export default class x{}const y=2;", true),
+            ("const x=1,y=2;export {x};", true),
+            ("const x=1,y=2;export {x as other};", true),
+            ("const x=1,y=2;export {x as default};", true),
+            ("const x=1,y=2;export default x;", true),
+            ("const x=1,y=2;export default (x);", true),
+            ("const x=1,y=2;export {x as other} from 'external';", false),
+            ("const x=1,y=2;export * as external from 'external';", false),
+            ("const x=1,y=2;export {};", false),
+        ] {
+            let allocator = Allocator::default();
+            let program = crate::parse_as(&allocator, source, SourceType::mjs())
+                .unwrap_or_else(|| unreachable!("{source}"));
+            let semantic = SemanticBuilder::new()
+                .with_check_syntax_error(true)
+                .build(&program);
+            assert!(semantic.diagnostics.is_empty(), "{source}");
+            let scoping = semantic.semantic.scoping();
+            let facts = BindingFacts::analyze(&program, scoping);
+            let x = scoping
+                .get_binding(scoping.root_scope_id(), "x".into())
+                .unwrap_or_else(|| unreachable!("{source}"));
+            let y = scoping
+                .get_binding(scoping.root_scope_id(), "y".into())
+                .unwrap_or_else(|| unreachable!("{source}"));
+            assert_eq!(!facts.is_private(scoping, x), exposed, "{source}");
+            assert!(facts.is_private(scoping, y), "{source}");
+        }
     }
 
     #[test]

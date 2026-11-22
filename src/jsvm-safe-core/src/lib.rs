@@ -8479,6 +8479,39 @@ use();
     }
 
     #[test]
+    fn exported_hoisted_callers_cannot_prove_closed_initialization_contexts() {
+        for (declaration, suffix, expected) in [
+            ("function g(){return d(0)}", "export {};g();", 1),
+            ("export function g(){return d(0)}", "g();", 0),
+            ("export default function g(){return d(0)}", "g();", 0),
+            ("function g(){return d(0)}", "export {g};g();", 0),
+            ("function g(){return d(0)}", "export {g as exposed};g();", 0),
+            ("function g(){return d(0)}", "export default g;g();", 0),
+            (
+                "function g(){return d(0)}",
+                "export {g as exposed} from 'unrelated';g();",
+                1,
+            ),
+        ] {
+            let source = format!(
+                "{declaration} const t=['YQ=='];function d(i){{return atob(t[i])}} {suffix}"
+            );
+            let result =
+                recover_static_decoders(&source, 4).unwrap_or_else(|| unreachable!("{source}"));
+            assert_eq!(
+                result
+                    .transforms
+                    .get("string_array_decode")
+                    .copied()
+                    .unwrap_or_default(),
+                expected,
+                "{source}: {}",
+                result.source
+            );
+        }
+    }
+
+    #[test]
     fn direct_tables_require_exact_property_keys_own_slots_and_initialized_bindings() {
         for (source, count) in [
             ("const t=['YQ==','Yg=='];function d(i){return atob(t[i])}sink(d(0),d('1'),d(-0),d(1n),d(1-1),d('00'),d('0x0'),d(' 1'),d('-0'),d(true),d(2));",5),
