@@ -800,6 +800,7 @@ mod tests {
     fn no_facts_cross_unknown_effects_or_deferred_execution() -> Result<(), BudgetExceeded> {
         for source in [
             "const a=[7];unknown(a[0]);",
+        "function f(){const a=[7];with(new Proxy({},{has(t,k){if(k==='b')a[0]=9;return false;}})){var b=a[0];}return b;}f();",
             "const a=[7];(eval)('a[0]=9');a[0];",
             "const a=[7];a[(mutate(a),0)];",
             "const a=[7];a[8];a[0];",

@@ -585,7 +585,6 @@ fn depythonify_safe_deob_script_completion_runtime_equivalence() -> Result<()> {
         "let a=[7];let b=a;const x=b[0];b=[9];[x,a[0],b[0]];",
         "let a=[7];{let a=[9];a[0];}a[0];",
         "const a=[7];let i=0;const o={[(i=1,'x')]:a[i-1]};[o.x,i];",
-        "function f(){const a=[7];with(new Proxy({},{has(t,k){if(k==='b')a[0]=9;return false;}})){var b=a[0];}return b;}f();",
     ];
     for (index, source) in sources.iter().enumerate() {
         let label = format!("script-completion-{index}");
