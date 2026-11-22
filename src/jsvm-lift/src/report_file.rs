@@ -17,6 +17,12 @@ pub(crate) struct StagedReport {
 }
 
 impl StagedReport {
+    fn publish_new(self) -> Result<()> {
+        self.pending
+            .persist_noclobber(&self.destination)
+            .with_context(|| format!("publishing new file {}", self.destination.display()))
+    }
+
     pub(crate) fn publish(self) -> Result<()> {
         self.pending
             .persist(&self.destination)
@@ -169,8 +175,18 @@ pub(crate) fn stage_json(path: &Path, value: &impl Serialize) -> Result<StagedRe
     Ok(report)
 }
 
-pub(crate) fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
+/// Write a complete JSON file, replacing an existing regular file atomically.
+/// # Errors
+/// Fails on destination preparation, serialization or publication errors.
+pub fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
     stage_json(path, value)?.publish()
+}
+
+/// Publish a complete JSON file only if the destination does not already exist.
+/// # Errors
+/// Fails if the destination exists or staging/serialization/publication fails.
+pub fn write_new_json(path: &Path, value: &impl Serialize) -> Result<()> {
+    stage_json(path, value)?.publish_new()
 }
 
 fn stage_bytes(path: &Path, value: &[u8]) -> Result<StagedReport> {
@@ -183,11 +199,9 @@ fn stage_bytes(path: &Path, value: &[u8]) -> Result<StagedReport> {
 
 /// Copy a regular input into a complete independent file while computing
 /// the exact archived length and digest, with bounded streaming storage.
-pub(crate) fn copy_snapshot(
-    source: &Path,
-    destination: &Path,
-    budget: &WorkBudget,
-) -> Result<FileDigest> {
+/// # Errors
+/// Fails on nonregular files, exhausted work budget, or read/write/rename errors.
+pub fn copy_snapshot(source: &Path, destination: &Path, budget: &WorkBudget) -> Result<FileDigest> {
     let reader = open_regular(source).with_context(|| format!("opening {}", source.display()))?;
     let mut charged = reader.metadata()?.len().div_ceil(1024);
     budget.consume(charged)?;
@@ -206,7 +220,10 @@ pub(crate) fn copy_snapshot(
     Ok(identity)
 }
 
-pub(crate) fn write_bytes(path: &Path, value: &[u8]) -> Result<()> {
+/// Atomically replace a regular file with complete bytes.
+/// # Errors
+/// Fails on destination preparation, writing, or publication errors.
+pub fn write_bytes(path: &Path, value: &[u8]) -> Result<()> {
     stage_bytes(path, value)?.publish()
 }
 
@@ -214,7 +231,10 @@ pub(crate) fn stage_text(path: &Path, value: &str) -> Result<StagedReport> {
     stage_bytes(path, value.as_bytes())
 }
 
-pub(crate) fn write_text(path: &Path, value: &str) -> Result<()> {
+/// Atomically replace a regular file with complete UTF-8 text.
+/// # Errors
+/// Fails on destination preparation, writing, or publication errors.
+pub fn write_text(path: &Path, value: &str) -> Result<()> {
     stage_text(path, value)?.publish()
 }
 
@@ -304,6 +324,25 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&path)?,
             format!("{}\n", serde_json::to_string_pretty(&replacement)?)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exclusive_json_publication_does_not_replace_a_concurrent_destination() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("new.json");
+        let pending = stage_json(&path, &serde_json::json!({"new":true}))?;
+        fs::write(&path, b"existing")?;
+        assert!(pending.publish_new().is_err());
+        assert_eq!(fs::read(&path)?, b"existing");
+        assert_eq!(fs::read_dir(root.path())?.count(), 1);
+        assert!(write_new_json(&path, &serde_json::json!({"new":true})).is_err());
+        fs::remove_file(&path)?;
+        write_new_json(&path, &serde_json::json!({"new":true}))?;
+        assert_eq!(
+            read_json::<serde_json::Value>(&path, "fixture")?,
+            serde_json::json!({"new":true})
         );
         Ok(())
     }

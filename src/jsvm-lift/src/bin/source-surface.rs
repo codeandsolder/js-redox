@@ -131,16 +131,10 @@ fn main() -> Result<()> {
             "interpretation":"Syntactic evidence with nested lexical depth; no execution claim"
         })
     };
-    let encoded = serde_json::to_vec_pretty(&output)?;
     if let Some(path) = args.output {
-        ensure!(
-            !path.exists(),
-            "refusing to overwrite existing output: {}",
-            path.display()
-        );
-        fs::write(&path, &encoded).with_context(|| format!("writing {}", path.display()))?;
+        jsvm_lift::report_file::write_new_json(&path, &output)?;
     } else {
-        println!("{}", String::from_utf8(encoded)?);
+        println!("{}", serde_json::to_string_pretty(&output)?);
     }
     Ok(())
 }

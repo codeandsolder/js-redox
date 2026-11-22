@@ -38,10 +38,6 @@ fn main() -> Result<()> {
         .flatten();
     let presented = inlined.as_ref().map_or(named, |(text, _)| text.as_str());
     let output = format_source(presented, &budget)?;
-    if let Some(parent) = args.output.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&args.output, output)
-        .with_context(|| format!("writing {}", args.output.display()))?;
+    jsvm_lift::report_file::write_text(&args.output, &output)?;
     Ok(())
 }

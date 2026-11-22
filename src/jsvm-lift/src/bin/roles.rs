@@ -456,9 +456,8 @@ fn main() -> Result<()> {
     role_by_ground_name.extend(gt.helper_roles);
     let output = infer_vm_roles(&vms, ground, &role_by_ground_name, &hard_anchors(&scans));
 
-    let json = serde_json::to_string_pretty(&output)?;
     if let Some(path) = args.output.as_ref() {
-        fs::write(path, &json).with_context(|| format!("writing {}", path.display()))?;
+        jsvm_lift::report_file::write_json(path, &output)?;
     }
     print_summary(&output);
     Ok(())

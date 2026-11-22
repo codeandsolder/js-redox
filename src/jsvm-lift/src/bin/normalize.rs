@@ -285,8 +285,7 @@ fn main() -> Result<()> {
         });
     }
 
-    fs::write(&args.output, serde_json::to_string_pretty(&output)?)
-        .with_context(|| format!("writing {}", args.output.display()))?;
+    jsvm_lift::report_file::write_json(&args.output, &output)?;
 
     println!(
         "normalized {} VMs -> {}",

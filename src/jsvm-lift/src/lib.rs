@@ -15,7 +15,7 @@ pub mod document_entrypoints;
 pub mod embedded;
 pub mod function_analysis;
 pub mod function_surface;
-mod report_file;
+pub mod report_file;
 mod report_markdown;
 pub mod scan_report;
 pub mod scanner;

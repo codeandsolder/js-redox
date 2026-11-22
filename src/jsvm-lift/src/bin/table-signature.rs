@@ -121,12 +121,10 @@ fn main() -> Result<()> {
         source: args.source.display().to_string(),
         handlers,
     };
-    let json = serde_json::to_string_pretty(&output)?;
     if let Some(path) = args.output {
-        fs::write(&path, format!("{json}\n"))
-            .with_context(|| format!("writing {}", path.display()))?;
+        jsvm_lift::report_file::write_json(&path, &output)?;
     } else {
-        println!("{json}");
+        println!("{}", serde_json::to_string_pretty(&output)?);
     }
     Ok(())
 }

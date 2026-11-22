@@ -284,7 +284,7 @@ fn disassemble_report(
             continue;
         };
         let text_path = output_dir.join(format!("{}.txt", safe_name(&decoder.function_id)));
-        fs::write(&text_path, render_disassembly(&disasm))
+        jsvm_lift::report_file::write_text(&text_path, &render_disassembly(&disasm))
             .with_context(|| format!("writing {}", text_path.display()))?;
         output.push(disasm);
     }
@@ -331,7 +331,7 @@ fn main() -> Result<()> {
         )?);
     }
     let json_path = args.output_dir.join("disassembly.json");
-    fs::write(&json_path, serde_json::to_string_pretty(&all)?)
+    jsvm_lift::report_file::write_json(&json_path, &all)
         .with_context(|| format!("writing {}", json_path.display()))?;
     print_summary(&all, &args.output_dir);
     Ok(())
