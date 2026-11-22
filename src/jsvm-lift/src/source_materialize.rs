@@ -197,10 +197,7 @@ fn materialize_text(
             formatted = true;
         }
     }
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    }
-    fs::write(dest, text).with_context(|| format!("writing {}", dest.display()))?;
+    crate::report_file::write_text(dest, &text)?;
     Ok(Map::from_iter([
         ("transform".into(), Value::String(transform.into())),
         ("formatted".into(), Value::Bool(formatted)),
@@ -408,10 +405,7 @@ pub fn materialize_capture_source(
                     bail!("runtime script digest mismatch {digest}");
                 }
                 let output = project.join(&raw_path);
-                if let Some(parent) = output.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::write(&output, bytes)?;
+                crate::report_file::write_bytes(&output, &bytes)?;
                 units.push(Unit {
                     kind: "javascript".into(),
                     captured_kind: "javascript".into(),
@@ -501,20 +495,6 @@ pub fn materialize_capture_source(
         rows.push(row);
     }
 
-    for group in groups.values() {
-        for task in group {
-            match fs::symlink_metadata(&task.dest) {
-                Ok(_) => fs::remove_file(&task.dest)
-                    .with_context(|| format!("removing {}", task.dest.display()))?,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("inspecting {}", task.dest.display()))
-                }
-            }
-        }
-    }
-
     let pool = ThreadPoolBuilder::new()
         .num_threads(jobs)
         .build()
@@ -547,11 +527,7 @@ pub fn materialize_capture_source(
             .get(key)
             .context("missing JavaScript group result")?;
         let canonical = group.first().context("empty JavaScript content group")?;
-        if let Some(parent) = canonical.dest.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-        }
-        fs::write(&canonical.dest, &result.output)
-            .with_context(|| format!("writing {}", canonical.dest.display()))?;
+        crate::report_file::write_text(&canonical.dest, &result.output)?;
         let (digest, charset_hint) = key;
         for (occurrence, task) in group.iter().enumerate() {
             let row = rows
@@ -828,6 +804,31 @@ mod tests {
                 duplicate["materialization"].as_str(),
                 Some("hardlink" | "copy")
             ));
+            // Regroup after one captured body changes; the older generation's
+            // hardlinked snapshot and independent duplicate must not be altered.
+            let duplicate_path = project.join(
+                duplicate["source_path"]
+                    .as_str()
+                    .context("duplicate path")?,
+            );
+            let canonical = rows
+                .iter()
+                .find(|row| row["resource_id"] == 42)
+                .context("canonical row")?;
+            let canonical_path = project.join(
+                canonical["source_path"]
+                    .as_str()
+                    .context("canonical path")?,
+            );
+            let old = fs::read(&canonical_path)?;
+            let snapshot = project.join("snapshot.js");
+            fs::hard_link(&canonical_path, &snapshot)?;
+            fs::write(project.join("resources/a.js"), "const x = 99;")?;
+            materialize_capture_source(&project, Some(2), &AnalysisBudgets::standard("regroup"))?;
+            assert_eq!(fs::read(&snapshot)?, old);
+            assert_eq!(fs::read(&duplicate_path)?, old);
+            assert_ne!(fs::read(&canonical_path)?, old);
+
             Ok(())
         })();
         let cleanup = fs::remove_dir_all(&project);

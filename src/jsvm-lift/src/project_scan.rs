@@ -197,8 +197,7 @@ fn recover_generated_unit(
         &string_budget,
     ) {
         Ok(string_outcome) => {
-            fs::write(&string_tmp, string_outcome.source.as_bytes())
-                .with_context(|| format!("writing {}", string_tmp.display()))?;
+            crate::report_file::write_text(&string_tmp, &string_outcome.source)?;
             write_json(&string_report, &string_outcome.report)?;
             let output_sha = crate::sha256_hex(string_outcome.source.as_bytes());
             let string_ok = string_outcome
@@ -277,8 +276,7 @@ fn recover_generated_unit(
                     selected.display()
                 );
             }
-            fs::write(&safe_dest, outcome.source.as_bytes())
-                .with_context(|| format!("writing {}", safe_dest.display()))?;
+            crate::report_file::write_text(&safe_dest, &outcome.source)?;
             write_json(&deob_report, &outcome.report)?;
             row["deobfuscation"] = json!({
                 "exit": 0,
@@ -294,13 +292,7 @@ fn recover_generated_unit(
             row["deobfuscation_report"] = Value::Null;
             row["deobfuscation"] = json!({"exit": 1, "changed": false, "error": error.to_string()});
             if string_ok && string_changed {
-                fs::copy(&string_tmp, &safe_dest).with_context(|| {
-                    format!(
-                        "copying {} to {}",
-                        string_tmp.display(),
-                        safe_dest.display()
-                    )
-                })?;
+                link_or_copy(&string_tmp, &safe_dest)?;
                 (safe_rel, "string_recovery_only")
             } else {
                 (PathBuf::from(raw_rel), "exact_fallback")
@@ -324,8 +316,7 @@ fn recover_generated_unit(
             (exact, false, Some(error.to_string()))
         }
     };
-    fs::write(&readable_dest, readable.as_bytes())
-        .with_context(|| format!("writing {}", readable_dest.display()))?;
+    crate::report_file::write_text(&readable_dest, &readable)?;
     let object = row
         .as_object_mut()
         .context("generated recovery row must be an object")?;
