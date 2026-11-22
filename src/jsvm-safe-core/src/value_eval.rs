@@ -20,7 +20,10 @@ use oxc_syntax::number::ToJsString;
 /// Signed numeric zero becomes "0"; the string "-0" remains distinct.
 #[must_use]
 pub fn canonical_array_index(value: &Value) -> Option<u32> {
-    let key = value.js_string()?;
+    canonical_array_index_key(&value.js_string()?)
+}
+
+pub(crate) fn canonical_array_index_key(key: &str) -> Option<u32> {
     let index = key.parse::<u32>().ok()?;
     (index != u32::MAX && index.to_string() == key).then_some(index)
 }
