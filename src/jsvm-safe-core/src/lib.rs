@@ -2292,6 +2292,8 @@ pub fn recover_static_decoders_with_source_mode(
 #[derive(Debug, Clone)]
 pub struct SafeTransformResult {
     pub source: String,
+    /// Exact validated parser mode; absent for unparseable browser-legacy recovery.
+    pub resolved_source_type: Option<SourceType>,
     pub iterations: usize,
     pub transforms: BTreeMap<String, usize>,
     pub arithmetic_state_proofs: Vec<ArithmeticStateProof>,
@@ -2326,6 +2328,7 @@ fn deobfuscate_with_mode(
             budget.checkpoint()?;
             return Ok(Some(SafeTransformResult {
                 source: source.to_string(),
+                resolved_source_type: None,
                 iterations: 0,
                 transforms: BTreeMap::new(),
                 arithmetic_state_proofs: Vec::new(),
@@ -2398,6 +2401,7 @@ fn deobfuscate_with_mode(
 
     Ok(Some(SafeTransformResult {
         source: current,
+        resolved_source_type: Some(source_type),
         iterations,
         transforms: counts.into_inner(),
         arithmetic_state_proofs,
@@ -7477,17 +7481,18 @@ mod tests {
 
     #[test]
     fn distinguishes_empty_function_and_nested_block_statements() {
-        // The first empty statement terminates the directive prologue. Only
-        // the second empty statement is ordinary removable function-body syntax.
+        // The leading run is redundant because the next statement is an if.
+        // A competing edit within that prefix may delay release to a later pass.
         let input = "function f(flag){ ; ; if(flag){ ; work(); } return 3; }";
-        let output = deobfuscate(input, 1);
+        let output = deobfuscate(input, 8);
         assert!(output.is_some(), "source is valid JavaScript");
         let Some(output) = output else {
             unreachable!();
         };
+        assert!(output.analysis_complete);
         assert_eq!(
             output.transforms.get("remove_empty_function_statement"),
-            Some(&1),
+            Some(&2),
             "{:?}",
             output.transforms
         );
@@ -7503,7 +7508,7 @@ mod tests {
             .filter(|ch| !ch.is_whitespace())
             .collect();
         assert!(
-            compact.starts_with("functionf(flag){;if"),
+            compact.starts_with("functionf(flag){if"),
             "{}",
             output.source
         );

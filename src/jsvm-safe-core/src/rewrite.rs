@@ -7,7 +7,7 @@
 //! JavaScript tokens into a different token.
 
 use crate::ArithmeticStateProof;
-use oxc_ast::ast::{FunctionBody, Program, Statement};
+use oxc_ast::ast::{Expression, FunctionBody, Program, Statement};
 use oxc_ast_visit::{walk, Visit};
 use oxc_span::GetSpan;
 use std::collections::{BTreeMap, HashSet};
@@ -183,6 +183,10 @@ struct StatementBoundaries {
     prologue_ends: HashSet<usize>,
     implicit_left: HashSet<usize>,
     nonempty_statements: HashSet<(usize, usize)>,
+    // A leading empty run may be redundant if its first nonempty statement
+    // cannot be a directive and the entire prologue prefix remains unchanged.
+    leading_empty_statements: HashSet<(usize, usize)>,
+    releasable_prologues: BTreeMap<usize, (usize, usize)>,
 }
 
 impl StatementBoundaries {
@@ -191,19 +195,84 @@ impl StatementBoundaries {
         directives: &[oxc_ast::ast::Directive<'_>],
         body: &[Statement<'_>],
         source: &str,
+        body_start: usize,
     ) {
-        if let Some(first) = body.first() {
-            let start = first.span().start as usize;
-            self.prologue_ends.insert(start);
-            if let Some(last) = directives.last() {
-                if !crate::fragment(source, last.span())
-                    .trim_end()
-                    .ends_with(';')
-                {
-                    self.implicit_left.insert(start);
-                }
+        let Some(first) = body.first() else {
+            return;
+        };
+        let start = first.span().start as usize;
+        self.prologue_ends.insert(start);
+        if directives.last().is_some_and(|last| {
+            !crate::fragment(source, last.span())
+                .trim_end()
+                .ends_with(';')
+        }) {
+            self.implicit_left.insert(start);
+            return;
+        }
+        if !matches!(first, Statement::EmptyStatement(_)) {
+            return;
+        }
+
+        let mut prefix_end = first.span().end as usize;
+        for statement in body {
+            let span = statement.span();
+            prefix_end = span.end as usize;
+            if matches!(statement, Statement::EmptyStatement(_)) {
+                self.leading_empty_statements
+                    .insert((span.start as usize, prefix_end));
+                continue;
+            }
+            // A bare string literal expression would become a directive.
+            // Other expression shapes and other statements terminate a
+            // directive prologue without requiring an empty statement.
+            if matches!(statement, Statement::ExpressionStatement(expr)
+                if matches!(expr.expression, Expression::StringLiteral(_)))
+            {
+                return;
+            }
+            break;
+        }
+        self.releasable_prologues
+            .insert(start, (body_start, prefix_end));
+    }
+
+    fn removes_leading_empty(&self, edit: &Replacement) -> bool {
+        edit.text.is_empty()
+            && self
+                .leading_empty_statements
+                .contains(&(edit.start, edit.end))
+    }
+
+    /// Index every competing edit, including insertions and edits later
+    /// rejected by overlap arbitration. A prefix is releasable only when
+    /// its existing syntax remains intact apart from empty-run deletion.
+    fn releasable_starts(&self, replacements: &[Replacement]) -> HashSet<usize> {
+        if self.releasable_prologues.is_empty() {
+            return HashSet::new();
+        }
+        let mut competing = BTreeMap::<usize, usize>::new();
+        for edit in replacements {
+            if !self.removes_leading_empty(edit) {
+                let end = competing.entry(edit.start).or_default();
+                *end = (*end).max(edit.end);
             }
         }
+        let mut furthest_end = 0;
+        for end in competing.values_mut() {
+            furthest_end = furthest_end.max(*end);
+            *end = furthest_end;
+        }
+        self.releasable_prologues
+            .iter()
+            .filter_map(|(&start, &(left, right))| {
+                let touched = competing
+                    .range(..=right)
+                    .next_back()
+                    .is_some_and(|(_, end)| *end >= left);
+                (!touched).then_some(start)
+            })
+            .collect()
     }
 
     fn possible_directive(text: &str) -> bool {
@@ -217,7 +286,10 @@ impl StatementBoundaries {
     }
 
     fn protect(&self, source: &str, replacements: &mut Vec<Replacement>) {
+        let releasable = self.releasable_starts(replacements);
         for replacement in &mut *replacements {
+            let releases_empty_prologue =
+                releasable.contains(&replacement.start) && self.removes_leading_empty(replacement);
             if replacement.text.is_empty()
                 && self
                     .nonempty_statements
@@ -228,6 +300,7 @@ impl StatementBoundaries {
                 replacement.text.push(';');
             }
             let prologue_risk = self.prologue_ends.contains(&replacement.start)
+                && !releases_empty_prologue
                 && Self::possible_directive(&replacement.text);
             let left_risk = self.implicit_left.contains(&replacement.start)
                 && !replacement.text.is_empty()
@@ -258,14 +331,22 @@ struct BoundaryCollector<'s> {
 
 impl<'a> Visit<'a> for BoundaryCollector<'_> {
     fn visit_program(&mut self, program: &Program<'a>) {
-        self.boundaries
-            .record_prologue_end(&program.directives, &program.body, self.source);
+        self.boundaries.record_prologue_end(
+            &program.directives,
+            &program.body,
+            self.source,
+            program.span.start as usize,
+        );
         walk::walk_program(self, program);
     }
 
     fn visit_function_body(&mut self, body: &FunctionBody<'a>) {
-        self.boundaries
-            .record_prologue_end(&body.directives, &body.statements, self.source);
+        self.boundaries.record_prologue_end(
+            &body.directives,
+            &body.statements,
+            self.source,
+            body.span.start as usize,
+        );
         walk::walk_function_body(self, body);
     }
 
@@ -388,6 +469,48 @@ mod tests {
         );
         assert!(rewritten.is_some(), "rewrite failed for {source:?}");
         rewritten.unwrap_or_default()
+    }
+
+    fn rewrite_script(source: &str, edits: Vec<Replacement>) -> String {
+        let allocator = oxc_allocator::Allocator::default();
+        let program = crate::parse_as(&allocator, source, oxc_span::SourceType::cjs())
+            .unwrap_or_else(|| unreachable!());
+        apply(&program, edits, &mut Counts::default(), &mut Vec::new(), 1)
+            .unwrap_or_else(|| unreachable!())
+    }
+
+    #[test]
+    fn leading_empty_run_can_disappear_before_an_unchanged_nondirective() {
+        for (source, expected) in [
+            (";;work();", "work();"),
+            (";;'x'+work();", "'x'+work();"),
+            (";;('x');", "('x');"),
+            (";;", ""),
+            (";;; 'use strict';", "; 'use strict';"),
+        ] {
+            let edits = (0..source.bytes().take_while(|byte| *byte == b';').count())
+                .map(|index| replacement(index, index + 1, ""))
+                .collect();
+            assert_eq!(rewrite_script(source, edits), expected);
+        }
+    }
+
+    #[test]
+    fn competing_rewrite_cannot_turn_an_exposed_statement_into_a_directive() {
+        let source = ";;work();";
+        let edits = vec![
+            replacement(0, 1, ""),
+            replacement(1, 2, ""),
+            replacement(2, source.len(), "'use strict';"),
+        ];
+        assert_eq!(rewrite_script(source, edits), ";'use strict';");
+
+        let edits = vec![
+            replacement(0, 1, ""),
+            replacement(1, 2, ""),
+            replacement(2, 2, "'use strict';"),
+        ];
+        assert_eq!(rewrite_script(source, edits), ";'use strict';work();");
     }
 
     #[test]
