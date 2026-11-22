@@ -8163,6 +8163,72 @@ mod tests {
     }
 
     #[test]
+    fn self_installing_decoder_calls_require_unobservable_function_identity() {
+        let prefix = "function p(){var t=['a','b'];p=function(){return t;};return p();}function d(i){const t=p();return (d=function(x){return t[x-=16]})(i)}";
+        for (suffix, expected) in [
+            ("sink(d(16));", 1),
+            ("const original=d;sink(original(16));", 1),
+            ("const original=d;const alias=original;sink(alias(16));", 1),
+            (
+                "const original=d;const value=d(16);sink(original===d,value);",
+                0,
+            ),
+            ("const value=d(16);sink(d.toString(),value);", 0),
+            ("const value=d(16);sink(d.name,value);", 0),
+            ("const alias=d;const value=d(16);sink(alias,value);", 0),
+            ("const alias=d;const value=d(16);sink(alias===d,value);", 0),
+            ("let alias;void(alias=d);sink(d(16));", 1),
+            ("let alias;(alias=d,0);sink(d(16));", 1),
+            ("let alias;for(alias=d;false;){}sink(d(16));", 1),
+            ("let alias;alias=d;sink(d(16));", 1),
+            ("let alias;sink(d(16));alias=d;", 0),
+            ("let alias;sink(d(16));(alias=d,alias);", 0),
+            (
+                "function capture(){const alias=d;return alias}sink(d(16),capture());",
+                0,
+            ),
+            ("const alias=d;alias.extra=1;sink(d(16));", 0),
+            (
+                "function invoke(alias){return alias(16)}sink(d(16),invoke(d));",
+                0,
+            ),
+            ("const value=d(16);export {d};sink(value);", 0),
+            (
+                "const alias=d;const value=d(16);export {alias};sink(value);",
+                0,
+            ),
+        ] {
+            let source = format!("{prefix}{suffix}");
+            let result =
+                recover_static_decoders(&source, 4).unwrap_or_else(|| unreachable!("{source}"));
+            assert_eq!(
+                result
+                    .transforms
+                    .get("string_array_decode")
+                    .copied()
+                    .unwrap_or_default(),
+                expected,
+                "{source}: {}",
+                result.source
+            );
+        }
+        for provider in [
+            "export function p(){var t=['a'];p=function(){return t};return p()}",
+            "function p(){using t=['a'];p=function(){return t};return p()}",
+        ] {
+            let source =
+                format!("{provider}function d(i){{i-=16;const t=p();return t[i]}}sink(d(16));");
+            let result =
+                recover_static_decoders(&source, 4).unwrap_or_else(|| unreachable!("{source}"));
+            assert!(
+                !result.transforms.contains_key("string_array_decode"),
+                "{source}: {}",
+                result.source
+            );
+        }
+    }
+
+    #[test]
     fn decoder_only_recovery_proves_inline_self_rewriting_plain_decoder() {
         let source = r#"
 function provider() {

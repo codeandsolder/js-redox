@@ -969,6 +969,32 @@ fn depythonify_safe_deob_plain_decoder_runtime_equivalence() -> Result<()> {
     script_runtime_equivalence(&refs, "plain-decoder", false)
 }
 
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_callable_installation_runtime_equivalence() -> Result<()> {
+    let prefix = "function p(){var t=['a','b'];p=function(){return t;};return p();}function d(i){const t=p();return (d=function(x){return t[x-=16]})(i)}";
+    let sources = [
+        "d(16);",
+        "const original=d;original(16);",
+        "const original=d;const alias=original;alias(16);",
+        "const original=d;const value=d(16);[original===d,value];",
+        "const value=d(16);[d.toString(),value];",
+        "const value=d(16);[d.name,value];",
+        "const alias=d;const value=d(16);[alias===d,value];",
+        "let alias;void(alias=d);d(16);",
+        "let alias;(alias=d,0);d(16);",
+        "let alias;for(alias=d;false;){}d(16);",
+        "let alias;alias=d;d(16);",
+        "let alias;d(16);alias=d;",
+        "let alias;d(16);(alias=d,alias);",
+        "function capture(){const alias=d;return alias}const original=capture();[d(16),original===capture()];",
+        "const alias=d;alias.extra=1;[d(16),d.extra];",
+        "function invoke(alias){return alias(16)}[d(16),invoke(d)];",
+    ].into_iter().map(|suffix|format!("{prefix}{suffix}")).collect::<Vec<_>>();
+    let refs = sources.iter().map(String::as_str).collect::<Vec<_>>();
+    script_runtime_equivalence(&refs, "callable-installation", false)
+}
+
 fn script_runtime_equivalence(sources: &[&str], suite: &str, browser_globals: bool) -> Result<()> {
     let scratch = TempDir::new()?;
     // Browser decoders assume standard atob. Node's isolated VM does not

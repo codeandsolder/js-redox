@@ -2,6 +2,7 @@ use crate::decoder_encoding::{
     decode_fixed_base64_latin1, decode_lower_alphabet_base64_rc4, decode_lower_alphabet_base64_uri,
     decode_standard_base64_latin1,
 };
+mod callable_observation;
 mod fixed_base64_proof;
 mod rotation_proof;
 
@@ -523,7 +524,8 @@ fn self_rewriting_provider(
         return None;
     }
     let provider = function.id.as_ref()?.symbol_id.get()?;
-    if !facts.binding_unmodified_by_eval(scoping, provider)
+    if facts.is_exported_binding(provider)
+        || !facts.binding_unmodified_by_eval(scoping, provider)
         || !scoping.symbol_redeclarations(provider).is_empty()
     {
         return None;
@@ -538,6 +540,9 @@ fn self_rewriting_provider(
             let Statement::VariableDeclaration(declaration) = first else {
                 return None;
             };
+            if !rotation_proof::ordinary_declaration(declaration) {
+                return None;
+            }
             let [declarator] = declaration.declarations.as_slice() else {
                 return None;
             };
@@ -3373,6 +3378,27 @@ fn detect_decoders(
             reads.next().is_none().then_some((function.symbol, decoder))
         })
         .collect::<HashMap<_, _>>();
+
+    // Pure return-value semantics do not justify deleting an observable
+    // self-installation. Classify source-local alias/call uses before proving
+    // rotations, because removing the setup can suppress installation too.
+    let installations = functions
+        .iter()
+        .filter_map(|function| {
+            let installation = function.plain_decoder.as_ref()?.installation?;
+            decoders
+                .contains_key(&function.symbol)
+                .then_some((function.symbol, installation))
+        })
+        .collect::<Vec<_>>();
+    if !installations.is_empty() {
+        let uses = callable_observation::CallableUses::collect(program, context);
+        for (symbol, installation) in installations {
+            if !uses.installation_unobservable(symbol, installation)? {
+                decoders.remove(&symbol);
+            }
+        }
+    }
 
     // A self-installing provider returns the same mutable allocation to
     // every caller. A reference outside its own installation, a proved
