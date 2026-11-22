@@ -2696,8 +2696,8 @@ pub fn proven_slow_lazy_cell_captured_handler_from_value(
         || value_call.receiver_end != handler_call.receiver_end
         || value_call.key_start != handler_call.key_start
         || value_call.key_end != handler_call.key_end
-        || value_call.value_start != handler_call.handler_start
-        || value_call.value_end != handler_call.handler_end
+        || Span::new(value_call.value_start, value_call.value_end)
+            != Span::new(handler_call.handler_start, handler_call.handler_end)
         || value_call.registry_path != handler_call.registry_path
     {
         return None;
@@ -3214,7 +3214,7 @@ fn analyze_slow_lazy_cell_resolver_index(
     }
 
     let key_declaration = semantic.scoping().symbol_span(factory_key_symbol);
-    if !(function.span.start <= key_declaration.start && key_declaration.end <= function.span.end)
+    if !function.span.contains_inclusive(key_declaration)
         || !binding_stable_from_factory_entry(
             source,
             program,
@@ -5141,8 +5141,8 @@ mod tests {
                 value.exact_key == install.exact_key
                     && value.install.call_start == install.install.call_start
                     && value.install.call_end == install.install.call_end
-                    && value.install.value_start == install.install.handler_start
-                    && value.install.value_end == install.install.handler_end
+                    && Span::new(value.install.value_start, value.install.value_end)
+                        == Span::new(install.install.handler_start, install.install.handler_end)
             })
             .test_value("same generic value install")?;
         let captured_value = proven_slow_lazy_cell_captured_value_install(

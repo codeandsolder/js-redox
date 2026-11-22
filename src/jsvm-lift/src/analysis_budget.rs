@@ -63,22 +63,23 @@ impl AnalysisOperation {
         // deterministic `work` dimension remains available for individual
         // algorithms once they expose meaningful units.
         let seconds = match self {
-            Self::CaptureImport => 240,
             Self::SyntaxCheck => 90,
-            Self::Format => 120,
-            Self::StaticStringRecovery | Self::SafeDeobfuscation => 180,
-            Self::StructuralScan => 120,
-            Self::IrMaterialization => 180,
-            Self::VmMaterialization => 180,
-            Self::ApiSurface => 120,
-            Self::SourceMaterialization => 120,
-            Self::ReferenceScan => 120,
-            Self::SourcemapRecovery => 120,
-            Self::BundleMaterialization => 180,
-            Self::WasmAnalysis => 180,
-            Self::RuntimeAnalysis => 120,
-            Self::SourceGraph => 120,
-            Self::ProjectReadme => 120,
+            Self::Format
+            | Self::StructuralScan
+            | Self::ApiSurface
+            | Self::SourceMaterialization
+            | Self::ReferenceScan
+            | Self::SourcemapRecovery
+            | Self::RuntimeAnalysis
+            | Self::SourceGraph
+            | Self::ProjectReadme => 120,
+            Self::StaticStringRecovery
+            | Self::SafeDeobfuscation
+            | Self::IrMaterialization
+            | Self::VmMaterialization
+            | Self::BundleMaterialization
+            | Self::WasmAnalysis => 180,
+            Self::CaptureImport => 240,
             Self::CorpusEvaluation => 360,
         };
         BudgetLimits::wall_time(Duration::from_secs(seconds))

@@ -1564,7 +1564,8 @@ impl VerifiedGetter<'_> {
                 let Some(site) = self.exact_instances.get(&initializer.call.key) else {
                     continue;
                 };
-                if site.end > initializer.call.start {
+                let initializer_start = initializer.call.start;
+                if site.end > initializer_start {
                     continue;
                 }
                 let mut export_calls = region
@@ -1573,7 +1574,7 @@ impl VerifiedGetter<'_> {
                     .filter(|export| {
                         export.key == initializer.call.key
                             && export.statement_index > initializer.statement_index
-                            && export.call.call_start > initializer.call.start
+                            && export.call.call_start > initializer_start
                             && !region.helper_call_indices.iter().any(|index| {
                                 *index > initializer.statement_index
                                     && *index <= export.statement_index

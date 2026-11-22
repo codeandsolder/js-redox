@@ -574,8 +574,10 @@ pub fn cfg_has_write_free_path(
         // writes in other blocks conservatively block the entire block.
         let killed = barriers_by_block.get(&block).is_some_and(|writes| {
             writes.iter().any(|write| {
-                (block != source_block || write.start >= source.end)
-                    && (block != sink_block || write.start < sink.start)
+                let write_start = write.start;
+                let after_source = block != source_block || write_start >= source.end;
+                let before_sink = block != sink_block || write_start < sink.start;
+                after_source && before_sink
             })
         });
         if killed {

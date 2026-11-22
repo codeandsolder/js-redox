@@ -453,11 +453,12 @@ impl BindingFacts {
     /// Source-local table proofs do not extend to object-backed script
     /// globals or exported mutable allocations accessed by external code.
     pub(crate) fn source_local_data_binding(&self, scoping: &Scoping, symbol: SymbolId) -> bool {
-        !self.is_exported_binding(symbol)
-            && !(self.ambient_root
-                && scoping.symbol_scope_id(symbol) == scoping.root_scope_id()
-                && !scoping.symbol_flags(symbol).is_block_scoped())
-            && !self.is_eval_exposed(scoping, symbol)
+        let object_backed_global = self.ambient_root
+            && scoping.symbol_scope_id(symbol) == scoping.root_scope_id()
+            && !scoping.symbol_flags(symbol).is_block_scoped();
+        !(self.is_exported_binding(symbol)
+            || object_backed_global
+            || self.is_eval_exposed(scoping, symbol))
             && self.binding_has_stable_value(scoping, symbol)
     }
 

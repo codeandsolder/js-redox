@@ -1132,7 +1132,7 @@ fn branch_state_variable_for_span(
     }
     impl Probe {
         fn consider(&mut self, binary: &oxc_ast::ast::BinaryExpression<'_>, span: Span) {
-            if !(span.start <= self.target.start && self.target.end <= span.end)
+            if !span.contains_inclusive(self.target)
                 || !matches!(binary.operator.as_str(), "==" | "===")
             {
                 return;

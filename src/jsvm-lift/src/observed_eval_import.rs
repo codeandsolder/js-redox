@@ -666,6 +666,7 @@ pub fn expand_observed_direct_bundle(
         let relative = format!("{}/manifest.json", capture.directory);
         let witness: Manifest =
             serde_json::from_slice(&read_observed_file(bundle_root, &relative)?)?;
+        let expected_executable_sha256 = descriptor.executable_sha256.as_str();
         anyhow::ensure!(
             witness.schema_version == 3
                 && witness.capture_sha256.as_deref() == Some(descriptor.capture_sha256.as_str())
@@ -675,7 +676,7 @@ pub fn expand_observed_direct_bundle(
                     .source_provenance
                     .executable
                     .as_ref()
-                    .is_some_and(|exe| exe.sha256 == descriptor.executable_sha256
+                    .is_some_and(|exe| exe.sha256 == expected_executable_sha256
                         && exe.eval_site == capture.eval_site),
             "direct-eval site witness disagrees with bundle"
         );

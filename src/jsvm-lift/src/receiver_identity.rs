@@ -1850,8 +1850,9 @@ pub fn structurally_proven_own_data_fields_at_member_calls(
     let mut proven = Vec::new();
 
     for initialization in &initializations {
+        let initialization_context = &initialization.context;
         for entry in flow.direct_calls.iter().filter(|call| {
-            call.caller == initialization.context
+            &call.caller == initialization_context
                 && initialization.evaluation_order < call.evaluation_order
                 && prove_event_completion_before_event(
                     semantic,
@@ -2324,7 +2325,8 @@ fn prove_own_data_field_at_runtime_method_call_with_facts(
         }
     } else {
         let first = &path[0];
-        if first.caller != initialization.context
+        let initialization_context = &initialization.context;
+        if &first.caller != initialization_context
             || initialization.evaluation_order >= first.evaluation_order
             || !prove_event_completion_before_event(
                 semantic,
