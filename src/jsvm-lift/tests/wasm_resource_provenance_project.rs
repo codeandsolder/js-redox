@@ -201,7 +201,8 @@ fn runtime_wasm_provenance_is_exact_and_fails_closed() -> Result<()> {
     )?;
 
     let mut runtime_artifact = json!({
-        "schema": "js-redox-runtime-scripts/v1",
+        "schema": "js-redox-runtime-scripts/v2",
+        "script_identity_conflicts": [],
         "sources": [runtime_source(
             &js_sha,
             &format!("runtime-scripts/{js_sha}.js"),

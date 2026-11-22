@@ -428,6 +428,12 @@ fn missing_conflicting_parent_body_does_not_turn_claim_into_exact_graph_link() -
         .iter()
         .find(|row| row["sha256"] == digest(child))
         .context("child source missing")?;
+    let conflicts = report["script_identity_conflicts"]
+        .as_array()
+        .context("raw conflict inventory missing")?;
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0]["script_id"], "1");
+    assert_eq!(conflicts[0]["event_count"], 2);
     let claim = &child_row["generated"]["origins"][0]["chain"][0];
     assert_eq!(claim["parent_event_status"], "conflicting_source_claims");
     assert!(claim["sha256"].is_null());

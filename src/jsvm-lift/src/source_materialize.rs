@@ -683,6 +683,7 @@ mod tests {
                 RUNTIME_SCRIPTS,
                 &json!({
                     "schema": RUNTIME_SCRIPTS.schema,
+                "script_identity_conflicts":[],
                     "sources": [
                         {"sha256": digest, "path": capture_path,
                          "classification": "network_response", "urls": ["https://example.test/a.js"],

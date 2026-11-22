@@ -122,7 +122,7 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
     let runtime = optional_artifact(
         &project,
         RUNTIME_SCRIPTS,
-        json!({"sources":[], "alpine_families":[], "gtm_families":[]}),
+        json!({"sources":[], "alpine_families":[], "gtm_families":[], "script_identity_conflicts":[]}),
     )?;
     let selective_trace = optional_artifact(
         &project,
@@ -653,6 +653,7 @@ mod tests {
             RUNTIME_SCRIPTS,
             &json!({
                 "schema": RUNTIME_SCRIPTS.schema,
+                "script_identity_conflicts":[],
                 "sources": [{
                     "sha256": digest, "path": format!("runtime-scripts/{digest}.js"),
                     "classification":"generated_runtime",

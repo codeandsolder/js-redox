@@ -8,7 +8,7 @@ use super::{
     array_field, bool_field, compact_key, digest_id, field, nonempty_string_field, string_field,
     GraphBuilder,
 };
-use crate::runtime_identity::script_id_text;
+use crate::runtime_identity::{script_id_text, IdentityState, ScriptIdentityIndex};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -16,14 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 /// CDP script IDs are scoped to their session. Store full source digests,
 /// not the abbreviated graph node IDs, and make conflicts permanent.
 #[derive(Default)]
-pub(super) struct RuntimeInstances {
-    sessions: BTreeMap<String, BTreeMap<String, InstanceSource>>,
-}
-
-enum InstanceSource {
-    Unique(String),
-    Conflict,
-}
+pub(super) struct RuntimeInstances(ScriptIdentityIndex<String>);
 
 pub(super) fn runtime_node_id(digest: &str) -> String {
     format!("runtime:{}", digest.get(..20).unwrap_or(digest))
@@ -39,44 +32,25 @@ pub(super) fn captured_runtime_source(graph: &GraphBuilder, digest: &str) -> Opt
 }
 
 impl RuntimeInstances {
+    #[cfg(test)]
     pub(super) fn register(&mut self, session: &str, script_id: &str, digest: &str) {
-        use std::collections::btree_map::Entry;
-        match self
-            .sessions
-            .entry(session.to_owned())
-            .or_default()
-            .entry(script_id.to_owned())
-        {
-            Entry::Vacant(entry) => {
-                entry.insert(InstanceSource::Unique(digest.to_owned()));
-            }
-            Entry::Occupied(mut entry) => {
-                if matches!(entry.get(), InstanceSource::Unique(previous) if previous != digest) {
-                    entry.insert(InstanceSource::Conflict);
-                }
-            }
-        }
+        self.0.register(session, script_id, digest.to_owned());
     }
 
-    fn register_source(&mut self, source: &Value, digest: &str) {
-        for instance in array_field(source, "script_instances") {
-            let Some(script_id) = instance.get("script_id").and_then(script_id_text) else {
-                continue;
-            };
-            let session = nonempty_string_field(instance, "cdp_session").unwrap_or("main");
-            self.register(session, &script_id, digest);
-        }
+    fn from_report(runtime: &Value, budget: &work_budget::WorkBudget) -> Result<Self> {
+        Ok(Self(ScriptIdentityIndex::from_runtime_report(
+            runtime,
+            budget,
+            |sha, _, _| Some(sha.to_owned()),
+        )?))
     }
 
-    fn lookup(&self, session: &str, script_id: &str) -> Option<&InstanceSource> {
-        self.sessions.get(session)?.get(script_id)
+    fn lookup(&self, session: &str, script_id: &str) -> Option<&IdentityState<String>> {
+        self.0.lookup(session, script_id)
     }
 
     fn digest(&self, session: &str, script_id: &str) -> Option<&str> {
-        match self.lookup(session, script_id)? {
-            InstanceSource::Unique(digest) => Some(digest),
-            InstanceSource::Conflict => None,
-        }
+        self.0.get(session, script_id).map(String::as_str)
     }
 
     pub(super) fn exact_node(
@@ -248,13 +222,13 @@ impl GenerationParent<'_> {
             .and_then(|id| instances.lookup(self.session, &id));
         let claimed = self.claimed_digest();
         let (digest, basis) = match (registered, claimed) {
-            (Some(InstanceSource::Conflict), _) => {
+            (Some(IdentityState::Conflict), _) => {
                 return GenerationParentResolution::Unresolved("conflicting_script_instance")
             }
-            (Some(InstanceSource::Unique(registered)), Some(claimed)) if registered != claimed => {
+            (Some(IdentityState::Unique(registered)), Some(claimed)) if registered != claimed => {
                 return GenerationParentResolution::Unresolved("conflicting_parent_digest")
             }
-            (Some(InstanceSource::Unique(registered)), _) => (
+            (Some(IdentityState::Unique(registered)), _) => (
                 registered.as_str(),
                 if event_status == Some("ambiguous_ancestry") {
                     "captured_digest_with_ambiguous_ancestry"
@@ -576,7 +550,6 @@ pub(super) fn seed_runtime_script_evidence(
         })
         .collect::<BTreeMap<_, _>>();
 
-    let mut instances = RuntimeInstances::default();
     let context = RuntimeClassificationContext {
         resource_nodes_by_sha,
         inline_nodes_by_sha,
@@ -626,9 +599,8 @@ pub(super) fn seed_runtime_script_evidence(
                 "application_source":classification != Some("capture_instrumentation"),
             }),
         )?;
-
-        instances.register_source(source, digest);
     }
+    let instances = RuntimeInstances::from_report(runtime, budget)?;
     // Resolve only against the complete source and instance inventory. A parent
     // may occur later in artifact order; a late conflict must invalidate proof.
     for source in array_field(runtime, "sources") {

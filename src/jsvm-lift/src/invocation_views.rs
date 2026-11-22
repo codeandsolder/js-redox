@@ -5,16 +5,13 @@ mod observed_guards;
 use crate::{
     analysis_artifacts::{load_artifact, write_artifact, RUNTIME_SCRIPTS, SELECTIVE_TRACE},
     analysis_budget::{AnalysisBudgets, AnalysisOperation},
+    runtime_identity::{script_id_text, ScriptIdentityIndex},
     sha256_hex,
 };
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::fmt::Write as _;
-use std::{
-    collections::{BTreeMap, HashMap},
-    fs,
-    path::Path,
-};
+use std::{collections::BTreeMap, fs, path::Path};
 
 fn fence(value: &str, language: &str) -> String {
     let longest = value.split(|ch| ch != '~').map(str::len).max().unwrap_or(0);
@@ -82,51 +79,22 @@ struct RuntimeSourceIdentity {
     capture_instrumentation: bool,
 }
 
-type RuntimeIdentityIndex = HashMap<(String, String), Option<RuntimeSourceIdentity>>;
+type RuntimeIdentityIndex = ScriptIdentityIndex<RuntimeSourceIdentity>;
 
-fn runtime_identity_index(runtime: &Value) -> RuntimeIdentityIndex {
-    let mut found = HashMap::new();
-    for source in runtime
-        .get("sources")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let Some(sha) = source.get("sha256").and_then(verified_sha) else {
-            continue;
-        };
-        for instance in source
-            .get("script_instances")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            let Some(session) = instance.get("cdp_session").and_then(Value::as_str) else {
-                continue;
-            };
-            let Some(script) = instance.get("script_id").and_then(Value::as_str) else {
-                continue;
-            };
-            let next = RuntimeSourceIdentity {
-                sha256: sha.to_owned(),
-                start_line: instance.get("start_line").and_then(Value::as_u64),
-                start_column: instance.get("start_column").and_then(Value::as_u64),
-                capture_instrumentation: source.get("classification").and_then(Value::as_str)
-                    == Some("capture_instrumentation"),
-            };
-            let key = (session.to_owned(), script.to_owned());
-            match found.get(&key) {
-                Some(Some(previous)) if previous != &next => {
-                    found.insert(key, None);
-                }
-                Some(None) => {}
-                _ => {
-                    found.insert(key, Some(next));
-                }
-            }
-        }
-    }
-    found
+fn runtime_identity_index(
+    runtime: &Value,
+    budget: &work_budget::WorkBudget,
+) -> Result<RuntimeIdentityIndex> {
+    ScriptIdentityIndex::from_runtime_report(runtime, budget, |sha, source, instance| {
+        verified_sha(source.get("sha256")?)?;
+        Some(RuntimeSourceIdentity {
+            sha256: sha.to_owned(),
+            start_line: instance.get("start_line").and_then(Value::as_u64),
+            start_column: instance.get("start_column").and_then(Value::as_u64),
+            capture_instrumentation: source.get("classification").and_then(Value::as_str)
+                == Some("capture_instrumentation"),
+        })
+    })
 }
 
 /// Group source definitions by exact script and original coordinate, not by
@@ -147,7 +115,7 @@ fn append_observed_callable_definitions(
         if definition.get("source_identity").and_then(Value::as_str) != Some("exact") {
             return;
         }
-        let Some(script) = definition.get("scriptId").and_then(Value::as_str) else {
+        let Some(script) = definition.get("scriptId").and_then(script_id_text) else {
             return;
         };
         let Some(sha) = definition.get("sourceSha256").and_then(verified_sha) else {
@@ -160,14 +128,13 @@ fn append_observed_callable_definitions(
             return;
         };
         if identities
-            .get(&(session.to_owned(), script.to_owned()))
-            .and_then(Option::as_ref)
+            .get(session, &script)
             .is_none_or(|identity| identity.sha256 != sha)
         {
             return;
         }
         sites
-            .entry((script.to_owned(), sha.to_owned(), line, column))
+            .entry((script.into_owned(), sha.to_owned(), line, column))
             .or_default()
             .push(seen_as);
     };
@@ -216,8 +183,7 @@ fn append_observed_callable_definitions(
     page.push_str("These are source definitions of function values **observed at this pause**, not proof that a function was called or is selected for every input.\n\n");
     for ((script, sha, line, column), seen_as) in sites {
         let location = identities
-            .get(&(session.to_owned(), script.clone()))
-            .and_then(Option::as_ref)
+            .get(session, &script)
             .context("missing verified runtime source location")?;
         let raw_path = format!("resources/runtime-scripts/{sha}.js");
         let bytes = fs::read(project.join(&raw_path))
@@ -316,10 +282,8 @@ fn build_observed_path_view(
             .filter(|s| !s.is_empty())
             .unwrap_or("<anonymous>");
         let location = &top["location"];
-        let script = location
-            .get("scriptId")
-            .and_then(Value::as_str)
-            .unwrap_or("?");
+        let script_id = location.get("scriptId").and_then(script_id_text);
+        let script = script_id.as_deref().unwrap_or("?");
         let line = location.get("lineNumber").and_then(Value::as_u64);
         let column = location.get("columnNumber").and_then(Value::as_u64);
         let _ = write!(page,
@@ -329,9 +293,9 @@ fn build_observed_path_view(
             column.map_or_else(|| "?".to_owned(), |v| v.to_string()),
         );
         let sha = top.get("sourceSha256").and_then(verified_sha);
-        let identity = identities
-            .get(&(session.to_owned(), script.to_owned()))
-            .and_then(Option::as_ref);
+        let identity = script_id
+            .as_deref()
+            .and_then(|id| identities.get(session, id));
         let exact = top.get("source_identity").and_then(Value::as_str) == Some("exact")
             && sha.is_some()
             && identity.is_some_and(|source| Some(source.sha256.as_str()) == sha);
@@ -404,11 +368,11 @@ pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -
     };
     let runtime = load_artifact(project, RUNTIME_SCRIPTS, false)?
         .context("invocation views require the runtime source inventory")?;
-    let identities = runtime_identity_index(&runtime);
     let budget = budgets.operation(
         AnalysisOperation::SourceMaterialization,
         "observed invocation views",
     );
+    let identities = runtime_identity_index(&runtime, &budget)?;
     let output = project.join("src/_observed/invocations");
     fs::create_dir_all(&output)?;
     let hits = trace
@@ -459,10 +423,8 @@ pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -
                 .filter(|name| !name.is_empty())
                 .unwrap_or("<anonymous>");
             let location = frame.get("location").unwrap_or(&Value::Null);
-            let script = location
-                .get("scriptId")
-                .and_then(Value::as_str)
-                .unwrap_or("?");
+            let script_id = location.get("scriptId").and_then(script_id_text);
+            let script = script_id.as_deref().unwrap_or("?");
             let line = location.get("lineNumber").and_then(Value::as_u64);
             let column = location.get("columnNumber").and_then(Value::as_u64);
             let _ = write!(view,
@@ -472,9 +434,9 @@ pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -
                 column.map_or_else(|| "?".into(), |n| n.to_string())
             );
             let expected = frame.get("sourceSha256").and_then(verified_sha);
-            let actual = identities
-                .get(&(session.clone(), script.to_owned()))
-                .and_then(Option::as_ref);
+            let actual = script_id
+                .as_deref()
+                .and_then(|id| identities.get(&session, id));
             let identity_verified = frame.get("source_identity").and_then(Value::as_str)
                 == Some("exact")
                 && expected.is_some()
@@ -512,7 +474,11 @@ pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -
                 })
                 .find(|instance| {
                     instance.get("cdp_session").and_then(Value::as_str) == Some(session.as_str())
-                        && instance.get("script_id").and_then(Value::as_str) == Some(script)
+                        && instance
+                            .get("script_id")
+                            .and_then(script_id_text)
+                            .as_deref()
+                            == Some(script)
                 });
             if let Some(instance) = matched_instance {
                 if let Some(url) = instance.get("script_url").and_then(Value::as_str) {
@@ -662,6 +628,7 @@ mod tests {
             RUNTIME_SCRIPTS,
             &json!({
                 "schema":RUNTIME_SCRIPTS.schema,
+                "script_identity_conflicts":[],
                 "summary":{}, "alpine_families":[], "gtm_families":[],
                 "sources":[{
                     "sha256":digest,

@@ -3,6 +3,7 @@ use crate::{
     analysis_artifacts::{write_artifact, RUNTIME_SCRIPTS},
     capture_project::CaptureManifest,
     har_project::html::{find_tag_end, parse_attrs},
+    runtime_identity::captured_javascript_digest,
     sha256_hex,
 };
 use anyhow::{bail, Context, Result};
@@ -130,13 +131,6 @@ fn sorted_unique_values<'a>(values: impl Iterator<Item = &'a Value>) -> Vec<Valu
         unique.entry(key).or_insert_with(|| value.clone());
     }
     unique.into_values().collect()
-}
-
-fn captured_javascript_digest(event: &Map<String, Value>) -> Option<&str> {
-    let captured = event.get("captured")?.as_object()?;
-    (text(captured.get("kind")) == Some("javascript"))
-        .then(|| text(captured.get("sha256")))
-        .flatten()
 }
 
 fn inline_origins(manifest: &CaptureManifest) -> HashMap<String, Vec<Value>> {
@@ -411,7 +405,7 @@ impl<'a> ParentEventEvidence<'a> {
 
 #[derive(Default)]
 struct ParentEventIndex<'a> {
-    sessions: HashMap<String, HashMap<String, ParentEventEvidence<'a>>>,
+    sessions: BTreeMap<String, BTreeMap<String, ParentEventEvidence<'a>>>,
 }
 
 impl<'a> ParentEventIndex<'a> {
@@ -429,6 +423,19 @@ impl<'a> ParentEventIndex<'a> {
 
     fn get(&self, session: &str, id: &str) -> Option<&ParentEventEvidence<'a>> {
         self.sessions.get(session)?.get(id)
+    }
+    fn identity_conflicts(&self, budget: &WorkBudget) -> Result<Vec<Value>> {
+        let mut conflicts = Vec::new();
+        for (session, scripts) in &self.sessions {
+            for (script, evidence) in scripts {
+                budget.consume(1)?;
+                if evidence.digests.len() > 1 {
+                    budget.consume(u64::try_from(evidence.digests.len())?)?;
+                    conflicts.push(json!({"cdp_session":session,"script_id":script,"sha256_claims":evidence.digests,"event_count":evidence.count}));
+                }
+            }
+        }
+        Ok(conflicts)
     }
 }
 
@@ -883,6 +890,7 @@ pub(super) fn analyze_recorder_runtime_scripts(
         "alpine_families": families(&alpine_shapes),
         "gtm_families": families(&gtm_shapes),
         "sources": sources,
+        "script_identity_conflicts": events_by_script_id.identity_conflicts(budget)?,
     });
     write_artifact(project, RUNTIME_SCRIPTS, &document)
 }

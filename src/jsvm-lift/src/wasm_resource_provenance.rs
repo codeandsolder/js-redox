@@ -2,11 +2,12 @@ use crate::{
     analysis_artifacts::{write_artifact, WASM_RESOURCE_PROVENANCE},
     analysis_budget::{AnalysisBudgets, AnalysisOperation},
     capture_project::load_manifest,
+    runtime_identity::{captured_javascript_digest, script_id_text, ScriptIdentityIndex},
 };
 use anyhow::{Context, Result};
 use serde_json::{json, Map, Value};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs,
     path::{Path, PathBuf},
 };
@@ -92,51 +93,50 @@ fn load_json(path: &Path) -> Result<Value> {
     serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))
 }
 
-fn runtime_script_identities(capture: &Path) -> HashMap<(String, String), Value> {
-    let path = capture.join("runtime-scripts.json");
-    let Ok(document) = load_json(&path) else {
-        return HashMap::new();
+#[derive(Default)]
+struct RawScriptIdentities {
+    digests: ScriptIdentityIndex<String>,
+    paths: ScriptIdentityIndex<Option<String>>,
+}
+
+fn runtime_script_identities(capture: &Path, budget: &WorkBudget) -> Result<RawScriptIdentities> {
+    let mut identities = RawScriptIdentities::default();
+    let Ok(document) = load_json(&capture.join("runtime-scripts.json")) else {
+        return Ok(identities);
     };
     let Some(events) = document.as_array() else {
-        return HashMap::new();
+        return Ok(identities);
     };
-    let mut identities: HashMap<(String, String), Value> = HashMap::new();
-    let mut conflicts = HashSet::new();
     for event in events {
+        budget.consume(1)?;
         let Some(event) = event.as_object() else {
             continue;
         };
-        let Some(script_id) = event.get("scriptId") else {
+        let Some(script) = event.get("scriptId").and_then(script_id_text) else {
             continue;
         };
-        let Some(captured) = event.get("captured").and_then(Value::as_object) else {
-            continue;
-        };
-        if text(captured.get("kind")) != Some("javascript") {
-            continue;
+        let session = cdp_session(event);
+        let captured = event.get("captured").and_then(Value::as_object);
+        let digest = captured_javascript_digest(event);
+        if let Some(digest) = digest {
+            identities
+                .digests
+                .register(&session, &script, digest.to_owned());
+            identities.paths.register(
+                &session,
+                &script,
+                captured
+                    .and_then(|row| text(row.get("path")))
+                    .map(ToOwned::to_owned),
+            );
+        } else {
+            // A partial or non-JS raw event for the same session/script cannot
+            // be dropped to manufacture exact identity from the remaining row.
+            identities.digests.invalidate(&session, &script);
+            identities.paths.invalidate(&session, &script);
         }
-        let Some(digest) = text(captured.get("sha256")).filter(|digest| !digest.is_empty()) else {
-            continue;
-        };
-        let key = (cdp_session(event), stringish(Some(script_id)));
-        let candidate = json!({
-            "sha256": digest,
-            "path": captured.get("path").cloned().unwrap_or(Value::Null),
-            "url": event.get("url").cloned().unwrap_or(Value::Null),
-        });
-        if conflicts.contains(&key) {
-            continue;
-        }
-        if let Some(previous) = identities.get(&key) {
-            if previous.get("sha256") != candidate.get("sha256") {
-                conflicts.insert(key.clone());
-                identities.remove(&key);
-                continue;
-            }
-        }
-        identities.insert(key, candidate);
     }
-    identities
+    Ok(identities)
 }
 
 fn normalized_frames(initiator: &Map<String, Value>) -> Vec<Value> {
@@ -151,7 +151,7 @@ fn normalized_frames(initiator: &Map<String, Value>) -> Vec<Value> {
         .map(|frame| {
             json!({
                 "function_name": frame.get("functionName").cloned().unwrap_or(Value::Null),
-                "script_id": frame.get("scriptId").map_or(Value::Null, |id| Value::String(stringish(Some(id)))),
+                "script_id": frame.get("scriptId").and_then(script_id_text),
                 "url": text(frame.get("url")).filter(|url| !url.is_empty()).map_or(Value::Null, |url| Value::String(url.to_owned())),
                 "line_number": frame.get("lineNumber").cloned().unwrap_or(Value::Null),
                 "column_number": frame.get("columnNumber").cloned().unwrap_or(Value::Null),
@@ -381,16 +381,23 @@ impl<'r> ResponseEvidenceIndex<'r> {
         session: &str,
         url: &str,
         resolved: &ResolvedResponse,
-        runtime_scripts: &HashMap<(String, String), Value>,
+        runtime_scripts: &RawScriptIdentities,
     ) -> Value {
         let initiator = row.get("initiator").and_then(Value::as_object);
         let frames = initiator.map_or_else(Vec::new, normalized_frames);
         let primary = frames.first().cloned();
-        let mut runtime_identity = None;
+        let mut runtime_digest = None;
+        let mut runtime_path = None;
         let mut initiator_resource_ids = Vec::new();
         if let Some(primary_object) = primary.as_ref().and_then(Value::as_object) {
             if let Some(script_id) = text(primary_object.get("script_id")) {
-                runtime_identity = runtime_scripts.get(&(session.to_owned(), script_id.to_owned()));
+                runtime_digest = runtime_scripts.digests.get(session, script_id);
+                if runtime_digest.is_some() {
+                    runtime_path = runtime_scripts
+                        .paths
+                        .get(session, script_id)
+                        .and_then(Option::as_deref);
+                }
             }
             if let Some(primary_url) = text(primary_object.get("url")) {
                 initiator_resource_ids = self
@@ -412,8 +419,8 @@ impl<'r> ResponseEvidenceIndex<'r> {
             "initiator_type": initiator.and_then(|value| value.get("type")).cloned().unwrap_or(Value::Null),
             "initiator_frames": frames,
             "primary_initiator": primary.unwrap_or(Value::Null),
-            "initiator_runtime_sha256": runtime_identity.and_then(|value| value.get("sha256")).cloned().unwrap_or(Value::Null),
-            "initiator_runtime_path": runtime_identity.and_then(|value| value.get("path")).cloned().unwrap_or(Value::Null),
+            "initiator_runtime_sha256": runtime_digest,
+            "initiator_runtime_path": runtime_path,
             "initiator_resource_ids": initiator_resource_ids,
             "evidence": "cdp_network_response_initiator",
             "response_identity_basis": resolved.identity_basis,
@@ -425,7 +432,7 @@ impl<'r> ResponseEvidenceIndex<'r> {
     fn correlate(
         &self,
         cdp_rows: &[Value],
-        runtime_scripts: &HashMap<(String, String), Value>,
+        runtime_scripts: &RawScriptIdentities,
         budget: &WorkBudget,
     ) -> Result<CorrelatedResponses> {
         let mut results = CorrelatedResponses::default();
@@ -615,7 +622,7 @@ pub fn correlate_wasm_resource_provenance(
     };
 
     let index = ResponseEvidenceIndex::build(&manifest.resources, cdp_rows, &budget)?;
-    let runtime_scripts = runtime_script_identities(&capture);
+    let runtime_scripts = runtime_script_identities(&capture, &budget)?;
     let results = index.correlate(cdp_rows, &runtime_scripts, &budget)?;
     budget.checkpoint()?;
     let (summary, document) = results.into_report();
@@ -626,6 +633,36 @@ pub fn correlate_wasm_resource_provenance(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_script_identity_retains_missing_and_conflicting_claims() -> Result<()> {
+        let capture = tempfile::tempdir()?;
+        let event = |session: &str, script: &str, path: &str| json!({"cdpSession":session,"scriptId":script,"captured":{"kind":"javascript","sha256":"same-digest","path":path}});
+        let events = [
+            event("main", "1", "a.js"),
+            json!({"cdpSession":"main","scriptId":"1"}),
+            event("worker", "1", "worker.js"),
+            event("main", "2", "a.js"),
+            event("main", "2", "b.js"),
+        ];
+        fs::write(
+            capture.path().join("runtime-scripts.json"),
+            serde_json::to_vec(&events)?,
+        )?;
+        let budget = WorkBudget::unlimited("raw-wasm-identity");
+        let index = runtime_script_identities(capture.path(), &budget)?;
+        assert!(index.digests.get("main", "1").is_none());
+        assert_eq!(
+            index.digests.get("worker", "1").map(String::as_str),
+            Some("same-digest")
+        );
+        assert_eq!(
+            index.digests.get("main", "2").map(String::as_str),
+            Some("same-digest")
+        );
+        assert!(index.paths.get("main", "2").is_none());
+        Ok(())
+    }
 
     #[test]
     fn body_expectation_matches_http_no_body_cases() {
