@@ -1143,7 +1143,7 @@ mod tests {
     #[test]
     fn caller_report_keeps_multiline_template_arguments_inside_literal_spans() -> anyhow::Result<()>
     {
-        let source="const leaf=x=>x;const api={};api.run=()=>leaf(\u{60}one\n# not a heading\nthree\u{60});";
+        let source="const leaf=x=>x;const middle=()=>leaf(\u{60}one\n# not a heading\nthree\u{60});const api={};api.run=()=>middle();";
         let view = reconstruct_caller_views(source, Some("run"))?.remove(0);
         let report = &view.source;
         assert!(

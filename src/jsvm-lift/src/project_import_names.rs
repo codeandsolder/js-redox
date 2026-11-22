@@ -18,7 +18,6 @@ use oxc_span::SourceType;
 use oxc_syntax::{identifier, keyword};
 use rolldown_redox::ecmascript::parse_program;
 use serde_json::Value;
-use std::fmt::Write as _;
 use std::{
     collections::{btree_map::Entry, BTreeMap, BTreeSet},
     fs,
