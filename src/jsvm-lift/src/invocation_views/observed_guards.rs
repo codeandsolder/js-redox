@@ -1,7 +1,10 @@
 //! Proof-bounded correspondence between a concrete debugger pause and an AST
 //! control guard in the exact original script. Never specialize the shared JS.
 use super::{verified_sha, RuntimeIdentityIndex};
-use crate::{runtime_identity::script_id_text, trace_identity::same_observed_call_stack};
+use crate::{
+    runtime_identity::script_id_text, source_text::SourceLineIndex,
+    trace_identity::same_observed_call_stack,
+};
 use anyhow::Result;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
@@ -94,34 +97,10 @@ fn parse_guards(source: &str) -> Option<Vec<Guard>> {
     None
 }
 
-/// CDP columns count UTF-16 code units; Oxc spans count UTF-8 bytes.
-/// Handle all JS line terminators and reject coordinates splitting a surrogate.
-fn cdp_byte_offset(
-    source: &str,
-    line: u64,
-    column: u64,
-    start_line: u64,
-    start_column: u64,
-) -> Option<usize> {
-    let target_line = line.checked_sub(start_line)?;
-    let mut current_line = 0_u64;
-    let mut current_col = start_column;
-    let mut chars = source.char_indices().peekable();
-    while let Some((offset, ch)) = chars.next() {
-        if current_line == target_line && current_col == column {
-            return Some(offset);
-        }
-        if matches!(ch, '\n' | '\r' | '\u{2028}' | '\u{2029}') {
-            if ch == '\r' && chars.peek().is_some_and(|(_, next)| *next == '\n') {
-                chars.next();
-            }
-            current_line += 1;
-            current_col = 0;
-        } else {
-            current_col += ch.len_utf16() as u64;
-        }
-    }
-    (current_line == target_line && current_col == column).then_some(source.len())
+struct GuardSource {
+    source: String,
+    lines: SourceLineIndex,
+    guards: Vec<Guard>,
 }
 
 fn top_frame(step: &Value) -> Option<&Value> {
@@ -142,7 +121,7 @@ pub(super) fn observe(
     let Some(session) = session else {
         return Ok(Vec::new());
     };
-    let mut by_sha: HashMap<String, Option<(String, Vec<Guard>)>> = HashMap::new();
+    let mut by_sha: HashMap<String, Option<GuardSource>> = HashMap::new();
     let mut out = Vec::new();
     for (step_index, step) in steps.iter().enumerate() {
         budget.consume(1)?;
@@ -188,12 +167,25 @@ pub(super) fn observe(
             let source = String::from_utf8(bytes)?;
             let guards = parse_guards(&source);
             budget.checkpoint()?;
-            by_sha.insert(sha.to_owned(), guards.map(|guards| (source, guards)));
+            by_sha.insert(
+                sha.to_owned(),
+                guards.map(|guards| GuardSource {
+                    lines: SourceLineIndex::new(&source),
+                    source,
+                    guards,
+                }),
+            );
         }
-        let Some(Some((source, guards))) = by_sha.get(sha) else {
+        let Some(Some(GuardSource {
+            source,
+            lines,
+            guards,
+        })) = by_sha.get(sha)
+        else {
             continue;
         };
-        let Some(position) = cdp_byte_offset(source, line, column, start_line, start_column) else {
+        let Some(position) = lines.cdp_byte_offset(source, line, column, start_line, start_column)
+        else {
             continue;
         };
         for expression in step
@@ -248,9 +240,13 @@ pub(super) fn observe(
                         .and_then(Value::as_u64);
                     if next_script.as_deref() == Some(script.as_ref()) && next_sha == Some(sha) {
                         if let (Some(line), Some(column)) = (next_line, next_column) {
-                            if let Some(at) =
-                                cdp_byte_offset(source, line, column, start_line, start_column)
-                            {
+                            if let Some(at) = lines.cdp_byte_offset(
+                                source,
+                                line,
+                                column,
+                                start_line,
+                                start_column,
+                            ) {
                                 let arm = if value {
                                     guard.consequent
                                 } else {
@@ -285,18 +281,6 @@ pub(super) fn observe(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn utf16_offsets_and_line_endings_are_exact() {
-        let s = "💡if (x) {}\r\nif (y) {}\u{2028}if (z) {}";
-        assert_eq!(cdp_byte_offset(s, 0, 0, 0, 0), Some(0));
-        assert_eq!(cdp_byte_offset(s, 0, 1, 0, 0), None);
-        assert_eq!(cdp_byte_offset(s, 0, 2, 0, 0), Some(4));
-        assert_eq!(cdp_byte_offset(s, 1, 0, 0, 0), s.find("if (y)"));
-        assert_eq!(cdp_byte_offset(s, 2, 0, 0, 0), s.find("if (z)"));
-        assert_eq!(cdp_byte_offset("if (x)", 5, 17, 5, 17), Some(0));
-        assert_eq!(cdp_byte_offset("if (x)", 5, 16, 5, 17), None);
-    }
 
     #[test]
     fn exact_boolean_guard_and_next_selected_arm_are_distinct_evidence() -> Result<()> {
