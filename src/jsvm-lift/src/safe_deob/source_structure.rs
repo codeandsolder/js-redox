@@ -55,7 +55,7 @@ struct StructureVisitor {
     outer_depths: Vec<usize>,
 }
 
-fn control_node(kind: AstKind<'_>) -> bool {
+const fn control_node(kind: AstKind<'_>) -> bool {
     matches!(
         kind,
         AstKind::IfStatement(_)
@@ -70,7 +70,7 @@ fn control_node(kind: AstKind<'_>) -> bool {
     )
 }
 
-fn execution_region(kind: AstKind<'_>) -> bool {
+const fn execution_region(kind: AstKind<'_>) -> bool {
     matches!(
         kind,
         AstKind::Function(_) | AstKind::ArrowFunctionExpression(_) | AstKind::StaticBlock(_)
@@ -126,7 +126,7 @@ impl<'a> Visit<'a> for StructureVisitor {
         match kind {
             AstKind::Directive(_) => self.profile.directives += 1,
             AstKind::Function(_) | AstKind::ArrowFunctionExpression(_) => {
-                self.profile.functions += 1
+                self.profile.functions += 1;
             }
             AstKind::BlockStatement(_) => self.profile.block_statements += 1,
             AstKind::EmptyStatement(_) => self.profile.empty_statements += 1,
