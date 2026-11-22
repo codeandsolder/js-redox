@@ -3,7 +3,7 @@
 use super::{verified_sha, RuntimeIdentityIndex};
 use crate::{
     runtime_identity::script_id_text, source_text::SourceLineIndex,
-    trace_identity::same_observed_call_stack,
+    trace_identity::same_verified_stack_shape,
 };
 use anyhow::Result;
 use oxc_allocator::Allocator;
@@ -223,44 +223,39 @@ pub(super) fn observe(
                 continue;
             };
             let mut next_pause_arm = None;
-            if let Some(next) = steps
-                .get(step_index + 1)
-                .filter(|next| same_observed_call_stack(step, next))
+            let next = match steps.get(step_index + 1) {
+                Some(next)
+                    if same_verified_stack_shape(step, next, budget, |script, sha| {
+                        identities
+                            .get(session, script)
+                            .is_some_and(|source| source.sha256 == sha)
+                    })? =>
+                {
+                    Some(next)
+                }
+                _ => None,
+            };
+            if let Some(location) = next
+                .and_then(top_frame)
+                .and_then(|frame| frame.get("location"))
             {
-                if let Some(next_frame) = top_frame(next) {
-                    let next_script = next_frame
-                        .pointer("/location/scriptId")
-                        .and_then(script_id_text);
-                    let next_sha = next_frame.get("sourceSha256").and_then(Value::as_str);
-                    let next_line = next_frame
-                        .pointer("/location/lineNumber")
-                        .and_then(Value::as_u64);
-                    let next_column = next_frame
-                        .pointer("/location/columnNumber")
-                        .and_then(Value::as_u64);
-                    if next_script.as_deref() == Some(script.as_ref()) && next_sha == Some(sha) {
-                        if let (Some(line), Some(column)) = (next_line, next_column) {
-                            if let Some(at) = lines.cdp_byte_offset(
-                                source,
-                                line,
-                                column,
-                                start_line,
-                                start_column,
-                            ) {
-                                let arm = if value {
-                                    guard.consequent
-                                } else {
-                                    guard.alternate
-                                };
-                                if arm.is_some_and(|span| {
-                                    span.start as usize <= at && at < span.end as usize
-                                }) {
-                                    next_pause_arm =
-                                        Some(if value { "consequent" } else { "alternate" });
-                                }
-                            }
-                        }
-                    }
+                let at = location
+                    .get("lineNumber")
+                    .and_then(Value::as_u64)
+                    .zip(location.get("columnNumber").and_then(Value::as_u64))
+                    .and_then(|(line, column)| {
+                        lines.cdp_byte_offset(source, line, column, start_line, start_column)
+                    });
+                let arm = if value {
+                    guard.consequent
+                } else {
+                    guard.alternate
+                };
+                if at
+                    .zip(arm)
+                    .is_some_and(|(at, span)| span.start as usize <= at && at < span.end as usize)
+                {
+                    next_pause_arm = Some(if value { "consequent" } else { "alternate" });
                 }
             }
             out.push(json!({
@@ -270,6 +265,7 @@ pub(super) fn observe(
                 "test_end_byte":guard.test.end,
                 "expression":condition, "observed_value":value,
                 "next_pause_in_selected_arm":next_pause_arm,
+                "same_activation_proven":false,
                 "evidence":"exact_source_ast_and_boolean_pause",
                 "concrete_observation_only":true, "complete_execution_path":false,
             }));
@@ -329,7 +325,7 @@ mod tests {
             project,
             &identities,
             Some("main"),
-            &[guard.clone(), consequent],
+            &[guard.clone(), consequent.clone()],
             &budget,
         )?;
         assert_eq!(witnesses.len(), 1);
@@ -337,6 +333,19 @@ mod tests {
         assert_eq!(witnesses[0]["observed_value"], true);
         assert_eq!(witnesses[0]["next_pause_in_selected_arm"], "consequent");
         assert_eq!(witnesses[0]["complete_execution_path"], false);
+
+        // A matching but unverified outer frame must not strengthen the guard.
+        let mut uncertain = [guard.clone(), consequent];
+        let outer = json!({"source_identity":"exact","sourceSha256":"b".repeat(64),"location":{"scriptId":"99"},"functionLocation":{"scriptId":"99","lineNumber":0,"columnNumber":0}});
+        for step in &mut uncertain {
+            step["frames"]
+                .as_array_mut()
+                .ok_or_else(|| anyhow::anyhow!("frames"))?
+                .push(outer.clone());
+        }
+        let witnesses = observe(project, &identities, Some("main"), &uncertain, &budget)?;
+        assert_eq!(witnesses.len(), 1);
+        assert!(witnesses[0]["next_pause_in_selected_arm"].is_null());
 
         let mut false_guard = guard.clone();
         false_guard["expressions"][0]["value"]["value"] = json!(false);

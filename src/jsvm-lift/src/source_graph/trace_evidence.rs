@@ -10,7 +10,7 @@ use super::{
 };
 use crate::{
     runtime_identity::{script_id_text, session_name},
-    trace_identity::same_observed_call_stack,
+    trace_identity::same_verified_stack_shape,
 };
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -299,9 +299,9 @@ fn add_observed_guard_witnesses(
             },
             json!({"exact_original_ast":exact,"concrete_observation_only":true}),
         )?;
-        let Some(identity) = identity else {
+        if !exact {
             continue;
-        };
+        }
         let selected_arm = if guard["observed_value"] == true {
             "consequent"
         } else {
@@ -313,19 +313,18 @@ fn add_observed_guard_witnesses(
         let Some(next) = steps.get(step_index + 1) else {
             continue;
         };
-        budget.consume(u64::try_from(array_field(step, "frames").len())?)?;
-        if !same_observed_call_stack(step, next) {
+        if !same_verified_stack_shape(step, next, budget, |script, sha| {
+            session.is_some_and(|session| instances.exact_node(session, script, sha).is_some())
+        })? {
             continue;
         }
-        let Some(next_identity) = array_field(next, "frames")
+        if !array_field(next, "frames")
             .first()
-            .and_then(|frame| exact_runtime_frame_identity(frame, session, instances))
-        else {
-            continue;
-        };
-        if next_identity.coordinates().is_none()
-            || next_identity.script_id != identity.script_id
-            || next_identity.sha != identity.sha
+            .and_then(|frame| frame.get("location"))
+            .is_some_and(|location| {
+                u64_field(location, "lineNumber").is_some()
+                    && u64_field(location, "columnNumber").is_some()
+            })
         {
             continue;
         }
@@ -333,7 +332,7 @@ fn add_observed_guard_witnesses(
             &guard_id,
             &format!("observed-step:{ordinal}:{}", step_index + 1),
             "observed_next_pause_in_selected_arm",
-            json!({"arm":selected_arm,"concrete_observation_only":true}),
+            json!({"arm":selected_arm,"same_verified_stack_shape":true,"same_activation_proven":false,"concrete_observation_only":true}),
         )?;
     }
     Ok(())
@@ -644,6 +643,32 @@ mod tests {
             .values()
             .any(|edge| edge["to"] == "observed-step:2:0"
                 && edge["kind"] == "observed_executed_location"));
+        let mut uncertain = trace["hits"][1].clone();
+        let outer = json!({"source_identity":"exact","sourceSha256":"c".repeat(64),"location":{"scriptId":"99","lineNumber":1,"columnNumber":0},"functionLocation":{"scriptId":"99","lineNumber":0,"columnNumber":0}});
+        for step in uncertain["steps"]
+            .as_array_mut()
+            .ok_or_else(|| anyhow::anyhow!("steps"))?
+        {
+            step["frames"]
+                .as_array_mut()
+                .ok_or_else(|| anyhow::anyhow!("frames"))?
+                .push(outer.clone());
+        }
+        let mut graph = GraphBuilder::default();
+        seed_selective_trace_witnesses(
+            &mut graph,
+            &json!({"hits":[uncertain]}),
+            instances,
+            &budget,
+        )?;
+        assert!(graph
+            .edges()
+            .values()
+            .any(|edge| edge["kind"] == "observed_ast_guard_value"));
+        assert!(!graph
+            .edges()
+            .values()
+            .any(|edge| edge["kind"] == "observed_next_pause_in_selected_arm"));
         Ok(())
     }
 
