@@ -1,5 +1,5 @@
 use super::parse::{HarContent, JsRedoxBodyRef};
-use crate::sha256_hex;
+use crate::{archive_storage::insert_suffix, sha256_hex};
 use anyhow::{ensure, Context, Result};
 use base64::Engine;
 use std::{fs, path::Path};
@@ -96,22 +96,6 @@ fn has_plausible_extension(name: &str, kind: &str) -> bool {
         // file extension (for example `typography@2.0.0`).
         _ => extension.bytes().any(|byte| byte.is_ascii_alphabetic()),
     }
-}
-
-pub(super) fn insert_suffix(path: &str, suffix: &str) -> String {
-    let p = Path::new(path);
-    let parent = p.parent().unwrap_or_else(|| Path::new(""));
-    let stem = p.file_stem().and_then(|x| x.to_str()).unwrap_or("resource");
-    let ext = p.extension().and_then(|x| x.to_str());
-    let mut name = format!("{stem}{suffix}");
-    if let Some(ext) = ext {
-        name.push('.');
-        name.push_str(ext);
-    }
-    parent
-        .join(name)
-        .to_string_lossy()
-        .replace(std::path::MAIN_SEPARATOR, "/")
 }
 
 pub(super) fn output_path_for(url: &str, kind: &str, mime: &str) -> String {

@@ -1,5 +1,6 @@
 pub mod analysis_artifacts;
 pub mod analysis_budget;
+mod archive_storage;
 pub mod ast_utils;
 pub mod browser_script_types;
 pub mod bytecode;

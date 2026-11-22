@@ -6,7 +6,6 @@ pub mod html;
 mod materialize;
 mod parse;
 pub mod resource;
-mod resource_store;
 
 use materialize::materialize_project;
 use parse::read_har;

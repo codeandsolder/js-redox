@@ -1,5 +1,4 @@
 //! Allocate distinct archive paths without clobbering previously staged bodies.
-use super::resource::insert_suffix;
 use crate::{capture_project::validate_project_relative_path, sha256_hex};
 use anyhow::{Context, Result};
 use std::{
@@ -10,6 +9,49 @@ use std::{
 };
 use work_budget::WorkBudget;
 
+pub(crate) fn insert_suffix(path: &str, suffix: &str) -> String {
+    let p = Path::new(path);
+    let parent = p.parent().unwrap_or_else(|| Path::new(""));
+    let stem = p.file_stem().and_then(|x| x.to_str()).unwrap_or("resource");
+    let ext = p.extension().and_then(|x| x.to_str());
+    let mut name = format!("{stem}{suffix}");
+    if let Some(ext) = ext {
+        name.push('.');
+        name.push_str(ext);
+    }
+    parent
+        .join(name)
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/")
+}
+
+/// Reserve a fresh directory under an already allocated parent. Existing
+/// files and directories are never reused as a new allocation.
+pub(crate) fn reserve_directory(root: &Path, base: &str, budget: &WorkBudget) -> Result<String> {
+    validate_project_relative_path(base, "archive directory path")?;
+    let mut version = 1usize;
+    loop {
+        budget.consume(1)?;
+        let candidate = if version == 1 {
+            base.to_owned()
+        } else {
+            format!("{base}~d{version}")
+        };
+        match fs::create_dir(root.join(&candidate)) {
+            Ok(()) => return Ok(candidate),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                version = version
+                    .checked_add(1)
+                    .context("archive directory suffix overflow")?;
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("creating archive directory {candidate}"))
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct FileVersions {
     by_digest: HashMap<String, String>,
@@ -17,14 +59,14 @@ struct FileVersions {
     next: usize,
 }
 
-pub(super) struct StoredResource {
-    pub(super) path: String,
-    pub(super) sha256: String,
-    pub(super) reused: bool,
+pub(crate) struct StoredResource {
+    pub(crate) path: String,
+    pub(crate) sha256: String,
+    pub(crate) reused: bool,
 }
 
 /// Owns the filesystem namespace of a single private import staging directory.
-pub(super) struct ResourceStore<'a> {
+pub(crate) struct ResourceStore<'a> {
     root: &'a Path,
     budget: &'a WorkBudget,
     directories: HashMap<String, String>,
@@ -32,7 +74,7 @@ pub(super) struct ResourceStore<'a> {
 }
 
 impl<'a> ResourceStore<'a> {
-    pub(super) fn new(root: &'a Path, budget: &'a WorkBudget) -> Self {
+    pub(crate) fn new(root: &'a Path, budget: &'a WorkBudget) -> Self {
         Self {
             root,
             budget,
@@ -58,38 +100,13 @@ impl<'a> ResourceStore<'a> {
                 physical.push('/');
             }
             let base = format!("{physical}{component}");
-            // create_dir provides the real filesystem's collision semantics,
-            // including case-insensitive names and an existing file ancestor.
-            let mut version = 1usize;
-            loop {
-                self.budget.consume(1)?;
-                let candidate = if version == 1 {
-                    base.clone()
-                } else {
-                    format!("{base}~d{version}")
-                };
-                match fs::create_dir(self.root.join(&candidate)) {
-                    Ok(()) => {
-                        self.directories.insert(logical.clone(), candidate.clone());
-                        physical = candidate;
-                        break;
-                    }
-                    Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                        version = version
-                            .checked_add(1)
-                            .context("archive directory suffix overflow")?;
-                    }
-                    Err(error) => {
-                        return Err(error)
-                            .with_context(|| format!("creating archive directory {candidate}"))
-                    }
-                }
-            }
+            physical = reserve_directory(self.root, &base, self.budget)?;
+            self.directories.insert(logical.clone(), physical.clone());
         }
         Ok(physical)
     }
 
-    pub(super) fn write(&mut self, desired: &str, bytes: &[u8]) -> Result<StoredResource> {
+    pub(crate) fn write(&mut self, desired: &str, bytes: &[u8]) -> Result<StoredResource> {
         self.budget.consume(1)?;
         validate_project_relative_path(desired, "archive resource path")?;
         let (parent, name) = desired
