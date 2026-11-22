@@ -7,6 +7,8 @@
 //! may resolve identifier and member reads only with independent proofs of
 //! binding identity, initialization and side-effect-free property access.
 
+mod literal_class;
+
 use oxc_ast::ast::{
     ArrayExpressionElement, BinaryExpression, Expression, LogicalExpression, ObjectPropertyKind,
     PropertyKey, StringLiteral, TemplateElement, UnaryExpression,
@@ -451,6 +453,8 @@ fn inert_literal_facts(expr: &Expression<'_>) -> Option<LiteralFacts> {
             )
         }
         Expression::RegExpLiteral(_) => of_type(LiteralTypes::OBJECT),
+        Expression::ClassExpression(class) => literal_class::inert_class_definition(class)
+            .then_some(LiteralFacts::of_type(LiteralTypes::FUNCTION)),
         // Creating a function does not execute its parameters or body.
         Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_) => {
             of_type(LiteralTypes::FUNCTION)
