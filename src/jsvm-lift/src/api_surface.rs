@@ -1128,6 +1128,108 @@ fn contains_with_statement(program: &Program<'_>) -> bool {
     detector.found
 }
 
+fn analyze_validated_program<'a>(
+    source: &str,
+    program: &'a Program<'a>,
+    semantic: &oxc_semantic::Semantic<'a>,
+    budget: &WorkBudget,
+) -> Result<ApiSurfaceAnalysis> {
+    let scoping = semantic.scoping();
+    budget.checkpoint()?;
+    let constants = ProvenConstantEnvironment::collect(program, scoping);
+    budget.checkpoint()?;
+
+    let mut callables = CallableIndex::collect(program, source, scoping, &constants);
+    budget.checkpoint()?;
+
+    let wrappers = forwarding::WrapperIndex::collect(semantic, budget)?;
+    forwarding::collect_returned_values(
+        semantic,
+        &wrappers,
+        &mut callables,
+        source,
+        &constants,
+        budget,
+    )?;
+    let wrapper_globals = wrappers
+        .root_mutation_targets()
+        .map(|(name, family)| (name.to_owned(), family))
+        .collect();
+
+    let lines = SourceLineIndex::new(source);
+    let mut mutations = SinkMutationCollector {
+        source,
+        lines: &lines,
+        scoping,
+        constants: &constants,
+        callables: &callables,
+        mutations: SinkMutations {
+            wrapper_globals,
+            ..SinkMutations::default()
+        },
+    };
+    mutations.visit_program(program);
+    budget.checkpoint()?;
+
+    let mut safe_member_refs = SafeMemberReferenceCollector {
+        source,
+        scoping,
+        constants: &constants,
+        callables: &callables,
+        mutations: &mutations.mutations,
+        refs: BTreeSet::new(),
+    };
+    safe_member_refs.visit_program(program);
+    budget.checkpoint()?;
+
+    let mut collector = Collector {
+        source,
+        scoping,
+        constants: &constants,
+        mutations: &mutations.mutations,
+        callables: &callables,
+        safe_member_refs: &safe_member_refs.refs,
+        lines: &lines,
+        callsites: BTreeSet::new(),
+    };
+    collector.visit_program(program);
+    budget.checkpoint()?;
+    for node in semantic.nodes().iter() {
+        budget.consume(1)?;
+        let site = match node.kind() {
+            oxc_ast::AstKind::CallExpression(call) if !call.optional => {
+                forwarding::InvocationSite {
+                    callee: &call.callee,
+                    arguments: &call.arguments,
+                    span: call.span,
+                    constructor: false,
+                }
+            }
+            oxc_ast::AstKind::NewExpression(new) => forwarding::InvocationSite {
+                callee: &new.callee,
+                arguments: &new.arguments,
+                span: new.span,
+                constructor: true,
+            },
+            _ => continue,
+        };
+        forwarding::specialize(site, semantic, &wrappers, &mut collector, budget)?;
+    }
+    budget.checkpoint()?;
+    let mut callsites = collector.callsites.into_iter().collect::<Vec<_>>();
+    callsites.sort_by(|left, right| {
+        (left.start, left.end, left.kind.as_str()).cmp(&(
+            right.start,
+            right.end,
+            right.kind.as_str(),
+        ))
+    });
+    Ok(ApiSurfaceAnalysis {
+        callsites,
+        mutation_sites: mutations.mutations.sites.into_iter().collect(),
+    })
+}
+
 /// Recover source-proven browser API call sites under a bounded analysis.
 ///
 /// # Errors
@@ -1156,100 +1258,7 @@ pub fn analyze_api_surface(source: &str, budget: &WorkBudget) -> Result<ApiSurfa
         if !semantic.diagnostics.is_empty() {
             continue;
         }
-        let scoping = semantic.semantic.scoping();
-        budget.checkpoint()?;
-        let constants = ProvenConstantEnvironment::collect(&program, scoping);
-        budget.checkpoint()?;
-
-        let mut callables = CallableIndex::collect(&program, source, scoping, &constants);
-        budget.checkpoint()?;
-
-        let wrappers = forwarding::WrapperIndex::collect(&semantic.semantic, budget)?;
-        forwarding::collect_returned_values(
-            &semantic.semantic,
-            &wrappers,
-            &mut callables,
-            source,
-            &constants,
-            budget,
-        )?;
-        let wrapper_globals = wrappers
-            .root_mutation_targets()
-            .map(|(name, family)| (name.to_owned(), family))
-            .collect();
-
-        let lines = SourceLineIndex::new(source);
-        let mut mutations = SinkMutationCollector {
-            source,
-            lines: &lines,
-            scoping,
-            constants: &constants,
-            callables: &callables,
-            mutations: SinkMutations {
-                wrapper_globals,
-                ..SinkMutations::default()
-            },
-        };
-        mutations.visit_program(&program);
-        budget.checkpoint()?;
-
-        let mut safe_member_refs = SafeMemberReferenceCollector {
-            source,
-            scoping,
-            constants: &constants,
-            callables: &callables,
-            mutations: &mutations.mutations,
-            refs: BTreeSet::new(),
-        };
-        safe_member_refs.visit_program(&program);
-        budget.checkpoint()?;
-
-        let mut collector = Collector {
-            source,
-            scoping,
-            constants: &constants,
-            mutations: &mutations.mutations,
-            callables: &callables,
-            safe_member_refs: &safe_member_refs.refs,
-            lines: &lines,
-            callsites: BTreeSet::new(),
-        };
-        collector.visit_program(&program);
-        budget.checkpoint()?;
-        for node in semantic.semantic.nodes().iter() {
-            budget.consume(1)?;
-            let site = match node.kind() {
-                oxc_ast::AstKind::CallExpression(call) if !call.optional => {
-                    forwarding::InvocationSite {
-                        callee: &call.callee,
-                        arguments: &call.arguments,
-                        span: call.span,
-                        constructor: false,
-                    }
-                }
-                oxc_ast::AstKind::NewExpression(new) => forwarding::InvocationSite {
-                    callee: &new.callee,
-                    arguments: &new.arguments,
-                    span: new.span,
-                    constructor: true,
-                },
-                _ => continue,
-            };
-            forwarding::specialize(site, &semantic.semantic, &wrappers, &mut collector, budget)?;
-        }
-        budget.checkpoint()?;
-        let mut callsites = collector.callsites.into_iter().collect::<Vec<_>>();
-        callsites.sort_by(|left, right| {
-            (left.start, left.end, left.kind.as_str()).cmp(&(
-                right.start,
-                right.end,
-                right.kind.as_str(),
-            ))
-        });
-        return Ok(ApiSurfaceAnalysis {
-            callsites,
-            mutation_sites: mutations.mutations.sites.into_iter().collect(),
-        });
+        return analyze_validated_program(source, &program, &semantic.semantic, budget);
     }
 
     Err(anyhow!(

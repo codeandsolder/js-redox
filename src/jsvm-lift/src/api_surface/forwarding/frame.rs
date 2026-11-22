@@ -252,6 +252,103 @@ impl FrameProof {
     }
 }
 
+fn confined_reference(
+    node_id: oxc_syntax::node::NodeId,
+    sink: Span,
+    locals: &[LocalInitializer<'_>],
+    semantic: &Semantic<'_>,
+    constants: &ProvenConstantEnvironment,
+    budget: &WorkBudget,
+    requirements: &mut ReferenceRequirements,
+) -> Result<bool> {
+    let scoping = semantic.scoping();
+    let mut current = semantic.nodes().get_node(node_id).span();
+    if current == sink {
+        return Ok(true);
+    }
+    let mut dispatch_member = false;
+    let mut in_materialized_array = false;
+    let mut accepted = false;
+    for id in semantic.nodes().ancestor_ids(node_id) {
+        budget.consume(1)?;
+        let kind = semantic.nodes().kind(id);
+        match kind {
+            AstKind::ParenthesizedExpression(_) => {}
+            AstKind::UnaryExpression(_)
+            | AstKind::BinaryExpression(_)
+            | AstKind::LogicalExpression(_)
+            | AstKind::ConditionalExpression(_)
+            | AstKind::TemplateLiteral(_)
+                if !dispatch_member =>
+            {
+                requirements.primitive = true;
+            }
+            AstKind::ArrayExpression(_) if !dispatch_member => in_materialized_array = true,
+            AstKind::ObjectExpression(_) if !dispatch_member => in_materialized_array = false,
+            AstKind::ObjectProperty(property)
+                if !dispatch_member && property.kind == PropertyKind::Init && !property.method =>
+            {
+                if property.computed && property.key.span() == current {
+                    requirements.primitive = true;
+                } else if property.value.span() != current
+                    || (!property.computed
+                        && literal_data_key(property, |expr| {
+                            constants.exact_primitive(expr, scoping)
+                        })
+                        .is_none())
+                {
+                    break;
+                }
+            }
+            AstKind::SpreadElement(_) if !dispatch_member => {
+                if !in_materialized_array {
+                    requirements.array = true;
+                }
+            }
+            AstKind::StaticMemberExpression(member)
+                if !dispatch_member
+                    && !member.optional
+                    && member.object.span() == current
+                    && matches!(member.property.name.as_str(), "call" | "apply" | "bind") =>
+            {
+                dispatch_member = true;
+            }
+            AstKind::ComputedMemberExpression(member)
+                if !dispatch_member
+                    && !member.optional
+                    && member.object.span() == current
+                    && static_string(&member.expression, scoping, constants)
+                        .as_deref()
+                        .is_some_and(|name| matches!(name, "call" | "apply" | "bind")) =>
+            {
+                dispatch_member = true;
+            }
+            AstKind::CallExpression(call) => {
+                accepted = call.span == sink && (!dispatch_member || call.callee.span() == current);
+                break;
+            }
+            AstKind::NewExpression(new) => {
+                accepted = !dispatch_member && new.span == sink;
+                break;
+            }
+            AstKind::VariableDeclarator(declaration) => {
+                accepted = !dispatch_member
+                    && locals.iter().any(|local| {
+                        declaration.span == local.span && local.expression.span() == current
+                    });
+                break;
+            }
+            _ => break,
+        }
+        current = kind.span();
+        if current == sink && !dispatch_member {
+            accepted = true;
+            break;
+        }
+    }
+    Ok(accepted)
+}
+
 fn reference_requirements(
     symbol: SymbolId,
     sink: Span,
@@ -272,94 +369,15 @@ fn reference_requirements(
             requirements.confined = false;
             break;
         }
-        let mut current = semantic.nodes().get_node(reference.node_id()).span();
-        if current == sink {
-            continue;
-        }
-        let mut dispatch_member = false;
-        let mut in_materialized_array = false;
-        let mut accepted = false;
-        for id in semantic.nodes().ancestor_ids(reference.node_id()) {
-            budget.consume(1)?;
-            let kind = semantic.nodes().kind(id);
-            match kind {
-                AstKind::ParenthesizedExpression(_) => {}
-                AstKind::UnaryExpression(_)
-                | AstKind::BinaryExpression(_)
-                | AstKind::LogicalExpression(_)
-                | AstKind::ConditionalExpression(_)
-                | AstKind::TemplateLiteral(_)
-                    if !dispatch_member =>
-                {
-                    requirements.primitive = true;
-                }
-                AstKind::ArrayExpression(_) if !dispatch_member => in_materialized_array = true,
-                AstKind::ObjectExpression(_) if !dispatch_member => in_materialized_array = false,
-                AstKind::ObjectProperty(property)
-                    if !dispatch_member
-                        && property.kind == PropertyKind::Init
-                        && !property.method =>
-                {
-                    if property.computed && property.key.span() == current {
-                        requirements.primitive = true;
-                    } else if property.value.span() != current
-                        || (!property.computed
-                            && literal_data_key(property, |expr| {
-                                constants.exact_primitive(expr, scoping)
-                            })
-                            .is_none())
-                    {
-                        break;
-                    }
-                }
-                AstKind::SpreadElement(_) if !dispatch_member => {
-                    if !in_materialized_array {
-                        requirements.array = true;
-                    }
-                }
-                AstKind::StaticMemberExpression(member)
-                    if !dispatch_member
-                        && !member.optional
-                        && member.object.span() == current
-                        && matches!(member.property.name.as_str(), "call" | "apply" | "bind") =>
-                {
-                    dispatch_member = true;
-                }
-                AstKind::ComputedMemberExpression(member)
-                    if !dispatch_member
-                        && !member.optional
-                        && member.object.span() == current
-                        && static_string(&member.expression, scoping, constants)
-                            .as_deref()
-                            .is_some_and(|name| matches!(name, "call" | "apply" | "bind")) =>
-                {
-                    dispatch_member = true;
-                }
-                AstKind::CallExpression(call) => {
-                    accepted =
-                        call.span == sink && (!dispatch_member || call.callee.span() == current);
-                    break;
-                }
-                AstKind::NewExpression(new) => {
-                    accepted = !dispatch_member && new.span == sink;
-                    break;
-                }
-                AstKind::VariableDeclarator(declaration) => {
-                    accepted = !dispatch_member
-                        && locals.iter().any(|local| {
-                            declaration.span == local.span && local.expression.span() == current
-                        });
-                    break;
-                }
-                _ => break,
-            }
-            current = kind.span();
-            if current == sink && !dispatch_member {
-                accepted = true;
-                break;
-            }
-        }
-        if !accepted {
+        if !confined_reference(
+            reference.node_id(),
+            sink,
+            locals,
+            semantic,
+            constants,
+            budget,
+            &mut requirements,
+        )? {
             requirements.confined = false;
             break;
         }
