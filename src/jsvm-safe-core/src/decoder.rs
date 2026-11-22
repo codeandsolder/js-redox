@@ -1907,7 +1907,8 @@ pub fn decoder_call_rewrite(
         None => None,
     };
     let argument = call.arguments.first()?;
-    let primitive_number = |expression: &Expression<'_>| eval(expression).map(|value| value.number());
+    let primitive_number =
+        |expression: &Expression<'_>| eval(expression).map(|value| value.number());
     if let Some(raw) = argument.as_expression().and_then(primitive_number) {
         return literal_decoder_rewrite(&decoder.value_for_call(raw, key.as_deref())?);
     }
