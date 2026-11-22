@@ -2,7 +2,7 @@ use super::parse::{HarContent, JsRedoxBodyRef};
 use crate::sha256_hex;
 use anyhow::{ensure, Context, Result};
 use base64::Engine;
-use std::{collections::HashMap, fs, path::Path};
+use std::{fs, path::Path};
 use url::Url;
 
 fn short_hash(text: &str) -> String {
@@ -98,7 +98,7 @@ fn has_plausible_extension(name: &str, kind: &str) -> bool {
     }
 }
 
-fn insert_suffix(path: &str, suffix: &str) -> String {
+pub(super) fn insert_suffix(path: &str, suffix: &str) -> String {
     let p = Path::new(path);
     let parent = p.parent().unwrap_or_else(|| Path::new(""));
     let stem = p.file_stem().and_then(|x| x.to_str()).unwrap_or("resource");
@@ -282,48 +282,6 @@ pub(super) fn format_json_if_possible(bytes: &[u8]) -> Vec<u8> {
     };
     pretty.push(10);
     pretty
-}
-
-pub(super) fn write_resource(
-    root: &Path,
-    desired: String,
-    bytes: &[u8],
-    seen: &mut HashMap<String, String>,
-) -> Result<(String, bool)> {
-    let digest = sha256_hex(bytes);
-    let mut path = desired;
-    let mut reused = false;
-    if let Some(existing) = seen.get(&path) {
-        if existing == &digest {
-            reused = true;
-        } else {
-            let mut n = 2usize;
-            loop {
-                let candidate = insert_suffix(&path, &format!("~v{n}"));
-                match seen.get(&candidate) {
-                    Some(h) if h == &digest => {
-                        path = candidate;
-                        reused = true;
-                        break;
-                    }
-                    Some(_) => n += 1,
-                    None => {
-                        path = candidate;
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    if !reused {
-        let full = root.join(&path);
-        if let Some(parent) = full.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&full, bytes).with_context(|| format!("writing {}", full.display()))?;
-        seen.insert(path.clone(), digest);
-    }
-    Ok((path, reused))
 }
 
 #[cfg(test)]
