@@ -4,12 +4,12 @@
 use crate::numeric::exact_u32;
 use crate::value_eval::{canonical_array_index_key, same_value, Value};
 use oxc_syntax::symbol::SymbolId;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 pub(super) type AllocationId = usize;
 pub(super) type Locations = Rc<[AllocationId]>;
-type Properties = HashMap<String, Option<Fact>>;
+type Properties = HashMap<String, Property>;
 
 #[derive(Clone)]
 pub(super) enum Fact {
@@ -74,10 +74,47 @@ impl Fact {
     }
 }
 
-/// None represents an unknown value, not an unknown descriptor. The key
-/// remains known to be own, writable data whenever it appears in Properties.
+/// The value lattice is separate from the descriptor lattice. Unknown data
+/// values do not imply arbitrary getters or setters. MaybeData means either
+/// an absent own property or a writable own data property on every path.
 fn join_value(left: &Option<Fact>, right: &Option<Fact>) -> Option<Fact> {
     left.as_ref()?.join(right.as_ref()?)
+}
+
+#[derive(Clone)]
+enum Property {
+    Absent,
+    Data(Option<Fact>),
+    MaybeData(Option<Fact>),
+    Opaque,
+}
+
+impl Property {
+    fn join(&self, other: &Self) -> Self {
+        match (self, other) {
+            (Self::Absent, Self::Absent) => Self::Absent,
+            (Self::Data(left), Self::Data(right)) => Self::Data(join_value(left, right)),
+            (Self::Absent, Self::Data(value) | Self::MaybeData(value))
+            | (Self::Data(value) | Self::MaybeData(value), Self::Absent) => {
+                Self::MaybeData(value.clone())
+            }
+            (Self::Data(left) | Self::MaybeData(left), Self::MaybeData(right))
+            | (Self::MaybeData(left), Self::Data(right)) => {
+                Self::MaybeData(join_value(left, right))
+            }
+            _ => Self::Opaque,
+        }
+    }
+}
+
+/// Explicit prototypes of fresh allocations are known by identity. The
+/// ordinary intrinsic prototype is deliberately unknown: its properties
+/// may have been modified before a literal was even evaluated.
+#[derive(Clone)]
+enum Prototype {
+    Unknown,
+    Null,
+    Objects(Locations),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -89,37 +126,80 @@ pub(super) enum AllocationKind {
 #[derive(Clone)]
 pub(super) struct OwnData {
     kind: AllocationKind,
+    prototype: Prototype,
     properties: Properties,
+    unlisted: Property,
 }
 
 impl OwnData {
     pub(super) fn new(kind: AllocationKind) -> Self {
         Self {
             kind,
+            prototype: Prototype::Unknown,
             properties: HashMap::new(),
+            unlisted: Property::Absent,
         }
     }
 
-    pub(super) fn insert(&mut self, key: String, value: Option<Fact>) {
-        self.properties.insert(key, value);
+    pub(super) fn define_data(&mut self, key: String, value: Option<Fact>) {
+        self.properties.insert(key, Property::Data(value));
     }
 
-    pub(super) fn remove(&mut self, key: &str) {
-        self.properties.remove(key);
+    pub(super) fn define_accessor(&mut self, key: String) {
+        self.properties.insert(key, Property::Opaque);
     }
 
-    pub(super) fn clear(&mut self) {
-        self.properties.clear();
+    pub(super) fn set_literal_prototype(&mut self, value: Option<Fact>) {
+        match value {
+            Some(Fact::Primitive(Value::Null)) => self.prototype = Prototype::Null,
+            Some(Fact::Objects(locations)) => self.prototype = Prototype::Objects(locations),
+            None => self.prototype = Prototype::Unknown,
+            // The special colon form ignores non-object, non-null values.
+            Some(Fact::Primitive(_)) => {}
+        }
+    }
+
+    fn delete_own(&mut self, key: &str) {
+        self.properties.insert(key.to_owned(), Property::Absent);
+    }
+
+    /// An unknown computed definition can overwrite any one own key,
+    /// and an unknown spread can overwrite any subset. Both join with the
+    /// previous descriptor instead of conflating unknown values with accessors.
+    pub(super) fn define_unknown_key(&mut self, is_data: bool, value: Option<Fact>) {
+        let definition = if is_data {
+            Property::Data(value)
+        } else {
+            Property::Opaque
+        };
+        for property in self.properties.values_mut() {
+            *property = property.join(&definition);
+        }
+        self.unlisted = self.unlisted.join(&definition);
+    }
+
+    /// Array spread cannot overwrite any of the already created prefix
+    /// elements. Unknown later indices are data or absent, never accessors.
+    pub(super) fn unknown_array_tail(&mut self) {
+        self.unlisted = Property::MaybeData(None);
+    }
+
+    fn property(&self, key: &str) -> &Property {
+        self.properties.get(key).unwrap_or(&self.unlisted)
     }
 
     fn join(&mut self, other: &Self) {
-        self.properties.retain(|key, value| {
-            let Some(right) = other.properties.get(key) else {
-                return false;
-            };
-            *value = join_value(value, right);
-            true
-        });
+        // A single allocation's prototype cannot change on any modeled
+        // path. Unknown prototype mutation invalidates the allocation.
+        for (key, property) in &mut self.properties {
+            *property = property.join(other.property(key));
+        }
+        for (key, property) in &other.properties {
+            self.properties
+                .entry(key.clone())
+                .or_insert_with(|| self.unlisted.join(property));
+        }
+        self.unlisted = self.unlisted.join(&other.unlisted);
     }
 
     fn is_length(&self, key: &str) -> bool {
@@ -130,9 +210,15 @@ impl OwnData {
         exact_u32(value.as_ref()?.primitive()?.number()?)
     }
 
+    fn exact_length(&self) -> Option<u32> {
+        let Property::Data(value) = self.property("length") else {
+            return None;
+        };
+        Self::length_value(value)
+    }
+
     fn can_write(&self, key: &str, value: &Option<Fact>) -> bool {
-        self.properties.contains_key(key)
-            && (!self.is_length(key) || Self::length_value(value).is_some())
+        !self.is_length(key) || Self::length_value(value).is_some()
     }
 
     fn write(&mut self, key: &str, value: Option<Fact>) {
@@ -142,16 +228,36 @@ impl OwnData {
             };
             // All indexed properties of a still-fresh Array literal are
             // configurable. ArraySetLength only removes indices >= length.
-            self.properties
-                .retain(|key, _| canonical_array_index_key(key).is_none_or(|index| index < length));
-            self.insert(
+            for (key, property) in &mut self.properties {
+                if canonical_array_index_key(key).is_some_and(|index| index >= length) {
+                    *property = Property::Absent;
+                }
+            }
+            self.define_data(
                 key.to_owned(),
                 Some(Fact::Primitive(Value::Number(f64::from(length)))),
             );
         } else {
-            self.insert(key.to_owned(), value);
+            if self.kind == AllocationKind::Array {
+                if let Some(index) = canonical_array_index_key(key) {
+                    let length = self.exact_length().map(|length| {
+                        Fact::Primitive(Value::Number(f64::from(length.max(index + 1))))
+                    });
+                    self.define_data("length".to_owned(), length);
+                }
+            }
+            self.define_data(key.to_owned(), value);
         }
     }
+}
+
+/// Outer None means no proved normal lookup yet; inner None is an
+/// effect-free data lookup whose value is unknown.
+fn join_lookup(result: &mut Option<Option<Fact>>, value: Option<Fact>) {
+    *result = Some(match result.take() {
+        Some(previous) => join_value(&previous, &value),
+        None => value,
+    });
 }
 
 #[derive(Clone, Default)]
@@ -221,16 +327,50 @@ impl Environment {
         }
     }
 
-    /// Outer None means potential inherited/accessor/missing property read.
-    /// Inner None means a known own-data read of an unknown value.
+    /// Resolve ordinary [[Get]] from every possible receiver and prototype.
+    /// Every successful path must reach either known ordinary writable data
+    /// or a null prototype, without an opaque descriptor or unknown object.
+    /// This is also sufficient to establish ordinary [[Set]] eligibility.
     pub(super) fn read(&self, locations: &Locations, key: &str) -> Option<Option<Fact>> {
-        let (&first, rest) = locations.split_first()?;
-        let mut value = self.allocations.get(&first)?.properties.get(key)?.clone();
-        for id in rest {
-            let right = self.allocations.get(id)?.properties.get(key)?;
-            value = join_value(&value, right);
+        if let [id] = locations.as_ref() {
+            if let Property::Data(value) = self.allocations.get(id)?.property(key) {
+                return Some(value.clone());
+            }
         }
-        Some(value)
+        let mut pending = locations.to_vec();
+        let mut visited = HashSet::new();
+        let mut result = None;
+        while let Some(id) = pending.pop() {
+            if !visited.insert(id) {
+                continue;
+            }
+            let data = self.allocations.get(&id)?;
+            match data.property(key) {
+                Property::Data(value) => {
+                    join_lookup(&mut result, value.clone());
+                    continue;
+                }
+                Property::MaybeData(value) => join_lookup(&mut result, value.clone()),
+                Property::Absent => {}
+                Property::Opaque => return None,
+            }
+            match &data.prototype {
+                Prototype::Unknown => return None,
+                Prototype::Null => {
+                    join_lookup(&mut result, Some(Fact::Primitive(Value::Undefined)));
+                }
+                Prototype::Objects(prototypes) => {
+                    // Literal prototypes already existed at allocation.
+                    // Check the invariant before following any edges.
+                    if prototypes.is_empty() || prototypes.iter().any(|&prototype| prototype >= id)
+                    {
+                        return None;
+                    }
+                    pending.extend(prototypes.iter().copied());
+                }
+            }
+        }
+        result
     }
 
     fn update(
@@ -268,6 +408,13 @@ impl Environment {
     }
 
     pub(super) fn write(&mut self, locations: &Locations, key: &str, value: Option<Fact>) -> bool {
+        // Own data, inherited writable data, and missing properties on a
+        // fully known prototype chain all define/update own data without
+        // an arbitrary setter. The receiver still needs its exotic Array
+        // length rules checked separately.
+        if self.read(locations, key).is_none() {
+            return false;
+        }
         self.update(
             locations,
             |data| data.can_write(key, &value),
@@ -281,7 +428,7 @@ impl Environment {
         self.update(
             locations,
             |data| !data.is_length(key),
-            |data| data.remove(key),
+            |data| data.delete_own(key),
         )
     }
 }
