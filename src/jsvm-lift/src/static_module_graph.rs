@@ -662,7 +662,9 @@ mod tests {
     use super::link_static_modules;
     use crate::{
         capture_project::{CaptureManifest, CaptureSource},
-        document_entrypoints::{CapturedScriptSource, DocumentEntrypoints, DocumentScriptRoot},
+        document_entrypoints::{
+            CapturedScriptSource, DocumentEntrypoints, DocumentScriptRoot, ScriptAttributes,
+        },
         sha256_hex,
     };
     use serde_json::json;
@@ -855,9 +857,7 @@ mod tests {
                 script_type: "module".into(),
                 executable: true,
                 is_module: true,
-                async_attribute: false,
-                defer_attribute: false,
-                nomodule_attribute: false,
+                attributes: ScriptAttributes::default(),
                 scheduling_class: "deferred",
                 src: Some("main.js".into()),
                 resolved_url: Some("https://example.test/main.js".into()),

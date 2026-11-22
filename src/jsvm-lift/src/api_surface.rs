@@ -960,8 +960,10 @@ impl Collector<'_, '_> {
         let mut mutated = false;
         // Captured function values may outlive replacement of their original
         // global property. Do not discard their potentially real invocation.
-        let mut binding_families =
-            vec![(family, callable.captured || callable.constructor_captured)];
+        let mut binding_families = vec![(
+            family,
+            callable.is_captured() || callable.constructor_captured,
+        )];
         if callable.kind == ApiKind::XhrOpen {
             binding_families.push(("xhr", callable.constructor_captured));
         }
@@ -1006,40 +1008,7 @@ impl Collector<'_, '_> {
         if candidate && method.2.as_deref() == Some("exact") {
             method.2 = Some("conditional".into());
         }
-        let proof = if mutated {
-            if callable.invocation_form() == "wrapper" {
-                "forwarded_api_binding_or_local_wrapper_may_be_mutated"
-            } else if callable.captured || callable.constructor_captured {
-                "captured_api_binding_or_native_dispatch_may_be_mutated"
-            } else {
-                match callable.kind {
-                    ApiKind::Fetch => "unresolved_global_member_mutation_may_replace_fetch",
-                    ApiKind::Beacon => "unresolved_global_member_mutation_may_replace_sendBeacon",
-                    ApiKind::WebSocket => "unresolved_global_member_mutation_may_replace_WebSocket",
-                    ApiKind::XhrOpen => {
-                        "unresolved_global_member_mutation_may_replace_XMLHttpRequest_or_open"
-                    }
-                    ApiKind::XhrConstructor => STANDARD_BROWSER_API_ASSUMPTION,
-                }
-            }
-        } else if escaped {
-            "unreassigned_binding_initialized_from_standard_XMLHttpRequest_but_receiver_escapes_or_is_mutable"
-        } else if callable.invocation_form() == "wrapper" {
-            "stable_local_wrapper_with_semantically_forwarded_arguments"
-        } else if matches!(
-            callable.invocation_form(),
-            "call" | "apply" | "reflect_apply"
-        ) {
-            "native_api_dispatch_with_proven_receiver"
-        } else if callable.bound {
-            "native_bound_api_with_proven_receiver"
-        } else if callable.captured {
-            "immutable_lexical_api_alias"
-        } else if callable.kind == ApiKind::XhrOpen {
-            "stable_symbol_initialized_from_standard_XMLHttpRequest"
-        } else {
-            STANDARD_BROWSER_API_ASSUMPTION
-        };
+        let proof = invocation_proof(callable, mutated, escaped);
         let callee_text = global_path(self.scoping, self.constants, callee)
             .unwrap_or_else(|| source_fragment(self.source, callee.span()));
         let (line, column) = self.lines.byte_line_column(span.start as usize);
@@ -1066,6 +1035,44 @@ impl Collector<'_, '_> {
             url: url.0,
             url_expression: url.1,
         });
+    }
+}
+
+/// Classify the assumptions of a call after collecting its source evidence.
+fn invocation_proof(callable: &Callable, mutated: bool, escaped: bool) -> &'static str {
+    if mutated {
+        if callable.invocation_form() == "wrapper" {
+            "forwarded_api_binding_or_local_wrapper_may_be_mutated"
+        } else if callable.is_captured() || callable.constructor_captured {
+            "captured_api_binding_or_native_dispatch_may_be_mutated"
+        } else {
+            match callable.kind {
+                ApiKind::Fetch => "unresolved_global_member_mutation_may_replace_fetch",
+                ApiKind::Beacon => "unresolved_global_member_mutation_may_replace_sendBeacon",
+                ApiKind::WebSocket => "unresolved_global_member_mutation_may_replace_WebSocket",
+                ApiKind::XhrOpen => {
+                    "unresolved_global_member_mutation_may_replace_XMLHttpRequest_or_open"
+                }
+                ApiKind::XhrConstructor => STANDARD_BROWSER_API_ASSUMPTION,
+            }
+        }
+    } else if escaped {
+        "unreassigned_binding_initialized_from_standard_XMLHttpRequest_but_receiver_escapes_or_is_mutable"
+    } else if callable.invocation_form() == "wrapper" {
+        "stable_local_wrapper_with_semantically_forwarded_arguments"
+    } else if matches!(
+        callable.invocation_form(),
+        "call" | "apply" | "reflect_apply"
+    ) {
+        "native_api_dispatch_with_proven_receiver"
+    } else if callable.is_bound() {
+        "native_bound_api_with_proven_receiver"
+    } else if callable.is_captured() {
+        "immutable_lexical_api_alias"
+    } else if callable.kind == ApiKind::XhrOpen {
+        "stable_symbol_initialized_from_standard_XMLHttpRequest"
+    } else {
+        STANDARD_BROWSER_API_ASSUMPTION
     }
 }
 

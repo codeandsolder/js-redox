@@ -18,8 +18,36 @@ use crate::{
     wasm_materialize::{materialize_wasm, WasmMaterializeSummary},
     wasm_resource_provenance::{correlate_wasm_resource_provenance, WasmResourceProvenanceSummary},
 };
-use anyhow::{ensure, Result};
+use anyhow::Result;
 use std::path::PathBuf;
+
+/// Source reconstruction stages form a dependency chain: bundle recovery
+/// requires the safe deobfuscation output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceRecovery {
+    Disabled,
+    Deobfuscate,
+    Bundles,
+}
+
+impl SourceRecovery {
+    #[must_use]
+    pub const fn deobfuscates(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+
+    #[must_use]
+    pub const fn materializes_bundles(self) -> bool {
+        matches!(self, Self::Bundles)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CaptureStages {
+    pub source: SourceRecovery,
+    pub wasm_analysis: bool,
+    pub vm_scan: bool,
+}
 
 #[derive(Debug, Clone)]
 pub struct CapturePipelineOptions {
@@ -28,10 +56,7 @@ pub struct CapturePipelineOptions {
     pub assets_dir: Option<PathBuf>,
     pub overwrite: bool,
     pub jobs: Option<usize>,
-    pub safe_deobfuscation: bool,
-    pub bundle_materialization: bool,
-    pub wasm_analysis: bool,
-    pub vm_scan: bool,
+    pub stages: CaptureStages,
     pub budgets: AnalysisBudgets,
 }
 
@@ -60,14 +85,9 @@ pub struct CapturePipelineSummary {
 ///
 /// # Errors
 ///
-/// Rejects bundle materialization without safe deobfuscation. Also propagates capture import,
-/// project artifact read/write, subordinate analysis and resource-budget failures.
+/// Propagates capture import, project artifact read/write, subordinate
+/// analysis and resource-budget failures.
 pub fn recover_capture_project(options: &CapturePipelineOptions) -> Result<CapturePipelineSummary> {
-    ensure!(
-        !options.bundle_materialization || options.safe_deobfuscation,
-        "bundle materialization requires safe deobfuscation"
-    );
-
     let import = import_capture_project(
         &CaptureImportOptions {
             input: options.input.clone(),
@@ -83,23 +103,27 @@ pub fn recover_capture_project(options: &CapturePipelineOptions) -> Result<Captu
     let source = materialize_capture_source(project, options.jobs, &options.budgets)?;
 
     let wasm = options
+        .stages
         .wasm_analysis
         .then(|| materialize_wasm(project, None, &options.budgets))
         .transpose()?;
-    let wasm_resource_provenance = if options.wasm_analysis && manifest.source.kind == "recorder" {
-        Some(correlate_wasm_resource_provenance(
-            project,
-            &options.budgets,
-        )?)
-    } else {
-        None
-    };
+    let wasm_resource_provenance =
+        if options.stages.wasm_analysis && manifest.source.kind == "recorder" {
+            Some(correlate_wasm_resource_provenance(
+                project,
+                &options.budgets,
+            )?)
+        } else {
+            None
+        };
 
     let sourcemaps = recover_project_sourcemaps(project, &options.budgets)?;
     let references = scan_project_references(project, options.jobs, &options.budgets)?;
 
     let deobfuscation = options
-        .safe_deobfuscation
+        .stages
+        .source
+        .deobfuscates()
         .then(|| {
             materialize_project_deobfuscation(
                 project,
@@ -112,7 +136,9 @@ pub fn recover_capture_project(options: &CapturePipelineOptions) -> Result<Captu
         })
         .transpose()?;
     let bundles = options
-        .bundle_materialization
+        .stages
+        .source
+        .materializes_bundles()
         .then(|| materialize_bundle_modules(project, options.jobs, &options.budgets))
         .transpose()?;
 
@@ -121,13 +147,13 @@ pub fn recover_capture_project(options: &CapturePipelineOptions) -> Result<Captu
     let observed_sources = materialize_observed_runtime_sources(project, &options.budgets)?;
     let observed_invocations = materialize_invocation_views(project, &options.budgets)?;
 
-    let wasm_js_boundary = if options.wasm_analysis && options.safe_deobfuscation {
+    let wasm_js_boundary = if options.stages.wasm_analysis && options.stages.source.deobfuscates() {
         Some(correlate_wasm_js_boundary(project, &options.budgets)?)
     } else {
         None
     };
 
-    let (vm_scan, vm_materialization) = if options.vm_scan {
+    let (vm_scan, vm_materialization) = if options.stages.vm_scan {
         let scan = scan_project(
             project,
             &ProjectScanOptions {
@@ -254,10 +280,11 @@ mod tests {
             assets_dir: None,
             overwrite: false,
             jobs: Some(2),
-            safe_deobfuscation: true,
-            bundle_materialization: false,
-            wasm_analysis: false,
-            vm_scan: true,
+            stages: CaptureStages {
+                source: SourceRecovery::Deobfuscate,
+                wasm_analysis: false,
+                vm_scan: true,
+            },
             budgets: AnalysisBudgets::standard("capture-pipeline-vm-test"),
         }
     }
@@ -269,10 +296,11 @@ mod tests {
             assets_dir: None,
             overwrite: false,
             jobs: Some(2),
-            safe_deobfuscation: true,
-            bundle_materialization: true,
-            wasm_analysis: false,
-            vm_scan: false,
+            stages: CaptureStages {
+                source: SourceRecovery::Bundles,
+                wasm_analysis: false,
+                vm_scan: false,
+            },
             budgets: AnalysisBudgets::standard("capture-pipeline-static-test"),
         }
     }

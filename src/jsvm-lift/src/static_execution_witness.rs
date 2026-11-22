@@ -167,7 +167,7 @@ pub fn join_initial_source_coverage(
 mod tests {
     use super::*;
     use crate::document_entrypoints::{
-        CapturedScriptSource, DocumentEntrypoints, DocumentScriptRoot,
+        CapturedScriptSource, DocumentEntrypoints, DocumentScriptRoot, ScriptAttributes,
     };
     use serde_json::json;
 
@@ -184,9 +184,7 @@ mod tests {
                 script_type: "text/javascript".into(),
                 executable: true,
                 is_module: false,
-                async_attribute: false,
-                defer_attribute: false,
-                nomodule_attribute: false,
+                attributes: ScriptAttributes::default(),
                 scheduling_class: "parser_blocking",
                 src: None,
                 resolved_url: None,

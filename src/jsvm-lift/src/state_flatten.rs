@@ -4949,7 +4949,7 @@ impl LoopRunner<'_, '_> {
     }
 
     fn build_opcode_map(
-        &mut self,
+        &self,
         switch: &SwitchStatement<'_>,
     ) -> Result<Option<OpcodeMapCandidate>, BudgetExceeded> {
         self.budget.checkpoint()?;

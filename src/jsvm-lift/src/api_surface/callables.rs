@@ -436,14 +436,23 @@ struct WitnessLink {
     dependency: Option<String>,
 }
 
+/// Receiver attachment and lexical capture describe one callable value.
+/// A bound function is always captured, and a detached alias is always
+/// captured but cannot be invoked directly with its original receiver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Binding {
+    Direct,
+    Captured,
+    Detached,
+    Bound,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct Callable {
     pub(super) kind: ApiKind,
     pub(super) receiver: Option<SymbolId>,
-    pub(super) captured: bool,
+    binding: Binding,
     pub(super) constructor_captured: bool,
-    pub(super) bound: bool,
-    detached: bool,
     pub(super) prefix: ApiArguments,
     witness: Option<Rc<WitnessLink>>,
     bound_object: Option<Span>,
@@ -458,10 +467,8 @@ impl Callable {
         Self {
             kind,
             receiver: None,
-            captured: false,
+            binding: Binding::Direct,
             constructor_captured: false,
-            bound: false,
-            detached: false,
             prefix: ApiArguments::default(),
             witness: None,
             bound_object: None,
@@ -512,8 +519,21 @@ impl Callable {
     }
 
     pub(super) const fn capture_as_argument(&mut self) {
-        self.captured = true;
-        self.detached = !self.bound && self.kind.needs_receiver();
+        if !self.is_bound() {
+            self.binding = if self.kind.needs_receiver() {
+                Binding::Detached
+            } else {
+                Binding::Captured
+            };
+        }
+    }
+
+    pub(super) const fn is_captured(&self) -> bool {
+        !matches!(self.binding, Binding::Direct)
+    }
+
+    pub(super) const fn is_bound(&self) -> bool {
+        matches!(self.binding, Binding::Bound)
     }
 
     pub(super) fn witnesses(&self) -> Vec<ApiBindingWitness> {
@@ -574,9 +594,9 @@ impl Callable {
     pub(super) const fn invocation_form(&self) -> &'static str {
         if let Some(dispatch) = self.dispatch {
             dispatch
-        } else if self.bound {
+        } else if self.is_bound() {
             "bound"
-        } else if self.captured {
+        } else if self.is_captured() {
             "alias"
         } else {
             "direct"
@@ -584,7 +604,7 @@ impl Callable {
     }
 
     pub(super) const fn callable_as(&self, constructor: bool) -> bool {
-        self.kind.is_constructor() == constructor && !self.detached
+        self.kind.is_constructor() == constructor && !matches!(self.binding, Binding::Detached)
     }
 }
 
@@ -649,7 +669,9 @@ impl Namespace {
     fn callable(&self, key: &str) -> Option<Callable> {
         let kind = ApiKind::from_global(&self.property(key)?)?;
         let mut callable = Callable::native(kind);
-        callable.captured = self.witness.is_some();
+        if self.witness.is_some() {
+            callable.binding = Binding::Captured;
+        }
         callable.witness.clone_from(&self.witness);
         callable
             .namespace_dependencies
@@ -880,7 +902,7 @@ impl CallableIndex {
                 let constructor = self.xhr.get(&symbol)?.at(object.span().start)?;
                 let mut callable = Callable::native(ApiKind::XhrOpen);
                 callable.receiver = Some(symbol);
-                callable.constructor_captured = constructor.captured;
+                callable.constructor_captured = constructor.is_captured();
                 callable.witness.clone_from(&constructor.witness);
                 callable
                     .namespace_dependencies
@@ -954,9 +976,7 @@ impl CallableIndex {
             scoping,
             constants,
         );
-        callable.bound = true;
-        callable.captured = true;
-        callable.detached = false;
+        callable.binding = Binding::Bound;
         callable.bound_object = Some(site.allocation);
         Some(callable)
     }
@@ -977,7 +997,7 @@ impl CallableIndex {
             {
                 Some(None)
             }
-            _ if callable.bound || callable.kind.is_constructor() => Some(None),
+            _ if callable.is_bound() || callable.kind.is_constructor() => Some(None),
             _ => None,
         }
     }
@@ -991,7 +1011,7 @@ impl CallableIndex {
     ) -> bool {
         let namespace = receiver.and_then(|expr| self.namespace(expr, scoping, constants));
         let path = namespace.as_ref().map(|ns| ns.path.as_str());
-        callable.bound
+        callable.is_bound()
             || callable.kind.is_constructor()
             || match callable.kind {
                 ApiKind::Fetch => {
@@ -1015,7 +1035,7 @@ impl CallableIndex {
         constants: &ProvenConstantEnvironment,
     ) {
         // Rebinding an already bound function ignores the supplied receiver.
-        if callable.bound || callable.kind.is_constructor() {
+        if callable.is_bound() || callable.kind.is_constructor() {
             return;
         }
         if let Some(namespace) = receiver.and_then(|expr| self.namespace(expr, scoping, constants))
@@ -1082,7 +1102,9 @@ impl CallableIndex {
         } else {
             callable.dispatch_member_family(operation)
         };
-        callable.detached = false;
+        if matches!(callable.binding, Binding::Detached) {
+            callable.binding = Binding::Captured;
+        }
         if !callable.is_returned() {
             callable.dispatch = Some(operation);
         }
@@ -1214,8 +1236,7 @@ impl BindingCollector<'_, '_> {
                 }
                 match value {
                     NamespaceValue::Callable(mut callable) => {
-                        callable.captured = true;
-                        callable.detached = !callable.bound && callable.kind.needs_receiver();
+                        callable.capture_as_argument();
                         callable.add_witness(kind, span, None);
                         self.index.aliases.insert(
                             symbol,

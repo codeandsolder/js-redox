@@ -8,9 +8,11 @@ use jsvm_lift::{
         WASM_RESOURCE_PROVENANCE,
     },
     analysis_budget::AnalysisBudgets,
-    capture_pipeline::{recover_capture_project, CapturePipelineOptions},
+    capture_pipeline::{
+        recover_capture_project, CapturePipelineOptions, CaptureStages, SourceRecovery,
+    },
     capture_project::{read_manifest, write_manifest, MANIFEST_NAME},
-    http_capture::{capture_url_to_har, HttpCaptureLimits},
+    http_capture::{capture_url_to_har, HttpCaptureLimits, HttpCaptureSummary},
     project_readme::refresh_project_readme,
 };
 use serde_json::Value;
@@ -30,10 +32,8 @@ struct Args {
     overwrite: bool,
     #[arg(long)]
     jobs: Option<usize>,
-    #[arg(long)]
-    skip_safe_deobfuscation: bool,
-    #[arg(long)]
-    skip_bundle_unpack: bool,
+    #[command(flatten)]
+    source: SourceArgs,
     #[arg(long)]
     skip_vm_scan: bool,
     #[arg(long)]
@@ -47,6 +47,26 @@ struct Args {
     /// Per-response HTTP byte cap in MiB.
     #[arg(long, default_value_t = 8)]
     http_max_resource_mib: usize,
+}
+
+#[derive(clap::Args, Debug)]
+struct SourceArgs {
+    #[arg(long)]
+    skip_safe_deobfuscation: bool,
+    #[arg(long)]
+    skip_bundle_unpack: bool,
+}
+
+impl SourceArgs {
+    const fn recovery(&self) -> SourceRecovery {
+        if self.skip_safe_deobfuscation {
+            SourceRecovery::Disabled
+        } else if self.skip_bundle_unpack {
+            SourceRecovery::Deobfuscate
+        } else {
+            SourceRecovery::Bundles
+        }
+    }
 }
 
 fn optional_artifact(project: &Path, spec: ArtifactSpec) -> Result<Value> {
@@ -79,13 +99,9 @@ fn recovered_sourcemap_sources(document: &Value) -> usize {
         .count()
 }
 
-fn print_summary(
-    project: &Path,
-    wasm_analysis: bool,
-    safe_deob: bool,
-    bundle_unpack: bool,
-    vm_scan: bool,
-) -> Result<()> {
+fn print_summary(project: &Path, stages: CaptureStages) -> Result<()> {
+    let wasm_analysis = stages.wasm_analysis;
+    let vm_scan = stages.vm_scan;
     let manifest = read_manifest(&project.join(MANIFEST_NAME))?;
     let source_index = load_artifact(project, SOURCE_INDEX)?;
     let sourcemaps = load_artifact(project, SOURCEMAPS)?;
@@ -103,50 +119,6 @@ fn print_summary(
         .filter(|unit| unit.get("kind").and_then(Value::as_str) == Some("javascript"))
         .count();
 
-    let wasm = if wasm_analysis {
-        optional_artifact(project, WASM_INDEX)?
-    } else {
-        Value::Null
-    };
-    let wasm_runtime = if wasm_analysis {
-        optional_artifact(project, WASM_RESOURCE_PROVENANCE)?
-    } else {
-        Value::Null
-    };
-    let wasm_boundary = if wasm_analysis && safe_deob {
-        optional_artifact(project, WASM_JS_BOUNDARY)?
-    } else {
-        Value::Null
-    };
-    let deob = if safe_deob {
-        optional_artifact(project, DEOBFUSCATION)?
-    } else {
-        Value::Null
-    };
-    let bundles = if safe_deob && bundle_unpack {
-        optional_artifact(project, BUNDLES)?
-    } else {
-        Value::Null
-    };
-    let generated = if vm_scan {
-        optional_artifact(project, GENERATED_RECOVERY)?
-    } else {
-        Value::Null
-    };
-    let vm = if vm_scan {
-        optional_artifact(project, JSVM_INDEX)?
-    } else {
-        Value::Null
-    };
-
-    let dynamic_units = vm
-        .get("dynamic_code_units")
-        .and_then(Value::as_array)
-        .map_or(0, Vec::len);
-    let devirtualized_units = vm
-        .get("devirtualized_units")
-        .and_then(Value::as_array)
-        .map_or(0, Vec::len);
     let runtime_events = summary_u64(&runtime, "script_parsed_events");
     let runtime_sources = summary_u64(&runtime, "unique_javascript_sources");
     let graph_nodes = summary_u64(&graph, "nodes");
@@ -174,52 +146,12 @@ fn print_summary(
         summary_u64(&references, "references")
     );
     println!("  API callsites:        {}", summary_u64(&api, "callsites"));
-    if safe_deob {
-        println!(
-            "  safe-deob changed:    {}",
-            summary_u64(&deob, "changed_units")
-        );
-    }
-    if safe_deob && bundle_unpack {
-        println!(
-            "  bundle modules:       {}",
-            summary_u64(&bundles, "modules")
-        );
-    }
+    print_source_summary(project, stages.source)?;
     if wasm_analysis {
-        println!(
-            "  WebAssembly modules:  {} ({} origin(s))",
-            summary_u64(&wasm, "modules"),
-            summary_u64(&wasm, "origins")
-        );
-        if wasm_runtime
-            .get("summary")
-            .and_then(|summary| summary.get("applicable"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            println!(
-                "  runtime WASM:         {} observation(s)",
-                summary_u64(&wasm_runtime, "observations")
-            );
-        }
-        if safe_deob {
-            println!(
-                "  copied-input proofs:  {}/{}",
-                summary_u64(&wasm_boundary, "proven_js_typed_array_copy_semantics"),
-                summary_u64(&wasm_boundary, "copied_input_candidates")
-            );
-        }
+        print_wasm_summary(project, stages.source)?;
     }
     if vm_scan {
-        println!("  dynamic units:        {dynamic_units}");
-        println!("  devirtualized VMs:    {devirtualized_units}");
-        println!(
-            "  generated recovery:   safe={} string-only={} exact-fallback={}",
-            summary_u64(&generated, "safe_deobfuscation"),
-            summary_u64(&generated, "string_recovery_only"),
-            summary_u64(&generated, "exact_fallback")
-        );
+        print_vm_summary(project)?;
     }
     if runtime_events != 0 {
         println!("  runtime scripts:      {runtime_events} events -> {runtime_sources} unique");
@@ -232,6 +164,115 @@ fn print_summary(
         );
     }
     println!("  source graph:         {graph_nodes} nodes / {graph_edges} edges / {graph_unresolved} unresolved claims");
+    Ok(())
+}
+
+fn print_source_summary(project: &Path, source: SourceRecovery) -> Result<()> {
+    if source.deobfuscates() {
+        let deob = optional_artifact(project, DEOBFUSCATION)?;
+        println!(
+            "  safe-deob changed:    {}",
+            summary_u64(&deob, "changed_units")
+        );
+    }
+    if source.materializes_bundles() {
+        let bundles = optional_artifact(project, BUNDLES)?;
+        println!(
+            "  bundle modules:       {}",
+            summary_u64(&bundles, "modules")
+        );
+    }
+    Ok(())
+}
+
+fn print_wasm_summary(project: &Path, source: SourceRecovery) -> Result<()> {
+    let wasm = optional_artifact(project, WASM_INDEX)?;
+    let runtime = optional_artifact(project, WASM_RESOURCE_PROVENANCE)?;
+    println!(
+        "  WebAssembly modules:  {} ({} origin(s))",
+        summary_u64(&wasm, "modules"),
+        summary_u64(&wasm, "origins")
+    );
+    if runtime
+        .get("summary")
+        .and_then(|summary| summary.get("applicable"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        println!(
+            "  runtime WASM:         {} observation(s)",
+            summary_u64(&runtime, "observations")
+        );
+    }
+    if source.deobfuscates() {
+        let boundary = optional_artifact(project, WASM_JS_BOUNDARY)?;
+        println!(
+            "  copied-input proofs:  {}/{}",
+            summary_u64(&boundary, "proven_js_typed_array_copy_semantics"),
+            summary_u64(&boundary, "copied_input_candidates")
+        );
+    }
+    Ok(())
+}
+
+fn print_vm_summary(project: &Path) -> Result<()> {
+    let vm = optional_artifact(project, JSVM_INDEX)?;
+    let generated = optional_artifact(project, GENERATED_RECOVERY)?;
+    let dynamic_units = vm
+        .get("dynamic_code_units")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let devirtualized_units = vm
+        .get("devirtualized_units")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    println!("  dynamic units:        {dynamic_units}");
+    println!("  devirtualized VMs:    {devirtualized_units}");
+    println!(
+        "  generated recovery:   safe={} string-only={} exact-fallback={}",
+        summary_u64(&generated, "safe_deobfuscation"),
+        summary_u64(&generated, "string_recovery_only"),
+        summary_u64(&generated, "exact_fallback")
+    );
+    Ok(())
+}
+
+fn archive_http_capture(
+    capture: &Path,
+    output: &Path,
+    requested_url: &str,
+    summary: &HttpCaptureSummary,
+) -> Result<()> {
+    let analysis = output.join("analysis");
+    let archived = analysis.join("http-capture.har");
+    jsvm_lift::report_file::copy_snapshot(
+        capture,
+        &archived,
+        &AnalysisBudgets::standard("http-capture-archive").scope("snapshot"),
+    )?;
+    jsvm_lift::report_file::write_json(&analysis.join("http-static.json"), summary)?;
+    let manifest_path = output.join(MANIFEST_NAME);
+    let mut manifest = read_manifest(&manifest_path)?;
+    manifest.source.kind = "http_static".into();
+    requested_url.clone_into(&mut manifest.source.input);
+    manifest
+        .source
+        .extra
+        .insert("requested_url".into(), summary.requested_url.clone().into());
+    manifest
+        .source
+        .extra
+        .insert("final_url".into(), summary.final_url.clone().into());
+    manifest
+        .source
+        .extra
+        .insert("captured_har".into(), "analysis/http-capture.har".into());
+    manifest
+        .source
+        .extra
+        .insert("http_static".into(), serde_json::to_value(summary)?);
+    write_manifest(&manifest_path, &manifest)?;
+    refresh_project_readme(output, &AnalysisBudgets::standard("http-project-readme"))?;
     Ok(())
 }
 
@@ -285,9 +326,11 @@ fn main() -> Result<()> {
         })
         .transpose()?;
 
-    let safe_deob = !args.skip_safe_deobfuscation;
-    let bundle_unpack = safe_deob && !args.skip_bundle_unpack;
-    let wasm_analysis = !args.skip_wasm_analysis;
+    let stages = CaptureStages {
+        source: args.source.recovery(),
+        wasm_analysis: !args.skip_wasm_analysis,
+        vm_scan: !args.skip_vm_scan,
+    };
 
     recover_capture_project(&CapturePipelineOptions {
         input: capture.clone(),
@@ -295,51 +338,13 @@ fn main() -> Result<()> {
         assets_dir,
         overwrite: args.overwrite,
         jobs: args.jobs,
-        safe_deobfuscation: safe_deob,
-        bundle_materialization: bundle_unpack,
-        wasm_analysis,
-        vm_scan: !args.skip_vm_scan,
+        stages,
         budgets: AnalysisBudgets::standard("capture-project"),
     })?;
 
     if let Some(summary) = http_summary {
-        let analysis = output.join("analysis");
-        let archived = analysis.join("http-capture.har");
-        jsvm_lift::report_file::copy_snapshot(
-            &capture,
-            &archived,
-            &AnalysisBudgets::standard("http-capture-archive").scope("snapshot"),
-        )?;
-        jsvm_lift::report_file::write_json(&analysis.join("http-static.json"), &summary)?;
-        let manifest_path = output.join(MANIFEST_NAME);
-        let mut manifest = read_manifest(&manifest_path)?;
-        manifest.source.kind = "http_static".into();
-        manifest.source.input.clone_from(&args.capture);
-        manifest
-            .source
-            .extra
-            .insert("requested_url".into(), summary.requested_url.clone().into());
-        manifest
-            .source
-            .extra
-            .insert("final_url".into(), summary.final_url.clone().into());
-        manifest
-            .source
-            .extra
-            .insert("captured_har".into(), "analysis/http-capture.har".into());
-        manifest
-            .source
-            .extra
-            .insert("http_static".into(), serde_json::to_value(&summary)?);
-        write_manifest(&manifest_path, &manifest)?;
-        refresh_project_readme(&output, &AnalysisBudgets::standard("http-project-readme"))?;
+        archive_http_capture(&capture, &output, &args.capture, &summary)?;
     }
 
-    print_summary(
-        &output,
-        wasm_analysis,
-        safe_deob,
-        bundle_unpack,
-        !args.skip_vm_scan,
-    )
+    print_summary(&output, stages)
 }

@@ -2275,12 +2275,10 @@ pub fn js_parse_int(text: &str, mut radix: u32) -> Option<f64> {
     }
     let hexadecimal = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X"));
     let text = if inferred || radix == 16 {
-        if let Some(rest) = hexadecimal {
+        hexadecimal.map_or(text, |rest| {
             radix = 16;
             rest
-        } else {
-            text
-        }
+        })
     } else {
         text
     };
@@ -2376,7 +2374,7 @@ fn guaranteed_expression_calls(expression: &Expression<'_>, visit: &mut impl FnM
         }
         Expression::LogicalExpression(logical) => guaranteed_expression_calls(&logical.left, visit),
         Expression::ConditionalExpression(conditional) => {
-            guaranteed_expression_calls(&conditional.test, visit)
+            guaranteed_expression_calls(&conditional.test, visit);
         }
         Expression::AssignmentExpression(assignment) if !assignment.operator.is_logical() => {
             guaranteed_expression_calls(&assignment.right, visit);
@@ -2447,10 +2445,10 @@ impl<'a> Visit<'a> for RotationStatementSpanCollector {
                         }
                     }
                     Statement::IfStatement(statement) => {
-                        guaranteed_expression_calls(&statement.test, &mut record)
+                        guaranteed_expression_calls(&statement.test, &mut record);
                     }
                     Statement::SwitchStatement(statement) => {
-                        guaranteed_expression_calls(&statement.discriminant, &mut record)
+                        guaranteed_expression_calls(&statement.discriminant, &mut record);
                     }
                     _ => {}
                 }

@@ -177,7 +177,7 @@ impl<'a> Visit<'a> for StablePrimitiveBindings<'_> {
 
 /// Primitive arguments at exact source-resolved original callsites. Resolve
 /// literal expressions and immutable lexical constant chains by `SymbolId`.
-/// LiteralCallCollector with a spread stop collecting at its position: later indexes cannot
+/// Calls with a spread stop collecting at its position: later indexes cannot
 /// be reliably mapped to formal parameters.
 #[derive(Clone, Debug)]
 enum ExpressionInput {
