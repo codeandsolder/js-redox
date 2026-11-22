@@ -110,32 +110,26 @@ fn runtime_identity_index(
             if previous.sha256 != next.sha256 {
                 return false;
             }
-            retain_agreed(&mut previous.start_line, next.start_line);
-            retain_agreed(&mut previous.start_column, next.start_column);
+            retain_agreed(&mut previous.start_line, next.start_line.as_ref());
+            retain_agreed(&mut previous.start_column, next.start_column.as_ref());
             retain_agreed(
                 &mut previous.capture_instrumentation,
-                next.capture_instrumentation,
+                next.capture_instrumentation.as_ref(),
             );
-            previous.origin.retain_agreed(next.origin);
+            previous.origin.retain_agreed(&next.origin);
             true
         },
     )
 }
 
-/// Group source definitions by exact script and original coordinate, not by
-/// display name or inspector handle. Multiple function objects may share one
-/// definition site; observations remain separate from reference equality.
-fn append_observed_callable_definitions(
-    page: &mut String,
-    sources: &mut VerifiedSources<'_>,
+type DefinitionSites = BTreeMap<(String, String, u64, u64), Vec<Value>>;
+
+fn callable_definition_sites(
     identities: &RuntimeIdentityIndex,
-    session: Option<&str>,
+    session: &str,
     hit: &Value,
-) -> Result<()> {
-    let Some(session) = session else {
-        return Ok(());
-    };
-    let mut sites = BTreeMap::<(String, String, u64, u64), Vec<Value>>::new();
+) -> DefinitionSites {
+    let mut sites = DefinitionSites::new();
     let mut add = |value: &Value, seen_as: Value| {
         let Some(definition) = value.get("functionDefinition") else {
             return;
@@ -204,6 +198,23 @@ fn append_observed_callable_definitions(
             }),
         );
     }
+    sites
+}
+
+/// Group source definitions by exact script and original coordinate, not by
+/// display name or inspector handle. Multiple function objects may share one
+/// definition site; observations remain separate from reference equality.
+fn append_observed_callable_definitions(
+    page: &mut String,
+    sources: &mut VerifiedSources<'_>,
+    identities: &RuntimeIdentityIndex,
+    session: Option<&str>,
+    hit: &Value,
+) -> Result<()> {
+    let Some(session) = session else {
+        return Ok(());
+    };
+    let sites = callable_definition_sites(identities, session, hit);
     if sites.is_empty() {
         return Ok(());
     }
@@ -232,6 +243,119 @@ fn append_observed_callable_definitions(
         page.push_str(&display_json(&json!(seen_as))?);
         page.push('\n');
         page.push_str(&source_excerpt(&source, line, location.start_line));
+        page.push('\n');
+    }
+    Ok(())
+}
+
+fn append_guard_witnesses(page: &mut String, hit: &Value) -> Result<()> {
+    let guard_witnesses = hit
+        .get("observed_guard_witnesses")
+        .and_then(Value::as_array);
+    if let Some(witnesses) = guard_witnesses.filter(|items| !items.is_empty()) {
+        page.push_str("## Guard observations matched to original AST\n\n");
+        page.push_str("Only side-effect-checked booleans at an exact captured guard site appear here. A selected-arm label requires the next debugger pause with the same verified stack shape and in the original AST arm. A matching shape does not establish activation continuity. Missing steps are not inferred.\n\n");
+        for witness in witnesses {
+            let _ = writeln!(
+                page,
+                "- **Step {}** — {} guard observed **{}**; next pause in selected arm: **{}**.",
+                witness["step_index"].as_u64().unwrap_or(0),
+                literal_text(witness["kind"].as_str().unwrap_or("?")),
+                witness["observed_value"].as_bool().unwrap_or(false),
+                literal_text(
+                    witness["next_pause_in_selected_arm"]
+                        .as_str()
+                        .unwrap_or("not witnessed")
+                )
+            );
+            page.push_str(&fenced_code(
+                &serde_json::to_string(&witness["expression"])?,
+                "json",
+            ));
+            page.push('\n');
+        }
+        page.push('\n');
+    }
+    Ok(())
+}
+
+fn append_path_step(
+    page: &mut String,
+    sources: &mut VerifiedSources<'_>,
+    identities: &RuntimeIdentityIndex,
+    session: Option<&str>,
+    index: usize,
+    step: &Value,
+) -> Result<()> {
+    let top = step
+        .get("frames")
+        .and_then(Value::as_array)
+        .and_then(|frames| frames.first());
+    let Some(top) = top else {
+        let _ = write!(page, "## Step {index}: no executing frame captured\n\n");
+        return Ok(());
+    };
+    let function = top
+        .get("functionName")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("<anonymous>");
+    let location = &top["location"];
+    let script_id = location.get("scriptId").and_then(script_id_text);
+    let script = code_span(script_id.as_deref().unwrap_or("?"));
+    let line = location.get("lineNumber").and_then(Value::as_u64);
+    let column = location.get("columnNumber").and_then(Value::as_u64);
+    let _ =
+        write!(page,
+        "## Step {index}: {}\n\nV8 script {script}, original line {}, column {} (zero-based).\n\n",
+        literal_text(function),
+        line.map_or_else(|| "?".to_owned(), |v| v.to_string()),
+        column.map_or_else(|| "?".to_owned(), |v| v.to_string()),
+    );
+    let sha = top.get("sourceSha256").and_then(verified_sha);
+    let identity = script_id
+        .as_deref()
+        .and_then(|id| identities.get(session?, id));
+    let exact = top.get("source_identity").and_then(Value::as_str) == Some("exact")
+        && sha.is_some()
+        && identity.is_some_and(|source| Some(source.sha256.as_str()) == sha);
+    if exact {
+        let sha = sha.context("checked exact original step source")?;
+        let raw_path = format!("resources/runtime-scripts/{sha}.js");
+        if identity.is_some_and(|source| source.capture_instrumentation == Some(true))
+            && !sources.project.join(&raw_path).is_file()
+        {
+            let _ = write!(page,
+                "Exact captured script SHA-256 **{sha}**; this is **recorder instrumentation**,                      intentionally excluded from the recovered application source tree.                      No original-source excerpt or application link is claimed.\n\n"
+            );
+        } else {
+            let raw = sources.load(sha)?;
+            let _ = write!(
+                page,
+                "Verified [original source](../../../{raw_path}), SHA-256 **{sha}**.\n\n"
+            );
+            let readable = format!("src/_readable/runtime-scripts/{sha}.js");
+            if sources.project.join(&readable).is_file() {
+                let _ = write!(page,
+                    "[General safe-readable view](../../../{readable}) (different source offsets).\n\n"
+                );
+            }
+            if let Some(line) = line {
+                page.push_str(&source_excerpt(
+                    &raw,
+                    line,
+                    identity.and_then(|source| source.start_line),
+                ));
+                page.push('\n');
+            }
+        }
+    } else {
+        page.push_str("Original source identity **unresolved**; no code excerpt claimed.\n\n");
+    }
+    let expressions = step.get("expressions").and_then(Value::as_array);
+    if expressions.is_some_and(|items| !items.is_empty()) {
+        page.push_str("Expressions evaluated at this pause (rejected/unavailable results remain explicitly marked):\n\n");
+        page.push_str(&display_json(&json!(expressions))?);
         page.push('\n');
     }
     Ok(())
@@ -269,104 +393,9 @@ fn build_observed_path_view(
                 .unwrap_or("unknown")
         ),
     );
-    let guard_witnesses = hit
-        .get("observed_guard_witnesses")
-        .and_then(Value::as_array);
-    if let Some(witnesses) = guard_witnesses.filter(|items| !items.is_empty()) {
-        page.push_str("## Guard observations matched to original AST\n\n");
-        page.push_str("Only side-effect-checked booleans at an exact captured guard site appear here. A selected-arm label requires the next debugger pause with the same verified stack shape and in the original AST arm. A matching shape does not establish activation continuity. Missing steps are not inferred.\n\n");
-        for witness in witnesses {
-            let _ = writeln!(
-                page,
-                "- **Step {}** — {} guard observed **{}**; next pause in selected arm: **{}**.",
-                witness["step_index"].as_u64().unwrap_or(0),
-                literal_text(witness["kind"].as_str().unwrap_or("?")),
-                witness["observed_value"].as_bool().unwrap_or(false),
-                literal_text(
-                    witness["next_pause_in_selected_arm"]
-                        .as_str()
-                        .unwrap_or("not witnessed")
-                )
-            );
-            page.push_str(&fenced_code(
-                &serde_json::to_string(&witness["expression"])?,
-                "json",
-            ));
-            page.push('\n');
-        }
-        page.push('\n');
-    }
+    append_guard_witnesses(&mut page, hit)?;
     for (index, step) in steps.iter().enumerate() {
-        let top = step
-            .get("frames")
-            .and_then(Value::as_array)
-            .and_then(|frames| frames.first());
-        let Some(top) = top else {
-            let _ = write!(page, "## Step {index}: no executing frame captured\n\n");
-            continue;
-        };
-        let function = top
-            .get("functionName")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .unwrap_or("<anonymous>");
-        let location = &top["location"];
-        let script_id = location.get("scriptId").and_then(script_id_text);
-        let script = code_span(script_id.as_deref().unwrap_or("?"));
-        let line = location.get("lineNumber").and_then(Value::as_u64);
-        let column = location.get("columnNumber").and_then(Value::as_u64);
-        let _ = write!(page,
-            "## Step {index}: {}\n\nV8 script {script}, original line {}, column {} (zero-based).\n\n",
-            literal_text(function),
-            line.map_or_else(|| "?".to_owned(), |v| v.to_string()),
-            column.map_or_else(|| "?".to_owned(), |v| v.to_string()),
-        );
-        let sha = top.get("sourceSha256").and_then(verified_sha);
-        let identity = script_id
-            .as_deref()
-            .and_then(|id| identities.get(session?, id));
-        let exact = top.get("source_identity").and_then(Value::as_str) == Some("exact")
-            && sha.is_some()
-            && identity.is_some_and(|source| Some(source.sha256.as_str()) == sha);
-        if exact {
-            let sha = sha.context("checked exact original step source")?;
-            let raw_path = format!("resources/runtime-scripts/{sha}.js");
-            if identity.is_some_and(|source| source.capture_instrumentation == Some(true))
-                && !sources.project.join(&raw_path).is_file()
-            {
-                let _ = write!(page,
-                    "Exact captured script SHA-256 **{sha}**; this is **recorder instrumentation**,                      intentionally excluded from the recovered application source tree.                      No original-source excerpt or application link is claimed.\n\n"
-                );
-            } else {
-                let raw = sources.load(sha)?;
-                let _ = write!(
-                    page,
-                    "Verified [original source](../../../{raw_path}), SHA-256 **{sha}**.\n\n"
-                );
-                let readable = format!("src/_readable/runtime-scripts/{sha}.js");
-                if sources.project.join(&readable).is_file() {
-                    let _ = write!(page,
-                        "[General safe-readable view](../../../{readable}) (different source offsets).\n\n"
-                    );
-                }
-                if let Some(line) = line {
-                    page.push_str(&source_excerpt(
-                        &raw,
-                        line,
-                        identity.and_then(|source| source.start_line),
-                    ));
-                    page.push('\n');
-                }
-            }
-        } else {
-            page.push_str("Original source identity **unresolved**; no code excerpt claimed.\n\n");
-        }
-        let expressions = step.get("expressions").and_then(Value::as_array);
-        if expressions.is_some_and(|items| !items.is_empty()) {
-            page.push_str("Expressions evaluated at this pause (rejected/unavailable results remain explicitly marked):\n\n");
-            page.push_str(&display_json(&json!(expressions))?);
-            page.push('\n');
-        }
+        append_path_step(&mut page, sources, identities, session, index, step)?;
     }
     page.push_str(
         "[Full machine-readable path and paused state](../../../analysis/selective-trace.json)\n",
@@ -434,6 +463,200 @@ fn remove_obsolete_pages(output: &Path, hits: Option<&[Value]>) -> Result<()> {
     Ok(())
 }
 
+fn append_stack_frames(
+    view: &mut String,
+    sources: &mut VerifiedSources<'_>,
+    identities: &RuntimeIdentityIndex,
+    session: Option<&str>,
+    hit: &Value,
+) -> Result<()> {
+    for (depth, frame) in hit
+        .get("frames")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(16)
+        .enumerate()
+    {
+        sources.budget.checkpoint()?;
+        let function = frame
+            .get("functionName")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .unwrap_or("<anonymous>");
+        let location = frame.get("location").unwrap_or(&Value::Null);
+        let script_id = location.get("scriptId").and_then(script_id_text);
+        let script = code_span(script_id.as_deref().unwrap_or("?"));
+        let line = location.get("lineNumber").and_then(Value::as_u64);
+        let column = location.get("columnNumber").and_then(Value::as_u64);
+        let _ = write!(view,
+            "### Frame {depth}: {}\n\nCDP script ID: {script}, line: **{}**, column: **{}** (zero-based).\n\n",
+            literal_text(function),
+            line.map_or_else(|| "?".into(), |n| n.to_string()),
+            column.map_or_else(|| "?".into(), |n| n.to_string())
+        );
+        let expected = frame.get("sourceSha256").and_then(verified_sha);
+        let actual = script_id
+            .as_deref()
+            .and_then(|id| identities.get(session?, id));
+        let identity_verified = frame.get("source_identity").and_then(Value::as_str)
+            == Some("exact")
+            && expected.is_some()
+            && actual.is_some_and(|source| Some(source.sha256.as_str()) == expected);
+        if !identity_verified {
+            view.push_str("Source identity **unresolved**; no source code excerpt or provenance link is asserted.\n\n");
+            continue;
+        }
+        let sha = expected.context("checked exact source identity")?;
+        let raw = sources.load(sha)?;
+        let _ = write!(view,
+            "Exact captured source SHA-256: **{sha}**. [Raw recorded code](../../../resources/runtime-scripts/{sha}.js).\n\n"
+        );
+        if let Some(identity) = actual {
+            if let Some(url) = identity.origin.url.as_deref() {
+                if let Ok(mut parsed) = url::Url::parse(url) {
+                    parsed.set_query(None);
+                    parsed.set_fragment(None);
+                    let _ = write!(
+                        view,
+                        "Script origin (query omitted): {}\n\n",
+                        code_span(parsed.as_str())
+                    );
+                }
+            }
+            if let Some(context) = identity.origin.execution_context_id {
+                let _ = write!(view, "V8 execution context ID: {context}\n\n");
+            }
+        }
+
+        for (target, label) in [
+            (format!("src/runtime-scripts/{sha}.js"), "General source"),
+            (
+                format!("src/_readable/runtime-scripts/{sha}.js"),
+                "Shared readable view",
+            ),
+            (format!("src/_observed/{sha}.js"), "Observed source view"),
+        ] {
+            if sources.project.join(&target).is_file() {
+                let _ = writeln!(view, "- [{label}](../../../{target})");
+            }
+        }
+        view.push('\n');
+        if let Some(line) = line {
+            view.push_str(&source_excerpt(
+                &raw,
+                line,
+                actual.and_then(|source| source.start_line),
+            ));
+            view.push('\n');
+        }
+    }
+    Ok(())
+}
+
+struct InvocationRenderer<'a, 'b> {
+    output: &'a Path,
+    sources: &'a mut VerifiedSources<'b>,
+    identities: &'a RuntimeIdentityIndex,
+    staged: &'a mut Vec<crate::report_file::StagedReport>,
+    index: &'a mut String,
+}
+
+impl InvocationRenderer<'_, '_> {
+    fn stage_hit(&mut self, ordinal: usize, hit: &mut Value) -> Result<()> {
+        self.sources.budget.checkpoint()?;
+        let fields = hit
+            .as_object_mut()
+            .context("selective trace hit must be an object")?;
+        // These fields describe this rendering pass, never a previous one.
+        for key in [
+            "readable_view_path",
+            "path_view_path",
+            "observed_guard_witnesses",
+        ] {
+            fields.remove(key);
+        }
+        let name = format!("{ordinal:04}.md");
+        let destination = format!("src/_observed/invocations/{name}");
+        let session = session_name(hit.get("cdpSession")).map(ToOwned::to_owned);
+        let session_label = code_span(session.as_deref().unwrap_or("unresolved"));
+        let mut view = format!(
+            "# Observed invocation {ordinal:04}\n\n\
+             CDP session: {session_label}. Breakpoint point, pause state and provenance:\n\n"
+        );
+        let header = json!({
+            "pointId": hit.get("pointId"),
+            "at": hit.get("at"),
+            "reason": hit.get("reason"),
+            "hitBreakpoints": hit.get("hitBreakpoints")
+        });
+        view.push_str(&display_json(&header)?);
+        view.push_str("\n## Captured call stack (top frame first)\n\n");
+
+        append_stack_frames(
+            &mut view,
+            self.sources,
+            self.identities,
+            session.as_deref(),
+            hit,
+        )?;
+        append_observed_callable_definitions(
+            &mut view,
+            self.sources,
+            self.identities,
+            session.as_deref(),
+            hit,
+        )?;
+        if has_path_steps(hit) {
+            let path_name = format!("{ordinal:04}-path.md");
+            let path_destination = format!("src/_observed/invocations/{path_name}");
+            let guards = observed_guards::observe(
+                self.sources,
+                self.identities,
+                session.as_deref(),
+                hit.get("steps")
+                    .and_then(Value::as_array)
+                    .context("steps")?,
+            )?;
+            hit["observed_guard_witnesses"] = json!(guards);
+            let path_view = build_observed_path_view(
+                self.sources,
+                self.identities,
+                session.as_deref(),
+                hit,
+                ordinal,
+            )?;
+            self.staged
+                .push(stage_text(&self.output.join(&path_name), &path_view)?);
+            hit["path_view_path"] = json!(path_destination);
+            let _ = write!(view,
+                "## Ordered execution witness\n\n[Browse {} observed debugger steps](./{path_name}). This is a bounded sequence, not universal path specialization.\n\n",
+                hit.get("steps").and_then(Value::as_array).map_or(0, Vec::len),
+            );
+        }
+        view.push_str("## Observed bindings and expression results\n\n");
+        view.push_str("Only values captured at this pause. Expressions were requested with side-effect checks; rejected or unavailable evaluations are not facts.\n\n");
+        view.push_str(&display_json(&json!({
+            "scopes": hit.get("scopes"),
+            "expressions": hit.get("expressions"),
+        }))?);
+        view.push_str("\n[Full machine-readable trace](../../../analysis/selective-trace.json)\n");
+        self.staged
+            .push(stage_text(&self.output.join(&name), &view)?);
+        hit["readable_view_path"] = json!(destination);
+        let point = hit
+            .get("pointId")
+            .and_then(Value::as_str)
+            .unwrap_or("unnamed");
+        let _ = writeln!(
+            self.index,
+            "- [Invocation {ordinal:04}](./{name}) — breakpoint point {} in CDP session {session_label}",
+            code_span(point)
+        );
+        Ok(())
+    }
+}
+
 /// Render every recorded invocation, including unresolved frames, without treating
 /// source offsets from transformed code as original CDP locations.
 ///
@@ -471,168 +694,15 @@ pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -
     );
 
     let mut staged = Vec::new();
+    let mut renderer = InvocationRenderer {
+        output: &output,
+        sources: &mut sources,
+        identities: &identities,
+        staged: &mut staged,
+        index: &mut index,
+    };
     for (ordinal, hit) in hits.iter_mut().enumerate() {
-        budget.checkpoint()?;
-        let fields = hit
-            .as_object_mut()
-            .context("selective trace hit must be an object")?;
-        // These fields describe this rendering pass, never a previous one.
-        for key in [
-            "readable_view_path",
-            "path_view_path",
-            "observed_guard_witnesses",
-        ] {
-            fields.remove(key);
-        }
-        let name = format!("{ordinal:04}.md");
-        let destination = format!("src/_observed/invocations/{name}");
-        let session = session_name(hit.get("cdpSession")).map(ToOwned::to_owned);
-        let session_label = code_span(session.as_deref().unwrap_or("unresolved"));
-        let mut view = format!(
-            "# Observed invocation {ordinal:04}\n\n\
-             CDP session: {session_label}. Breakpoint point, pause state and provenance:\n\n"
-        );
-        let header = json!({
-            "pointId": hit.get("pointId"),
-            "at": hit.get("at"),
-            "reason": hit.get("reason"),
-            "hitBreakpoints": hit.get("hitBreakpoints")
-        });
-        view.push_str(&display_json(&header)?);
-        view.push_str("\n## Captured call stack (top frame first)\n\n");
-
-        for (depth, frame) in hit
-            .get("frames")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .take(16)
-            .enumerate()
-        {
-            budget.checkpoint()?;
-            let function = frame
-                .get("functionName")
-                .and_then(Value::as_str)
-                .filter(|name| !name.is_empty())
-                .unwrap_or("<anonymous>");
-            let location = frame.get("location").unwrap_or(&Value::Null);
-            let script_id = location.get("scriptId").and_then(script_id_text);
-            let script = code_span(script_id.as_deref().unwrap_or("?"));
-            let line = location.get("lineNumber").and_then(Value::as_u64);
-            let column = location.get("columnNumber").and_then(Value::as_u64);
-            let _ = write!(view,
-                "### Frame {depth}: {}\n\nCDP script ID: {script}, line: **{}**, column: **{}** (zero-based).\n\n",
-                literal_text(function),
-                line.map_or_else(|| "?".into(), |n| n.to_string()),
-                column.map_or_else(|| "?".into(), |n| n.to_string())
-            );
-            let expected = frame.get("sourceSha256").and_then(verified_sha);
-            let actual = script_id
-                .as_deref()
-                .and_then(|id| identities.get(session.as_deref()?, id));
-            let identity_verified = frame.get("source_identity").and_then(Value::as_str)
-                == Some("exact")
-                && expected.is_some()
-                && actual.is_some_and(|source| Some(source.sha256.as_str()) == expected);
-            if !identity_verified {
-                view.push_str("Source identity **unresolved**; no source code excerpt or provenance link is asserted.\n\n");
-                continue;
-            }
-            let sha = expected.context("checked exact source identity")?;
-            let raw = sources.load(sha)?;
-            let _ = write!(view,
-                "Exact captured source SHA-256: **{sha}**. [Raw recorded code](../../../resources/runtime-scripts/{sha}.js).\n\n"
-            );
-            if let Some(identity) = actual {
-                if let Some(url) = identity.origin.url.as_deref() {
-                    if let Ok(mut parsed) = url::Url::parse(url) {
-                        parsed.set_query(None);
-                        parsed.set_fragment(None);
-                        let _ = write!(
-                            view,
-                            "Script origin (query omitted): {}\n\n",
-                            code_span(parsed.as_str())
-                        );
-                    }
-                }
-                if let Some(context) = identity.origin.execution_context_id {
-                    let _ = write!(view, "V8 execution context ID: {}\n\n", context);
-                }
-            }
-
-            for (target, label) in [
-                (format!("src/runtime-scripts/{sha}.js"), "General source"),
-                (
-                    format!("src/_readable/runtime-scripts/{sha}.js"),
-                    "Shared readable view",
-                ),
-                (format!("src/_observed/{sha}.js"), "Observed source view"),
-            ] {
-                if project.join(&target).is_file() {
-                    let _ = writeln!(view, "- [{label}](../../../{target})");
-                }
-            }
-            view.push('\n');
-            if let Some(line) = line {
-                view.push_str(&source_excerpt(
-                    &raw,
-                    line,
-                    actual.and_then(|source| source.start_line),
-                ));
-                view.push('\n');
-            }
-        }
-        append_observed_callable_definitions(
-            &mut view,
-            &mut sources,
-            &identities,
-            session.as_deref(),
-            hit,
-        )?;
-        if has_path_steps(hit) {
-            let path_name = format!("{ordinal:04}-path.md");
-            let path_destination = format!("src/_observed/invocations/{path_name}");
-            let guards = observed_guards::observe(
-                &mut sources,
-                &identities,
-                session.as_deref(),
-                hit.get("steps")
-                    .and_then(Value::as_array)
-                    .context("steps")?,
-            )?;
-            hit["observed_guard_witnesses"] = json!(guards);
-            let path_view = build_observed_path_view(
-                &mut sources,
-                &identities,
-                session.as_deref(),
-                hit,
-                ordinal,
-            )?;
-            staged.push(stage_text(&output.join(&path_name), &path_view)?);
-            hit["path_view_path"] = json!(path_destination);
-            let _ = write!(view,
-                "## Ordered execution witness\n\n[Browse {} observed debugger steps](./{path_name}). This is a bounded sequence, not universal path specialization.\n\n",
-                hit.get("steps").and_then(Value::as_array).map_or(0, Vec::len),
-            );
-        }
-        view.push_str("## Observed bindings and expression results\n\n");
-        view.push_str("Only values captured at this pause. Expressions were requested with side-effect checks; rejected or unavailable evaluations are not facts.\n\n");
-        view.push_str(&display_json(&json!({
-            "scopes": hit.get("scopes"),
-            "expressions": hit.get("expressions"),
-        }))?);
-        view.push_str("\n[Full machine-readable trace](../../../analysis/selective-trace.json)\n");
-        staged.push(stage_text(&output.join(&name), &view)?);
-        hit["readable_view_path"] = json!(destination);
-        let point = hit
-            .get("pointId")
-            .and_then(Value::as_str)
-            .unwrap_or("unnamed");
-        let _ = writeln!(
-            index,
-            "- [Invocation {ordinal:04}](./{name}) — breakpoint point {} in CDP session {session_label}",
-            code_span(point)
-        );
+        renderer.stage_hit(ordinal, hit)?;
     }
 
     // Finish rendering and serialization before replacing any output. A
@@ -714,10 +784,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn exact_invocation_renders_raw_location_and_values_not_deob_offsets() -> Result<()> {
-        let tmp = TempDir::new()?;
-        let project = tmp.path();
+    fn write_invocation_fixture(project: &Path) -> Result<()> {
         let source = "function dispatch(opcode) {\n  const handler = registry[opcode];\n  return handler(opcode);\n}\n";
         let digest = sha256_hex(source.as_bytes());
         fs::create_dir_all(project.join("resources/runtime-scripts"))?;
@@ -775,6 +842,14 @@ mod tests {
                     "value":{"type":"boolean","value":true}}]}]
             }),
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn exact_invocation_renders_raw_location_and_values_not_deob_offsets() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let project = tmp.path();
+        write_invocation_fixture(project)?;
         assert_eq!(
             materialize_invocation_views(project, &AnalysisBudgets::standard("fixture"))?,
             1

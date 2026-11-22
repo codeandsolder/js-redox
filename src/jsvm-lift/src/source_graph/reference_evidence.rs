@@ -177,8 +177,8 @@ pub(super) fn seed_import_map_definitions(
                             graph,
                             &src,
                             specifier,
-                            document_resource_id.clone(),
-                            Value::Null,
+                            &document_resource_id,
+                            &Value::Null,
                         )?;
                     }
                     continue;
@@ -210,8 +210,8 @@ pub(super) fn seed_import_map_definitions(
                                 graph,
                                 &src,
                                 specifier,
-                                document_resource_id.clone(),
-                                json!(scope),
+                                &document_resource_id,
+                                &json!(scope),
                             )?;
                         }
                         continue;
@@ -241,8 +241,8 @@ fn add_blocked_import_map_entry(
     graph: &mut GraphBuilder,
     source: &str,
     specifier: &str,
-    document_resource_id: Value,
-    scope: Value,
+    document_resource_id: &Value,
+    scope: &Value,
 ) -> Result<()> {
     let target = digest_id("specifier:", specifier);
     graph.intern_node(

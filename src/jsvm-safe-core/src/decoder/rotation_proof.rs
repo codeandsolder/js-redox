@@ -92,7 +92,7 @@ impl ChecksumExpression {
                     rotation,
                     key.as_deref(),
                 )?;
-                js_parse_int(&value.js_string()?, *radix)
+                js_parse_int(&value.js_string(), *radix)
             }
         }
     }
@@ -293,20 +293,21 @@ impl Setup<'_> {
         {
             return None;
         }
-        let Expression::CallExpression(decoded) =
+        let Expression::CallExpression(decode_call) =
             unparenthesized(call.arguments.first()?.as_expression()?)
         else {
             return None;
         };
-        if decoded.optional || !(1..=2).contains(&decoded.arguments.len()) {
+        if decode_call.optional || !(1..=2).contains(&decode_call.arguments.len()) {
             return None;
         }
-        let alias = self.identifier(&decoded.callee)?;
-        let decoder = self.aliases.get(&alias).copied().or_else(|| {
-            (!self.local(alias) && self.scoping.symbol_flags(alias).is_function()).then_some(alias)
+        let callee_symbol = self.identifier(&decode_call.callee)?;
+        let decoder = self.aliases.get(&callee_symbol).copied().or_else(|| {
+            (!self.local(callee_symbol) && self.scoping.symbol_flags(callee_symbol).is_function())
+                .then_some(callee_symbol)
         })?;
-        let raw = self.integer(decoded.arguments.first()?.as_expression()?)?;
-        let key = match decoded.arguments.get(1) {
+        let raw = self.integer(decode_call.arguments.first()?.as_expression()?)?;
+        let key = match decode_call.arguments.get(1) {
             Some(argument) => {
                 let Expression::StringLiteral(literal) = unparenthesized(argument.as_expression()?)
                 else {
@@ -352,11 +353,10 @@ impl Setup<'_> {
             return None;
         }
         let target = |expression: &Expression<'_>| {
-            if let Some(symbol) = self.parameter_target {
-                (self.identifier(expression) == Some(symbol)).then_some(0)
-            } else {
-                expression_integer(expression)
-            }
+            self.parameter_target.map_or_else(
+                || expression_integer(expression),
+                |symbol| (self.identifier(expression) == Some(symbol)).then_some(0),
+            )
         };
         let (target, checksum) = if let Some(target) = target(&binary.left) {
             (target, &binary.right)
@@ -487,7 +487,7 @@ fn rotation_step(
         .then_some(())
 }
 
-pub(super) fn ordinary_declaration(declaration: &VariableDeclaration<'_>) -> bool {
+pub(super) const fn ordinary_declaration(declaration: &VariableDeclaration<'_>) -> bool {
     matches!(
         declaration.kind,
         VariableDeclarationKind::Var

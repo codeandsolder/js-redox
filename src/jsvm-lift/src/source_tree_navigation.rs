@@ -272,20 +272,15 @@ fn append_assignment_outline_node(
     };
     let guard = node.nearest_guard.as_ref().map_or_else(
         || "none".to_owned(),
-        |guard| format!("{} ({} total)", guard, node.guard_depth),
+        |guard| format!("{guard} ({} total)", node.guard_depth),
     );
     let _ = writeln!(
         output,
-        "| {} | {} | {} {} | {} | {} | {} | {}:{} ({}–{}) |",
-        depth,
+        "| {depth} | {} | {target} {} | {} | {role} | {} | {line}:{col} ({}–{}) |",
         index + 1,
-        target,
         literal_text(&node.operator),
         node.rhs,
-        role,
         literal_text(&guard),
-        line,
-        col,
         node.span.start,
         node.span.end,
     );
@@ -446,25 +441,7 @@ fn label(raw: &str) -> String {
     }
 }
 
-/// Two independent navigational projections. A deep call chain supplies an
-/// optional Markdown outline, while any long expression can receive a layout
-/// even if the helper has no deeply nested calls.
-#[must_use]
-pub fn helper_navigation(source: &str, helper_path: &str) -> Option<HelperNavigation> {
-    let allocator = Allocator::default();
-    let parsed = parse_program(&allocator, source, SourceType::unambiguous());
-    if !parsed.is_clean() {
-        return None;
-    }
-    let lines = SourceLineIndex::new(source);
-    let assignment_outline_markdown = assignment_outline(source, &parsed.program, &lines);
-    let ordered_assignment_phases_markdown =
-        crate::source_tree_eval_order::ordered_assignment_phases(source, &parsed.program, &lines);
-    let mut collector = Collector {
-        source,
-        ..Collector::default()
-    };
-    collector.visit_program(&parsed.program);
+fn deepest_call_path(collector: &Collector<'_>) -> Vec<usize> {
     let deepest = collector
         .calls
         .iter()
@@ -480,20 +457,16 @@ pub fn helper_navigation(source: &str, helper_path: &str) -> Option<HelperNaviga
         }
         path.reverse();
     }
-    // Insert whitespace only at parsed argument boundaries or immediately
-    // before a call's closing paren. In particular, never rewrite callee
-    // expressions, so direct eval and receiver identity remain unchanged.
-    let mut expressions = ExpressionBreaks {
-        source,
-        depth: 0,
-        positions: BTreeMap::new(),
-    };
-    expressions.visit_program(&parsed.program);
-    let mut breaks = expressions.positions;
-    if path.is_empty() && breaks.is_empty() && assignment_outline_markdown.is_none() {
-        return None;
-    }
-    for &index in &path {
+    path
+}
+
+fn whitespace_layout(
+    source: &str,
+    collector: &Collector<'_>,
+    path: &[usize],
+    mut breaks: BTreeMap<usize, usize>,
+) -> Option<String> {
+    for &index in path {
         let call = &collector.calls[index];
         if call.argument_spans.is_empty() {
             continue;
@@ -529,22 +502,19 @@ pub fn helper_navigation(source: &str, helper_path: &str) -> Option<HelperNaviga
         previous = position;
     }
     layout.push_str(source.get(previous..)?);
-    // Formatting is analyst-only, but it still must parse identically. The
-    // source bytes are all retained; reject unexpected lexical consequences.
-    let layout_arena = Allocator::default();
-    let layout_parsed = parse_program(&layout_arena, &layout, SourceType::unambiguous());
-    if !layout_parsed.is_clean()
-        || Codegen::new().build(&parsed.program).code
-            != Codegen::new().build(&layout_parsed.program).code
-    {
-        return None;
-    }
+    Some(layout)
+}
+
+fn call_spine(
+    collector: &Collector<'_>,
+    source: &str,
+    helper_path: &str,
+    path: &[usize],
+    lines: &SourceLineIndex,
+) -> Option<String> {
     let layout_path = helper_path.trim_start_matches("helpers/");
-    let call_spine_markdown = if path.is_empty() {
-        None
-    } else {
-        let mut markdown = format!(
-            r"# Deep call nesting — {helper_label}
+    let mut markdown = format!(
+        r"# Deep call nesting — {helper_label}
 
 [Open the readable lexical helper](../{helper_link}) or
 [view its whitespace-only nested-call layout](../expression-layouts/{layout_link}).
@@ -564,28 +534,78 @@ in the original JavaScript. Byte ranges refer to that readable helper.
 | Depth | Callee | Location | Nested within |
 |---:|---|---|---|
 ",
-            helper_label = literal_text(helper_path),
-            helper_link = link_destination(helper_path),
-            layout_link = link_destination(layout_path),
+        helper_label = literal_text(helper_path),
+        helper_link = link_destination(helper_path),
+        layout_link = link_destination(layout_path),
+    );
+    for (depth, &index) in path.iter().enumerate() {
+        let call = &collector.calls[index];
+        let (line, column) = lines.character_line_column(source, call.span.start as usize)?;
+        let slot = call.parent.map_or_else(
+            || "root of this chain".to_owned(),
+            |parent| collector.slot(parent, call.span),
         );
-        for (depth, index) in path.into_iter().enumerate() {
-            let call = &collector.calls[index];
-            let (line, column) = lines.character_line_column(source, call.span.start as usize)?;
-            let slot = call.parent.map_or_else(
-                || "root of this chain".to_owned(),
-                |parent| collector.slot(parent, call.span),
-            );
-            let _ = writeln!(
-                markdown,
-                "| {} | {} | line {line}:{column}, bytes {}–{} | {} |",
-                depth + 1,
-                label(&call.callee),
-                call.span.start,
-                call.span.end,
-                literal_text(&slot),
-            );
-        }
-        Some(markdown)
+        let _ = writeln!(
+            markdown,
+            "| {} | {} | line {line}:{column}, bytes {}–{} | {} |",
+            depth + 1,
+            label(&call.callee),
+            call.span.start,
+            call.span.end,
+            literal_text(&slot),
+        );
+    }
+    Some(markdown)
+}
+
+/// Two independent navigational projections. A deep call chain supplies an
+/// optional Markdown outline, while any long expression can receive a layout
+/// even if the helper has no deeply nested calls.
+#[must_use = "Use the returned navigation view when a valid layout is available"]
+pub fn helper_navigation(source: &str, helper_path: &str) -> Option<HelperNavigation> {
+    let allocator = Allocator::default();
+    let parsed = parse_program(&allocator, source, SourceType::unambiguous());
+    if !parsed.is_clean() {
+        return None;
+    }
+    let lines = SourceLineIndex::new(source);
+    let assignment_outline_markdown = assignment_outline(source, &parsed.program, &lines);
+    let ordered_assignment_phases_markdown =
+        crate::source_tree_eval_order::ordered_assignment_phases(source, &parsed.program, &lines);
+    let mut collector = Collector {
+        source,
+        ..Collector::default()
+    };
+    collector.visit_program(&parsed.program);
+    let path = deepest_call_path(&collector);
+    // Insert whitespace only at parsed argument boundaries or immediately
+    // before a call's closing paren. In particular, never rewrite callee
+    // expressions, so direct eval and receiver identity remain unchanged.
+    let mut expressions = ExpressionBreaks {
+        source,
+        depth: 0,
+        positions: BTreeMap::new(),
+    };
+    expressions.visit_program(&parsed.program);
+    let breaks = expressions.positions;
+    if path.is_empty() && breaks.is_empty() && assignment_outline_markdown.is_none() {
+        return None;
+    }
+    let layout = whitespace_layout(source, &collector, &path, breaks)?;
+    // Formatting is analyst-only, but it still must parse identically. The
+    // source bytes are all retained; reject unexpected lexical consequences.
+    let layout_arena = Allocator::default();
+    let layout_parsed = parse_program(&layout_arena, &layout, SourceType::unambiguous());
+    if !layout_parsed.is_clean()
+        || Codegen::new().build(&parsed.program).code
+            != Codegen::new().build(&layout_parsed.program).code
+    {
+        return None;
+    }
+    let call_spine_markdown = if path.is_empty() {
+        None
+    } else {
+        Some(call_spine(&collector, source, helper_path, &path, &lines)?)
     };
     Some(HelperNavigation {
         call_spine_markdown,

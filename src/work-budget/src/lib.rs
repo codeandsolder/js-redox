@@ -31,7 +31,7 @@ pub struct BudgetLimits {
 }
 
 impl BudgetLimits {
-    #[must_use]
+    #[must_use = "Use the constructed value when explicitly selecting unlimited work"]
     pub const fn unlimited() -> Self {
         Self {
             wall_time: None,
@@ -39,7 +39,7 @@ impl BudgetLimits {
         }
     }
 
-    #[must_use]
+    #[must_use = "Use the returned limits to impose the wall-time bound"]
     pub const fn wall_time(wall_time: Duration) -> Self {
         Self {
             wall_time: Some(wall_time),
@@ -47,7 +47,7 @@ impl BudgetLimits {
         }
     }
 
-    #[must_use]
+    #[must_use = "Use the returned limits to impose the work bound"]
     pub const fn work(work: u64) -> Self {
         Self {
             wall_time: None,
@@ -55,13 +55,13 @@ impl BudgetLimits {
         }
     }
 
-    #[must_use]
+    #[must_use = "Use the returned limits; the previous value is consumed"]
     pub const fn with_wall_time(mut self, wall_time: Duration) -> Self {
         self.wall_time = Some(wall_time);
         self
     }
 
-    #[must_use]
+    #[must_use = "Use the returned limits; the previous value is consumed"]
     pub const fn with_work(mut self, work: u64) -> Self {
         self.work = Some(work);
         self
@@ -96,41 +96,41 @@ pub struct BudgetExceeded {
 }
 
 impl BudgetExceeded {
-    #[must_use]
+    #[must_use = "Use the returned scope name to identify the exhausted budget"]
     pub fn scope(&self) -> &str {
         &self.scope
     }
 
-    #[must_use]
+    #[must_use = "Use the returned failure kind to distinguish exhaustion causes"]
     pub const fn kind(&self) -> BudgetExceededKind {
         self.kind
     }
 
-    #[must_use]
+    #[must_use = "Use the returned elapsed duration for exhaustion accounting"]
     pub const fn elapsed(&self) -> Duration {
         self.elapsed
     }
 
-    #[must_use]
+    #[must_use = "Use the returned work limit when assessing exhaustion"]
     pub const fn work_limit(&self) -> Option<u64> {
         self.work_limit
     }
 
-    #[must_use]
+    #[must_use = "Use the returned consumption count for budget accounting"]
     pub const fn work_consumed(&self) -> Option<u64> {
         self.work_consumed
     }
 
     /// Whether the exhausted constraint belongs to an ancestor of the budget
     /// that observed it, rather than the observing operation's local scope.
-    #[must_use]
+    #[must_use = "Check whether exhaustion originates from an ancestor budget"]
     pub const fn is_inherited(&self) -> bool {
         self.inherited
     }
 
     /// Whether the exhausted constraint belongs to the budget scope that
     /// observed it rather than one of its ancestors.
-    #[must_use]
+    #[must_use = "Check whether exhaustion originates from the current budget"]
     pub const fn is_local(&self) -> bool {
         !self.inherited
     }
@@ -186,7 +186,7 @@ impl Error for CommandRunError {
 }
 
 impl CommandRunError {
-    #[must_use]
+    #[must_use = "Inspect the returned budget failure when present"]
     pub const fn budget(&self) -> Option<&BudgetExceeded> {
         match self {
             Self::Budget(error) => Some(error),
@@ -194,7 +194,7 @@ impl CommandRunError {
         }
     }
 
-    #[must_use]
+    #[must_use = "Inspect the returned process-spawn error when present"]
     pub const fn spawn_io_error(&self) -> Option<&io::Error> {
         match self {
             Self::Spawn(error) => Some(error),
@@ -431,7 +431,7 @@ pub struct WorkBudget {
 }
 
 impl WorkBudget {
-    #[must_use]
+    #[must_use = "Use the newly constructed budget or poller to account for subsequent work"]
     pub fn new(scope: impl Into<Arc<str>>, limits: BudgetLimits) -> Self {
         Self {
             states: Arc::from([Arc::new(BudgetState::new(scope.into(), limits))]),
@@ -439,12 +439,12 @@ impl WorkBudget {
         }
     }
 
-    #[must_use]
+    #[must_use = "Use the constructed value when explicitly selecting unlimited work"]
     pub fn unlimited(scope: impl Into<Arc<str>>) -> Self {
         Self::new(scope, BudgetLimits::unlimited())
     }
 
-    #[must_use]
+    #[must_use = "Use the returned child budget to enforce inherited and local limits"]
     pub fn child(&self, scope: impl Into<Arc<str>>, limits: BudgetLimits) -> Self {
         let mut states = self.states.iter().cloned().collect::<Vec<_>>();
         states.push(Arc::new(BudgetState::new(scope.into(), limits)));
@@ -512,24 +512,24 @@ impl WorkBudget {
         }
     }
 
-    #[must_use]
+    #[must_use = "Check this result to stop work when the budget is exhausted"]
     pub fn is_exhausted(&self) -> bool {
         self.checkpoint().is_err()
     }
 
-    #[must_use]
+    #[must_use = "Use the returned scope depth for budget diagnostics"]
     pub fn depth(&self) -> usize {
         self.states.len()
     }
 
-    #[must_use]
+    #[must_use = "Check whether any inherited or local work limit applies"]
     pub fn has_work_limit(&self) -> bool {
         self.states.iter().any(|state| state.work_limit.is_some())
     }
 
     /// Return the tightest deterministic work allowance still available in this
     /// scope hierarchy. `None` means every scope is work-unbounded.
-    #[must_use]
+    #[must_use = "Use the remaining work estimate to bound further analysis"]
     pub fn remaining_work(&self) -> Option<u64> {
         self.states
             .iter()
@@ -557,7 +557,7 @@ pub struct BudgetPoller {
 }
 
 impl BudgetPoller {
-    #[must_use]
+    #[must_use = "Use the newly constructed budget or poller to account for subsequent work"]
     pub fn new(budget: &WorkBudget, poll_interval: u64) -> Self {
         Self {
             budget: budget.clone(),
@@ -610,7 +610,7 @@ impl BudgetPoller {
 }
 
 /// Find a budget-exhaustion error anywhere in a standard error source chain.
-#[must_use]
+#[must_use = "Inspect the returned budget failure before treating the error as unrelated"]
 pub fn find_budget_exceeded<'a>(
     mut error: &'a (dyn Error + 'static),
 ) -> Option<&'a BudgetExceeded> {

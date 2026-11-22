@@ -101,7 +101,7 @@ fn computed_key(expr: &Expression<'_>) -> Option<String> {
 fn module_id(expr: &Expression<'_>) -> Option<String> {
     match eval_static_primitive(expr)? {
         StaticPrimitiveValue::String(value) => Some(value),
-        value @ StaticPrimitiveValue::Number(_) => value.js_string(),
+        value @ StaticPrimitiveValue::Number(_) => Some(value.js_string()),
         _ => None,
     }
 }
@@ -1152,16 +1152,15 @@ impl Collector<'_, '_> {
                 .items
                 .get(2)
                 .and_then(|param| binding_symbol(&param.pattern));
-            let mut dependencies = BTreeSet::new();
-            if let Some(require_symbol) = require_symbol {
+            let dependencies = require_symbol.map_or_else(BTreeSet::new, |require_symbol| {
                 let mut collector = DependencyCollector {
                     scoping: self.scoping,
                     require_symbol,
                     dependencies: BTreeSet::new(),
                 };
                 collector.visit_function_body(body);
-                dependencies = collector.dependencies;
-            }
+                collector.dependencies
+            });
 
             let module_symbol = params
                 .items
@@ -1513,6 +1512,53 @@ fn parse<'a>(
     parse_program(allocator, source, source_type)
 }
 
+impl Collector<'_, '_> {
+    fn finish_named_modules(&mut self) {
+        if !self.amd_modules.is_empty() {
+            let start = self.amd_start.unwrap_or_default();
+            let end = self.amd_end.unwrap_or(start);
+            self.bundles.push(BundleRecord {
+                kind: "amd_named_modules".into(),
+                start,
+                end,
+                callee: "define".into(),
+                chunk_ids: Vec::new(),
+                module_table_start: start,
+                module_table_end: end,
+                modules: std::mem::take(&mut self.amd_modules),
+            });
+        }
+        let mut member_groups = std::mem::take(&mut self.amd_member_groups)
+            .into_iter()
+            .filter_map(|(receiver, group)| {
+                let proven = match receiver {
+                    MemberReceiverKey::Global(_) => group.explicit_dependency_arrays > 0,
+                    MemberReceiverKey::Local(symbol) => self
+                        .amd_loader_evidence
+                        .get(&symbol)
+                        .is_some_and(|evidence| {
+                            evidence.supports_named_modules(group.modules.len())
+                        }),
+                };
+                proven.then_some(group)
+            })
+            .collect::<Vec<_>>();
+        member_groups.sort_by_key(|group| group.start);
+        for group in member_groups {
+            self.bundles.push(BundleRecord {
+                kind: "member_named_modules".into(),
+                start: group.start,
+                end: group.end,
+                callee: group.callee,
+                chunk_ids: Vec::new(),
+                module_table_start: group.start,
+                module_table_end: group.end,
+                modules: group.modules,
+            });
+        }
+    }
+}
+
 /// Analyze one JavaScript source body for statically explicit bundle/module tables.
 ///
 /// # Errors
@@ -1534,7 +1580,9 @@ pub fn analyze_bundle_source(
 
     let mut diagnostics = parsed.diagnostics;
     let fatal_error = parsed.fatal_error;
-    let mut bundles = if !fatal_error {
+    let mut bundles = if fatal_error {
+        Vec::new()
+    } else {
         let semantic_ret = SemanticBuilder::new()
             .with_check_syntax_error(true)
             .build(&parsed.program);
@@ -1556,51 +1604,8 @@ pub fn analyze_bundle_source(
         collector.visit_program(&parsed.program);
         collector.budget_poller.finish()?;
         budget.checkpoint()?;
-        if !collector.amd_modules.is_empty() {
-            let start = collector.amd_start.unwrap_or_default();
-            let end = collector.amd_end.unwrap_or(start);
-            collector.bundles.push(BundleRecord {
-                kind: "amd_named_modules".into(),
-                start,
-                end,
-                callee: "define".into(),
-                chunk_ids: Vec::new(),
-                module_table_start: start,
-                module_table_end: end,
-                modules: std::mem::take(&mut collector.amd_modules),
-            });
-        }
-        let mut member_groups = std::mem::take(&mut collector.amd_member_groups)
-            .into_iter()
-            .filter_map(|(receiver, group)| {
-                let proven = match receiver {
-                    MemberReceiverKey::Global(_) => group.explicit_dependency_arrays > 0,
-                    MemberReceiverKey::Local(symbol) => collector
-                        .amd_loader_evidence
-                        .get(&symbol)
-                        .is_some_and(|evidence| {
-                            evidence.supports_named_modules(group.modules.len())
-                        }),
-                };
-                proven.then_some(group)
-            })
-            .collect::<Vec<_>>();
-        member_groups.sort_by_key(|group| group.start);
-        for group in member_groups {
-            collector.bundles.push(BundleRecord {
-                kind: "member_named_modules".into(),
-                start: group.start,
-                end: group.end,
-                callee: group.callee,
-                chunk_ids: Vec::new(),
-                module_table_start: group.start,
-                module_table_end: group.end,
-                modules: group.modules,
-            });
-        }
+        collector.finish_named_modules();
         collector.bundles
-    } else {
-        Vec::new()
     };
 
     // Explicit generated-table contexts may also satisfy the conservative
@@ -1680,7 +1685,7 @@ mod tests {
 
     #[test]
     fn webpack_and_browserify_factory_roles_remain_distinct() -> Result<(), BudgetExceeded> {
-        let webpack = r#"
+        let webpack = r"
             (function(modules) {
                 function load(id) { return modules[id]; }
                 load.m = modules;
@@ -1693,7 +1698,7 @@ mod tests {
                     exports.other = 1;
                 }
             });
-        "#;
+        ";
         let browserify = r#"
             (function(modules, cache, entries) {})({
                 1: [function(require, module, exports) {

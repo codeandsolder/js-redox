@@ -7,6 +7,7 @@ use crate::{
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::{fs, path::Path};
+use work_budget::WorkBudget;
 
 /// Verify an inspector-provided definition against the captured script
 /// inventory. This proves the code location of one observed function value,
@@ -63,6 +64,155 @@ fn verify_observed_frame_source(
     exact
 }
 
+#[derive(Default)]
+struct VerificationCounts {
+    verified: u64,
+    unresolved: u64,
+}
+
+impl VerificationCounts {
+    fn frames(
+        &mut self,
+        frames: &mut [Value],
+        session: Option<&str>,
+        identities: &ScriptIdentityIndex<String>,
+        budget: &WorkBudget,
+    ) -> Result<()> {
+        for frame in frames {
+            budget.consume(1)?;
+            if verify_observed_frame_source(frame, session, identities) {
+                self.verified += 1;
+            } else {
+                self.unresolved += 1;
+            }
+        }
+        Ok(())
+    }
+
+    fn definition(
+        &mut self,
+        value: &mut Value,
+        session: Option<&str>,
+        identities: &ScriptIdentityIndex<String>,
+    ) {
+        verify_function_definition(
+            value,
+            session,
+            identities,
+            &mut self.verified,
+            &mut self.unresolved,
+        );
+    }
+}
+
+#[derive(Default)]
+struct TraceVerification {
+    hit_frames: VerificationCounts,
+    step_frames: VerificationCounts,
+    definitions: VerificationCounts,
+}
+
+impl TraceVerification {
+    fn verify_hit(
+        &mut self,
+        hit: &mut Value,
+        identities: &ScriptIdentityIndex<String>,
+        budget: &WorkBudget,
+    ) -> Result<()> {
+        budget.consume(1)?;
+        let session = session_name(hit.get("cdpSession")).map(ToOwned::to_owned);
+        let frames = hit
+            .get_mut("frames")
+            .and_then(Value::as_array_mut)
+            .context("trace hit missing frames[]")?;
+        self.hit_frames
+            .frames(frames, session.as_deref(), identities, budget)?;
+        self.verify_steps(hit, session.as_deref(), identities, budget)?;
+        self.verify_definitions(hit, session.as_deref(), identities, budget)
+    }
+
+    fn verify_steps(
+        &mut self,
+        hit: &mut Value,
+        session: Option<&str>,
+        identities: &ScriptIdentityIndex<String>,
+        budget: &WorkBudget,
+    ) -> Result<()> {
+        let steps = hit.get_mut("steps").and_then(Value::as_array_mut);
+        if let Some(steps) = steps {
+            if steps.len() > 32 {
+                bail!("observed path has more than 32 bounded debugger step events");
+            }
+            for (index, step) in steps.iter_mut().enumerate() {
+                budget.consume(1)?;
+                if step.get("index").and_then(Value::as_u64) != Some(index as u64) {
+                    bail!("observed path step indices must be sequential");
+                }
+                let frames = step
+                    .get_mut("frames")
+                    .and_then(Value::as_array_mut)
+                    .context("observed path step requires frames[]")?;
+                self.step_frames
+                    .frames(frames, session, identities, budget)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_definitions(
+        &mut self,
+        hit: &mut Value,
+        session: Option<&str>,
+        identities: &ScriptIdentityIndex<String>,
+        budget: &WorkBudget,
+    ) -> Result<()> {
+        for scope in hit
+            .get_mut("scopes")
+            .and_then(Value::as_array_mut)
+            .into_iter()
+            .flatten()
+        {
+            budget.consume(1)?;
+            for variable in scope
+                .get_mut("variables")
+                .and_then(Value::as_array_mut)
+                .into_iter()
+                .flatten()
+            {
+                budget.consume(1)?;
+                if let Some(value) = variable.get_mut("value") {
+                    self.definitions.definition(value, session, identities);
+                }
+            }
+        }
+        for expression in hit
+            .get_mut("expressions")
+            .and_then(Value::as_array_mut)
+            .into_iter()
+            .flatten()
+        {
+            budget.consume(1)?;
+            if expression.get("status").and_then(Value::as_str) != Some("observed") {
+                continue;
+            }
+            if let Some(value) = expression.get_mut("value") {
+                self.definitions.definition(value, session, identities);
+            }
+        }
+        Ok(())
+    }
+
+    fn publish_summary(&self, trace: &mut Value) {
+        trace["schema"] = json!(SELECTIVE_TRACE.schema);
+        trace["summary"]["verifiedSourceFrames"] = json!(self.hit_frames.verified);
+        trace["summary"]["unresolvedSourceFrames"] = json!(self.hit_frames.unresolved);
+        trace["summary"]["verifiedStepFrames"] = json!(self.step_frames.verified);
+        trace["summary"]["unresolvedStepFrames"] = json!(self.step_frames.unresolved);
+        trace["summary"]["verifiedFunctionDefinitions"] = json!(self.definitions.verified);
+        trace["summary"]["unresolvedFunctionDefinitions"] = json!(self.definitions.unresolved);
+    }
+}
+
 pub(super) fn import_selective_trace(
     capture: &Path,
     project: &Path,
@@ -83,108 +233,15 @@ pub(super) fn import_selective_trace(
         .context("runtime inventory required for breakpoint source verification")?;
     let identities =
         ScriptIdentityIndex::from_runtime_report(&runtime, &budget, |sha, _, _| sha.to_owned())?;
-    let mut verified = 0_u64;
-    let mut unresolved = 0_u64;
-    let mut verified_step_frames = 0_u64;
-    let mut unresolved_step_frames = 0_u64;
-    let mut verified_definitions = 0_u64;
-    let mut unresolved_definitions = 0_u64;
+    let mut verification = TraceVerification::default();
     let hits = trace
         .get_mut("hits")
         .and_then(Value::as_array_mut)
         .context("selective trace requires hits[]")?;
     for hit in hits {
-        budget.consume(1)?;
-        let session = session_name(hit.get("cdpSession")).map(ToOwned::to_owned);
-        let frames = hit
-            .get_mut("frames")
-            .and_then(Value::as_array_mut)
-            .context("trace hit missing frames[]")?;
-        for frame in frames {
-            budget.consume(1)?;
-            if verify_observed_frame_source(frame, session.as_deref(), &identities) {
-                verified += 1;
-            } else {
-                unresolved += 1;
-            }
-        }
-        let steps = hit.get_mut("steps").and_then(Value::as_array_mut);
-        if let Some(steps) = steps {
-            if steps.len() > 32 {
-                bail!("observed path has more than 32 bounded debugger step events");
-            }
-            for (index, step) in steps.iter_mut().enumerate() {
-                budget.consume(1)?;
-                if step.get("index").and_then(Value::as_u64) != Some(index as u64) {
-                    bail!("observed path step indices must be sequential");
-                }
-                let frames = step
-                    .get_mut("frames")
-                    .and_then(Value::as_array_mut)
-                    .context("observed path step requires frames[]")?;
-                for frame in frames {
-                    budget.consume(1)?;
-                    if verify_observed_frame_source(frame, session.as_deref(), &identities) {
-                        verified_step_frames += 1;
-                    } else {
-                        unresolved_step_frames += 1;
-                    }
-                }
-            }
-        }
-        for scope in hit
-            .get_mut("scopes")
-            .and_then(Value::as_array_mut)
-            .into_iter()
-            .flatten()
-        {
-            budget.consume(1)?;
-            for variable in scope
-                .get_mut("variables")
-                .and_then(Value::as_array_mut)
-                .into_iter()
-                .flatten()
-            {
-                budget.consume(1)?;
-                if let Some(value) = variable.get_mut("value") {
-                    verify_function_definition(
-                        value,
-                        session.as_deref(),
-                        &identities,
-                        &mut verified_definitions,
-                        &mut unresolved_definitions,
-                    );
-                }
-            }
-        }
-        for expression in hit
-            .get_mut("expressions")
-            .and_then(Value::as_array_mut)
-            .into_iter()
-            .flatten()
-        {
-            budget.consume(1)?;
-            if expression.get("status").and_then(Value::as_str) != Some("observed") {
-                continue;
-            }
-            if let Some(value) = expression.get_mut("value") {
-                verify_function_definition(
-                    value,
-                    session.as_deref(),
-                    &identities,
-                    &mut verified_definitions,
-                    &mut unresolved_definitions,
-                );
-            }
-        }
+        verification.verify_hit(hit, &identities, &budget)?;
     }
-    trace["schema"] = json!(SELECTIVE_TRACE.schema);
-    trace["summary"]["verifiedSourceFrames"] = json!(verified);
-    trace["summary"]["unresolvedSourceFrames"] = json!(unresolved);
-    trace["summary"]["verifiedStepFrames"] = json!(verified_step_frames);
-    trace["summary"]["unresolvedStepFrames"] = json!(unresolved_step_frames);
-    trace["summary"]["verifiedFunctionDefinitions"] = json!(verified_definitions);
-    trace["summary"]["unresolvedFunctionDefinitions"] = json!(unresolved_definitions);
+    verification.publish_summary(&mut trace);
     write_artifact(project, SELECTIVE_TRACE, &trace)?;
     Ok(())
 }

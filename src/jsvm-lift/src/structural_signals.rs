@@ -382,7 +382,7 @@ fn is_tiny_proxy_function(expr: &Expression<'_>) -> bool {
     }
 }
 
-#[must_use]
+#[must_use = "Check the returned classification before treating a name as an API hint"]
 pub fn apiish_name(value: &str) -> bool {
     matches!(
         value,
@@ -672,8 +672,8 @@ fn detect_direct_table_decoder(function: &Function<'_>) -> Option<StructuralSign
         span: function.span,
         subject: Some(table.clone()),
         detail: format!(
-            "{} indexed table use(s) through parameter {}; {} decode primitive call(s) [{}]",
-            probe.indexed_uses, params[0], probe.decode_calls, table
+            "{} indexed table use(s) through parameter {}; {} decode primitive call(s) [{table}]",
+            probe.indexed_uses, params[0], probe.decode_calls
         ),
     })
 }
@@ -829,10 +829,9 @@ fn detect_selector_dispatcher(function: &Function<'_>) -> Option<StructuralSigna
         span: function.span,
         subject: function_subject(function),
         detail: format!(
-            "{} numeric selector value(s), {} return path(s) through parameter {}",
+            "{} numeric selector value(s), {} return path(s) through parameter {selector}",
             probe.literals.len(),
-            probe.returns,
-            selector
+            probe.returns
         ),
     })
 }

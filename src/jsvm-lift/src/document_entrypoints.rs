@@ -24,15 +24,42 @@ pub struct CapturedScriptSource {
     pub matches_manifest_sha256: bool,
 }
 
+/// Raw script scheduling attributes are independent of the resolved source
+/// and the classification of its script type.
+#[derive(Debug, Default, Clone, Copy, Serialize)]
+pub struct ScriptAttributes {
+    pub async_attribute: bool,
+    pub defer_attribute: bool,
+    pub nomodule_attribute: bool,
+}
+
+impl ScriptAttributes {
+    const fn scheduling_class(
+        self,
+        executable: bool,
+        module: bool,
+        external: bool,
+    ) -> &'static str {
+        if !executable {
+            "inert"
+        } else if self.async_attribute && external {
+            "asynchronous"
+        } else if module || (self.defer_attribute && external) {
+            "deferred"
+        } else {
+            "parser_blocking"
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DocumentScriptRoot {
     pub ordinal: usize,
     pub script_type: String,
     pub executable: bool,
     pub is_module: bool,
-    pub async_attribute: bool,
-    pub defer_attribute: bool,
-    pub nomodule_attribute: bool,
+    #[serde(flatten)]
+    pub attributes: ScriptAttributes,
     /// `parser_blocking`, deferred, asynchronous, or inert.
     pub scheduling_class: &'static str,
     pub src: Option<String>,
@@ -82,24 +109,6 @@ fn first_base_href(html: &str) -> Option<String> {
     None
 }
 
-const fn scheduling_class(
-    executable: bool,
-    module: bool,
-    src: bool,
-    is_async: bool,
-    is_defer: bool,
-) -> &'static str {
-    if !executable {
-        "inert"
-    } else if is_async && src {
-        "asynchronous"
-    } else if module || (is_defer && src) {
-        "deferred"
-    } else {
-        "parser_blocking"
-    }
-}
-
 /// Enumerate parser-visible initial script roots and *candidate* scheduling
 /// classes. The ordinal is source markup order, not an actual runtime sequence.
 ///
@@ -127,23 +136,18 @@ pub fn static_document_scripts(
             .as_deref()
             .and_then(|raw| base.join(raw).ok())
             .map(|url| url.to_string());
-        let is_async = tag.attrs.contains_key("async");
-        let is_defer = tag.attrs.contains_key("defer");
+        let attributes = ScriptAttributes {
+            async_attribute: tag.attrs.contains_key("async"),
+            defer_attribute: tag.attrs.contains_key("defer"),
+            nomodule_attribute: tag.attrs.contains_key("nomodule"),
+        };
         scripts.push(DocumentScriptRoot {
             ordinal: ordinal0 + 1,
             script_type,
             executable,
             is_module,
-            async_attribute: is_async,
-            defer_attribute: is_defer,
-            nomodule_attribute: tag.attrs.contains_key("nomodule"),
-            scheduling_class: scheduling_class(
-                executable,
-                is_module,
-                src.is_some(),
-                is_async,
-                is_defer,
-            ),
+            attributes,
+            scheduling_class: attributes.scheduling_class(executable, is_module, src.is_some()),
             src,
             resolved_url,
             captured_sources: Vec::new(),
@@ -285,7 +289,7 @@ mod tests {
         assert_eq!(scripts[2].scheduling_class, "deferred");
         assert_eq!(scripts[3].scheduling_class, "asynchronous");
         assert_eq!(scripts[4].scheduling_class, "inert");
-        assert!(scripts[5].nomodule_attribute);
+        assert!(scripts[5].attributes.nomodule_attribute);
         assert!(!scripts[5].execution_observed);
         Ok(())
     }

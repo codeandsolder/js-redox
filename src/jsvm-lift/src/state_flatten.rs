@@ -86,7 +86,7 @@ pub struct DetectedStateMachines {
 }
 
 fn static_u64(expr: &Expression<'_>) -> Option<u64> {
-    eval_static(expr).and_then(|value| exact_u64(value.number()?))
+    eval_static(expr).and_then(|value| exact_u64(value.number()))
 }
 
 fn finite_static_state_targets(expr: &Expression<'_>) -> Option<BTreeSet<u64>> {
@@ -1037,7 +1037,7 @@ pub fn prove_detected_if_ladder_event_unreachable_with_integer_bindings(
 ///
 /// Parameter bindings are keyed by formal-parameter index, so callers can join
 /// against symbol-resolved direct-call proofs without relying on source names.
-#[must_use]
+#[must_use = "Use the returned exact bindings only for proven parameter values"]
 fn exact_integer_parameter_env(
     function: &Function<'_>,
     scoping: &Scoping,
@@ -1132,7 +1132,7 @@ fn branch_state_variable_for_span(
     }
     impl Probe {
         fn consider(&mut self, binary: &oxc_ast::ast::BinaryExpression<'_>, span: Span) {
-            if !(span.start <= self.target.start && self.target.end <= span.end)
+            if !span.contains_inclusive(self.target)
                 || !matches!(binary.operator.as_str(), "==" | "===")
             {
                 return;
@@ -1358,37 +1358,25 @@ struct ProtectedLoopReachabilityRunner<'s> {
     env: HashMap<String, Scalar>,
     result: Option<bool>,
 }
-impl<'a> Visit<'a> for ProtectedLoopReachabilityRunner<'_> {
-    fn visit_while_statement(&mut self, while_statement: &WhileStatement<'a>) {
-        if self.result.is_some() {
-            return;
-        }
-        if while_statement.span != self.target {
-            walk::walk_while_statement(self, while_statement);
-            return;
-        }
+impl ProtectedLoopReachabilityRunner<'_> {
+    fn prove_target(&mut self, while_statement: &WhileStatement<'_>) -> bool {
         if !control_test_is_effect_free(&while_statement.test) {
-            self.result = Some(false);
-            return;
+            return false;
         }
         let Statement::TryStatement(try_statement) = &while_statement.body else {
-            self.result = Some(false);
-            return;
+            return false;
         };
         let (Some(handler), None) = (&try_statement.handler, &try_statement.finalizer) else {
-            self.result = Some(false);
-            return;
+            return false;
         };
         let Some((state_var, event_state)) =
             branch_state_variable_for_span(&try_statement.block, self.event)
         else {
-            self.result = Some(false);
-            return;
+            return false;
         };
 
         if protected_loop_captures_state(while_statement, &state_var) {
-            self.result = Some(false);
-            return;
+            return false;
         }
 
         let mut evidence = IfLadderEvidenceVisitor {
@@ -1397,53 +1385,62 @@ impl<'a> Visit<'a> for ProtectedLoopReachabilityRunner<'_> {
         };
         evidence.visit_block_statement(&try_statement.block);
         if evidence.evidence.compared_states.len() < 4 || evidence.evidence.state_assignments < 4 {
-            self.result = Some(false);
-            return;
+            return false;
         }
 
+        self.run_loop(
+            &try_statement.block.body,
+            &handler.body.body,
+            &state_var,
+            event_state,
+        )
+    }
+
+    fn run_loop(
+        &mut self,
+        body: &[Statement<'_>],
+        handler: &[Statement<'_>],
+        state_var: &str,
+        event_state: u64,
+    ) -> bool {
         for _ in 0..256 {
-            let Some(Scalar::Int(state)) = self.env.get(&state_var).copied() else {
-                self.result = Some(false);
-                return;
+            let Some(Scalar::Int(state)) = self.env.get(state_var).copied() else {
+                return false;
             };
             if u64::try_from(state).ok() == Some(event_state) {
-                self.result = Some(false);
-                return;
+                return false;
             }
 
             let mut semantic = Vec::new();
             let mut ambiguous_envs = Vec::new();
             match exec_statements(
-                &try_statement.block.body,
+                body,
                 self.source,
-                &state_var,
+                state_var,
                 &mut self.env,
                 &mut semantic,
                 &mut ambiguous_envs,
             ) {
                 ExecStatus::Return | ExecStatus::Break => {
-                    self.result = Some(true);
-                    return;
+                    return true;
                 }
                 ExecStatus::Throw => {
                     let mut catch_semantic = Vec::new();
                     let mut catch_ambiguous_envs = Vec::new();
                     match exec_statements(
-                        &handler.body.body,
+                        handler,
                         self.source,
-                        &state_var,
+                        state_var,
                         &mut self.env,
                         &mut catch_semantic,
                         &mut catch_ambiguous_envs,
                     ) {
                         ExecStatus::Return | ExecStatus::Throw | ExecStatus::Break => {
-                            self.result = Some(true);
-                            return;
+                            return true;
                         }
                         ExecStatus::Normal => {
                             if !catch_semantic.is_empty() {
-                                self.result = Some(false);
-                                return;
+                                return false;
                             }
                         }
                     }
@@ -1454,9 +1451,9 @@ impl<'a> Visit<'a> for ProtectedLoopReachabilityRunner<'_> {
                         let mut catch_semantic = Vec::new();
                         let mut catch_ambiguous_envs = Vec::new();
                         let catch_status = exec_statements(
-                            &handler.body.body,
+                            handler,
                             self.source,
-                            &state_var,
+                            state_var,
                             &mut catch_env,
                             &mut catch_semantic,
                             &mut catch_ambiguous_envs,
@@ -1465,14 +1462,26 @@ impl<'a> Visit<'a> for ProtectedLoopReachabilityRunner<'_> {
                             catch_status,
                             ExecStatus::Return | ExecStatus::Throw | ExecStatus::Break
                         ) {
-                            self.result = Some(false);
-                            return;
+                            return false;
                         }
                     }
                 }
             }
         }
-        self.result = Some(false);
+        false
+    }
+}
+
+impl<'a> Visit<'a> for ProtectedLoopReachabilityRunner<'_> {
+    fn visit_while_statement(&mut self, while_statement: &WhileStatement<'a>) {
+        if self.result.is_some() {
+            return;
+        }
+        if while_statement.span != self.target {
+            walk::walk_while_statement(self, while_statement);
+            return;
+        }
+        self.result = Some(self.prove_target(while_statement));
     }
     fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
     fn visit_arrow_function_expression(
@@ -1491,7 +1500,7 @@ impl<'a> Visit<'a> for ProtectedLoopReachabilityRunner<'_> {
 /// plain formal parameters are exact `undefined` values. Unsupported control,
 /// non-terminal ambiguous effects, dynamic scalar state, and recoverable
 /// exception paths all fail closed.
-#[must_use]
+#[must_use = "Only a true result proves the protected event unreachable for these arguments"]
 pub fn prove_function_protected_if_ladder_event_unreachable_with_call_arguments(
     source: &str,
     program: &Program<'_>,
@@ -1606,7 +1615,7 @@ impl<'a> Visit<'a> for ExactBooleanExpressionProbe<'_> {
 /// requested function body. Parameter facts use the same fail-closed scalar
 /// environment as the structured-branch proofs: mutable parameters are
 /// omitted, while dynamic scope or `arguments` makes the result unknown.
-#[must_use]
+#[must_use = "Use the returned boolean only when the expression result is proven"]
 pub fn proven_function_boolean_expression_with_integer_parameters(
     program: &Program<'_>,
     scoping: &Scoping,
@@ -1767,7 +1776,7 @@ impl<'a> Visit<'a> for StructuredBranchExclusionProbe<'_> {
 /// Only the scalar evaluator's side-effect-free subset participates. Unknown
 /// tests, targets not contained by a recognized branch, and dynamic scalar
 /// bindings fail closed.
-#[must_use]
+#[must_use = "Only a true result proves the branch event unreachable for these parameters"]
 pub fn prove_function_structured_branch_event_unreachable_with_integer_parameters(
     program: &Program<'_>,
     scoping: &Scoping,
@@ -1935,7 +1944,7 @@ impl<'a> Visit<'a> for StructuredSwitchExclusionProbe<'_> {
 /// The proof accepts only scalar-pure case selection and a selected case that
 /// either lies after the target or ends in an unconditional top-level
 /// break/return/throw before any later target case.
-#[must_use]
+#[must_use = "Only a true result proves the switch event unreachable for these parameters"]
 pub fn prove_function_switch_event_unreachable_with_integer_parameters(
     program: &Program<'_>,
     scoping: &Scoping,
@@ -2012,7 +2021,7 @@ pub fn prove_function_if_ladder_event_unreachable_with_integer_parameters(
 /// state transitions with the supplied call facts. The scalar/control subset,
 /// lexical-safety checks, and fail-closed behavior are identical to the exact
 /// unreachable-event theorem above.
-#[must_use]
+#[must_use = "Only a true result proves the required states precede the event for these parameters"]
 pub fn prove_function_if_ladder_states_before_event_with_integer_parameters(
     source: &str,
     program: &Program<'_>,
@@ -2634,6 +2643,33 @@ fn protected_assignment_symbol(
     resolved_reference_symbol(semantic.scoping(), identifier.reference_id.get())
 }
 
+fn eval_protected_binary(
+    binary: &oxc_ast::ast::BinaryExpression<'_>,
+    semantic: &Semantic<'_>,
+    env: &mut HashMap<SymbolId, Scalar>,
+) -> Option<ProtectedScalarValue> {
+    let left = eval_protected_scalar_expression(&binary.left, semantic, env)?;
+    let right = eval_protected_scalar_expression(&binary.right, semantic, env)?;
+    let (ProtectedScalarValue::Known(left), ProtectedScalarValue::Known(right)) = (left, right)
+    else {
+        return Some(ProtectedScalarValue::Unknown);
+    };
+    let value = match binary.operator.as_str() {
+        "==" | "===" => i64::from(match (left, right) {
+            (Scalar::Undefined, Scalar::Undefined) => true,
+            (Scalar::Int(left), Scalar::Int(right)) => left == right,
+            _ => false,
+        }),
+        "!=" | "!==" => i64::from(match (left, right) {
+            (Scalar::Undefined, Scalar::Undefined) => false,
+            (Scalar::Int(left), Scalar::Int(right)) => left != right,
+            _ => true,
+        }),
+        _ => return None,
+    };
+    Some(ProtectedScalarValue::Known(Scalar::Int(value)))
+}
+
 fn eval_protected_scalar_expression(
     expression: &Expression<'_>,
     semantic: &Semantic<'_>,
@@ -2699,29 +2735,7 @@ fn eval_protected_scalar_expression(
                 _ => None,
             }
         }
-        Expression::BinaryExpression(binary) => {
-            let left = eval_protected_scalar_expression(&binary.left, semantic, env)?;
-            let right = eval_protected_scalar_expression(&binary.right, semantic, env)?;
-            let (ProtectedScalarValue::Known(left), ProtectedScalarValue::Known(right)) =
-                (left, right)
-            else {
-                return Some(ProtectedScalarValue::Unknown);
-            };
-            let value = match binary.operator.as_str() {
-                "==" | "===" => i64::from(match (left, right) {
-                    (Scalar::Undefined, Scalar::Undefined) => true,
-                    (Scalar::Int(left), Scalar::Int(right)) => left == right,
-                    _ => false,
-                }),
-                "!=" | "!==" => i64::from(match (left, right) {
-                    (Scalar::Undefined, Scalar::Undefined) => false,
-                    (Scalar::Int(left), Scalar::Int(right)) => left != right,
-                    _ => true,
-                }),
-                _ => return None,
-            };
-            Some(ProtectedScalarValue::Known(Scalar::Int(value)))
-        }
+        Expression::BinaryExpression(binary) => eval_protected_binary(binary, semantic, env),
         Expression::ConditionalExpression(conditional) => {
             let ProtectedScalarValue::Known(test) =
                 eval_protected_scalar_expression(&conditional.test, semantic, env)?
@@ -3069,7 +3083,7 @@ fn prove_protected_machine_event_unreachable_after_state(
 /// The unique machine containing `event` must use a `try` body with one catch
 /// handler and no finalizer. Unsupported scalar effects and non-finite
 /// unresolved state transitions fail closed.
-#[must_use]
+#[must_use = "Only a true result proves the protected event unreachable after the given state"]
 pub fn prove_function_protected_if_ladder_event_unreachable_after_state(
     source: &str,
     program: &Program<'_>,
@@ -3254,7 +3268,7 @@ fn prove_identifier_equalities_in_machine(
 /// closed. Direct writes in the declaring factory are allowed because the
 /// returned inner function cannot execute until that factory invocation has
 /// completed.
-#[must_use]
+#[must_use = "Use the returned equality evidence rather than assuming identifier values"]
 pub fn structurally_proven_if_ladder_identifier_equalities_at_event(
     source: &str,
     program: &Program<'_>,
@@ -3361,7 +3375,7 @@ pub fn structurally_proven_if_ladder_identifier_equalities_at_event(
 
 /// Prove required flattened-machine states dominate an event in one already
 /// detected machine.
-#[must_use]
+#[must_use = "Only a true result proves the detected machine visits the required states first"]
 pub fn prove_detected_if_ladder_states_before_event(
     program: &Program<'_>,
     machine: &IfLadderStateMachineCandidate,
@@ -3384,6 +3398,112 @@ pub fn prove_detected_if_ladder_event_before_barriers(
     })
 }
 
+struct IfLadderMachineCollector<'s, 'p, F> {
+    source: &'s str,
+    detection_scope: &'static str,
+    event: Span,
+    prove: &'p mut F,
+    matches: usize,
+    result: bool,
+}
+
+impl<F> IfLadderMachineCollector<'_, '_, F> {
+    fn consider<'a>(&mut self, machine: &IfLadderStateMachineCandidate, body: &Statement<'a>)
+    where
+        F: FnMut(&IfLadderStateMachineCandidate, &Statement<'a>) -> bool,
+    {
+        if machine.start <= self.event.start && self.event.end <= machine.end {
+            self.matches += 1;
+            self.result = (self.prove)(machine, body);
+        }
+    }
+
+    fn scan_statement_list<'a>(&mut self, statements: &[Statement<'a>])
+    where
+        F: FnMut(&IfLadderStateMachineCandidate, &Statement<'a>) -> bool,
+    {
+        for pair in statements.windows(2) {
+            let [init, Statement::WhileStatement(while_statement)] = pair else {
+                continue;
+            };
+            let Some(machine) = detect_while_state_machine(
+                self.source,
+                self.detection_scope,
+                init,
+                while_statement,
+            ) else {
+                continue;
+            };
+            self.consider(&machine, &while_statement.body);
+        }
+    }
+}
+
+impl<'a, F: FnMut(&IfLadderStateMachineCandidate, &Statement<'a>) -> bool> Visit<'a>
+    for IfLadderMachineCollector<'_, '_, F>
+{
+    fn visit_function_body(&mut self, body: &FunctionBody<'a>) {
+        self.scan_statement_list(&body.statements);
+        walk::walk_function_body(self, body);
+    }
+
+    fn visit_block_statement(&mut self, block: &oxc_ast::ast::BlockStatement<'a>) {
+        self.scan_statement_list(&block.body);
+        walk::walk_block_statement(self, block);
+    }
+
+    fn visit_for_statement(&mut self, statement: &ForStatement<'a>) {
+        let detected = detect_for_state_machines(self.source, self.detection_scope, statement);
+        for machine in detected.if_ladder_machines {
+            self.consider(&machine, &statement.body);
+        }
+        walk::walk_for_statement(self, statement);
+    }
+
+    fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+    fn visit_arrow_function_expression(
+        &mut self,
+        _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+    ) {
+    }
+}
+
+struct IfLadderFunctionHarness<'s, 'p, F> {
+    source: &'s str,
+    function_start: u32,
+    function_end: u32,
+    detection_scope: &'static str,
+    event: Span,
+    prove: &'p mut F,
+    result: Option<bool>,
+}
+
+impl<'a, F: FnMut(&IfLadderStateMachineCandidate, &Statement<'a>) -> bool> Visit<'a>
+    for IfLadderFunctionHarness<'_, '_, F>
+{
+    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        if self.result.is_some() {
+            return;
+        }
+        if function.span.start == self.function_start && function.span.end == self.function_end {
+            self.result = Some(function.body.as_ref().is_some_and(|body| {
+                let mut collector = IfLadderMachineCollector {
+                    source: self.source,
+                    detection_scope: self.detection_scope,
+                    event: self.event,
+                    prove: &mut *self.prove,
+                    matches: 0,
+                    result: false,
+                };
+                collector.visit_function_body(body);
+                collector.matches == 1 && collector.result
+            }));
+            return;
+        }
+        walk::walk_function(self, function, flags);
+    }
+}
+
 // Find a unique flattened loop in exactly one function, without entering
 // nested functions. Each proof supplies its own detection scope and obligations;
 // both use identical for/while traversal and fail closed on ambiguous matches.
@@ -3396,114 +3516,7 @@ fn prove_function_if_ladder_machine<'a>(
     detection_scope: &'static str,
     mut prove: impl FnMut(&IfLadderStateMachineCandidate, &Statement<'a>) -> bool,
 ) -> bool {
-    struct MachineCollector<'s, 'p, F> {
-        source: &'s str,
-        detection_scope: &'static str,
-        event: Span,
-        prove: &'p mut F,
-        matches: usize,
-        result: bool,
-    }
-
-    impl<F> MachineCollector<'_, '_, F> {
-        fn consider<'a>(&mut self, machine: &IfLadderStateMachineCandidate, body: &Statement<'a>)
-        where
-            F: FnMut(&IfLadderStateMachineCandidate, &Statement<'a>) -> bool,
-        {
-            if machine.start <= self.event.start && self.event.end <= machine.end {
-                self.matches += 1;
-                self.result = (self.prove)(machine, body);
-            }
-        }
-
-        fn scan_statement_list<'a>(&mut self, statements: &[Statement<'a>])
-        where
-            F: FnMut(&IfLadderStateMachineCandidate, &Statement<'a>) -> bool,
-        {
-            for pair in statements.windows(2) {
-                let [init, Statement::WhileStatement(while_statement)] = pair else {
-                    continue;
-                };
-                let Some(machine) = detect_while_state_machine(
-                    self.source,
-                    self.detection_scope,
-                    init,
-                    while_statement,
-                ) else {
-                    continue;
-                };
-                self.consider(&machine, &while_statement.body);
-            }
-        }
-    }
-
-    impl<'a, F: FnMut(&IfLadderStateMachineCandidate, &Statement<'a>) -> bool> Visit<'a>
-        for MachineCollector<'_, '_, F>
-    {
-        fn visit_function_body(&mut self, body: &FunctionBody<'a>) {
-            self.scan_statement_list(&body.statements);
-            walk::walk_function_body(self, body);
-        }
-
-        fn visit_block_statement(&mut self, block: &oxc_ast::ast::BlockStatement<'a>) {
-            self.scan_statement_list(&block.body);
-            walk::walk_block_statement(self, block);
-        }
-
-        fn visit_for_statement(&mut self, statement: &ForStatement<'a>) {
-            let detected = detect_for_state_machines(self.source, self.detection_scope, statement);
-            for machine in detected.if_ladder_machines {
-                self.consider(&machine, &statement.body);
-            }
-            walk::walk_for_statement(self, statement);
-        }
-
-        fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
-        fn visit_arrow_function_expression(
-            &mut self,
-            _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
-        ) {
-        }
-    }
-
-    struct FunctionHarness<'s, 'p, F> {
-        source: &'s str,
-        function_start: u32,
-        function_end: u32,
-        detection_scope: &'static str,
-        event: Span,
-        prove: &'p mut F,
-        result: Option<bool>,
-    }
-
-    impl<'a, F: FnMut(&IfLadderStateMachineCandidate, &Statement<'a>) -> bool> Visit<'a>
-        for FunctionHarness<'_, '_, F>
-    {
-        fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
-            if self.result.is_some() {
-                return;
-            }
-            if function.span.start == self.function_start && function.span.end == self.function_end
-            {
-                self.result = Some(function.body.as_ref().is_some_and(|body| {
-                    let mut collector = MachineCollector {
-                        source: self.source,
-                        detection_scope: self.detection_scope,
-                        event: self.event,
-                        prove: &mut *self.prove,
-                        matches: 0,
-                        result: false,
-                    };
-                    collector.visit_function_body(body);
-                    collector.matches == 1 && collector.result
-                }));
-                return;
-            }
-            walk::walk_function(self, function, flags);
-        }
-    }
-
-    let mut harness = FunctionHarness {
+    let mut harness = IfLadderFunctionHarness {
         source,
         function_start,
         function_end,
@@ -3518,7 +3531,7 @@ fn prove_function_if_ladder_machine<'a>(
 
 /// Prove required state visitation inside the unique detected flattened
 /// if-ladder machine containing `event` in one exact function.
-#[must_use]
+#[must_use = "Only a true result proves the function visits the required states first"]
 pub fn prove_function_if_ladder_states_before_event(
     source: &str,
     program: &Program<'_>,
@@ -3666,7 +3679,7 @@ fn detect_if_ladder_candidate(
     })
 }
 
-#[must_use]
+#[must_use = "Use the detected machine evidence only when recognition succeeds"]
 pub fn detect_while_state_machine(
     source: &str,
     function_id: &str,
@@ -3833,6 +3846,50 @@ impl Scalar {
     }
 }
 
+fn eval_scalar_binary(operator: &str, left: Scalar, right: Scalar) -> Option<Scalar> {
+    match operator {
+        "==" | "===" => Some(Scalar::Int(i64::from(match (left, right) {
+            (Scalar::Undefined, Scalar::Undefined) => true,
+            (Scalar::Int(left), Scalar::Int(right)) => left == right,
+            _ => false,
+        }))),
+        "!=" | "!==" => Some(Scalar::Int(i64::from(match (left, right) {
+            (Scalar::Undefined, Scalar::Undefined) => false,
+            (Scalar::Int(left), Scalar::Int(right)) => left != right,
+            _ => true,
+        }))),
+        "<" => match (left.int(), right.int()) {
+            (Some(left), Some(right)) => Some(Scalar::Int(i64::from(left < right))),
+            _ => None,
+        },
+        "<=" => match (left.int(), right.int()) {
+            (Some(left), Some(right)) => Some(Scalar::Int(i64::from(left <= right))),
+            _ => None,
+        },
+        ">" => match (left.int(), right.int()) {
+            (Some(left), Some(right)) => Some(Scalar::Int(i64::from(left > right))),
+            _ => None,
+        },
+        ">=" => match (left.int(), right.int()) {
+            (Some(left), Some(right)) => Some(Scalar::Int(i64::from(left >= right))),
+            _ => None,
+        },
+        op @ ("&" | "|" | "^" | "<<" | ">>" | ">>>") => match (left.int(), right.int()) {
+            (Some(left), Some(right)) => eval_js_bitwise_i64(op, left, right).map(Scalar::Int),
+            _ => None,
+        },
+        "+" => match (left.int(), right.int()) {
+            (Some(left), Some(right)) => Some(Scalar::Int(left.wrapping_add(right))),
+            _ => None,
+        },
+        "-" => match (left.int(), right.int()) {
+            (Some(left), Some(right)) => Some(Scalar::Int(left.wrapping_sub(right))),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn eval_expr_impl(
     expr: &Expression<'_>,
     env: &HashMap<String, Scalar>,
@@ -3876,49 +3933,7 @@ fn eval_expr_impl(
             let Some(right) = eval_expr_impl(&binary.right, env, budget)? else {
                 return Ok(None);
             };
-            match binary.operator.as_str() {
-                "==" | "===" => Some(Scalar::Int(i64::from(match (left, right) {
-                    (Scalar::Undefined, Scalar::Undefined) => true,
-                    (Scalar::Int(left), Scalar::Int(right)) => left == right,
-                    _ => false,
-                }))),
-                "!=" | "!==" => Some(Scalar::Int(i64::from(match (left, right) {
-                    (Scalar::Undefined, Scalar::Undefined) => false,
-                    (Scalar::Int(left), Scalar::Int(right)) => left != right,
-                    _ => true,
-                }))),
-                "<" => match (left.int(), right.int()) {
-                    (Some(left), Some(right)) => Some(Scalar::Int(i64::from(left < right))),
-                    _ => None,
-                },
-                "<=" => match (left.int(), right.int()) {
-                    (Some(left), Some(right)) => Some(Scalar::Int(i64::from(left <= right))),
-                    _ => None,
-                },
-                ">" => match (left.int(), right.int()) {
-                    (Some(left), Some(right)) => Some(Scalar::Int(i64::from(left > right))),
-                    _ => None,
-                },
-                ">=" => match (left.int(), right.int()) {
-                    (Some(left), Some(right)) => Some(Scalar::Int(i64::from(left >= right))),
-                    _ => None,
-                },
-                op @ ("&" | "|" | "^" | "<<" | ">>" | ">>>") => match (left.int(), right.int()) {
-                    (Some(left), Some(right)) => {
-                        eval_js_bitwise_i64(op, left, right).map(Scalar::Int)
-                    }
-                    _ => None,
-                },
-                "+" => match (left.int(), right.int()) {
-                    (Some(left), Some(right)) => Some(Scalar::Int(left.wrapping_add(right))),
-                    _ => None,
-                },
-                "-" => match (left.int(), right.int()) {
-                    (Some(left), Some(right)) => Some(Scalar::Int(left.wrapping_sub(right))),
-                    _ => None,
-                },
-                _ => None,
-            }
+            eval_scalar_binary(binary.operator.as_str(), left, right)
         }
         Expression::LogicalExpression(logical) => {
             let Some(left) = eval_expr_impl(&logical.left, env, budget)? else {
@@ -4163,7 +4178,6 @@ fn expression_definitely_throws_impl(
                 "||" if !left.truthy() => {
                     expression_definitely_throws_impl(&logical.right, env, budget)
                 }
-                "&&" | "||" => Ok(false),
                 _ => Ok(false),
             }
         }
@@ -4217,6 +4231,81 @@ fn record_ambiguous_effect(
     semantic.push(slice(source, span));
 }
 
+fn exec_control_assignment(
+    assignment: &oxc_ast::ast::AssignmentExpression<'_>,
+    source: &str,
+    env: &mut HashMap<String, Scalar>,
+    semantic: &mut Vec<String>,
+    ambiguous_envs: &mut Vec<HashMap<String, Scalar>>,
+    budget: Option<&WorkBudget>,
+) -> Result<ExecStatus, BudgetExceeded> {
+    Ok(
+        if let Some(target) = assignment.left.get_identifier_name() {
+            if let Some(value) = eval_expr_impl(&assignment.right, env, budget)? {
+                env.insert(target.to_string(), value);
+            } else if expression_definitely_throws_impl(&assignment.right, env, budget)? {
+                return Ok(ExecStatus::Throw);
+            } else {
+                record_ambiguous_effect(source, assignment.span, env, semantic, ambiguous_envs);
+                env.remove(target);
+            }
+            ExecStatus::Normal
+        } else if expression_definitely_throws_impl(&assignment.right, env, budget)? {
+            ExecStatus::Throw
+        } else {
+            record_ambiguous_effect(source, assignment.span, env, semantic, ambiguous_envs);
+            ExecStatus::Normal
+        },
+    )
+}
+
+fn exec_control_logical(
+    logical: &oxc_ast::ast::LogicalExpression<'_>,
+    source: &str,
+    env: &mut HashMap<String, Scalar>,
+    semantic: &mut Vec<String>,
+    ambiguous_envs: &mut Vec<HashMap<String, Scalar>>,
+    budget: Option<&WorkBudget>,
+) -> Result<ExecStatus, BudgetExceeded> {
+    if expression_definitely_throws_impl(&logical.left, env, budget)? {
+        return Ok(ExecStatus::Throw);
+    }
+    Ok(
+        if let Some(left) = eval_expr_impl(&logical.left, env, budget)? {
+            match logical.operator.as_str() {
+                "&&" if left.truthy() => {
+                    return exec_control_expr_impl(
+                        &logical.right,
+                        source,
+                        env,
+                        semantic,
+                        ambiguous_envs,
+                        budget,
+                    );
+                }
+                "||" if !left.truthy() => {
+                    return exec_control_expr_impl(
+                        &logical.right,
+                        source,
+                        env,
+                        semantic,
+                        ambiguous_envs,
+                        budget,
+                    );
+                }
+                "&&" | "||" => ExecStatus::Normal,
+                _ => {
+                    record_ambiguous_effect(source, logical.span, env, semantic, ambiguous_envs);
+                    ExecStatus::Normal
+                }
+            }
+        } else {
+            record_ambiguous_effect(source, logical.span, env, semantic, ambiguous_envs);
+            ExecStatus::Normal
+        },
+    )
+}
+
 fn exec_control_expr_impl(
     expr: &Expression<'_>,
     source: &str,
@@ -4256,22 +4345,7 @@ fn exec_control_expr_impl(
             ExecStatus::Normal
         }
         Expression::AssignmentExpression(assignment) if assignment.operator.is_assign() => {
-            if let Some(target) = assignment.left.get_identifier_name() {
-                if let Some(value) = eval_expr_impl(&assignment.right, env, budget)? {
-                    env.insert(target.to_string(), value);
-                } else if expression_definitely_throws_impl(&assignment.right, env, budget)? {
-                    return Ok(ExecStatus::Throw);
-                } else {
-                    record_ambiguous_effect(source, assignment.span, env, semantic, ambiguous_envs);
-                    env.remove(target);
-                }
-                ExecStatus::Normal
-            } else if expression_definitely_throws_impl(&assignment.right, env, budget)? {
-                ExecStatus::Throw
-            } else {
-                record_ambiguous_effect(source, assignment.span, env, semantic, ambiguous_envs);
-                ExecStatus::Normal
-            }
+            exec_control_assignment(assignment, source, env, semantic, ambiguous_envs, budget)?
         }
         Expression::ConditionalExpression(conditional) => {
             if expression_definitely_throws_impl(&conditional.test, env, budget)? {
@@ -4296,47 +4370,7 @@ fn exec_control_expr_impl(
             ExecStatus::Normal
         }
         Expression::LogicalExpression(logical) => {
-            if expression_definitely_throws_impl(&logical.left, env, budget)? {
-                return Ok(ExecStatus::Throw);
-            }
-            if let Some(left) = eval_expr_impl(&logical.left, env, budget)? {
-                match logical.operator.as_str() {
-                    "&&" if left.truthy() => {
-                        return exec_control_expr_impl(
-                            &logical.right,
-                            source,
-                            env,
-                            semantic,
-                            ambiguous_envs,
-                            budget,
-                        );
-                    }
-                    "||" if !left.truthy() => {
-                        return exec_control_expr_impl(
-                            &logical.right,
-                            source,
-                            env,
-                            semantic,
-                            ambiguous_envs,
-                            budget,
-                        );
-                    }
-                    "&&" | "||" => ExecStatus::Normal,
-                    _ => {
-                        record_ambiguous_effect(
-                            source,
-                            logical.span,
-                            env,
-                            semantic,
-                            ambiguous_envs,
-                        );
-                        ExecStatus::Normal
-                    }
-                }
-            } else {
-                record_ambiguous_effect(source, logical.span, env, semantic, ambiguous_envs);
-                ExecStatus::Normal
-            }
+            exec_control_logical(logical, source, env, semantic, ambiguous_envs, budget)?
         }
         _ if expression_definitely_throws_impl(expr, env, budget)? => ExecStatus::Throw,
         _ => {
@@ -4842,7 +4876,7 @@ fn numeric_case_map<'a>(
 
 impl LoopRunner<'_, '_> {
     fn simulate_opcode<'a>(
-        &mut self,
+        &self,
         opcode: u64,
         case_map: &BTreeMap<u64, &'a [Statement<'a>]>,
         observed_opcodes: &BTreeSet<u64>,
@@ -4950,7 +4984,7 @@ impl LoopRunner<'_, '_> {
     }
 
     fn build_opcode_map(
-        &mut self,
+        &self,
         switch: &SwitchStatement<'_>,
     ) -> Result<Option<OpcodeMapCandidate>, BudgetExceeded> {
         self.budget.checkpoint()?;
@@ -6022,7 +6056,7 @@ mod tests {
             result: Option<bool>,
         }
         impl Harness<'_> {
-            fn inspect_statements<'a>(&mut self, statements: &[Statement<'a>]) {
+            fn inspect_statements(&mut self, statements: &[Statement<'_>]) {
                 for pair in statements.windows(2) {
                     let [init, Statement::WhileStatement(while_statement)] = pair else {
                         continue;
@@ -6396,7 +6430,7 @@ mod tests {
             &machine,
             &while_statement.body,
             event,
-            &[(("selector").to_string(), 14i64)].into_iter().collect(),
+            &std::iter::once((("selector").to_string(), 14i64)).collect(),
         ));
         assert!(
             super::prove_function_if_ladder_event_unreachable_with_integer_parameters(
@@ -6406,7 +6440,7 @@ mod tests {
                 IntegerParameterEvent {
                     function: Span::new(function.span.start, function.span.end),
                     event,
-                    parameter_bindings: &[(0usize, 14i64)].into_iter().collect(),
+                    parameter_bindings: &std::iter::once((0usize, 14i64)).collect(),
                 },
             )
         );

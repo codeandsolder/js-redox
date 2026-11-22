@@ -32,7 +32,7 @@ pub enum AnalysisOperation {
 }
 
 impl AnalysisOperation {
-    #[must_use]
+    #[must_use = "Use the returned stable spelling when serializing or displaying this value"]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::CaptureImport => "capture-import",
@@ -56,32 +56,41 @@ impl AnalysisOperation {
         }
     }
 
-    #[must_use]
+    #[must_use = "Apply the returned limits to bound the analysis operation"]
     pub const fn limits(self) -> BudgetLimits {
         // These envelopes preserve the useful containment behavior of the old
         // process wrappers while moving enforcement into the algorithms. The
         // deterministic `work` dimension remains available for individual
         // algorithms once they expose meaningful units.
         let seconds = match self {
-            Self::CaptureImport => 240,
             Self::SyntaxCheck => 90,
-            Self::Format => 120,
-            Self::StaticStringRecovery | Self::SafeDeobfuscation => 180,
-            Self::StructuralScan => 120,
-            Self::IrMaterialization => 180,
-            Self::VmMaterialization => 180,
-            Self::ApiSurface => 120,
-            Self::SourceMaterialization => 120,
-            Self::ReferenceScan => 120,
-            Self::SourcemapRecovery => 120,
-            Self::BundleMaterialization => 180,
-            Self::WasmAnalysis => 180,
-            Self::RuntimeAnalysis => 120,
-            Self::SourceGraph => 120,
-            Self::ProjectReadme => 120,
+            Self::Format
+            | Self::StructuralScan
+            | Self::ApiSurface
+            | Self::SourceMaterialization
+            | Self::ReferenceScan
+            | Self::SourcemapRecovery
+            | Self::RuntimeAnalysis
+            | Self::SourceGraph
+            | Self::ProjectReadme => 120,
+            Self::StaticStringRecovery
+            | Self::SafeDeobfuscation
+            | Self::IrMaterialization
+            | Self::VmMaterialization
+            | Self::BundleMaterialization
+            | Self::WasmAnalysis => 180,
+            Self::CaptureImport => 240,
             Self::CorpusEvaluation => 360,
         };
         BudgetLimits::wall_time(Duration::from_secs(seconds))
+    }
+    /// Derive an operation-specific envelope from its actual parent.
+    /// The parent carries the cancellation and resource limits; the root
+    /// budget container is not involved once a stage is already established.
+    #[must_use = "Use the returned child budget to enforce both operation and parent limits"]
+    pub fn under(self, parent: &WorkBudget, label: impl AsRef<str>) -> WorkBudget {
+        let scope = format!("{}:{}", self.as_str(), label.as_ref());
+        parent.child(scope, self.limits())
     }
 }
 
@@ -91,19 +100,19 @@ pub struct AnalysisBudgets {
 }
 
 impl AnalysisBudgets {
-    #[must_use]
+    #[must_use = "Use the constructed budget set to account for subsequent analysis"]
     pub fn new(scope: impl Into<std::sync::Arc<str>>, limits: BudgetLimits) -> Self {
         Self {
             root: WorkBudget::new(scope, limits),
         }
     }
 
-    #[must_use]
+    #[must_use = "Use the returned budget set to enforce standard analysis limits"]
     pub fn standard(scope: impl Into<std::sync::Arc<str>>) -> Self {
         Self::new(scope, BudgetLimits::unlimited())
     }
 
-    #[must_use]
+    #[must_use = "Use the returned scope value for attribution or scoped budget enforcement"]
     pub fn scope(&self, label: impl AsRef<str>) -> WorkBudget {
         self.root.child(
             format!("scope:{}", label.as_ref()),
@@ -111,23 +120,12 @@ impl AnalysisBudgets {
         )
     }
 
-    #[must_use]
+    #[must_use = "Use the returned operation budget when performing the analysis"]
     pub fn operation(&self, operation: AnalysisOperation, label: impl AsRef<str>) -> WorkBudget {
-        self.operation_under(&self.root, operation, label)
+        operation.under(&self.root, label)
     }
 
-    #[must_use]
-    pub fn operation_under(
-        &self,
-        parent: &WorkBudget,
-        operation: AnalysisOperation,
-        label: impl AsRef<str>,
-    ) -> WorkBudget {
-        let scope = format!("{}:{}", operation.as_str(), label.as_ref());
-        parent.child(scope, operation.limits())
-    }
-
-    #[must_use]
+    #[must_use = "Use the returned budget to account for project-wide work"]
     pub const fn root(&self) -> &WorkBudget {
         &self.root
     }
@@ -168,9 +166,8 @@ mod tests {
 
     #[test]
     fn nested_operation_reports_stage_exhaustion_as_inherited() {
-        let budgets = AnalysisBudgets::standard("project");
         let stage = WorkBudget::new("stage", BudgetLimits::work(1));
-        let unit = budgets.operation_under(&stage, AnalysisOperation::StructuralScan, "fixture.js");
+        let unit = AnalysisOperation::StructuralScan.under(&stage, "fixture.js");
         assert!(unit.consume(1).is_ok());
         assert!(matches!(
             unit.consume(1),

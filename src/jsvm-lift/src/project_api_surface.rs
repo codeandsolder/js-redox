@@ -25,40 +25,181 @@ fn string_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value.get(key).and_then(Value::as_str)
 }
 
-/// Preserve identical source identity on both callsites and mutating
-/// expressions so provenance graph parent selection cannot drift.
-fn attach_source_identity(
-    object: &mut Map<String, Value>,
-    source_index_ordinal: usize,
-    unit: &Value,
-    raw_path: Option<&str>,
-    analysis_path: &str,
-    deob: Option<&Value>,
-) {
-    object.insert("source_index_ordinal".into(), json!(source_index_ordinal));
-    object.insert(
-        "resource_id".into(),
-        unit.get("resource_id").cloned().unwrap_or(Value::Null),
-    );
-    object.insert(
-        "resource_url".into(),
-        unit.get("url").cloned().unwrap_or(Value::Null),
-    );
-    object.insert(
-        "raw_path".into(),
-        raw_path.map_or(Value::Null, |raw| json!(raw)),
-    );
-    object.insert(
-        "source_path".into(),
-        unit.get("source_path").cloned().unwrap_or(Value::Null),
-    );
-    object.insert("analysis_path".into(), json!(analysis_path));
-    object.insert(
-        "deobfuscation_ordinal".into(),
-        deob.and_then(|entry| entry.get("ordinal"))
+struct SelectedUnit<'a> {
+    ordinal: usize,
+    unit: &'a Value,
+    deob: Option<&'a Value>,
+    analysis_path: &'a str,
+}
+
+impl<'a> SelectedUnit<'a> {
+    fn select(
+        ordinal: usize,
+        unit: &'a Value,
+        deob_by_raw: &BTreeMap<&str, &'a Value>,
+    ) -> Option<Self> {
+        if string_field(unit, "kind") != Some("javascript") {
+            return None;
+        }
+        let source_path = string_field(unit, "source_path")?;
+        let deob = string_field(unit, "raw_path").and_then(|raw| deob_by_raw.get(raw).copied());
+        let analysis_path = deob
+            .and_then(|row| string_field(row, "output_path"))
+            .unwrap_or(source_path);
+        Some(Self {
+            ordinal,
+            unit,
+            deob,
+            analysis_path,
+        })
+    }
+
+    fn raw_path(&self) -> Option<&str> {
+        string_field(self.unit, "raw_path")
+    }
+
+    /// Keep callsite and mutation provenance identical.
+    fn attach_identity(&self, object: &mut Map<String, Value>) {
+        object.insert("source_index_ordinal".into(), json!(self.ordinal));
+        object.insert(
+            "resource_id".into(),
+            self.unit.get("resource_id").cloned().unwrap_or(Value::Null),
+        );
+        object.insert(
+            "resource_url".into(),
+            self.unit.get("url").cloned().unwrap_or(Value::Null),
+        );
+        object.insert(
+            "raw_path".into(),
+            self.raw_path().map_or(Value::Null, |raw| json!(raw)),
+        );
+        object.insert(
+            "source_path".into(),
+            self.unit.get("source_path").cloned().unwrap_or(Value::Null),
+        );
+        object.insert("analysis_path".into(), json!(self.analysis_path));
+        object.insert(
+            "deobfuscation_ordinal".into(),
+            self.deob
+                .and_then(|entry| entry.get("ordinal"))
+                .cloned()
+                .unwrap_or(Value::Null),
+        );
+    }
+
+    fn failure(&self, error: impl std::fmt::Display) -> Value {
+        json!({
+            "source_index_ordinal": self.ordinal,
+            "resource_id": self.unit.get("resource_id").cloned().unwrap_or(Value::Null),
+            "raw_path": self.raw_path(),
+            "analysis_path": self.analysis_path,
+            "error": error.to_string(),
+        })
+    }
+}
+
+#[derive(Default)]
+struct ApiSurfaceInventory {
+    callsites: Vec<Value>,
+    mutation_sites: Vec<Value>,
+    failures: Vec<Value>,
+    analyzed_units: usize,
+}
+
+impl ApiSurfaceInventory {
+    fn analyze_unit(
+        &mut self,
+        project: &Path,
+        selected: &SelectedUnit<'_>,
+        stage_budget: &work_budget::WorkBudget,
+    ) -> Result<()> {
+        self.analyzed_units += 1;
+        let source_path = project.join(selected.analysis_path);
+        if !source_path.is_file() {
+            self.failures
+                .push(selected.failure("selected analysis source is missing"));
+            return Ok(());
+        }
+        let source = match fs::read_to_string(&source_path) {
+            Ok(source) => source,
+            Err(error) => {
+                let error = recoverable_unit_error(error.into())?;
+                self.failures.push(selected.failure(format_args!(
+                    "failed to read selected analysis source: {error}"
+                )));
+                return Ok(());
+            }
+        };
+        let budget =
+            AnalysisOperation::ApiSurface.under(stage_budget, source_path.display().to_string());
+        let rows = match analyze_api_surface(&source, &budget) {
+            Ok(rows) => rows,
+            Err(error) => {
+                let error = recoverable_unit_error(error)?;
+                self.failures.push(selected.failure(error));
+                return Ok(());
+            }
+        };
+        for (ordinal, row) in rows.mutation_sites.into_iter().enumerate() {
+            let Value::Object(mut object) = serde_json::to_value(row)? else {
+                anyhow::bail!("invalid mutation site");
+            };
+            selected.attach_identity(&mut object);
+            object.insert("mutation_site_ordinal".into(), json!(ordinal));
+            self.mutation_sites.push(Value::Object(object));
+        }
+        for (ordinal, row) in rows.callsites.into_iter().enumerate() {
+            let Value::Object(mut object) = serde_json::to_value(row)? else {
+                anyhow::bail!("invalid API callsite");
+            };
+            selected.attach_identity(&mut object);
+            object.insert("callsite_ordinal".into(), json!(ordinal));
+            let absolute = absolute_network_url(object.get("url"));
+            object.insert("absolute_network_url".into(), Value::Bool(absolute));
+            self.callsites.push(Value::Object(object));
+        }
+        Ok(())
+    }
+
+    fn publish(self, project: &Path) -> Result<Value> {
+        let Self {
+            callsites,
+            mutation_sites,
+            failures,
+            analyzed_units,
+        } = self;
+        let mut kinds = BTreeMap::<String, usize>::new();
+        for row in &callsites {
+            if let Some(kind) = string_field(row, "kind") {
+                *kinds.entry(kind.to_owned()).or_default() += 1;
+            }
+        }
+        let summary = json!({
+            "units": analyzed_units,
+            "callsites": callsites.len(),
+            "forwarded_callsites": callsites.iter().filter(|row| string_field(row, "invocation_form") == Some("wrapper")).count(),
+            "mutation_sites": mutation_sites.len(),
+            "candidates": callsites.iter().filter(|row| string_field(row, "binding_status") == Some("candidate")).count(),
+            "failures": failures.len(),
+            "kinds": kinds,
+            "static_urls": callsites.iter().filter(|row| string_field(row, "url").is_some()).count(),
+            "absolute_network_urls": callsites.iter().filter(|row| row.get("absolute_network_url").and_then(Value::as_bool) == Some(true)).count(),
+            "static_methods": callsites.iter().filter(|row| string_field(row, "method").is_some()).count(),
+            "invalid_methods": callsites.iter().filter(|row| string_field(row, "method_status") == Some("invalid")).count(),
+        });
+        let document = json!({
+            "schema": API_SURFACE.schema,
+            "callsites": callsites,
+            "mutation_sites": mutation_sites,
+            "failures": failures,
+            "summary": summary,
+        });
+        write_artifact(project, API_SURFACE, &document)?;
+        Ok(document
+            .get("summary")
             .cloned()
-            .unwrap_or(Value::Null),
-    );
+            .unwrap_or_else(|| json!({})))
+    }
 }
 
 /// Analyze every selected JavaScript view in a capture project and persist the
@@ -75,7 +216,7 @@ pub fn analyze_project_api_surface(project: &Path, budgets: &AnalysisBudgets) ->
         .context("source index is required for API-surface analysis")?;
     let deobfuscation = load_optional_artifact(project, DEOBFUSCATION)?;
 
-    let mut deob_by_raw = BTreeMap::<String, Value>::new();
+    let mut deob_by_raw = BTreeMap::<&str, &Value>::new();
     if let Some(rows) = deobfuscation
         .as_ref()
         .and_then(|document| document.get("units"))
@@ -87,7 +228,7 @@ pub fn analyze_project_api_surface(project: &Path, budgets: &AnalysisBudgets) ->
             };
             let exit = row.get("exit").and_then(Value::as_i64).unwrap_or_default();
             if exit == 0 && string_field(row, "output_path").is_some() {
-                deob_by_raw.insert(raw_path.to_owned(), row.clone());
+                deob_by_raw.insert(raw_path, row);
             }
         }
     }
@@ -96,140 +237,14 @@ pub fn analyze_project_api_surface(project: &Path, budgets: &AnalysisBudgets) ->
         .get("units")
         .and_then(Value::as_array)
         .context("source index units must be an array")?;
-    let mut callsites = Vec::new();
-    let mut mutation_sites = Vec::new();
-    let mut failures = Vec::new();
-    let mut analyzed_units = 0_usize;
-
-    for (source_index_ordinal, unit) in units.iter().enumerate() {
+    let mut inventory = ApiSurfaceInventory::default();
+    for (ordinal, unit) in units.iter().enumerate() {
         stage_budget.checkpoint()?;
-        if string_field(unit, "kind") != Some("javascript")
-            || string_field(unit, "source_path").is_none()
-        {
-            continue;
-        }
-        let raw_path = string_field(unit, "raw_path");
-        let deob = raw_path.and_then(|raw| deob_by_raw.get(raw));
-        let analysis_path = deob
-            .and_then(|row| string_field(row, "output_path"))
-            .or_else(|| string_field(unit, "source_path"));
-        let Some(analysis_path) = analysis_path else {
-            continue;
-        };
-        analyzed_units += 1;
-        let source_path = project.join(analysis_path);
-        if !source_path.is_file() {
-            failures.push(json!({
-                "source_index_ordinal": source_index_ordinal,
-                "resource_id": unit.get("resource_id").cloned().unwrap_or(Value::Null),
-                "raw_path": raw_path,
-                "analysis_path": analysis_path,
-                "error": "selected analysis source is missing",
-            }));
-            continue;
-        }
-
-        let source = match fs::read_to_string(&source_path) {
-            Ok(source) => source,
-            Err(error) => {
-                let error = recoverable_unit_error(error.into())?;
-                failures.push(json!({
-                    "source_index_ordinal": source_index_ordinal,
-                    "resource_id": unit.get("resource_id").cloned().unwrap_or(Value::Null),
-                    "raw_path": raw_path,
-                    "analysis_path": analysis_path,
-                    "error": format!("failed to read selected analysis source: {error}"),
-                }));
-                continue;
-            }
-        };
-        let budget = budgets.operation_under(
-            &stage_budget,
-            AnalysisOperation::ApiSurface,
-            source_path.display().to_string(),
-        );
-        let rows = match analyze_api_surface(&source, &budget) {
-            Ok(rows) => rows,
-            Err(error) => {
-                let error = recoverable_unit_error(error)?;
-                failures.push(json!({
-                    "source_index_ordinal": source_index_ordinal,
-                    "resource_id": unit.get("resource_id").cloned().unwrap_or(Value::Null),
-                    "raw_path": raw_path,
-                    "analysis_path": analysis_path,
-                    "error": error.to_string(),
-                }));
-                continue;
-            }
-        };
-
-        for (mutation_site_ordinal, row) in rows.mutation_sites.into_iter().enumerate() {
-            let value = serde_json::to_value(row)?;
-            let mut object = value
-                .as_object()
-                .cloned()
-                .context("invalid mutation site")?;
-            attach_source_identity(
-                &mut object,
-                source_index_ordinal,
-                unit,
-                raw_path,
-                analysis_path,
-                deob,
-            );
-            object.insert("mutation_site_ordinal".into(), json!(mutation_site_ordinal));
-            mutation_sites.push(Value::Object(object));
-        }
-
-        for (callsite_ordinal, row) in rows.callsites.into_iter().enumerate() {
-            let value = serde_json::to_value(row)?;
-            let mut object = value.as_object().cloned().context("invalid API callsite")?;
-            attach_source_identity(
-                &mut object,
-                source_index_ordinal,
-                unit,
-                raw_path,
-                analysis_path,
-                deob,
-            );
-            object.insert("callsite_ordinal".into(), json!(callsite_ordinal));
-            let absolute = absolute_network_url(object.get("url"));
-            object.insert("absolute_network_url".into(), Value::Bool(absolute));
-            callsites.push(Value::Object(object));
+        if let Some(selected) = SelectedUnit::select(ordinal, unit, &deob_by_raw) {
+            inventory.analyze_unit(project, &selected, &stage_budget)?;
         }
     }
-
-    let mut kinds = BTreeMap::<String, usize>::new();
-    for row in &callsites {
-        if let Some(kind) = string_field(row, "kind") {
-            *kinds.entry(kind.to_owned()).or_default() += 1;
-        }
-    }
-    let summary = json!({
-        "units": analyzed_units,
-        "callsites": callsites.len(),
-        "forwarded_callsites": callsites.iter().filter(|row| string_field(row, "invocation_form") == Some("wrapper")).count(),
-        "mutation_sites": mutation_sites.len(),
-        "candidates": callsites.iter().filter(|row| string_field(row, "binding_status") == Some("candidate")).count(),
-        "failures": failures.len(),
-        "kinds": kinds,
-        "static_urls": callsites.iter().filter(|row| string_field(row, "url").is_some()).count(),
-        "absolute_network_urls": callsites.iter().filter(|row| row.get("absolute_network_url").and_then(Value::as_bool) == Some(true)).count(),
-        "static_methods": callsites.iter().filter(|row| string_field(row, "method").is_some()).count(),
-        "invalid_methods": callsites.iter().filter(|row| string_field(row, "method_status") == Some("invalid")).count(),
-    });
-    let document = json!({
-        "schema": API_SURFACE.schema,
-        "callsites": callsites,
-        "mutation_sites": mutation_sites,
-        "failures": failures,
-        "summary": summary,
-    });
-    write_artifact(project, API_SURFACE, &document)?;
-    Ok(document
-        .get("summary")
-        .cloned()
-        .unwrap_or_else(|| json!({})))
+    inventory.publish(project)
 }
 
 #[cfg(test)]
@@ -474,16 +489,11 @@ navigator.sendBeacon("https://api.example.test/events", payload);
         Ok(())
     }
 
-    #[test]
-    fn api_surface_graph_and_readme_remain_consistent() -> anyhow::Result<()> {
-        use crate::{
-            capture_project::{write_manifest, CaptureManifest, CaptureSource, MANIFEST_NAME},
-            project_readme::refresh_project_readme,
-            source_graph::build_source_graph,
+    fn setup_api_surface_graph_project(project: &std::path::Path) -> anyhow::Result<()> {
+        use crate::capture_project::{
+            write_manifest, CaptureManifest, CaptureSource, MANIFEST_NAME,
         };
 
-        let temp = tempfile::tempdir()?;
-        let project = temp.path().join("project");
         fs::create_dir_all(project.join("resources"))?;
         fs::create_dir_all(project.join("src/_deobfuscated"))?;
 
@@ -549,7 +559,7 @@ function shadow(fetch) { fetch("https://fake.invalid/"); }
             },
         )?;
         write_artifact(
-            &project,
+            project,
             SOURCE_INDEX,
             &json!({
                 "schema": SOURCE_INDEX.schema,
@@ -562,7 +572,7 @@ function shadow(fetch) { fetch("https://fake.invalid/"); }
             }),
         )?;
         write_artifact(
-            &project,
+            project,
             DEOBFUSCATION,
             &json!({
                 "schema": DEOBFUSCATION.schema,
@@ -577,24 +587,11 @@ function shadow(fetch) { fetch("https://fake.invalid/"); }
             }),
         )?;
 
-        let summary = analyze_project_api_surface(
-            &project,
-            &AnalysisBudgets::standard("api-surface-graph-test"),
-        )?;
-        assert_eq!(summary["units"], 2);
-        assert_eq!(summary["callsites"], 9);
-        assert_eq!(summary["failures"], 1);
-        assert_eq!(summary["static_urls"], 9);
-        assert_eq!(summary["kinds"]["fetch"], 5);
-        assert_eq!(summary["kinds"]["send_beacon"], 1);
-        assert_eq!(summary["kinds"]["websocket"], 1);
-        assert_eq!(summary["kinds"]["xhr_open"], 1);
-        assert_eq!(summary["kinds"]["xhr_open_candidate"], 1);
-        assert_eq!(summary["absolute_network_urls"], 7);
-        assert_eq!(summary["static_methods"], 6);
-        assert_eq!(summary["invalid_methods"], 1);
+        Ok(())
+    }
 
-        let artifact = load_artifact(&project, API_SURFACE)?;
+    fn assert_api_surface_rows(project: &std::path::Path) -> anyhow::Result<()> {
+        let artifact = load_artifact(project, API_SURFACE)?;
         let callsites = artifact["callsites"]
             .as_array()
             .context("api-surface callsites must be an array")?;
@@ -630,12 +627,15 @@ function shadow(fetch) { fetch("https://fake.invalid/"); }
             .get("method")
             .is_none_or(serde_json::Value::is_null));
 
-        let graph_summary = build_source_graph(
-            &project,
-            &AnalysisBudgets::standard("api-source-graph-test"),
-        )?;
+        Ok(())
+    }
+
+    fn assert_api_surface_graph(project: &std::path::Path) -> anyhow::Result<()> {
+        use crate::source_graph::build_source_graph;
+        let graph_summary =
+            build_source_graph(project, &AnalysisBudgets::standard("api-source-graph-test"))?;
         assert!(graph_summary.nodes >= 8);
-        let graph = load_artifact(&project, crate::analysis_artifacts::SOURCE_GRAPH)?;
+        let graph = load_artifact(project, crate::analysis_artifacts::SOURCE_GRAPH)?;
         let api_nodes = graph["nodes"]
             .as_array()
             .context("source graph nodes must be an array")?
@@ -676,6 +676,36 @@ function shadow(fetch) { fetch("https://fake.invalid/"); }
                     && node["url"] == "https://api.example.test/forbidden"
             })
         }));
+
+        Ok(())
+    }
+
+    #[test]
+    fn api_surface_graph_and_readme_remain_consistent() -> anyhow::Result<()> {
+        use crate::project_readme::refresh_project_readme;
+
+        let temp = tempfile::tempdir()?;
+        let project = temp.path().join("project");
+        setup_api_surface_graph_project(&project)?;
+        let summary = analyze_project_api_surface(
+            &project,
+            &AnalysisBudgets::standard("api-surface-graph-test"),
+        )?;
+        assert_eq!(summary["units"], 2);
+        assert_eq!(summary["callsites"], 9);
+        assert_eq!(summary["failures"], 1);
+        assert_eq!(summary["static_urls"], 9);
+        assert_eq!(summary["kinds"]["fetch"], 5);
+        assert_eq!(summary["kinds"]["send_beacon"], 1);
+        assert_eq!(summary["kinds"]["websocket"], 1);
+        assert_eq!(summary["kinds"]["xhr_open"], 1);
+        assert_eq!(summary["kinds"]["xhr_open_candidate"], 1);
+        assert_eq!(summary["absolute_network_urls"], 7);
+        assert_eq!(summary["static_methods"], 6);
+        assert_eq!(summary["invalid_methods"], 1);
+
+        assert_api_surface_rows(&project)?;
+        assert_api_surface_graph(&project)?;
 
         refresh_project_readme(
             &project,

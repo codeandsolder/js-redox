@@ -11,6 +11,27 @@ use oxc_syntax::symbol::SymbolId;
 use serde::Serialize;
 use std::collections::HashMap;
 
+/// Evidence tying the module argument to exact decoded WASM bytes.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+pub struct ModuleIdentityEvidence {
+    pub exact_module_identity_proven: bool,
+    pub module_sha256: Option<String>,
+    pub module_identity_kind: Option<&'static str>,
+    pub standard_module_decode_builtins_required: bool,
+}
+
+impl ModuleIdentityEvidence {
+    fn from_exact(exact: Option<&ExactModuleSite>) -> Self {
+        Self {
+            exact_module_identity_proven: exact.is_some(),
+            module_sha256: exact.map(|site| site.sha256.clone()),
+            module_identity_kind: exact.map(|site| site.identity_kind),
+            standard_module_decode_builtins_required: exact
+                .is_some_and(|site| site.standard_decode_builtins_required),
+        }
+    }
+}
+
 /// A source-level WebAssembly instantiation site using one exact stable local import object.
 ///
 /// `exact_module_identity_proven` is stronger than lexical site identity: when true, the first
@@ -28,10 +49,8 @@ pub struct WasmInstantiationSite {
     pub standard_webassembly_builtin_semantics_required: bool,
     pub exact_import_object_identity_proven: bool,
     pub import_object_identity_kind: &'static str,
-    pub exact_module_identity_proven: bool,
-    pub module_sha256: Option<String>,
-    pub module_identity_kind: Option<&'static str>,
-    pub standard_module_decode_builtins_required: bool,
+    #[serde(flatten)]
+    pub module: ModuleIdentityEvidence,
     #[serde(skip)]
     pub(super) factory_invocation: Option<InvocationSite>,
 }
@@ -125,11 +144,7 @@ fn site_record(
         standard_webassembly_builtin_semantics_required: true,
         exact_import_object_identity_proven: true,
         import_object_identity_kind,
-        exact_module_identity_proven: exact.is_some(),
-        module_sha256: exact.map(|site| site.sha256.clone()),
-        module_identity_kind: exact.map(|site| site.identity_kind),
-        standard_module_decode_builtins_required: exact
-            .is_some_and(|site| site.standard_decode_builtins_required),
+        module: ModuleIdentityEvidence::from_exact(exact),
         factory_invocation: None,
     }
 }

@@ -637,104 +637,70 @@ fn families(shapes: &BTreeMap<String, Vec<String>>) -> Vec<Value> {
     rows
 }
 
-pub(super) fn analyze_recorder_runtime_scripts(
-    capture: &Path,
-    project: &Path,
-    manifest: &CaptureManifest,
-    budget: &WorkBudget,
-) -> Result<()> {
-    budget.checkpoint()?;
-    let runtime_manifest = capture.join("runtime-scripts.json");
-    let runtime_dir = capture.join("runtime-scripts");
-    if !runtime_manifest.is_file() || !runtime_dir.is_dir() {
-        bail!(
-            "not a recorder runtime-script bundle: {}",
-            capture.display()
-        );
-    }
-    let events_value: Value = serde_json::from_slice(&fs::read(&runtime_manifest)?)
-        .with_context(|| format!("parsing {}", runtime_manifest.display()))?;
-    budget.checkpoint()?;
-    let events = events_value
-        .as_array()
-        .context("runtime-scripts.json must contain an array")?;
-    let coverage = CoverageIndex::load(capture, project, budget)?;
-    let patterns = RuntimePatterns::new()?;
-    let directives = frame_directives(capture)?;
-    budget.checkpoint()?;
-    let inline_by_hash = inline_origins(manifest);
-    let (body_hashes, network_urls) = captured_resource_identity(manifest);
+struct ScriptEvents<'a> {
+    events: &'a [Value],
+    by_hash: HashMap<&'a str, Vec<usize>>,
+    by_script_id: ParentEventIndex<'a>,
+    coverage: Option<CoverageIndex>,
+}
 
-    let mut events_by_hash = HashMap::<String, Vec<usize>>::new();
-    let mut events_by_script_id = ParentEventIndex::default();
-    for (index, event) in events.iter().enumerate() {
-        budget.checkpoint()?;
-        let Some(event) = event.as_object() else {
-            continue;
-        };
-        events_by_script_id.register(event);
-        if let Some(digest) = captured_javascript_digest(event) {
-            events_by_hash
-                .entry(digest.to_owned())
-                .or_default()
-                .push(index);
+impl<'a> ScriptEvents<'a> {
+    fn index(
+        events: &'a [Value],
+        coverage: Option<CoverageIndex>,
+        budget: &WorkBudget,
+    ) -> Result<Self> {
+        let mut events_by_hash = HashMap::<&str, Vec<usize>>::new();
+        let mut events_by_script_id = ParentEventIndex::default();
+        for (index, event) in events.iter().enumerate() {
+            budget.checkpoint()?;
+            let Some(event) = event.as_object() else {
+                continue;
+            };
+            events_by_script_id.register(event);
+            if let Some(digest) = captured_javascript_digest(event) {
+                events_by_hash.entry(digest).or_default().push(index);
+            }
         }
+
+        Ok(Self {
+            events,
+            by_hash: events_by_hash,
+            by_script_id: events_by_script_id,
+            coverage,
+        })
     }
 
-    let mut source_paths = fs::read_dir(&runtime_dir)?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| {
-            path.is_file()
-                && path
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    .is_some_and(|extension| extension.eq_ignore_ascii_case("js"))
-        })
-        .collect::<Vec<PathBuf>>();
-    source_paths.sort();
-
-    let mut sources = Vec::new();
-    let mut class_counts = BTreeMap::<String, usize>::new();
-    let mut class_bytes = BTreeMap::<String, usize>::new();
-    let mut instrumentation_counts = BTreeMap::<String, usize>::new();
-    let mut alpine_shapes = BTreeMap::<String, Vec<String>>::new();
-    let mut gtm_shapes = BTreeMap::<String, Vec<String>>::new();
-    let mut alpine_dom_mapped = 0usize;
-    let mut alpine_dom_matches = 0usize;
-
-    for source_path in source_paths {
-        budget.checkpoint()?;
-        let raw_source = fs::read(&source_path)?;
-        let digest = sha256_hex(&raw_source);
-        let source = String::from_utf8_lossy(&raw_source);
-        let event_rows = events_by_hash.get(&digest).cloned().unwrap_or_default();
+    fn observe(&self, digest: &str, budget: &WorkBudget) -> Result<ScriptObservation> {
+        let event_rows = self.by_hash.get(digest).map_or(&[][..], Vec::as_slice);
         let mut urls = BTreeSet::new();
         let mut sessions = BTreeSet::new();
         let mut script_ids = Vec::new();
         let mut execution_context_values = Vec::new();
         let mut script_instances = Vec::new();
-        for event_index in &event_rows {
+        for event_index in event_rows {
             budget.checkpoint()?;
-            let Some(event) = events.get(*event_index).and_then(Value::as_object) else {
+            let Some(event) = self.events.get(*event_index).and_then(Value::as_object) else {
                 continue;
             };
             if let Some(url) = text(event.get("url")).filter(|url| !url.is_empty()) {
                 urls.insert(url.to_owned());
             }
             let session = event_session(event);
-            sessions.extend(session);
+            sessions.extend(session.map(str::to_owned));
             script_ids.push(event.get("scriptId").cloned().unwrap_or(Value::Null));
             if let Some(value) = event.get("executionContextId") {
                 execution_context_values.push(value);
             }
             let script = script_id(event.get("scriptId"));
-            let execution = match (&coverage, session, script.as_deref()) {
+            let execution = match (&self.coverage, session, script.as_deref()) {
                 (Some(index), Some(session), Some(script)) => {
                     let raw = index.for_script(session, script);
-                    if events_by_script_id
+                    if self
+                        .by_script_id
                         .get(session, script)
                         .and_then(ParentEventEvidence::digest)
-                        == Some(digest.as_str())
+                        == Some(digest)
                     {
                         raw
                     } else {
@@ -757,30 +723,59 @@ pub(super) fn analyze_recorder_runtime_scripts(
             }));
         }
 
-        let origins = generation_origins(&event_rows, events, &events_by_script_id, budget)?;
-        let document_origins = document_inline_origins(&event_rows, events);
-        let relative_path = source_path
-            .strip_prefix(capture)
-            .with_context(|| format!("runtime source outside capture: {}", source_path.display()))?
-            .to_string_lossy()
-            .into_owned();
+        let origins = generation_origins(event_rows, self.events, &self.by_script_id, budget)?;
+        let document_origins = document_inline_origins(event_rows, self.events);
+        Ok(ScriptObservation {
+            urls,
+            sessions,
+            script_ids,
+            execution_context_ids: sorted_unique_values(execution_context_values.into_iter()),
+            script_instances,
+            event_count: event_rows.len(),
+            origins,
+            document_origins,
+        })
+    }
+}
+
+struct ScriptObservation {
+    urls: BTreeSet<String>,
+    sessions: BTreeSet<String>,
+    script_ids: Vec<Value>,
+    execution_context_ids: Vec<Value>,
+    script_instances: Vec<Value>,
+    event_count: usize,
+    origins: Vec<Value>,
+    document_origins: Vec<Value>,
+}
+
+impl ScriptObservation {
+    fn row(
+        self,
+        digest: &str,
+        size: usize,
+        relative_path: &str,
+        coverage: Option<&CoverageIndex>,
+        budget: &WorkBudget,
+    ) -> Result<(Map<String, Value>, BTreeSet<String>)> {
         let mut row = Map::new();
         row.insert("sha256".into(), json!(digest));
-        row.insert("size".into(), json!(raw_source.len()));
+        row.insert("size".into(), json!(size));
         row.insert("path".into(), json!(relative_path));
-        row.insert("event_count".into(), json!(event_rows.len()));
-        row.insert("script_ids".into(), Value::Array(script_ids));
-        row.insert("cdp_sessions".into(), json!(sessions));
+        row.insert("event_count".into(), json!(self.event_count));
+        row.insert("script_ids".into(), Value::Array(self.script_ids));
+        row.insert("cdp_sessions".into(), json!(self.sessions));
         row.insert(
             "execution_context_ids".into(),
-            Value::Array(sorted_unique_values(execution_context_values.into_iter())),
+            Value::Array(self.execution_context_ids),
         );
-        row.insert("script_instances".into(), Value::Array(script_instances));
+        row.insert(
+            "script_instances".into(),
+            Value::Array(self.script_instances),
+        );
         row.insert(
             "coverage_mode".into(),
-            coverage
-                .as_ref()
-                .map_or(Value::Null, |index| json!(index.mode())),
+            coverage.map_or(Value::Null, |index| json!(index.mode())),
         );
         let observed_executed = row
             .get("script_instances")
@@ -789,18 +784,18 @@ pub(super) fn analyze_recorder_runtime_scripts(
             .flatten()
             .any(|instance| instance["execution"]["status"] == "positive");
         row.insert("observed_executed".into(), json!(observed_executed));
-        row.insert("urls".into(), json!(urls));
-        if !document_origins.is_empty() {
+        row.insert("urls".into(), json!(self.urls));
+        if !self.document_origins.is_empty() {
             row.insert(
                 "document_inline_origins".into(),
-                Value::Array(document_origins),
+                Value::Array(self.document_origins),
             );
         }
-        if !origins.is_empty() {
+        if !self.origins.is_empty() {
             let mut root_hashes = BTreeSet::new();
             let mut root_urls = BTreeSet::new();
             let mut max_depth = 0usize;
-            for origin in &origins {
+            for origin in &self.origins {
                 budget.checkpoint()?;
                 let chain = origin
                     .get("chain")
@@ -822,7 +817,7 @@ pub(super) fn analyze_recorder_runtime_scripts(
             row.insert(
                 "generated".into(),
                 json!({
-                    "origins": origins,
+                    "origins": self.origins,
                     "root_sha256s": root_hashes,
                     "root_urls": root_urls,
                     "max_depth": max_depth,
@@ -830,25 +825,77 @@ pub(super) fn analyze_recorder_runtime_scripts(
             );
         }
 
-        let classification = if body_hashes.contains(&digest) {
+        Ok((row, self.urls))
+    }
+}
+
+#[derive(Default)]
+struct RuntimeSummary {
+    sources: Vec<Value>,
+    class_counts: BTreeMap<String, usize>,
+    class_bytes: BTreeMap<String, usize>,
+    instrumentation_counts: BTreeMap<String, usize>,
+    alpine_shapes: BTreeMap<String, Vec<String>>,
+    gtm_shapes: BTreeMap<String, Vec<String>>,
+    alpine_dom_mapped: usize,
+    alpine_dom_matches: usize,
+}
+
+struct ClassificationInputs {
+    patterns: RuntimePatterns,
+    directives: BTreeMap<String, Vec<Value>>,
+    inline_by_hash: HashMap<String, Vec<Value>>,
+    body_hashes: BTreeSet<String>,
+    network_urls: BTreeSet<String>,
+}
+
+impl ClassificationInputs {
+    fn new(capture: &Path, manifest: &CaptureManifest, budget: &WorkBudget) -> Result<Self> {
+        let patterns = RuntimePatterns::new()?;
+        let directives = frame_directives(capture)?;
+        budget.checkpoint()?;
+        let inline_by_hash = inline_origins(manifest);
+        let (body_hashes, network_urls) = captured_resource_identity(manifest);
+
+        Ok(Self {
+            patterns,
+            directives,
+            inline_by_hash,
+            body_hashes,
+            network_urls,
+        })
+    }
+}
+
+impl RuntimeSummary {
+    fn classify(
+        &mut self,
+        inputs: &ClassificationInputs,
+        source: &str,
+        digest: &str,
+        urls: &BTreeSet<String>,
+        row: &mut Map<String, Value>,
+    ) -> &'static str {
+        if inputs.body_hashes.contains(digest) {
             "network_response"
-        } else if let Some(origins) = inline_by_hash.get(&digest) {
+        } else if let Some(origins) = inputs.inline_by_hash.get(digest) {
             row.insert("inline_origins".into(), Value::Array(origins.clone()));
             "inline_script"
-        } else if urls.iter().any(|url| network_urls.contains(url)) {
+        } else if urls.iter().any(|url| inputs.network_urls.contains(url)) {
             "network_observed"
         } else if row.contains_key("document_inline_origins") {
             "document_inline_script"
-        } else if let Some((compiled, expression)) = recover_alpine_expression(&source) {
-            let (mapping_kind, matches) = match_directives(&expression, &directives, &patterns);
-            let shape = patterns.normalize_expression_shape(&expression);
-            alpine_shapes
+        } else if let Some((compiled, expression)) = recover_alpine_expression(source) {
+            let (mapping_kind, matches) =
+                match_directives(&expression, &inputs.directives, &inputs.patterns);
+            let shape = inputs.patterns.normalize_expression_shape(&expression);
+            self.alpine_shapes
                 .entry(shape.clone())
                 .or_default()
-                .push(digest.clone());
+                .push(digest.to_owned());
             if !matches.is_empty() {
-                alpine_dom_mapped += 1;
-                alpine_dom_matches += matches.len();
+                self.alpine_dom_mapped += 1;
+                self.alpine_dom_matches += matches.len();
             }
             row.insert(
                 "alpine".into(),
@@ -861,53 +908,133 @@ pub(super) fn analyze_recorder_runtime_scripts(
                 }),
             );
             "alpine_expression"
-        } else if let Some(shape) = recover_gtm_custom_javascript(&source, &patterns) {
-            gtm_shapes
+        } else if let Some(shape) = recover_gtm_custom_javascript(source, &inputs.patterns) {
+            self.gtm_shapes
                 .entry(shape.clone())
                 .or_default()
-                .push(digest.clone());
+                .push(digest.to_owned());
             row.insert("gtm".into(), json!({"shape": shape}));
             "gtm_custom_javascript"
-        } else if let Some(kind) = instrumentation_kind(&source) {
-            *instrumentation_counts.entry(kind.into()).or_default() += 1;
+        } else if let Some(kind) = instrumentation_kind(source) {
+            *self.instrumentation_counts.entry(kind.into()).or_default() += 1;
             row.insert("instrumentation_kind".into(), json!(kind));
             "capture_instrumentation"
         } else if row.contains_key("generated") {
             "generated_runtime"
         } else {
             "anonymous_runtime"
-        };
-        row.insert("classification".into(), json!(classification));
-        *class_counts.entry(classification.into()).or_default() += 1;
-        *class_bytes.entry(classification.into()).or_default() += raw_source.len();
-        sources.push(Value::Object(row));
+        }
     }
 
-    let class_count = |name: &str| class_counts.get(name).copied().unwrap_or_default();
-    let document = json!({
-        "schema": RUNTIME_SCRIPTS.schema,
-        "capture": capture.display().to_string(),
-        "summary": {
-            "script_parsed_events": events.len(),
-            "captured_javascript_events": events_by_hash.values().map(Vec::len).sum::<usize>(),
-            "unique_javascript_sources": sources.len(),
-            "unique_javascript_bytes": sources.iter().filter_map(|row| row.get("size").and_then(Value::as_u64)).sum::<u64>(),
-            "classifications": class_counts,
-            "classification_bytes": class_bytes,
-            "alpine_dom_mapped_sources": alpine_dom_mapped,
-            "alpine_dom_match_occurrences": alpine_dom_matches,
-            "alpine_expression_shapes": alpine_shapes.len(),
-            "gtm_expression_shapes": gtm_shapes.len(),
-            "capture_instrumentation_kinds": instrumentation_counts,
-            "generated_runtime_sources": class_count("generated_runtime"),
-            "anonymous_runtime_sources": class_count("anonymous_runtime"),
-        },
-        "alpine_families": families(&alpine_shapes),
-        "gtm_families": families(&gtm_shapes),
-        "sources": sources,
-        "script_identity_conflicts": events_by_script_id.identity_conflicts(budget)?,
-    });
-    write_artifact(project, RUNTIME_SCRIPTS, &document)
+    fn record(
+        &mut self,
+        capture: &Path,
+        source_path: &Path,
+        events: &ScriptEvents<'_>,
+        inputs: &ClassificationInputs,
+        budget: &WorkBudget,
+    ) -> Result<()> {
+        budget.checkpoint()?;
+        let raw_source = fs::read(source_path)?;
+        let digest = sha256_hex(&raw_source);
+        let source = String::from_utf8_lossy(&raw_source);
+        let observed = events.observe(&digest, budget)?;
+        let relative_path = source_path
+            .strip_prefix(capture)
+            .with_context(|| format!("runtime source outside capture: {}", source_path.display()))?
+            .to_string_lossy()
+            .into_owned();
+        let (mut row, urls) = observed.row(
+            &digest,
+            raw_source.len(),
+            &relative_path,
+            events.coverage.as_ref(),
+            budget,
+        )?;
+        let classification = self.classify(inputs, &source, &digest, &urls, &mut row);
+        row.insert("classification".into(), json!(classification));
+        *self.class_counts.entry(classification.into()).or_default() += 1;
+        *self.class_bytes.entry(classification.into()).or_default() += raw_source.len();
+        self.sources.push(Value::Object(row));
+        Ok(())
+    }
+
+    fn publish(
+        &self,
+        capture: &Path,
+        project: &Path,
+        events: &ScriptEvents<'_>,
+        budget: &WorkBudget,
+    ) -> Result<()> {
+        let class_count = |name: &str| self.class_counts.get(name).copied().unwrap_or_default();
+        let document = json!({
+            "schema": RUNTIME_SCRIPTS.schema,
+            "capture": capture.display().to_string(),
+            "summary": {
+                "script_parsed_events": events.events.len(),
+                "captured_javascript_events": events.by_hash.values().map(Vec::len).sum::<usize>(),
+                "unique_javascript_sources": self.sources.len(),
+                "unique_javascript_bytes": self.sources.iter().filter_map(|row| row.get("size").and_then(Value::as_u64)).sum::<u64>(),
+                "classifications": self.class_counts,
+                "classification_bytes": self.class_bytes,
+                "alpine_dom_mapped_sources": self.alpine_dom_mapped,
+                "alpine_dom_match_occurrences": self.alpine_dom_matches,
+                "alpine_expression_shapes": self.alpine_shapes.len(),
+                "gtm_expression_shapes": self.gtm_shapes.len(),
+                "capture_instrumentation_kinds": self.instrumentation_counts,
+                "generated_runtime_sources": class_count("generated_runtime"),
+                "anonymous_runtime_sources": class_count("anonymous_runtime"),
+            },
+            "alpine_families": families(&self.alpine_shapes),
+            "gtm_families": families(&self.gtm_shapes),
+            "sources": self.sources,
+            "script_identity_conflicts": events.by_script_id.identity_conflicts(budget)?,
+        });
+        write_artifact(project, RUNTIME_SCRIPTS, &document)
+    }
+}
+
+pub(super) fn analyze_recorder_runtime_scripts(
+    capture: &Path,
+    project: &Path,
+    manifest: &CaptureManifest,
+    budget: &WorkBudget,
+) -> Result<()> {
+    budget.checkpoint()?;
+    let runtime_manifest = capture.join("runtime-scripts.json");
+    let runtime_dir = capture.join("runtime-scripts");
+    if !runtime_manifest.is_file() || !runtime_dir.is_dir() {
+        bail!(
+            "not a recorder runtime-script bundle: {}",
+            capture.display()
+        );
+    }
+    let events_value: Value = serde_json::from_slice(&fs::read(&runtime_manifest)?)
+        .with_context(|| format!("parsing {}", runtime_manifest.display()))?;
+    budget.checkpoint()?;
+    let events = events_value
+        .as_array()
+        .context("runtime-scripts.json must contain an array")?;
+    let coverage = CoverageIndex::load(capture, project, budget)?;
+    let inputs = ClassificationInputs::new(capture, manifest, budget)?;
+    let events = ScriptEvents::index(events, coverage, budget)?;
+    let mut source_paths = fs::read_dir(&runtime_dir)?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("js"))
+        })
+        .collect::<Vec<PathBuf>>();
+    source_paths.sort();
+
+    let mut summary = RuntimeSummary::default();
+    for source_path in source_paths {
+        summary.record(capture, &source_path, &events, &inputs, budget)?;
+    }
+    summary.publish(capture, project, &events, budget)
 }
 
 #[cfg(test)]
@@ -1080,7 +1207,7 @@ mod tests {
             &index,
             &WorkBudget::unlimited("unscoped-generation"),
         )?;
-        assert!(!origins.is_empty());
+        assert_ne!(origins, [] as [serde_json::Value; 0]);
         for origin in origins {
             assert!(origin["cdp_session"].is_null());
             assert_eq!(origin["chain_termination"], "unresolved_session_identity");

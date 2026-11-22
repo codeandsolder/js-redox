@@ -217,26 +217,20 @@ fn only_copied_input(boundary: &Value) -> Result<&Value> {
     Ok(&rows[0])
 }
 
-#[test]
-fn wasm_capture_deduplicates_origins_and_correlates_host_effects() -> Result<()> {
-    let workspace = tempfile::tempdir()?;
-    let har = workspace.path().join("fixture.har");
-    let project = workspace.path().join("project");
-    let wasm = decode_hex(HOST_EFFECT_WASM_HEX)?;
-    let wasm_b64 = STANDARD.encode(&wasm);
+fn write_host_effect_capture(har: &Path, wasm: &[u8]) -> Result<()> {
+    let wasm_b64 = STANDARD.encode(wasm);
     let js = format!(
         "var host = window;\nvar imports = {{wbg: {{}}}};\nimports.wbg.__wbg_signal_fixture = function(memory, base, offset) {{ var view = new host.DataView(memory.buffer), address = base + offset; offset === 56708 || view.setUint32(address, 1, false); }};\nfunction bA(A) {{ if (Uint8Array.fromBase64) return [Uint8Array.fromBase64(A).buffer, false]; for (var Q = atob(A), g = new Uint8Array(Q.length), E = 0; E < Q.length; E++) g[E] = Q.charCodeAt(E); return [g.buffer, false]; }}\nconst embedded = \"{wasm_b64}\";\nvar bytes = bA(embedded)[0];\nhost.WebAssembly.instantiate(bytes, imports);\n"
     );
     let split = wasm.len() / 2;
     let split_js = format!(
-        "function loadSplit() {{ const left = atob(\"{}\"); const right = atob(\"{}\"); const output = new Uint8Array({}); function copy(chunk, offset) {{ for (let i = 0; i < chunk.length; i++) output[offset + i] = chunk.charCodeAt(i); }} copy(left, 0); copy(right, {}); return new WebAssembly.Module(output); }}\n",
+        "function loadSplit() {{ const left = atob(\"{}\"); const right = atob(\"{}\"); const output = new Uint8Array({}); function copy(chunk, offset) {{ for (let i = 0; i < chunk.length; i++) output[offset + i] = chunk.charCodeAt(i); }} copy(left, 0); copy(right, {split}); return new WebAssembly.Module(output); }}\n",
         STANDARD.encode(&wasm[..split]),
         STANDARD.encode(&wasm[split..]),
         wasm.len(),
-        split,
     );
     write_har(
-        &har,
+        har,
         "wasm capture regression",
         &[
             har_entry(
@@ -265,6 +259,16 @@ fn wasm_capture_deduplicates_origins_and_correlates_host_effects() -> Result<()>
             ),
         ],
     )?;
+    Ok(())
+}
+
+#[test]
+fn wasm_capture_deduplicates_origins_and_correlates_host_effects() -> Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let har = workspace.path().join("fixture.har");
+    let project = workspace.path().join("project");
+    let wasm = decode_hex(HOST_EFFECT_WASM_HEX)?;
+    write_host_effect_capture(&har, &wasm)?;
     let boundary = run_wasm_boundary_pipeline(&har, &project)?;
 
     let manifest = read_json(&project.join("capture-manifest.json"))?;

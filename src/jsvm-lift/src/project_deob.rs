@@ -14,7 +14,7 @@ use crate::{
     string_recovery::recover_static_strings,
 };
 use anyhow::{bail, Context, Result};
-use rayon::{prelude::*, ThreadPoolBuilder};
+use rayon::{prelude::*, ThreadPool, ThreadPoolBuilder};
 use serde_json::{json, Map, Value};
 use std::{
     collections::BTreeMap,
@@ -107,12 +107,10 @@ fn derived_path(raw_path: &str, root: &str) -> PathBuf {
 fn run_string_recovery(
     work: &Path,
     key: &ContentKey,
-    group: &[Occurrence],
-    budgets: &AnalysisBudgets,
+    canonical: &Occurrence,
     parent_budget: &WorkBudget,
 ) -> Result<StringResult> {
     let (raw_sha, mode) = key;
-    let canonical = group.first().context("empty raw-source group")?;
     let cache = work.join("string").join(mode.as_str()).join(raw_sha);
     fs::create_dir_all(&cache).with_context(|| format!("creating {}", cache.display()))?;
     let recovered = cache.join(format!("recovered{}", mode.suffix()));
@@ -125,11 +123,8 @@ fn run_string_recovery(
             canonical.source.display()
         );
     }
-    let budget = budgets.operation_under(
-        parent_budget,
-        AnalysisOperation::StaticStringRecovery,
-        canonical.source.display().to_string(),
-    );
+    let budget = AnalysisOperation::StaticStringRecovery
+        .under(parent_budget, canonical.source.display().to_string());
     let outcome = match recover_static_strings(
         &original,
         canonical.source.display().to_string(),
@@ -194,19 +189,11 @@ fn run_string_recovery(
 fn run_safe_deob(
     work: &Path,
     key: &ContentKey,
-    raw_group_keys: &[ContentKey],
-    string_results: &BTreeMap<ContentKey, StringResult>,
+    representative: &StringResult,
     max_iterations: usize,
-    budgets: &AnalysisBudgets,
     parent_budget: &WorkBudget,
 ) -> Result<DeobResult> {
     let (selected_sha, mode) = key;
-    let representative_key = raw_group_keys
-        .first()
-        .context("empty pre-deob source group")?;
-    let representative = string_results
-        .get(representative_key)
-        .context("missing string-recovery result")?;
     let selected = fs::read_to_string(&representative.selected_path)
         .with_context(|| format!("reading {}", representative.selected_path.display()))?;
     if sha256_hex(selected.as_bytes()) != *selected_sha {
@@ -216,11 +203,8 @@ fn run_safe_deob(
         );
     }
 
-    let budget = budgets.operation_under(
-        parent_budget,
-        AnalysisOperation::SafeDeobfuscation,
-        representative.canonical_raw_path.clone(),
-    );
+    let budget = AnalysisOperation::SafeDeobfuscation
+        .under(parent_budget, representative.canonical_raw_path.clone());
     match deobfuscate_source(
         &selected,
         representative.canonical_raw_path.clone(),
@@ -260,7 +244,6 @@ fn format_output(
     work: &Path,
     key: &ContentKey,
     deob: &DeobResult,
-    budgets: &AnalysisBudgets,
     parent_budget: &WorkBudget,
 ) -> Result<ReadableResult> {
     let (output_sha, mode) = key;
@@ -270,11 +253,7 @@ fn format_output(
         .context("missing deobfuscated output")?;
     let exact = fs::read_to_string(output_path)
         .with_context(|| format!("reading {}", output_path.display()))?;
-    let budget = budgets.operation_under(
-        parent_budget,
-        AnalysisOperation::Format,
-        output_path.display().to_string(),
-    );
+    let budget = AnalysisOperation::Format.under(parent_budget, output_path.display().to_string());
     // Analyst-only semantic naming: keep the exact, proof-checked source in
     // `src/_deobfuscated/` and enrich only the navigable presentation copy.
     let renamed = recover_readable_names(&exact);
@@ -315,6 +294,468 @@ fn as_object_mut(value: &mut Value) -> Result<&mut Map<String, Value>> {
         .context("artifact row must be an object")
 }
 
+struct RawGroup {
+    representative: usize,
+    count: usize,
+}
+
+struct RawInputs {
+    occurrences: Vec<Occurrence>,
+    groups: BTreeMap<ContentKey, RawGroup>,
+}
+
+impl RawInputs {
+    fn collect(project: &Path, source_units: &[Value]) -> Result<Self> {
+        let mut occurrences = Vec::<Occurrence>::new();
+        let mut groups = BTreeMap::<ContentKey, RawGroup>::new();
+        for (ordinal, unit) in source_units.iter().enumerate() {
+            if source_value(unit, "kind") != Some("javascript") {
+                continue;
+            }
+            let Some(source_path) = source_value(unit, "source_path") else {
+                continue;
+            };
+            let Some(raw_path) = source_value(unit, "raw_path") else {
+                continue;
+            };
+            let source = project.join(raw_path);
+            if !source.is_file() {
+                continue;
+            }
+            let raw_bytes =
+                fs::read(&source).with_context(|| format!("reading {}", source.display()))?;
+            let raw_sha = sha256_hex(&raw_bytes);
+            let mode = SourceMode::for_path(Path::new(source_path));
+            let occurrence = Occurrence {
+                ordinal,
+                unit: unit.clone(),
+                raw_path: raw_path.to_string(),
+                source,
+                raw_sha: raw_sha.clone(),
+                mode,
+            };
+            let group = groups.entry((raw_sha, mode)).or_insert(RawGroup {
+                representative: occurrences.len(),
+                count: 0,
+            });
+            group.count += 1;
+            occurrences.push(occurrence);
+        }
+
+        Ok(Self {
+            occurrences,
+            groups,
+        })
+    }
+}
+
+fn analyze_groups<A: Sync, B: Send>(
+    pool: &ThreadPool,
+    groups: &BTreeMap<ContentKey, A>,
+    analyze: impl Fn(&ContentKey, &A) -> Result<B> + Sync,
+) -> Result<BTreeMap<ContentKey, B>> {
+    // Preserve stable key order for error reporting, and finish the started
+    // batch before publishing results or starting dependent work.
+    let group_refs = groups.iter().collect::<Vec<_>>();
+    pool.install(|| {
+        group_refs
+            .par_iter()
+            .map(|(key, group)| analyze(key, group).map(|result| ((*key).clone(), result)))
+            .collect::<Vec<_>>()
+    })
+    .into_iter()
+    .collect()
+}
+
+struct RecoveryResults {
+    strings: BTreeMap<ContentKey, StringResult>,
+    deobfuscated: BTreeMap<ContentKey, DeobResult>,
+    readable: BTreeMap<ContentKey, ReadableResult>,
+}
+
+impl RecoveryResults {
+    fn recover(
+        inputs: &RawInputs,
+        work: &Path,
+        pool: &ThreadPool,
+        max_iterations: usize,
+        budget: &WorkBudget,
+    ) -> Result<Self> {
+        let strings = analyze_groups(pool, &inputs.groups, |key, group| {
+            run_string_recovery(work, key, &inputs.occurrences[group.representative], budget)
+        })?;
+        budget.checkpoint()?;
+        let mut pre_deob = BTreeMap::new();
+        for result in strings.values() {
+            pre_deob
+                .entry((result.selected_sha.clone(), result.mode))
+                .or_insert(result);
+        }
+        let deobfuscated = analyze_groups(pool, &pre_deob, |key, representative| {
+            run_safe_deob(work, key, representative, max_iterations, budget)
+        })?;
+        budget.checkpoint()?;
+        let mut outputs = BTreeMap::new();
+        for result in deobfuscated.values() {
+            if let Some(report) = &result.report {
+                outputs
+                    .entry((report.output_sha256.clone(), result.mode))
+                    .or_insert(result);
+            }
+        }
+        let readable = analyze_groups(pool, &outputs, |key, representative| {
+            format_output(work, key, representative, budget)
+        })?;
+        budget.checkpoint()?;
+        Ok(Self {
+            strings,
+            deobfuscated,
+            readable,
+        })
+    }
+
+    fn publish_occurrence(
+        &self,
+        project: &Path,
+        occurrence: &Occurrence,
+        group_size: usize,
+    ) -> Result<(Value, Value)> {
+        let raw_key = (occurrence.raw_sha.clone(), occurrence.mode);
+        let string_result = self
+            .strings
+            .get(&raw_key)
+            .context("missing string-recovery result")?;
+        let pre_key = (string_result.selected_sha.clone(), occurrence.mode);
+        let deob_result = self
+            .deobfuscated
+            .get(&pre_key)
+            .context("missing deob result")?;
+        let report_rel = PathBuf::from(format!(
+            "analysis/deobfuscation/{:04}.json",
+            occurrence.ordinal
+        ));
+        let string_report_rel = PathBuf::from(format!(
+            "analysis/string-recovery/{:04}.json",
+            occurrence.ordinal
+        ));
+        if let Some(source_report) = &string_result.report_path {
+            link_or_copy(source_report, &project.join(&string_report_rel))?;
+        }
+        if let Some(report) = &deob_result.report {
+            write_json(&project.join(&report_rel), report)?;
+        }
+
+        let deduplicated = occurrence.ordinal != string_result.canonical_ordinal;
+        let string_row =
+            string_recovery_row(occurrence, string_result, &string_report_rel, group_size)?;
+
+        let rel = derived_path(&occurrence.raw_path, "_deobfuscated");
+        let readable_rel = derived_path(&occurrence.raw_path, "_readable");
+        let mut row = json!({
+            "ordinal": occurrence.ordinal,
+            "resource_id": occurrence.unit.get("resource_id").cloned().unwrap_or(Value::Null),
+            "url": occurrence.unit.get("url").cloned().unwrap_or(Value::Null),
+            "raw_path": occurrence.raw_path,
+            "input_path": occurrence.raw_path,
+            "output_path": rel.to_string_lossy(),
+            "readable_output_path": readable_rel.to_string_lossy(),
+            "report_path": report_rel.to_string_lossy(),
+            "string_recovery_report_path": string_report_rel.to_string_lossy(),
+            "string_recovery_changed": string_result.changed,
+            "string_recovery_replacements": string_result.replacements,
+            "input_sha256": occurrence.raw_sha,
+            "source_mode": occurrence.mode.as_str(),
+            "pre_deob_sha256": string_result.selected_sha,
+            "exit": deob_result.exit,
+            "content_group_size": group_size,
+            "deduplicated": deduplicated,
+            "deduplicated_from_ordinal": if deduplicated { Value::from(string_result.canonical_ordinal) } else { Value::Null },
+        });
+        let Some(report) = &deob_result.report else {
+            if let Some(error) = &deob_result.error {
+                as_object_mut(&mut row)?.insert("error".into(), Value::String(error.clone()));
+            }
+            return Ok((row, string_row));
+        };
+
+        let output = deob_result
+            .output_path
+            .as_deref()
+            .context("missing successful deob output")?;
+        let output_key = (report.output_sha256.clone(), occurrence.mode);
+        let formatted = self
+            .readable
+            .get(&output_key)
+            .context("missing readable output")?;
+        publish_success(
+            project,
+            &mut row,
+            report,
+            string_result,
+            OutputViews {
+                output,
+                exact: &rel,
+                readable: &readable_rel,
+                formatted,
+            },
+        )?;
+        Ok((row, string_row))
+    }
+
+    fn publish(
+        &self,
+        project: &Path,
+        inputs: &RawInputs,
+        jobs: usize,
+    ) -> Result<ProjectDeobSummary> {
+        fs::create_dir_all(project.join("analysis/deobfuscation"))?;
+        fs::create_dir_all(project.join("analysis/string-recovery"))?;
+        let counts = RecoveryCounts {
+            javascript_units: inputs.occurrences.len(),
+            unique_raw_inputs: inputs.groups.len(),
+            unique_pre_deob_inputs: self.deobfuscated.len(),
+            unique_deob_outputs: self.readable.len(),
+        };
+        let mut units = Vec::with_capacity(counts.javascript_units);
+        let mut string_units = Vec::with_capacity(counts.javascript_units);
+        for occurrence in &inputs.occurrences {
+            let group = inputs
+                .groups
+                .get(&(occurrence.raw_sha.clone(), occurrence.mode))
+                .context("missing raw group")?;
+            let (row, string_row) = self.publish_occurrence(project, occurrence, group.count)?;
+            units.push(row);
+            string_units.push(string_row);
+        }
+        publish_indexes(project, counts, jobs, &units, &string_units)
+    }
+}
+
+fn string_recovery_row(
+    occurrence: &Occurrence,
+    string_result: &StringResult,
+    string_report_rel: &Path,
+    group_size: usize,
+) -> Result<Value> {
+    let deduplicated = occurrence.ordinal != string_result.canonical_ordinal;
+    let mut string_row = json!({
+        "ordinal": occurrence.ordinal,
+        "resource_id": occurrence.unit.get("resource_id").cloned().unwrap_or(Value::Null),
+        "url": occurrence.unit.get("url").cloned().unwrap_or(Value::Null),
+        "input_path": occurrence.raw_path,
+        "report_path": string_report_rel.to_string_lossy(),
+        "input_sha256": occurrence.raw_sha,
+        "source_mode": occurrence.mode.as_str(),
+        "output_sha256": string_result.selected_sha,
+        "exit": string_result.exit,
+        "changed": string_result.changed,
+        "replacements": string_result.replacements,
+        "decoders": string_result.decoders,
+        "content_group_size": group_size,
+        "deduplicated": deduplicated,
+        "deduplicated_from_ordinal": if deduplicated { Value::from(string_result.canonical_ordinal) } else { Value::Null },
+    });
+    if let Some(error) = &string_result.error {
+        let row = as_object_mut(&mut string_row)?;
+        row.insert("error".into(), Value::String(error.clone()));
+        row.insert(
+            "fallback".into(),
+            Value::String("original source passed to safe deobfuscator".into()),
+        );
+    }
+
+    Ok(string_row)
+}
+
+#[derive(Clone, Copy)]
+struct OutputViews<'a> {
+    output: &'a Path,
+    exact: &'a Path,
+    readable: &'a Path,
+    formatted: &'a ReadableResult,
+}
+
+fn publish_success(
+    project: &Path,
+    row: &mut Value,
+    report: &SafeDeobReport,
+    string_result: &StringResult,
+    views: OutputViews<'_>,
+) -> Result<()> {
+    let mut transforms = report.transforms.clone();
+    if string_result.replacements != 0 {
+        transforms.insert("encoded_string_decode".into(), string_result.replacements);
+    }
+    link_or_copy(views.output, &project.join(views.exact))?;
+
+    link_or_copy(&views.formatted.path, &project.join(views.readable))?;
+    let row_object = as_object_mut(row)?;
+    row_object.extend(Map::from_iter([
+        (
+            "changed".into(),
+            Value::Bool(report.changed || string_result.changed),
+        ),
+        ("iterations".into(), Value::from(report.iterations)),
+        ("transforms".into(), serde_json::to_value(&transforms)?),
+        (
+            "arithmetic_state_proofs".into(),
+            serde_json::to_value(&report.arithmetic_state_proofs)?,
+        ),
+        (
+            "safe_static_only".into(),
+            Value::Bool(report.guarantees.safe_static_only),
+        ),
+        (
+            "presentation_formatted".into(),
+            Value::Bool(report.guarantees.presentation_formatted),
+        ),
+        (
+            "runtime_semantics_preserved_by_design".into(),
+            Value::Bool(report.guarantees.runtime_semantics_preserved_by_design),
+        ),
+        (
+            "output_sha256".into(),
+            Value::String(report.output_sha256.clone()),
+        ),
+        (
+            "readable_formatted".into(),
+            Value::Bool(views.formatted.formatted),
+        ),
+    ]));
+    if let Some(error) = &views.formatted.error {
+        row_object.insert("readable_format_error".into(), Value::String(error.clone()));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct RecoveryCounts {
+    javascript_units: usize,
+    unique_raw_inputs: usize,
+    unique_pre_deob_inputs: usize,
+    unique_deob_outputs: usize,
+}
+
+struct StringStats {
+    changed: usize,
+    replacements: usize,
+}
+
+fn publish_string_index(
+    project: &Path,
+    counts: RecoveryCounts,
+    string_units: &[Value],
+) -> Result<StringStats> {
+    let string_changed = string_units
+        .iter()
+        .filter(|unit| unit.get("changed").and_then(Value::as_bool) == Some(true))
+        .count();
+    let string_failed = string_units
+        .iter()
+        .filter(|unit| unit.get("exit").and_then(Value::as_i64).unwrap_or(0) != 0)
+        .count();
+    let string_replacements = string_units
+        .iter()
+        .filter_map(|unit| unit.get("replacements").and_then(Value::as_u64))
+        .filter_map(|count| usize::try_from(count).ok())
+        .fold(0usize, usize::saturating_add);
+    let string_index = json!({
+        "schema": STRING_RECOVERY.schema,
+        "safe_static_only": true,
+        "mode_sensitive_deduplication": true,
+        "recoverer": "jsvm_lift::string_recovery",
+        "units": string_units,
+        "summary": {
+            "javascript_units": counts.javascript_units,
+            "unique_input_bodies": counts.unique_raw_inputs,
+            "deduplicated_units": counts.javascript_units.saturating_sub(counts.unique_raw_inputs),
+            "unique_post_recovery_bodies": counts.unique_pre_deob_inputs,
+            "changed_units": string_changed,
+            "failed_units": string_failed,
+            "replacements": string_replacements,
+            "invocations": counts.unique_raw_inputs,
+        },
+    });
+    write_artifact(project, STRING_RECOVERY, &string_index)?;
+    Ok(StringStats {
+        changed: string_changed,
+        replacements: string_replacements,
+    })
+}
+
+fn publish_indexes(
+    project: &Path,
+    counts: RecoveryCounts,
+    jobs: usize,
+    units: &[Value],
+    string_units: &[Value],
+) -> Result<ProjectDeobSummary> {
+    let strings = publish_string_index(project, counts, string_units)?;
+    let changed = units
+        .iter()
+        .filter(|unit| unit.get("changed").and_then(Value::as_bool) == Some(true))
+        .count();
+    let failed = units
+        .iter()
+        .filter(|unit| unit.get("exit").and_then(Value::as_i64).unwrap_or(0) != 0)
+        .count();
+    let mut totals = BTreeMap::<String, usize>::new();
+    for unit in units {
+        if let Some(transforms) = unit.get("transforms").and_then(Value::as_object) {
+            for (kind, count) in transforms {
+                let count = count
+                    .as_u64()
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or(0);
+                *totals.entry(kind.clone()).or_default() += count;
+            }
+        }
+    }
+
+    let index = json!({
+        "schema": DEOBFUSCATION.schema,
+        "safe_static_only": true,
+        "mode_sensitive_deduplication": true,
+        "runtime_semantics_preserved_by_design": true,
+        "presentation_formatted": false,
+        "deobfuscator": "jsvm_lift::safe_deob",
+        "formatter": "jsvm_lift::js_format",
+        "string_recovery": STRING_RECOVERY.relative_path,
+        "units": units,
+        "summary": {
+            "javascript_units": counts.javascript_units,
+            "unique_raw_inputs": counts.unique_raw_inputs,
+            "deduplicated_raw_units": counts.javascript_units.saturating_sub(counts.unique_raw_inputs),
+            "unique_pre_deob_inputs": counts.unique_pre_deob_inputs,
+            "unique_deob_outputs": counts.unique_deob_outputs,
+            "string_recovery_invocations": counts.unique_raw_inputs,
+            "safe_deob_invocations": counts.unique_pre_deob_inputs,
+            "readable_format_invocations": counts.unique_deob_outputs,
+            "jobs": jobs,
+            "changed_units": changed,
+            "failed_units": failed,
+            "string_recovery_changed_units": strings.changed,
+            "string_recovery_replacements": strings.replacements,
+            "transforms": totals,
+        },
+    });
+    write_artifact(project, DEOBFUSCATION, &index)?;
+    // The module reference graph was resolved before this stage.
+    // Enrich local importer names only in the analyst-readable view.
+    let _ = propagate_imported_names(project)?;
+
+    Ok(ProjectDeobSummary {
+        javascript_units: counts.javascript_units,
+        unique_raw_inputs: counts.unique_raw_inputs,
+        unique_pre_deob_inputs: counts.unique_pre_deob_inputs,
+        unique_deob_outputs: counts.unique_deob_outputs,
+        changed_units: changed,
+        failed_units: failed,
+        string_recovery_changed_units: strings.changed,
+        string_recovery_replacements: strings.replacements,
+    })
+}
+
 /// Produce the deobfuscated project view from the indexed original sources.
 ///
 /// # Errors
@@ -350,369 +791,21 @@ pub fn materialize_project_deobfuscation(
         })?;
     let work_path = work.path();
 
-    let mut occurrences = Vec::<Occurrence>::new();
-    let mut raw_groups = BTreeMap::<ContentKey, Vec<Occurrence>>::new();
-    for (ordinal, unit) in source_units.iter().enumerate() {
-        if source_value(unit, "kind") != Some("javascript") {
-            continue;
-        }
-        let Some(source_path) = source_value(unit, "source_path") else {
-            continue;
-        };
-        let Some(raw_path) = source_value(unit, "raw_path") else {
-            continue;
-        };
-        let source = project.join(raw_path);
-        if !source.is_file() {
-            continue;
-        }
-        let raw_bytes =
-            fs::read(&source).with_context(|| format!("reading {}", source.display()))?;
-        let raw_sha = sha256_hex(&raw_bytes);
-        let mode = SourceMode::for_path(Path::new(source_path));
-        let occurrence = Occurrence {
-            ordinal,
-            unit: unit.clone(),
-            raw_path: raw_path.to_string(),
-            source,
-            raw_sha: raw_sha.clone(),
-            mode,
-        };
-        raw_groups
-            .entry((raw_sha, mode))
-            .or_default()
-            .push(occurrence.clone());
-        occurrences.push(occurrence);
-    }
-
+    let inputs = RawInputs::collect(project, source_units)?;
     let jobs = options.jobs.unwrap_or_else(|| default_jobs(8)).max(1);
     let pool = ThreadPoolBuilder::new()
         .num_threads(jobs)
         .build()
         .context("building project-deobfuscation thread pool")?;
 
-    let raw_group_refs = raw_groups.iter().collect::<Vec<_>>();
-    let string_results = pool
-        .install(|| {
-            raw_group_refs
-                .par_iter()
-                .map(|(key, group)| {
-                    run_string_recovery(work_path, key, group, &options.budgets, &stage_budget)
-                        .map(|result| ((*key).clone(), result))
-                })
-                .collect::<Vec<_>>()
-        })
-        .into_iter()
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .collect::<BTreeMap<_, _>>();
-    stage_budget.checkpoint()?;
-
-    let mut pre_deob_groups = BTreeMap::<ContentKey, Vec<ContentKey>>::new();
-    for (raw_key, result) in &string_results {
-        pre_deob_groups
-            .entry((result.selected_sha.clone(), result.mode))
-            .or_default()
-            .push(raw_key.clone());
-    }
-
-    let pre_group_refs = pre_deob_groups.iter().collect::<Vec<_>>();
-    let deob_results = pool
-        .install(|| {
-            pre_group_refs
-                .par_iter()
-                .map(|(key, raw_keys)| {
-                    run_safe_deob(
-                        work_path,
-                        key,
-                        raw_keys,
-                        &string_results,
-                        options.max_iterations,
-                        &options.budgets,
-                        &stage_budget,
-                    )
-                    .map(|result| ((*key).clone(), result))
-                })
-                .collect::<Vec<_>>()
-        })
-        .into_iter()
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .collect::<BTreeMap<_, _>>();
-    stage_budget.checkpoint()?;
-
-    let mut output_groups = BTreeMap::<ContentKey, Vec<ContentKey>>::new();
-    for (pre_key, result) in &deob_results {
-        let Some(report) = &result.report else {
-            continue;
-        };
-        output_groups
-            .entry((report.output_sha256.clone(), result.mode))
-            .or_default()
-            .push(pre_key.clone());
-    }
-
-    let output_group_refs = output_groups.iter().collect::<Vec<_>>();
-    let readable_results = pool
-        .install(|| {
-            output_group_refs
-                .par_iter()
-                .map(|(key, pre_keys)| {
-                    let representative = pre_keys
-                        .first()
-                        .and_then(|pre_key| deob_results.get(pre_key))
-                        .context("missing representative deob result")?;
-                    format_output(
-                        work_path,
-                        key,
-                        representative,
-                        &options.budgets,
-                        &stage_budget,
-                    )
-                    .map(|result| ((*key).clone(), result))
-                })
-                .collect::<Vec<_>>()
-        })
-        .into_iter()
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .collect::<BTreeMap<_, _>>();
-    stage_budget.checkpoint()?;
-
-    let deob_report_dir = project.join("analysis/deobfuscation");
-    let string_report_dir = project.join("analysis/string-recovery");
-    fs::create_dir_all(&deob_report_dir)?;
-    fs::create_dir_all(&string_report_dir)?;
-
-    let mut units = Vec::<Value>::new();
-    let mut string_units = Vec::<Value>::new();
-    for occurrence in &occurrences {
-        let raw_key = (occurrence.raw_sha.clone(), occurrence.mode);
-        let raw_group = raw_groups.get(&raw_key).context("missing raw group")?;
-        let string_result = string_results
-            .get(&raw_key)
-            .context("missing string-recovery result")?;
-        let pre_key = (string_result.selected_sha.clone(), occurrence.mode);
-        let deob_result = deob_results.get(&pre_key).context("missing deob result")?;
-
-        let report_rel = PathBuf::from(format!(
-            "analysis/deobfuscation/{:04}.json",
-            occurrence.ordinal
-        ));
-        let string_report_rel = PathBuf::from(format!(
-            "analysis/string-recovery/{:04}.json",
-            occurrence.ordinal
-        ));
-        if let Some(source_report) = &string_result.report_path {
-            link_or_copy(source_report, &project.join(&string_report_rel))?;
-        }
-        if let Some(report) = &deob_result.report {
-            write_json(&project.join(&report_rel), report)?;
-        }
-
-        let deduplicated = occurrence.ordinal != string_result.canonical_ordinal;
-        let mut string_row = json!({
-            "ordinal": occurrence.ordinal,
-            "resource_id": occurrence.unit.get("resource_id").cloned().unwrap_or(Value::Null),
-            "url": occurrence.unit.get("url").cloned().unwrap_or(Value::Null),
-            "input_path": occurrence.raw_path,
-            "report_path": string_report_rel.to_string_lossy(),
-            "input_sha256": occurrence.raw_sha,
-            "source_mode": occurrence.mode.as_str(),
-            "output_sha256": string_result.selected_sha,
-            "exit": string_result.exit,
-            "changed": string_result.changed,
-            "replacements": string_result.replacements,
-            "decoders": string_result.decoders,
-            "content_group_size": raw_group.len(),
-            "deduplicated": deduplicated,
-            "deduplicated_from_ordinal": if deduplicated { Value::from(string_result.canonical_ordinal) } else { Value::Null },
-        });
-        if let Some(error) = &string_result.error {
-            let row = as_object_mut(&mut string_row)?;
-            row.insert("error".into(), Value::String(error.clone()));
-            row.insert(
-                "fallback".into(),
-                Value::String("original source passed to safe deobfuscator".into()),
-            );
-        }
-        string_units.push(string_row);
-
-        let rel = derived_path(&occurrence.raw_path, "_deobfuscated");
-        let readable_rel = derived_path(&occurrence.raw_path, "_readable");
-        let mut row = json!({
-            "ordinal": occurrence.ordinal,
-            "resource_id": occurrence.unit.get("resource_id").cloned().unwrap_or(Value::Null),
-            "url": occurrence.unit.get("url").cloned().unwrap_or(Value::Null),
-            "raw_path": occurrence.raw_path,
-            "input_path": occurrence.raw_path,
-            "output_path": rel.to_string_lossy(),
-            "readable_output_path": readable_rel.to_string_lossy(),
-            "report_path": report_rel.to_string_lossy(),
-            "string_recovery_report_path": string_report_rel.to_string_lossy(),
-            "string_recovery_changed": string_result.changed,
-            "string_recovery_replacements": string_result.replacements,
-            "input_sha256": occurrence.raw_sha,
-            "source_mode": occurrence.mode.as_str(),
-            "pre_deob_sha256": string_result.selected_sha,
-            "exit": deob_result.exit,
-            "content_group_size": raw_group.len(),
-            "deduplicated": deduplicated,
-            "deduplicated_from_ordinal": if deduplicated { Value::from(string_result.canonical_ordinal) } else { Value::Null },
-        });
-        let Some(report) = &deob_result.report else {
-            if let Some(error) = &deob_result.error {
-                as_object_mut(&mut row)?.insert("error".into(), Value::String(error.clone()));
-            }
-            units.push(row);
-            continue;
-        };
-
-        let mut transforms = report.transforms.clone();
-        if string_result.replacements != 0 {
-            transforms.insert("encoded_string_decode".into(), string_result.replacements);
-        }
-        let output_path = deob_result
-            .output_path
-            .as_ref()
-            .context("missing successful deob output")?;
-        link_or_copy(output_path, &project.join(&rel))?;
-        let output_key = (report.output_sha256.clone(), occurrence.mode);
-        let readable = readable_results
-            .get(&output_key)
-            .context("missing readable output")?;
-        link_or_copy(&readable.path, &project.join(&readable_rel))?;
-        let row_object = as_object_mut(&mut row)?;
-        row_object.extend(Map::from_iter([
-            (
-                "changed".into(),
-                Value::Bool(report.changed || string_result.changed),
-            ),
-            ("iterations".into(), Value::from(report.iterations)),
-            ("transforms".into(), serde_json::to_value(&transforms)?),
-            (
-                "arithmetic_state_proofs".into(),
-                serde_json::to_value(&report.arithmetic_state_proofs)?,
-            ),
-            (
-                "safe_static_only".into(),
-                Value::Bool(report.safe_static_only),
-            ),
-            (
-                "presentation_formatted".into(),
-                Value::Bool(report.presentation_formatted),
-            ),
-            (
-                "runtime_semantics_preserved_by_design".into(),
-                Value::Bool(report.runtime_semantics_preserved_by_design),
-            ),
-            (
-                "output_sha256".into(),
-                Value::String(report.output_sha256.clone()),
-            ),
-            ("readable_formatted".into(), Value::Bool(readable.formatted)),
-        ]));
-        if let Some(error) = &readable.error {
-            row_object.insert("readable_format_error".into(), Value::String(error.clone()));
-        }
-        units.push(row);
-    }
-
-    let string_changed = string_units
-        .iter()
-        .filter(|unit| unit.get("changed").and_then(Value::as_bool) == Some(true))
-        .count();
-    let string_failed = string_units
-        .iter()
-        .filter(|unit| unit.get("exit").and_then(Value::as_i64).unwrap_or(0) != 0)
-        .count();
-    let string_replacements = string_units
-        .iter()
-        .filter_map(|unit| unit.get("replacements").and_then(Value::as_u64))
-        .filter_map(|count| usize::try_from(count).ok())
-        .fold(0usize, usize::saturating_add);
-    let string_index = json!({
-        "schema": STRING_RECOVERY.schema,
-        "safe_static_only": true,
-        "mode_sensitive_deduplication": true,
-        "recoverer": "jsvm_lift::string_recovery",
-        "units": string_units,
-        "summary": {
-            "javascript_units": occurrences.len(),
-            "unique_input_bodies": raw_groups.len(),
-            "deduplicated_units": occurrences.len().saturating_sub(raw_groups.len()),
-            "unique_post_recovery_bodies": pre_deob_groups.len(),
-            "changed_units": string_changed,
-            "failed_units": string_failed,
-            "replacements": string_replacements,
-            "invocations": raw_groups.len(),
-        },
-    });
-    write_artifact(project, STRING_RECOVERY, &string_index)?;
-
-    let changed = units
-        .iter()
-        .filter(|unit| unit.get("changed").and_then(Value::as_bool) == Some(true))
-        .count();
-    let failed = units
-        .iter()
-        .filter(|unit| unit.get("exit").and_then(Value::as_i64).unwrap_or(0) != 0)
-        .count();
-    let mut totals = BTreeMap::<String, usize>::new();
-    for unit in &units {
-        if let Some(transforms) = unit.get("transforms").and_then(Value::as_object) {
-            for (kind, count) in transforms {
-                let count = count
-                    .as_u64()
-                    .and_then(|value| usize::try_from(value).ok())
-                    .unwrap_or(0);
-                *totals.entry(kind.clone()).or_default() += count;
-            }
-        }
-    }
-
-    let index = json!({
-        "schema": DEOBFUSCATION.schema,
-        "safe_static_only": true,
-        "mode_sensitive_deduplication": true,
-        "runtime_semantics_preserved_by_design": true,
-        "presentation_formatted": false,
-        "deobfuscator": "jsvm_lift::safe_deob",
-        "formatter": "jsvm_lift::js_format",
-        "string_recovery": STRING_RECOVERY.relative_path,
-        "units": units,
-        "summary": {
-            "javascript_units": occurrences.len(),
-            "unique_raw_inputs": raw_groups.len(),
-            "deduplicated_raw_units": occurrences.len().saturating_sub(raw_groups.len()),
-            "unique_pre_deob_inputs": pre_deob_groups.len(),
-            "unique_deob_outputs": output_groups.len(),
-            "string_recovery_invocations": raw_groups.len(),
-            "safe_deob_invocations": pre_deob_groups.len(),
-            "readable_format_invocations": output_groups.len(),
-            "jobs": jobs,
-            "changed_units": changed,
-            "failed_units": failed,
-            "string_recovery_changed_units": string_changed,
-            "string_recovery_replacements": string_replacements,
-            "transforms": totals,
-        },
-    });
-    write_artifact(project, DEOBFUSCATION, &index)?;
-    // The module reference graph was resolved before this stage.
-    // Enrich local importer names only in the analyst-readable view.
-    let _ = propagate_imported_names(project)?;
-
-    Ok(ProjectDeobSummary {
-        javascript_units: occurrences.len(),
-        unique_raw_inputs: raw_groups.len(),
-        unique_pre_deob_inputs: pre_deob_groups.len(),
-        unique_deob_outputs: output_groups.len(),
-        changed_units: changed,
-        failed_units: failed,
-        string_recovery_changed_units: string_changed,
-        string_recovery_replacements: string_replacements,
-    })
+    let results = RecoveryResults::recover(
+        &inputs,
+        work_path,
+        &pool,
+        options.max_iterations,
+        &stage_budget,
+    )?;
+    results.publish(project, &inputs, jobs)
 }
 
 #[cfg(test)]
@@ -785,6 +878,55 @@ export {v as t, r as decode, c as panel};
             ),
             "{readable}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn project_deduplicates_occurrences_without_changing_canonical_ordinal() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let project = temp.path();
+        fs::create_dir_all(project.join("resources"))?;
+        let source = "function f() { return 1 + 2; } f();";
+        for name in ["z-first.js", "a-second.js"] {
+            fs::write(project.join("resources").join(name), source)?;
+        }
+        write_artifact(
+            project,
+            SOURCE_INDEX,
+            &json!({
+                "schema": SOURCE_INDEX.schema,
+                "units": [
+                    {"kind": "html", "raw_path": "resources/page.html"},
+                    {"kind": "javascript", "raw_path": "resources/z-first.js", "source_path": "src/z-first.js"},
+                    {"kind": "javascript", "raw_path": "resources/a-second.js", "source_path": "src/a-second.js"}
+                ],
+                "summary": {}
+            }),
+        )?;
+        let summary = materialize_project_deobfuscation(
+            project,
+            &ProjectDeobOptions {
+                jobs: Some(2),
+                max_iterations: 8,
+                budgets: AnalysisBudgets::standard("dedup-occurrences"),
+            },
+        )?;
+        assert_eq!(summary.javascript_units, 2);
+        assert_eq!(summary.unique_raw_inputs, 1);
+        assert_eq!(summary.unique_pre_deob_inputs, 1);
+        assert_eq!(summary.unique_deob_outputs, 1);
+        assert_eq!(summary.failed_units, 0);
+        for spec in [STRING_RECOVERY, DEOBFUSCATION] {
+            let index = load_artifact(project, spec)?;
+            let rows = index["units"].as_array().context("unit rows")?;
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0]["ordinal"], 1);
+            assert_eq!(rows[1]["ordinal"], 2);
+            assert_eq!(rows[0]["deduplicated"], false);
+            assert_eq!(rows[1]["deduplicated"], true);
+            assert_eq!(rows[1]["deduplicated_from_ordinal"], 1);
+            assert!(rows.iter().all(|row| row["content_group_size"] == 2));
+        }
         Ok(())
     }
 

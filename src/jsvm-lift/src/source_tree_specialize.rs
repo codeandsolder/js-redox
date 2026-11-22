@@ -61,13 +61,13 @@ fn literal_argument<'a>(arg: &'a Argument<'a>, source: &'a str) -> Option<String
         .map(str::to_owned)
 }
 
-struct Calls<'s> {
+struct LiteralCallCollector<'s> {
     source: &'s str,
     scoping: &'s Scoping,
     calls: Vec<LiteralCall>,
 }
 
-impl<'a> Visit<'a> for Calls<'_> {
+impl<'a> Visit<'a> for LiteralCallCollector<'_> {
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         if !call.optional {
             if let Expression::Identifier(callee) = unparen(&call.callee) {
@@ -111,7 +111,7 @@ pub fn literal_calls(source: &str) -> Result<Vec<LiteralCall>> {
     let parsed = parse_program(&allocator, source, SourceType::unambiguous());
     ensure!(parsed.is_clean(), "invalid JavaScript in handler");
     let semantic = SemanticBuilder::new().build(&parsed.program);
-    let mut visitor = Calls {
+    let mut visitor = LiteralCallCollector {
         source,
         scoping: semantic.semantic.scoping(),
         calls: Vec::new(),
@@ -403,15 +403,11 @@ impl<'a> Visit<'a> for OriginalCallLiterals<'_> {
 
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         if !call.optional {
-            let offset = if matches!(
+            let offset = usize::from(matches!(
                 unparen(&call.callee),
                 Expression::StaticMemberExpression(member)
                     if !member.optional && member.property.name == "call"
-            ) {
-                1
-            } else {
-                0
-            };
+            ));
             self.remember(call.span, call.arguments.get(offset..).unwrap_or_default());
         }
         walk::walk_call_expression(self, call);
@@ -517,58 +513,105 @@ struct CallContext {
     widened_cycles: BTreeSet<[u32; 2]>,
 }
 
-/// Recover function-level variants by tracing *exact* primitive arguments and
-/// immutable forwarded formal parameters through arbitrarily deep lexical call
-/// chains.
-///
-/// Every root entry starts with unknown parameters. Each emitted variant is
-/// attached to at least one real resolved incoming callsite.
-///
-/// This is a path-specific source-reading view, not an executable replacement.
-///
-/// # Errors
-///
-/// Rejects invalid original JavaScript; failures in source transformation or verification
-/// propagate rather than yielding unsupported specialized code.
-pub fn specialize_resolved_call_graph(
-    original: &str,
-    views: &[CallerView],
-) -> Result<Vec<ResolvedSpecialization>> {
-    let allocator = Allocator::default();
-    let parsed = parse_program(&allocator, original, SourceType::unambiguous());
-    ensure!(parsed.is_clean(), "invalid original lexical JavaScript");
-    let semantic = SemanticBuilder::new().build(&parsed.program);
-    let scoping = semantic.semantic.scoping();
-    let mut unsafe_forwarding = UnsafeParameterForwarding::default();
-    unsafe_forwarding.visit_program(&parsed.program);
-
-    // Dynamic with/eval can shadow or mutate a normally resolved identifier
-    // at runtime, so never substitute a value through a lexical reference in
-    // those programs. Pure self-contained argument expressions still work.
-    let mut bindings = StablePrimitiveBindings {
-        scoping,
-        values: BTreeMap::new(),
-        changed: false,
-    };
-    if !unsafe_forwarding.dynamic_scope {
-        loop {
-            bindings.changed = false;
-            bindings.visit_program(&parsed.program);
-            if !bindings.changed {
+impl OriginalCallLiterals<'_> {
+    fn edge_constants(
+        &self,
+        edge: &ResolvedCallEdge,
+        context: &CallContext,
+        incoming: &BTreeMap<usize, String>,
+        unsafe_forwarding: &UnsafeParameterForwarding,
+    ) -> (Vec<(usize, String)>, bool) {
+        // Computed selectors may generate infinitely many distinct
+        // values along a recursive call chain. Loop invariants are
+        // propagated using exact-value intersection below.
+        let direct = self.sites.get(&edge.call.span);
+        let forwarded_is_safe = !unsafe_forwarding.functions.contains(&context.function);
+        let mut next = Vec::new();
+        let mut computed_here = false;
+        for (index, arg) in edge.call.arguments.iter().enumerate() {
+            if !arg.positional {
                 break;
             }
+            let literal = direct
+                .and_then(|values| values.iter().find(|(at, _)| *at == index))
+                .map(|(_, literal)| literal.clone())
+                .or_else(|| {
+                    forwarded_is_safe
+                        .then_some(arg.caller_param_index)
+                        .flatten()
+                        .and_then(|from| incoming.get(&from).cloned())
+                })
+                .or_else(|| {
+                    let inferred = forwarded_is_safe
+                        .then(|| self.computed.get(&edge.call.span))
+                        .flatten()
+                        .and_then(|args| args.get(index))
+                        .and_then(Option::as_ref)
+                        .and_then(|computed| computed.evaluate(incoming));
+                    computed_here |= inferred.is_some();
+                    inferred
+                });
+            if let Some(literal) = literal {
+                next.push((index, literal));
+            }
+        }
+        (next, computed_here)
+    }
+}
+
+impl CallContext {
+    fn propagate(
+        &self,
+        target: [u32; 2],
+        next: Vec<(usize, String)>,
+        chain: Vec<[u32; 2]>,
+        computed_here: bool,
+    ) -> Self {
+        let mut propagated = next;
+        let mut widened_cycles = self.widened_cycles.clone();
+        if let Some(previous) = self
+            .history
+            .iter()
+            .rposition(|entry| entry.function == target)
+        {
+            // Literal/identity forwarding alone draws from a finite set
+            // of source constants and requires no widening. A recursive
+            // computed edge may create new values on each iteration.
+            let computed_in_cycle = computed_here
+                || self.history[previous + 1..]
+                    .iter()
+                    .any(|entry| entry.computed_on_incoming_edge);
+            if computed_in_cycle && !widened_cycles.insert(target) {
+                let before = self.history[previous]
+                    .constants
+                    .iter()
+                    .cloned()
+                    .collect::<BTreeMap<_, _>>();
+                propagated
+                    .retain(|(index, value)| before.get(index).is_some_and(|prior| prior == value));
+            }
+        }
+        let mut history = self.history.clone();
+        history.push(CallHistoryEntry {
+            function: target,
+            constants: propagated.clone(),
+            computed_on_incoming_edge: computed_here,
+        });
+        Self {
+            function: target,
+            constants: propagated,
+            chain,
+            history,
+            widened_cycles,
         }
     }
-    let mut collector = OriginalCallLiterals {
-        source: original,
-        scoping,
-        values: bindings.values,
-        sites: BTreeMap::new(),
-        computed: BTreeMap::new(),
-        functions: Vec::new(),
-    };
-    collector.visit_program(&parsed.program);
+}
 
+fn specialization_requests(
+    views: &[CallerView],
+    collector: &OriginalCallLiterals<'_>,
+    unsafe_forwarding: &UnsafeParameterForwarding,
+) -> BTreeMap<RequestKey, RequestValue> {
     let mut outgoing = BTreeMap::<[u32; 2], Vec<&ResolvedCallEdge>>::new();
     for edge in views.iter().flat_map(|view| &view.reachable_edges) {
         let at = outgoing.entry(edge.from_span).or_default();
@@ -609,40 +652,8 @@ pub fn specialize_resolved_call_graph(
             .cloned()
             .collect::<BTreeMap<_, _>>();
         for edge in edges {
-            // Computed selectors may generate infinitely many distinct
-            // values along a recursive call chain. Loop invariants are
-            // propagated using exact-value intersection below.
-            let direct = collector.sites.get(&edge.call.span);
-            let forwarded_is_safe = !unsafe_forwarding.functions.contains(&context.function);
-            let mut next = Vec::new();
-            let mut computed_here = false;
-            for (index, arg) in edge.call.arguments.iter().enumerate() {
-                if !arg.positional {
-                    break;
-                }
-                let literal = direct
-                    .and_then(|values| values.iter().find(|(at, _)| *at == index))
-                    .map(|(_, literal)| literal.clone())
-                    .or_else(|| {
-                        forwarded_is_safe
-                            .then_some(arg.caller_param_index)
-                            .flatten()
-                            .and_then(|from| incoming.get(&from).cloned())
-                    })
-                    .or_else(|| {
-                        let inferred = forwarded_is_safe
-                            .then(|| collector.computed.get(&edge.call.span))
-                            .flatten()
-                            .and_then(|args| args.get(index))
-                            .and_then(Option::as_ref)
-                            .and_then(|computed| computed.evaluate(&incoming));
-                        computed_here |= inferred.is_some();
-                        inferred
-                    });
-                if let Some(literal) = literal {
-                    next.push((index, literal));
-                }
-            }
+            let (next, computed_here) =
+                collector.edge_constants(edge, &context, &incoming, unsafe_forwarding);
             let mut chain = context.chain.clone();
             chain.push(edge.call.span);
             if !next.is_empty() {
@@ -651,47 +662,17 @@ pub fn specialize_resolved_call_graph(
                     .or_insert_with(|| (edge.call.callee.clone(), BTreeSet::new(), chain.clone()));
                 entry.1.insert(edge.call.span);
             }
-            let mut propagated = next;
-            let mut widened_cycles = context.widened_cycles.clone();
-            if let Some(previous) = context
-                .history
-                .iter()
-                .rposition(|entry| entry.function == edge.to_span)
-            {
-                // Literal/identity forwarding alone draws from a finite set
-                // of source constants and requires no widening. A recursive
-                // computed edge may create new values on each iteration.
-                let computed_in_cycle = computed_here
-                    || context.history[previous + 1..]
-                        .iter()
-                        .any(|entry| entry.computed_on_incoming_edge);
-                if computed_in_cycle && !widened_cycles.insert(edge.to_span) {
-                    let before = context.history[previous]
-                        .constants
-                        .iter()
-                        .cloned()
-                        .collect::<BTreeMap<_, _>>();
-                    propagated.retain(|(index, value)| {
-                        before.get(index).is_some_and(|prior| prior == value)
-                    });
-                }
-            }
-            let mut history = context.history.clone();
-            history.push(CallHistoryEntry {
-                function: edge.to_span,
-                constants: propagated.clone(),
-                computed_on_incoming_edge: computed_here,
-            });
-            pending.push_back(CallContext {
-                function: edge.to_span,
-                constants: propagated,
-                chain,
-                history,
-                widened_cycles,
-            });
+            pending.push_back(context.propagate(edge.to_span, next, chain, computed_here));
         }
     }
 
+    requested
+}
+
+fn materialize_requested_specializations(
+    original: &str,
+    requested: BTreeMap<RequestKey, RequestValue>,
+) -> Result<Vec<ResolvedSpecialization>> {
     let mut specializations = Vec::new();
     for ((function_span, constants), (helper, call_sites, example_call_chain)) in requested {
         let Some(raw) = original.get(function_span[0] as usize..function_span[1] as usize) else {
@@ -750,6 +731,62 @@ pub fn specialize_resolved_call_graph(
         }
     }
     Ok(deduplicated.into_values().collect())
+}
+
+/// Recover function-level variants by tracing *exact* primitive arguments and
+/// immutable forwarded formal parameters through arbitrarily deep lexical call
+/// chains.
+///
+/// Every root entry starts with unknown parameters. Each emitted variant is
+/// attached to at least one real resolved incoming callsite.
+///
+/// This is a path-specific source-reading view, not an executable replacement.
+///
+/// # Errors
+///
+/// Rejects invalid original JavaScript; failures in source transformation or verification
+/// propagate rather than yielding unsupported specialized code.
+pub fn specialize_resolved_call_graph(
+    original: &str,
+    views: &[CallerView],
+) -> Result<Vec<ResolvedSpecialization>> {
+    let allocator = Allocator::default();
+    let parsed = parse_program(&allocator, original, SourceType::unambiguous());
+    ensure!(parsed.is_clean(), "invalid original lexical JavaScript");
+    let semantic = SemanticBuilder::new().build(&parsed.program);
+    let scoping = semantic.semantic.scoping();
+    let mut unsafe_forwarding = UnsafeParameterForwarding::default();
+    unsafe_forwarding.visit_program(&parsed.program);
+
+    // Dynamic with/eval can shadow or mutate a normally resolved identifier
+    // at runtime, so never substitute a value through a lexical reference in
+    // those programs. Pure self-contained argument expressions still work.
+    let mut bindings = StablePrimitiveBindings {
+        scoping,
+        values: BTreeMap::new(),
+        changed: false,
+    };
+    if !unsafe_forwarding.dynamic_scope {
+        loop {
+            bindings.changed = false;
+            bindings.visit_program(&parsed.program);
+            if !bindings.changed {
+                break;
+            }
+        }
+    }
+    let mut collector = OriginalCallLiterals {
+        source: original,
+        scoping,
+        values: bindings.values,
+        sites: BTreeMap::new(),
+        computed: BTreeMap::new(),
+        functions: Vec::new(),
+    };
+    collector.visit_program(&parsed.program);
+
+    let requested = specialization_requests(views, &collector, &unsafe_forwarding);
+    materialize_requested_specializations(original, requested)
 }
 
 struct FunctionCandidate {
@@ -1169,6 +1206,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::literal_string_with_formatting_args,
+        reason = "JavaScript fixture braces are source syntax, not Rust format placeholders"
+    )]
     fn dynamic_scope_and_mutated_bindings_are_not_inferred_as_constants() -> Result<()> {
         for src in [
             "const leaf=x=>x;const api={};api.run=()=>{let x=3;x=4;return leaf(x);};",

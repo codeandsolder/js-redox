@@ -75,7 +75,7 @@ impl GraphBuilder {
     }
 
     #[cfg(test)]
-    pub(super) fn edges(&self) -> &BTreeMap<EdgeIdentity, Value> {
+    pub(super) const fn edges(&self) -> &BTreeMap<EdgeIdentity, Value> {
         &self.edges
     }
 
@@ -158,7 +158,7 @@ impl GraphBuilder {
                         serde_json::map::Entry::Occupied(mut entry) if entry.get().is_null() => {
                             entry.insert(value);
                         }
-                        _ => {}
+                        serde_json::map::Entry::Occupied(_) => {}
                     }
                 }
             }

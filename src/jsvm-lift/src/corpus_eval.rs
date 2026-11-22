@@ -475,6 +475,177 @@ fn validate_sample_policy(
     Ok(())
 }
 
+struct SampleEvaluation<'a> {
+    root: &'a Path,
+    temp: &'a TempDir,
+    budgets: &'a AnalysisBudgets,
+    defaults: &'a CorpusDefaults,
+}
+
+impl SampleEvaluation<'_> {
+    fn format_sample(
+        &self,
+        sample: &CorpusSample,
+        raw_source: &str,
+        source_mode: SourceMode,
+        sample_budget: &WorkBudget,
+    ) -> Result<String> {
+        let format_budget = AnalysisOperation::Format.under(sample_budget, &sample.id);
+        let pretty = format_source(raw_source, &format_budget)
+            .with_context(|| format!("{}: formatting", sample.id))?;
+        let syntax_budget =
+            AnalysisOperation::SyntaxCheck.under(sample_budget, format!("{}:pretty", sample.id));
+        assert_node_syntax(
+            self.temp,
+            &sample.id,
+            "pretty",
+            &pretty,
+            source_mode,
+            &syntax_budget,
+        )?;
+        if let Some(pretty_path) = &sample.pretty_path {
+            let committed_path =
+                canonical_corpus_path(self.root, pretty_path, &format!("{} pretty", sample.id))?;
+            if let (Some(expected_bytes), Some(expected_sha)) =
+                (sample.pretty_bytes, sample.pretty_sha256.as_deref())
+            {
+                let committed = verify_file(
+                    &committed_path,
+                    expected_bytes,
+                    expected_sha,
+                    &format!("{} pretty", sample.id),
+                )?;
+                if sha256_hex(pretty.as_bytes()) != sha256_hex(&committed) {
+                    bail!("{}: committed analyst view is stale", sample.id);
+                }
+            }
+        }
+
+        Ok(pretty)
+    }
+
+    fn verify_sample(&self, sample: &CorpusSample) -> Result<(PathBuf, Vec<u8>)> {
+        let raw_path =
+            canonical_corpus_path(self.root, &sample.path, &format!("{} sample", sample.id))?;
+        let raw_bytes = verify_file(&raw_path, sample.bytes, &sample.sha256, &sample.id)?;
+
+        if let Some(source) = sample
+            .source
+            .as_deref()
+            .map(Path::new)
+            .filter(|path| path.is_file())
+        {
+            let mirrored =
+                fs::read(source).with_context(|| format!("reading {}", source.display()))?;
+            if sha256_hex(&mirrored) != sample.sha256 {
+                bail!("{}: mirrored source bytes differ from corpus", sample.id);
+            }
+        }
+
+        Ok((raw_path, raw_bytes))
+    }
+
+    fn evaluate(&self, sample: &CorpusSample) -> Result<CorpusEvalRow> {
+        let sample_budget = self
+            .budgets
+            .operation(AnalysisOperation::CorpusEvaluation, &sample.id);
+        sample_budget.checkpoint()?;
+        let (raw_path, raw_bytes) = self.verify_sample(sample)?;
+        if sample.role != CorpusRole::Raw {
+            return Ok(CorpusEvalRow {
+                id: sample.id.clone(),
+                family: sample.family.clone(),
+                role: sample.role,
+                bytes: sample.bytes,
+                sha256: sample.sha256.clone(),
+                formatter_bytes: None,
+                deob_changed: None,
+                deob_iterations: None,
+                deob_rewrites: None,
+                deob_transforms: None,
+                arithmetic_state_proofs: None,
+                scanner: None,
+                status: "reference-hash-ok".to_owned(),
+            });
+        }
+        let raw_source = std::str::from_utf8(&raw_bytes)
+            .with_context(|| format!("{}: JavaScript is not UTF-8", sample.id))?;
+
+        // Module/CommonJS semantics belong to the manifest's logical filename,
+        // not to a canonical symlink target whose suffix may differ.
+        let source_mode = SourceMode::for_path(&sample.path);
+        let pretty = self.format_sample(sample, raw_source, source_mode, &sample_budget)?;
+        let deob_budget = AnalysisOperation::SafeDeobfuscation.under(&sample_budget, &sample.id);
+        let deob = deobfuscate_source(
+            raw_source,
+            raw_path.display().to_string(),
+            source_mode,
+            16,
+            false,
+            &deob_budget,
+        )
+        .with_context(|| format!("{}: safe deobfuscation", sample.id))?;
+        let syntax_budget =
+            AnalysisOperation::SyntaxCheck.under(&sample_budget, format!("{}:deob", sample.id));
+        assert_node_syntax(
+            self.temp,
+            &sample.id,
+            "deob",
+            &deob.source,
+            source_mode,
+            &syntax_budget,
+        )?;
+        if !deob.report.guarantees.safe_static_only
+            || deob.report.guarantees.presentation_formatted
+            || !deob.report.guarantees.runtime_semantics_preserved_by_design
+            || deob.report.transforms.contains_key("presentation_codegen")
+        {
+            bail!("{}: safe-deob report contract violated", sample.id);
+        }
+        let rewrites = deob
+            .report
+            .transforms
+            .iter()
+            .filter(|(kind, _)| {
+                kind.as_str() != "canonical_codegen" && kind.as_str() != "presentation_codegen"
+            })
+            .map(|(_, count)| *count)
+            .sum::<usize>();
+
+        let scan_budget = AnalysisOperation::StructuralScan.under(&sample_budget, &sample.id);
+        let scan = scan_source(&pretty, sample.id.clone(), None, source_mode, &scan_budget)?;
+        if scan.fatal_error {
+            bail!("{}: scanner fatal error", sample.id);
+        }
+        let metrics = scanner_metrics(&scan);
+        validate_sample_policy(
+            sample,
+            self.defaults,
+            &deob.source,
+            &deob.report.transforms,
+            rewrites,
+            &metrics,
+        )?;
+        Ok(CorpusEvalRow {
+            id: sample.id.clone(),
+            family: sample.family.clone(),
+            role: sample.role,
+            bytes: sample.bytes,
+            sha256: sample.sha256.clone(),
+            formatter_bytes: Some(pretty.len()),
+            deob_changed: Some(deob.report.changed),
+            deob_iterations: Some(deob.report.iterations),
+            deob_rewrites: Some(rewrites),
+            deob_transforms: Some(deob.report.transforms),
+            arithmetic_state_proofs: Some(serde_json::to_value(
+                deob.report.arithmetic_state_proofs,
+            )?),
+            scanner: Some(metrics),
+            status: "ok".to_owned(),
+        })
+    }
+}
+
 /// Evaluate corpus manifest samples against authenticated source bytes and analysis invariants.
 ///
 /// # Errors
@@ -499,169 +670,25 @@ pub fn evaluate_manifest(manifest_path: &Path, corpus_root: &Path) -> Result<Cor
     let mut raw_samples = 0_usize;
     let mut reference_samples = 0_usize;
 
+    let evaluation = SampleEvaluation {
+        root: &corpus_root,
+        temp: &temp,
+        budgets: &budgets,
+        defaults: &manifest.defaults,
+    };
     for sample in &manifest.samples {
-        let sample_budget = budgets.operation(AnalysisOperation::CorpusEvaluation, &sample.id);
-        sample_budget.checkpoint()?;
-        let raw_path =
-            canonical_corpus_path(&corpus_root, &sample.path, &format!("{} sample", sample.id))?;
-        let raw_bytes = verify_file(&raw_path, sample.bytes, &sample.sha256, &sample.id)?;
-
-        if let Some(source) = sample
-            .source
-            .as_deref()
-            .map(Path::new)
-            .filter(|path| path.is_file())
-        {
-            let mirrored =
-                fs::read(source).with_context(|| format!("reading {}", source.display()))?;
-            if sha256_hex(&mirrored) != sample.sha256 {
-                bail!("{}: mirrored source bytes differ from corpus", sample.id);
-            }
-        }
-
-        if sample.role != CorpusRole::Raw {
+        let row = evaluation.evaluate(sample)?;
+        if row.role == CorpusRole::Raw {
+            raw_samples += 1;
+        } else {
             reference_samples += 1;
-            rows.push(CorpusEvalRow {
-                id: sample.id.clone(),
-                family: sample.family.clone(),
-                role: sample.role,
-                bytes: sample.bytes,
-                sha256: sample.sha256.clone(),
-                formatter_bytes: None,
-                deob_changed: None,
-                deob_iterations: None,
-                deob_rewrites: None,
-                deob_transforms: None,
-                arithmetic_state_proofs: None,
-                scanner: None,
-                status: "reference-hash-ok".to_owned(),
-            });
-            continue;
         }
-        raw_samples += 1;
-        let raw_source = std::str::from_utf8(&raw_bytes)
-            .with_context(|| format!("{}: JavaScript is not UTF-8", sample.id))?;
-
-        // Module/CommonJS semantics belong to the manifest's logical filename,
-        // not to a canonical symlink target whose suffix may differ.
-        let source_mode = SourceMode::for_path(&sample.path);
-        let format_budget =
-            budgets.operation_under(&sample_budget, AnalysisOperation::Format, &sample.id);
-        let pretty = format_source(raw_source, &format_budget)
-            .with_context(|| format!("{}: formatting", sample.id))?;
-        let syntax_budget = budgets.operation_under(
-            &sample_budget,
-            AnalysisOperation::SyntaxCheck,
-            format!("{}:pretty", sample.id),
-        );
-        assert_node_syntax(
-            &temp,
-            &sample.id,
-            "pretty",
-            &pretty,
-            source_mode,
-            &syntax_budget,
-        )?;
-        if let Some(pretty_path) = &sample.pretty_path {
-            let committed_path =
-                canonical_corpus_path(&corpus_root, pretty_path, &format!("{} pretty", sample.id))?;
-            if let (Some(expected_bytes), Some(expected_sha)) =
-                (sample.pretty_bytes, sample.pretty_sha256.as_deref())
-            {
-                let committed = verify_file(
-                    &committed_path,
-                    expected_bytes,
-                    expected_sha,
-                    &format!("{} pretty", sample.id),
-                )?;
-                if sha256_hex(pretty.as_bytes()) != sha256_hex(&committed) {
-                    bail!("{}: committed analyst view is stale", sample.id);
-                }
-            }
-        }
-
-        let deob_budget = budgets.operation_under(
-            &sample_budget,
-            AnalysisOperation::SafeDeobfuscation,
-            &sample.id,
-        );
-        let deob = deobfuscate_source(
-            raw_source,
-            raw_path.display().to_string(),
-            source_mode,
-            16,
-            false,
-            &deob_budget,
-        )
-        .with_context(|| format!("{}: safe deobfuscation", sample.id))?;
-        let syntax_budget = budgets.operation_under(
-            &sample_budget,
-            AnalysisOperation::SyntaxCheck,
-            format!("{}:deob", sample.id),
-        );
-        assert_node_syntax(
-            &temp,
-            &sample.id,
-            "deob",
-            &deob.source,
-            source_mode,
-            &syntax_budget,
-        )?;
-        if !deob.report.safe_static_only
-            || deob.report.presentation_formatted
-            || !deob.report.runtime_semantics_preserved_by_design
-            || deob.report.transforms.contains_key("presentation_codegen")
-        {
-            bail!("{}: safe-deob report contract violated", sample.id);
-        }
-        let rewrites = deob
-            .report
-            .transforms
-            .iter()
-            .filter(|(kind, _)| {
-                kind.as_str() != "canonical_codegen" && kind.as_str() != "presentation_codegen"
-            })
-            .map(|(_, count)| *count)
-            .sum::<usize>();
-
-        let scan_budget = budgets.operation_under(
-            &sample_budget,
-            AnalysisOperation::StructuralScan,
-            &sample.id,
-        );
-        let scan = scan_source(&pretty, sample.id.clone(), None, source_mode, &scan_budget)?;
-        if scan.fatal_error {
-            bail!("{}: scanner fatal error", sample.id);
-        }
-        let metrics = scanner_metrics(&scan);
-        validate_sample_policy(
-            sample,
-            &manifest.defaults,
-            &deob.source,
-            &deob.report.transforms,
-            rewrites,
-            &metrics,
-        )?;
-        proven_rewrites += rewrites;
-        confirmed_dispatchers += metrics.confirmed_dispatchers_recursive;
-
-        rows.push(CorpusEvalRow {
-            id: sample.id.clone(),
-            family: sample.family.clone(),
-            role: sample.role,
-            bytes: sample.bytes,
-            sha256: sample.sha256.clone(),
-            formatter_bytes: Some(pretty.len()),
-            deob_changed: Some(deob.report.changed),
-            deob_iterations: Some(deob.report.iterations),
-            deob_rewrites: Some(rewrites),
-            deob_transforms: Some(deob.report.transforms),
-            arithmetic_state_proofs: Some(serde_json::to_value(
-                deob.report.arithmetic_state_proofs,
-            )?),
-            scanner: Some(metrics),
-            status: "ok".to_owned(),
-        });
+        proven_rewrites += row.deob_rewrites.unwrap_or_default();
+        confirmed_dispatchers += row
+            .scanner
+            .as_ref()
+            .map_or(0, |metrics| metrics.confirmed_dispatchers_recursive);
+        rows.push(row);
     }
 
     Ok(CorpusEvalReport {

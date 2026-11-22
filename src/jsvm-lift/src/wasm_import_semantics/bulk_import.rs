@@ -373,6 +373,86 @@ impl TableInitializerVerifier<'_, '_, '_> {
             .all(|statement| self.verify_statement(statement))
     }
 
+    fn verify_assignment(&mut self, assignment: &oxc_ast::ast::AssignmentExpression<'_>) -> bool {
+        if assignment.operator.as_str() != "=" {
+            return false;
+        }
+        let AssignmentTarget::AssignmentTargetIdentifier(left) = &assignment.left else {
+            return false;
+        };
+        let Some(target) = left
+            .reference_id
+            .get()
+            .and_then(|reference_id| self.scoping.get_reference(reference_id).symbol_id())
+        else {
+            return false;
+        };
+        if !self.locals.contains(&target) {
+            return false;
+        }
+
+        if target == self.receiver {
+            if self.receiver_assigned {
+                return false;
+            }
+            let Some((object, property)) = static_member_parts(&assignment.right) else {
+                return false;
+            };
+            if property != "__wbindgen_export_0"
+                || symbol_of(self.scoping, object) != Some(self.exports)
+            {
+                return false;
+            }
+            self.receiver_assigned = true;
+            return true;
+        }
+
+        if let Some(call) = table_initializer_receiver_call(
+            &assignment.right,
+            self.scoping,
+            self.receiver,
+            "grow",
+            1,
+        ) {
+            if !self.receiver_assigned {
+                return false;
+            }
+            let Some(argument) = call.arguments[0].as_expression() else {
+                return false;
+            };
+            if !proof_primitive_expression(
+                argument,
+                self.scoping,
+                self.global_aliases,
+                &self.primitive_locals,
+            ) {
+                return false;
+            }
+            let Expression::NumericLiteral(delta) = unparenthesized(argument) else {
+                return false;
+            };
+            let Some(delta) = exact_u64(delta.value).and_then(|value| u32::try_from(value).ok())
+            else {
+                return false;
+            };
+            self.exact_grow_deltas.push(delta);
+            self.primitive_locals.insert(target);
+            self.saw_table_operation = true;
+            return true;
+        }
+
+        if proof_primitive_expression(
+            &assignment.right,
+            self.scoping,
+            self.global_aliases,
+            &self.primitive_locals,
+        ) {
+            self.primitive_locals.insert(target);
+            return true;
+        }
+        false
+    }
+
     fn verify_statement(&mut self, statement: &Statement<'_>) -> bool {
         match statement {
             Statement::BlockStatement(block) => self.verify_statements(&block.body),
@@ -405,84 +485,7 @@ impl TableInitializerVerifier<'_, '_, '_> {
             Statement::ExpressionStatement(statement) => {
                 let expression = unparenthesized(&statement.expression);
                 if let Expression::AssignmentExpression(assignment) = expression {
-                    if assignment.operator.as_str() != "=" {
-                        return false;
-                    }
-                    let AssignmentTarget::AssignmentTargetIdentifier(left) = &assignment.left
-                    else {
-                        return false;
-                    };
-                    let Some(target) = left.reference_id.get().and_then(|reference_id| {
-                        self.scoping.get_reference(reference_id).symbol_id()
-                    }) else {
-                        return false;
-                    };
-                    if !self.locals.contains(&target) {
-                        return false;
-                    }
-
-                    if target == self.receiver {
-                        if self.receiver_assigned {
-                            return false;
-                        }
-                        let Some((object, property)) = static_member_parts(&assignment.right)
-                        else {
-                            return false;
-                        };
-                        if property != "__wbindgen_export_0"
-                            || symbol_of(self.scoping, object) != Some(self.exports)
-                        {
-                            return false;
-                        }
-                        self.receiver_assigned = true;
-                        return true;
-                    }
-
-                    if let Some(call) = table_initializer_receiver_call(
-                        &assignment.right,
-                        self.scoping,
-                        self.receiver,
-                        "grow",
-                        1,
-                    ) {
-                        if !self.receiver_assigned {
-                            return false;
-                        }
-                        let Some(argument) = call.arguments[0].as_expression() else {
-                            return false;
-                        };
-                        if !proof_primitive_expression(
-                            argument,
-                            self.scoping,
-                            self.global_aliases,
-                            &self.primitive_locals,
-                        ) {
-                            return false;
-                        }
-                        let Expression::NumericLiteral(delta) = unparenthesized(argument) else {
-                            return false;
-                        };
-                        let Some(delta) =
-                            exact_u64(delta.value).and_then(|value| u32::try_from(value).ok())
-                        else {
-                            return false;
-                        };
-                        self.exact_grow_deltas.push(delta);
-                        self.primitive_locals.insert(target);
-                        self.saw_table_operation = true;
-                        return true;
-                    }
-
-                    if proof_primitive_expression(
-                        &assignment.right,
-                        self.scoping,
-                        self.global_aliases,
-                        &self.primitive_locals,
-                    ) {
-                        self.primitive_locals.insert(target);
-                        return true;
-                    }
-                    false
+                    self.verify_assignment(assignment)
                 } else if let Some(call) = table_initializer_receiver_call(
                     expression,
                     self.scoping,

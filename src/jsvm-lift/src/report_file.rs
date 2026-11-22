@@ -112,7 +112,7 @@ pub(crate) fn prepare_destination(path: &Path) -> Result<(&Path, Option<fs::Perm
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
+        .unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     let permissions = match fs::symlink_metadata(path) {
         Ok(metadata) => {

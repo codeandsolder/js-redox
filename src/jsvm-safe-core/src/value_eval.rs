@@ -18,12 +18,12 @@ use oxc_syntax::number::ToJsString;
 /// [0, 2^32 - 2]. Computed members use `ToPropertyKey`, *not* `ToNumber`:
 /// `arr[true]` reads `"true"`, not index 1, and `arr["01"]` is not `arr[1]`.
 /// Signed numeric zero becomes "0"; the string "-0" remains distinct.
-#[must_use]
+#[must_use = "Use the returned index only when the property key is canonical"]
 pub fn canonical_array_index(value: &Value) -> Option<u32> {
-    canonical_array_index_key(&value.js_string()?)
+    canonical_array_index_key(&value.js_string())
 }
 
-pub(crate) fn canonical_array_index_key(key: &str) -> Option<u32> {
+pub fn canonical_array_index_key(key: &str) -> Option<u32> {
     let index = key.parse::<u32>().ok()?;
     (index != u32::MAX && index.to_string() == key).then_some(index)
 }
@@ -32,15 +32,15 @@ pub(crate) fn canonical_array_index_key(key: &str) -> Option<u32> {
 ///
 /// Oxc preserves lone UTF-16 surrogates in `JSStr`; js-redox's proof domain
 /// uses Rust `String`, so those values are deliberately not approximated.
-#[must_use]
+#[must_use = "Use the returned string only when it can be represented losslessly"]
 pub fn string_literal_value(literal: &StringLiteral<'_>) -> Option<String> {
     literal.value.as_str().map(str::to_owned)
 }
 
-/// Exact ToPropertyKey for noncomputed object-literal keys. Oxc's
-/// StaticPropertyName uses Rust float display for numeric literals, which
+/// Exact `ToPropertyKey` for noncomputed object-literal keys. Oxc's
+/// `StaticPropertyName` uses Rust float display for numeric literals, which
 /// disagrees with JavaScript at exponential magnitudes and signed zero.
-pub(crate) fn literal_property_key(key: &PropertyKey<'_>) -> Option<String> {
+pub fn literal_property_key(key: &PropertyKey<'_>) -> Option<String> {
     match key {
         PropertyKey::StaticIdentifier(identifier) => Some(identifier.name.to_string()),
         PropertyKey::StringLiteral(literal) => string_literal_value(literal),
@@ -51,9 +51,9 @@ pub(crate) fn literal_property_key(key: &PropertyKey<'_>) -> Option<String> {
 }
 
 /// Evaluate a computed property key only when its complete primitive
-/// evaluation is proven. BigInt literals are exact even though BigInt
+/// evaluation is proven. `BigInt` literals are exact even though `BigInt`
 /// arithmetic is not in the shared primitive evaluator's domain.
-#[must_use]
+#[must_use = "Use the property key only when its value is proven"]
 pub fn exact_computed_property_key(
     expression: &Expression<'_>,
     primitive: impl FnOnce(&Expression<'_>) -> Option<Value>,
@@ -62,13 +62,15 @@ pub fn exact_computed_property_key(
     if let Expression::BigIntLiteral(literal) = expression {
         return Some(literal.value.to_string());
     }
-    primitive(expression)?.js_string()
+    Some(primitive(expression)?.js_string())
 }
 
 /// Canonical ECMAScript property identity, with an explicit computed-key
-/// evaluator. In particular, never treat a computed RegExp or object literal
-/// as a statically known name: ToPrimitive can invoke user code.
-#[must_use]
+/// evaluator.
+///
+/// In particular, never treat a computed `RegExp` or object literal
+/// as a statically known name: `ToPrimitive` can invoke user code.
+#[must_use = "Use the property key only when its value is proven"]
 pub fn exact_property_key(
     key: &PropertyKey<'_>,
     computed: bool,
@@ -84,7 +86,7 @@ pub fn exact_property_key(
 /// The special object initializer colon-form is a prototype setter, not an
 /// own property. Computed, shorthand, method and accessor forms are ordinary
 /// definitions, even if the key has the same text.
-#[must_use]
+#[must_use = "Check whether the property has special prototype setter semantics"]
 pub fn is_prototype_setter(property: &oxc_ast::ast::ObjectProperty<'_>, name: &str) -> bool {
     name == "__proto__"
         && property.kind == oxc_ast::ast::PropertyKind::Init
@@ -98,7 +100,7 @@ pub fn is_prototype_setter(property: &oxc_ast::ast::ObjectProperty<'_>, name: &s
 /// Prefer cooked text, falling back to raw spelling when cooked is absent.
 /// A lone surrogate in cooked text cannot be represented in Rust's string
 /// proof domain, so the recovery fails closed.
-#[must_use]
+#[must_use = "Use the returned template value only when decoding succeeds"]
 pub fn template_element_value(quasi: &TemplateElement<'_>) -> Option<String> {
     quasi.value.cooked.as_ref().map_or_else(
         || Some(quasi.value.raw.as_str().to_owned()),
@@ -116,7 +118,7 @@ pub enum Value {
 }
 
 impl Value {
-    #[must_use]
+    #[must_use = "Use the returned ECMAScript truthiness result"]
     pub fn truthy(&self) -> bool {
         match self {
             Self::String(s) => !s.is_empty(),
@@ -126,29 +128,29 @@ impl Value {
         }
     }
 
-    #[must_use]
-    pub fn number(&self) -> Option<f64> {
+    #[must_use = "Use the converted ECMAScript number, including NaN"]
+    pub fn number(&self) -> f64 {
         match self {
-            Self::Number(n) => Some(*n),
-            Self::Bool(v) => Some(if *v { 1.0 } else { 0.0 }),
-            Self::Null => Some(0.0),
-            Self::Undefined => Some(f64::NAN),
-            Self::String(s) => Some(s.as_str().string_to_number()),
+            Self::Number(n) => *n,
+            Self::Bool(v) => f64::from(u8::from(*v)),
+            Self::Null => 0.0,
+            Self::Undefined => f64::NAN,
+            Self::String(s) => s.as_str().string_to_number(),
         }
     }
 
-    #[must_use]
-    pub fn js_string(&self) -> Option<String> {
-        Some(match self {
+    #[must_use = "Use the converted ECMAScript string"]
+    pub fn js_string(&self) -> String {
+        match self {
             Self::String(s) => s.clone(),
             Self::Number(n) => n.to_js_string(),
             Self::Bool(v) => (if *v { "true" } else { "false" }).to_string(),
             Self::Null => "null".into(),
             Self::Undefined => "undefined".into(),
-        })
+        }
     }
 
-    #[must_use]
+    #[must_use = "Use the returned rendering only when the value is representable"]
     pub fn render(&self) -> Option<String> {
         match self {
             Self::String(s) => serde_json::to_string(s).ok(),
@@ -164,7 +166,7 @@ impl Value {
     /// A negative number and undefined are unary expressions, not atoms:
     /// substituting them without grouping can change a surrounding member,
     /// call, optional chain or exponentiation.
-    #[must_use]
+    #[must_use = "Use the returned rendering only when the value is representable as an expression"]
     pub fn render_expression(&self) -> Option<String> {
         let text = self.render()?;
         if matches!(self, Self::Undefined)
@@ -211,7 +213,7 @@ pub fn render_value_array(values: &[Value]) -> Option<String> {
     Some(format!("[{}]", rendered.join(", ")))
 }
 
-#[must_use]
+#[must_use = "Use the returned value only for supported constant expressions"]
 pub fn eval(expr: &Expression<'_>) -> Option<Value> {
     eval_with_resolver(expr, &|_| None)
 }
@@ -236,7 +238,7 @@ where
             let mut quasis = v.quasis.iter();
             let mut text = template_element_value(quasis.next()?)?;
             for expression in &v.expressions {
-                text.push_str(&eval_with_resolver(expression, resolve)?.js_string()?);
+                text.push_str(&eval_with_resolver(expression, resolve)?.js_string());
                 text.push_str(&template_element_value(quasis.next()?)?);
             }
             Some(Value::String(text))
@@ -332,11 +334,9 @@ pub fn eval_unary(v: &UnaryExpression<'_>) -> Option<Value> {
 pub fn eval_unary_value(op: &str, value: &Value) -> Option<Value> {
     match op {
         "!" => Some(Value::Bool(!value.truthy())),
-        "+" => value.number().map(Value::Number),
-        "-" => value.number().map(|x| Value::Number(-x)),
-        "~" => value
-            .number()
-            .map(|x| Value::Number(f64::from(!js_to_int32(x)))),
+        "+" => Some(Value::Number(value.number())),
+        "-" => Some(Value::Number(-value.number())),
+        "~" => Some(Value::Number(f64::from(!js_to_int32(value.number())))),
         "void" => Some(Value::Undefined),
         "typeof" => Some(Value::String(
             match value {
@@ -401,47 +401,47 @@ pub fn eval_binary(op: &str, left: &Value, right: &Value) -> Option<Value> {
             if matches!(left, Value::String(_)) || matches!(right, Value::String(_)) {
                 Some(Value::String(format!(
                     "{}{}",
-                    left.js_string()?,
-                    right.js_string()?
+                    left.js_string(),
+                    right.js_string()
                 )))
             } else {
-                Some(Value::Number(left.number()? + right.number()?))
+                Some(Value::Number(left.number() + right.number()))
             }
         }
-        "-" => Some(Value::Number(left.number()? - right.number()?)),
-        "*" => Some(Value::Number(left.number()? * right.number()?)),
-        "/" => Some(Value::Number(left.number()? / right.number()?)),
-        "%" => Some(Value::Number(left.number()? % right.number()?)),
+        "-" => Some(Value::Number(left.number() - right.number())),
+        "*" => Some(Value::Number(left.number() * right.number())),
+        "/" => Some(Value::Number(left.number() / right.number())),
+        "%" => Some(Value::Number(left.number() % right.number())),
         "**" => Some(Value::Number(crate::numeric::js_number_exponentiate(
-            left.number()?,
-            right.number()?,
+            left.number(),
+            right.number(),
         ))),
         "<<" => {
-            let shift = js_to_uint32(right.number()?) & 31;
+            let shift = js_to_uint32(right.number()) & 31;
             Some(Value::Number(f64::from(
-                js_to_int32(left.number()?).wrapping_shl(shift),
+                js_to_int32(left.number()).wrapping_shl(shift),
             )))
         }
         ">>" => {
-            let shift = js_to_uint32(right.number()?) & 31;
+            let shift = js_to_uint32(right.number()) & 31;
             Some(Value::Number(f64::from(
-                js_to_int32(left.number()?) >> shift,
+                js_to_int32(left.number()) >> shift,
             )))
         }
         ">>>" => {
-            let shift = js_to_uint32(right.number()?) & 31;
+            let shift = js_to_uint32(right.number()) & 31;
             Some(Value::Number(f64::from(
-                js_to_uint32(left.number()?) >> shift,
+                js_to_uint32(left.number()) >> shift,
             )))
         }
         "|" => Some(Value::Number(f64::from(
-            js_to_int32(left.number()?) | js_to_int32(right.number()?),
+            js_to_int32(left.number()) | js_to_int32(right.number()),
         ))),
         "^" => Some(Value::Number(f64::from(
-            js_to_int32(left.number()?) ^ js_to_int32(right.number()?),
+            js_to_int32(left.number()) ^ js_to_int32(right.number()),
         ))),
         "&" => Some(Value::Number(f64::from(
-            js_to_int32(left.number()?) & js_to_int32(right.number()?),
+            js_to_int32(left.number()) & js_to_int32(right.number()),
         ))),
         "===" => Some(Value::Bool(same_value(left, right))),
         "!==" => Some(Value::Bool(!same_value(left, right))),
@@ -463,8 +463,8 @@ pub fn eval_binary(op: &str, left: &Value, right: &Value) -> Option<Value> {
                     _ => unreachable!(),
                 }
             } else {
-                let a = left.number()?;
-                let b = right.number()?;
+                let a = left.number();
+                let b = right.number();
                 match op {
                     "<" => a < b,
                     "<=" => a <= b,

@@ -537,16 +537,13 @@ fn import_maps_preserve_document_context_and_isolate_workers() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn html_base_is_shared_by_har_scripts_import_maps_and_module_graph() -> Result<()> {
-    let root = tempfile::tempdir()?;
-    let input = root.path().join("base.har");
-    let project = root.path().join("project");
-    let page_url = "https://fixture.invalid/site/page.html";
-    let base_url = "https://fixture.invalid/assets/";
-    let entry_url = "https://fixture.invalid/assets/entry.js";
-    let mapped_url = "https://fixture.invalid/assets/vendor/logic.js";
-    let dynamic_url = "https://fixture.invalid/assets/dynamic.js";
+const BASE_PAGE_URL: &str = "https://fixture.invalid/site/page.html";
+const BASE_BASE_URL: &str = "https://fixture.invalid/assets/";
+const BASE_ENTRY_URL: &str = "https://fixture.invalid/assets/entry.js";
+const BASE_MAPPED_URL: &str = "https://fixture.invalid/assets/vendor/logic.js";
+const BASE_DYNAMIC_URL: &str = "https://fixture.invalid/assets/dynamic.js";
+
+fn write_html_base_fixture(input: &Path) -> Result<()> {
     let page = r#"<!doctype html><base href="../assets/">
       <link rel="modulepreload" href="vendor/logic.js">
       <link rel="preload stylesheet" as="script" href="dynamic.js">
@@ -554,25 +551,25 @@ fn html_base_is_shared_by_har_scripts_import_maps_and_module_graph() -> Result<(
       <script type="module">import {answer} from 'pkg/logic.js'; import('./dynamic.js'); console.log(answer);</script>
       <script src="entry.js" type="module"></script>"#;
     let entries = vec![
-        har_entry(page_url, "text/html; charset=utf-8", page),
+        har_entry(BASE_PAGE_URL, "text/html; charset=utf-8", page),
         har_entry(
-            entry_url,
+            BASE_ENTRY_URL,
             "application/javascript",
             "import {answer} from 'pkg/logic.js'; console.log(answer);",
         ),
         har_entry(
-            mapped_url,
+            BASE_MAPPED_URL,
             "application/javascript",
             "export const answer=42;",
         ),
         har_entry(
-            dynamic_url,
+            BASE_DYNAMIC_URL,
             "application/javascript",
             "export const dynamic=true;",
         ),
     ];
     fs::write(
-        &input,
+        input,
         serde_json::to_vec(&json!({
             "log": {
                 "version": "1.2",
@@ -582,18 +579,27 @@ fn html_base_is_shared_by_har_scripts_import_maps_and_module_graph() -> Result<(
             }
         }))?,
     )?;
+    Ok(())
+}
+
+#[test]
+fn html_base_is_shared_by_har_scripts_import_maps_and_module_graph() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let input = root.path().join("base.har");
+    let project = root.path().join("project");
+    write_html_base_fixture(&input)?;
     run_pipeline(&input, &project)?;
     let manifest = read_json(&project.join("capture-manifest.json"))?;
     let document = &manifest["resources"][0];
-    assert_eq!(document["document_base_url"], base_url);
+    assert_eq!(document["document_base_url"], BASE_BASE_URL);
     let preload_references = document["references"]
         .as_array()
         .context("document references missing")?;
     assert!(preload_references.iter().any(|reference| {
-        reference["kind"] == "modulepreload" && reference["resolved_url"] == mapped_url
+        reference["kind"] == "modulepreload" && reference["resolved_url"] == BASE_MAPPED_URL
     }));
     assert!(preload_references.iter().any(|reference| {
-        reference["kind"] == "script_preload" && reference["resolved_url"] == dynamic_url
+        reference["kind"] == "script_preload" && reference["resolved_url"] == BASE_DYNAMIC_URL
     }));
     let scripts = manifest["inline_scripts"]
         .as_array()
@@ -602,7 +608,7 @@ fn html_base_is_shared_by_har_scripts_import_maps_and_module_graph() -> Result<(
         .iter()
         .find(|script| script["src"] == "entry.js")
         .context("external script declaration missing")?;
-    assert_eq!(external["resolved_src"], entry_url);
+    assert_eq!(external["resolved_src"], BASE_ENTRY_URL);
 
     let maps = read_json(&project.join("analysis/import-maps.json"))?;
     assert_eq!(
@@ -613,23 +619,23 @@ fn html_base_is_shared_by_har_scripts_import_maps_and_module_graph() -> Result<(
     let units = refs["code_units"]
         .as_array()
         .context("missing JS reference units")?;
-    let external = code_unit(units, entry_url)?;
+    let external = code_unit(units, BASE_ENTRY_URL)?;
     assert_eq!(
         reference(external, "pkg/logic.js")?["resolved_url"],
-        mapped_url
+        BASE_MAPPED_URL
     );
     assert_eq!(external["document_resource_ids"], json!([0]));
     let inline = units
         .iter()
-        .find(|unit| unit["url"] == page_url && unit["origin"] == "inline_script")
+        .find(|unit| unit["url"] == BASE_PAGE_URL && unit["origin"] == "inline_script")
         .context("missing inline module reference unit")?;
     assert_eq!(
         reference(inline, "pkg/logic.js")?["resolved_url"],
-        mapped_url
+        BASE_MAPPED_URL
     );
     assert_eq!(
         reference(inline, "./dynamic.js")?["resolved_url"],
-        dynamic_url
+        BASE_DYNAMIC_URL
     );
     assert_eq!(inline["document_resource_ids"], json!([0]));
 
@@ -637,7 +643,7 @@ fn html_base_is_shared_by_har_scripts_import_maps_and_module_graph() -> Result<(
     let source_units = index["units"].as_array().context("missing source units")?;
     let output = source_units
         .iter()
-        .find(|unit| unit["url"] == entry_url)
+        .find(|unit| unit["url"] == BASE_ENTRY_URL)
         .context("missing entrypoint source")?;
     let source_path = output["source_path"]
         .as_str()
@@ -710,6 +716,45 @@ fn write_shared_module_context_fixture(input: &Path, project: &Path) -> Result<(
         }))?,
     )?;
     run_pipeline(input, project)?;
+    Ok(())
+}
+
+fn assert_shared_module_graph(
+    project: &Path,
+    source_ids: [u64; 3],
+    mapped_id: u64,
+    plain_id: u64,
+    mapped_target_id: u64,
+) -> Result<()> {
+    let graph = read_json(&project.join("analysis/source-graph.json"))?;
+    let edges = graph["edges"]
+        .as_array()
+        .context("source graph edges missing")?;
+    for source_id in source_ids {
+        let source = format!("resource:{source_id}");
+        let pkg_edges = edges
+            .iter()
+            .filter(|edge| {
+                edge["from"] == source
+                    && edge["kind"] == "js_import_static"
+                    && edge["specifier"] == "pkg"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(pkg_edges.len(), 2);
+        assert!(pkg_edges.iter().any(|edge| {
+            edge["to"] == format!("resource:{mapped_target_id}")
+                && edge["document_resource_id"] == mapped_id
+                && edge["resolution"] == "import_map"
+        }));
+        assert!(pkg_edges.iter().any(|edge| {
+            edge["to"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("specifier:"))
+                && edge["document_resource_id"] == plain_id
+                && edge["resolution"] == "unresolved_bare"
+                && edge["resolved_url"].is_null()
+        }));
+    }
     Ok(())
 }
 
@@ -804,35 +849,13 @@ fn shared_modules_keep_mapped_and_unmapped_document_contexts() -> Result<()> {
         2
     );
 
-    let graph = read_json(&project.join("analysis/source-graph.json"))?;
-    let edges = graph["edges"]
-        .as_array()
-        .context("source graph edges missing")?;
-    for source_id in [shared_id, child_id, reexported_id] {
-        let source = format!("resource:{source_id}");
-        let pkg_edges = edges
-            .iter()
-            .filter(|edge| {
-                edge["from"] == source
-                    && edge["kind"] == "js_import_static"
-                    && edge["specifier"] == "pkg"
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(pkg_edges.len(), 2);
-        assert!(pkg_edges.iter().any(|edge| {
-            edge["to"] == format!("resource:{mapped_target_id}")
-                && edge["document_resource_id"] == mapped_id
-                && edge["resolution"] == "import_map"
-        }));
-        assert!(pkg_edges.iter().any(|edge| {
-            edge["to"]
-                .as_str()
-                .is_some_and(|id| id.starts_with("specifier:"))
-                && edge["document_resource_id"] == plain_id
-                && edge["resolution"] == "unresolved_bare"
-                && edge["resolved_url"].is_null()
-        }));
-    }
+    assert_shared_module_graph(
+        &project,
+        [shared_id, child_id, reexported_id],
+        mapped_id,
+        plain_id,
+        mapped_target_id,
+    )?;
     Ok(())
 }
 

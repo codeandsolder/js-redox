@@ -22,7 +22,7 @@ fn main() -> Result<()> {
     )?;
     println!(
         "Observed JavaScript: {} witnessed, {} formatted, {} unformatted",
-        summary.witnessed_sources, summary.formatted_sources, summary.unformatted_sources
+        summary.witnessed, summary.formatted, summary.unformatted
     );
     Ok(())
 }

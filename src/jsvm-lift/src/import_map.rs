@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use url::Url;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct ImportMap {
+pub struct ImportMap {
     #[serde(default)]
     pub(crate) imports: BTreeMap<String, Option<String>>,
     #[serde(default)]
@@ -22,7 +22,7 @@ fn absolute_url(value: &str) -> bool {
     Url::parse(value).is_ok_and(|url| !url.scheme().is_empty())
 }
 
-pub(crate) fn join_url(base: &str, value: &str) -> Option<String> {
+pub fn join_url(base: &str, value: &str) -> Option<String> {
     Url::parse(base)
         .ok()?
         .join(value)
@@ -95,11 +95,7 @@ fn parse_specifier_map(
     out
 }
 
-pub(crate) fn parse_import_map(
-    base_url: &str,
-    payload: &Value,
-    warnings: &mut Vec<String>,
-) -> ImportMap {
+pub fn parse_import_map(base_url: &str, payload: &Value, warnings: &mut Vec<String>) -> ImportMap {
     let Some(object) = payload.as_object() else {
         warnings.push("import map root is not an object".into());
         return ImportMap::default();
@@ -161,7 +157,7 @@ fn merge_specifier_map(
     merged
 }
 
-pub(crate) fn merge_import_map(existing: &ImportMap, new: &ImportMap) -> ImportMap {
+pub fn merge_import_map(existing: &ImportMap, new: &ImportMap) -> ImportMap {
     let mut merged = ImportMap {
         imports: merge_specifier_map(&existing.imports, &new.imports),
         scopes: existing.scopes.clone(),
@@ -249,7 +245,7 @@ fn resolve_from_map(
     ))
 }
 
-pub(crate) fn resolve_with_import_map(
+pub fn resolve_with_import_map(
     base_url: Option<&str>,
     specifier: &str,
     import_map: Option<&ImportMap>,

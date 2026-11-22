@@ -3,7 +3,7 @@
 /// Equal finite or infinite IEEE-754 encodings compare equal, either signed
 /// zero compares equal to the other, and NaN never compares equal (even when
 /// its payload bits happen to match). This is *not* SameValue/Object.is.
-#[must_use]
+#[must_use = "Use the comparison result with ECMAScript number equality semantics"]
 pub const fn js_number_equal(left: f64, right: f64) -> bool {
     const ABS_MASK: u64 = 0x7fff_ffff_ffff_ffff;
     if left.is_nan() || right.is_nan() {
@@ -14,10 +14,10 @@ pub const fn js_number_equal(left: f64, right: f64) -> bool {
     left_bits == right_bits || ((left_bits & ABS_MASK) == 0 && (right_bits & ABS_MASK) == 0)
 }
 
-/// ECMAScript Number::exponentiate differs from IEEE 754 pow at NaN
+/// ECMAScript `Number::exponentiate` differs from IEEE 754 pow at NaN
 /// exponents and infinite exponents with a unit-magnitude base. Delegate
 /// the remaining (implementation-approximated) finite computation to powf.
-#[must_use]
+#[must_use = "Use the computed result with ECMAScript exponentiation semantics"]
 pub fn js_number_exponentiate(base: f64, exponent: f64) -> f64 {
     if exponent.is_nan() || (exponent.is_infinite() && js_number_equal(base.abs(), 1.0)) {
         f64::NAN
@@ -26,7 +26,7 @@ pub fn js_number_exponentiate(base: f64, exponent: f64) -> f64 {
     }
 }
 
-#[must_use]
+#[must_use = "Use the integer only when conversion is exact"]
 pub fn exact_u64(value: f64) -> Option<u64> {
     if !value.is_finite() || value < 0.0 {
         return None;
@@ -52,7 +52,7 @@ pub fn exact_u64(value: f64) -> Option<u64> {
     }
 }
 
-#[must_use]
+#[must_use = "Use the integer only when conversion is exact"]
 pub fn exact_i64(value: f64) -> Option<i64> {
     if value == 0.0 {
         return Some(0);
@@ -70,12 +70,12 @@ pub fn exact_i64(value: f64) -> Option<i64> {
     }
 }
 
-#[must_use]
+#[must_use = "Use the integer only when conversion is exact"]
 pub fn exact_u32(value: f64) -> Option<u32> {
     u32::try_from(exact_u64(value)?).ok()
 }
 
-#[must_use]
+#[must_use = "Use the integer only when conversion is exact"]
 pub fn exact_usize(value: f64) -> Option<usize> {
     usize::try_from(exact_u64(value)?).ok()
 }

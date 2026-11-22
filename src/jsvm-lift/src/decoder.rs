@@ -63,7 +63,7 @@ pub struct DecoderCandidate {
     pub preview: String,
 }
 
-#[must_use]
+#[must_use = "Use the recovered identifier origin when present"]
 pub fn origin_ident(expr: &Expression<'_>) -> Option<String> {
     match expr {
         Expression::Identifier(id) => Some(id.name.to_string()),
@@ -75,7 +75,7 @@ pub fn origin_ident(expr: &Expression<'_>) -> Option<String> {
     }
 }
 
-#[must_use]
+#[must_use = "Use the recovered exact integer origin when present"]
 pub fn origin_u64(expr: &Expression<'_>) -> Option<u64> {
     match expr {
         Expression::NumericLiteral(n) => exact_u64(n.value),
@@ -125,7 +125,7 @@ fn base_offset_shape(expr: &Expression<'_>) -> Option<IndexShape> {
     })
 }
 
-#[must_use]
+#[must_use = "Use the returned structural index evidence when present"]
 pub fn index_shape(expr: &Expression<'_>) -> Option<IndexShape> {
     match expr {
         Expression::ParenthesizedExpression(paren) => index_shape(&paren.expression),
@@ -158,8 +158,11 @@ pub fn index_shape(expr: &Expression<'_>) -> Option<IndexShape> {
     }
 }
 
-#[must_use]
-pub fn resolve_alias(name: &str, aliases: &HashMap<String, String>) -> String {
+#[must_use = "Use the resolved alias rather than the unverified original name"]
+pub fn resolve_alias(
+    name: &str,
+    aliases: &HashMap<String, String, impl std::hash::BuildHasher>,
+) -> String {
     let mut current = name.to_string();
     let mut seen = HashSet::new();
     while seen.insert(current.clone()) {
@@ -171,7 +174,7 @@ pub fn resolve_alias(name: &str, aliases: &HashMap<String, String>) -> String {
     current
 }
 
-#[must_use]
+#[must_use = "Use the returned candidates as structural decoder leads"]
 pub fn derive_candidates(function_id: &str, accesses: &[IndexedAccess]) -> Vec<DecoderCandidate> {
     let mut out = Vec::new();
     for access in accesses {
@@ -268,9 +271,9 @@ pub fn derive_candidates(function_id: &str, accesses: &[IndexedAccess]) -> Vec<D
 
 pub fn annotate_bitfield_selectors(
     candidates: &mut [DecoderCandidate],
-    indexed_value_vars: &HashMap<String, IndexedAccess>,
-    bit_masks: &HashMap<String, BTreeSet<u64>>,
-    aliases: &HashMap<String, String>,
+    indexed_value_vars: &HashMap<String, IndexedAccess, impl std::hash::BuildHasher>,
+    bit_masks: &HashMap<String, BTreeSet<u64>, impl std::hash::BuildHasher>,
+    aliases: &HashMap<String, String, impl std::hash::BuildHasher>,
 ) {
     let mut reads: Vec<_> = indexed_value_vars.iter().collect();
     reads.sort_by_key(|(_, access)| access.start);
@@ -328,9 +331,9 @@ pub fn annotate_bitfield_selectors(
 
 pub fn link_candidates(
     candidates: &mut [DecoderCandidate],
-    aliases: &HashMap<String, String>,
+    aliases: &HashMap<String, String, impl std::hash::BuildHasher>,
     push_builder_vars: &BTreeSet<String>,
-    push_builder_sites: &HashMap<String, BuilderSite>,
+    push_builder_sites: &HashMap<String, BuilderSite, impl std::hash::BuildHasher>,
 ) {
     for candidate in candidates {
         if candidate.builder_var.is_some() {
@@ -393,7 +396,7 @@ pub fn complete_selector_masks(
     }
 }
 
-#[must_use]
+#[must_use = "Use the returned opcode observations when describing the decoder"]
 pub fn observed_opcodes(decoder: &DecoderCandidate, builders: &[PushBuilderCandidate]) -> Vec<u64> {
     let (Some(builder_start), Ok(width)) = (decoder.builder_start, usize::try_from(decoder.width))
     else {

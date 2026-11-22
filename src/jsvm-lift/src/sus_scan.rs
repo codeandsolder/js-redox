@@ -103,13 +103,23 @@ pub struct SusOpaqueParseSpan {
 }
 
 #[derive(Debug, Serialize)]
+pub struct DecodeProvenance {
+    #[serde(rename = "decode_encoding")]
+    pub encoding: String,
+    #[serde(rename = "decode_source")]
+    pub source: String,
+    #[serde(rename = "decode_had_errors")]
+    pub had_errors: bool,
+    #[serde(rename = "decode_uncertain")]
+    pub uncertain: bool,
+}
+
+#[derive(Debug, Serialize)]
 pub struct SusFileReport {
     pub input: String,
     pub bytes: usize,
-    pub decode_encoding: String,
-    pub decode_source: String,
-    pub decode_had_errors: bool,
-    pub decode_uncertain: bool,
+    #[serde(flatten)]
+    pub decoding: DecodeProvenance,
     pub diagnostics: usize,
     pub parser_fatal_error: bool,
     pub fatal_error: bool,
@@ -207,7 +217,7 @@ impl Collector<'_> {
     }
 
     fn argument_static_string(arg: &Argument<'_>) -> Option<String> {
-        eval_static_primitive(arg.as_expression()?)?.js_string()
+        Some(eval_static_primitive(arg.as_expression()?)?.js_string())
     }
 
     fn identifier(expr: &Expression<'_>) -> Option<String> {
@@ -508,6 +518,10 @@ impl Collector<'_> {
             }
         }
 
+        self.record_dynamic_decoder_calls(it, callee, lower);
+    }
+
+    fn record_dynamic_decoder_calls(&mut self, it: &CallExpression<'_>, callee: &str, lower: &str) {
         if lower == "atob"
             || has_dotted_member_suffix(lower, "atob")
             || (callee == "Buffer.from"
@@ -1369,10 +1383,12 @@ fn analyze_program(
     SusFileReport {
         input: input.display().to_string(),
         bytes: source.len(),
-        decode_encoding: "UTF-8".to_string(),
-        decode_source: "already-unicode".to_string(),
-        decode_had_errors: false,
-        decode_uncertain: false,
+        decoding: DecodeProvenance {
+            encoding: "UTF-8".to_string(),
+            source: "already-unicode".to_string(),
+            had_errors: false,
+            uncertain: false,
+        },
         diagnostics,
         parser_fatal_error,
         fatal_error,
@@ -1535,10 +1551,12 @@ pub fn analyze_bytes(
     let decoded = decode_script(bytes, ScriptDecodeContext::classic_unknown());
     let mut report = analyze_source(&decoded.source, input, options)?;
     report.bytes = bytes.len();
-    report.decode_encoding = decoded.encoding;
-    report.decode_source = decoded.decode_source.as_str().to_string();
-    report.decode_had_errors = decoded.had_errors;
-    report.decode_uncertain = decoded.uncertain;
+    report.decoding = DecodeProvenance {
+        encoding: decoded.encoding,
+        source: decoded.decode_source.as_str().to_string(),
+        had_errors: decoded.had_errors,
+        uncertain: decoded.uncertain,
+    };
     Ok(report)
 }
 
@@ -1755,10 +1773,10 @@ mod tests {
         fs::write(&malformed, malformed_bytes)?;
         let report = analyze_bytes(malformed_bytes, &malformed, &options())?;
         assert!(!report.fatal_error);
-        assert!(report.decode_had_errors);
-        assert!(report.decode_uncertain);
-        assert_eq!(report.decode_encoding, "UTF-8");
-        assert_eq!(report.decode_source, "utf8-fallback");
+        assert!(report.decoding.had_errors);
+        assert!(report.decoding.uncertain);
+        assert_eq!(report.decoding.encoding, "UTF-8");
+        assert_eq!(report.decoding.source, "utf8-fallback");
         Ok(())
     }
 
@@ -1926,6 +1944,12 @@ mod tests {
         assert_eq!(actionable_kind_count(&blobs, "opaque_blob"), 0);
         assert_eq!(blobs.actionable_signal_count, 0);
 
+        Ok(())
+    }
+
+    #[test]
+    fn actionability_distinguishes_cookie_helpers_from_table_decoders() -> Result<()> {
+        let options = options();
         let cookie = analyze_source(
             concat!(
                 "function getCookieValue(name) {\n",

@@ -124,7 +124,7 @@ impl<'s> Plan<'s> {
                 );
             }
             SimpleAssignmentTarget::ComputedMemberExpression(member) if !member.optional => {
-                self.computed_reference(member)
+                self.computed_reference(member);
             }
             SimpleAssignmentTarget::PrivateFieldExpression(member) if !member.optional => {
                 self.expression(&member.object);
@@ -384,6 +384,22 @@ impl<'s> Plan<'s> {
             );
         }
     }
+    fn update(&mut self, update: &oxc_ast::ast::UpdateExpression<'_>) {
+        if self.simple_target(&update.argument) {
+            if let SimpleAssignmentTarget::ComputedMemberExpression(member) = &update.argument {
+                self.key_coercion(Some((member.object.span(), member.expression.span())));
+            }
+            self.mark(update.argument.span(), "GetValue target", "getter may run");
+            self.mark(update.span, "numeric update", update.operator.as_str());
+            if let SimpleAssignmentTarget::ComputedMemberExpression(member) = &update.argument {
+                self.key_coercion(Some((member.object.span(), member.expression.span())));
+            }
+            self.mark(update.argument.span(), "PutValue target", "setter may run");
+        } else {
+            self.opaque(update.span, "extended update expression");
+        }
+    }
+
     fn expression(&mut self, expr: &Expression<'_>) {
         match expr {
             Expression::ParenthesizedExpression(paren) => self.expression(&paren.expression),
@@ -479,25 +495,7 @@ impl<'s> Plan<'s> {
                     "void produces undefined only if its operand completes",
                 );
             }
-            Expression::UpdateExpression(update) => {
-                if self.simple_target(&update.argument) {
-                    if let SimpleAssignmentTarget::ComputedMemberExpression(member) =
-                        &update.argument
-                    {
-                        self.key_coercion(Some((member.object.span(), member.expression.span())));
-                    }
-                    self.mark(update.argument.span(), "GetValue target", "getter may run");
-                    self.mark(update.span, "numeric update", update.operator.as_str());
-                    if let SimpleAssignmentTarget::ComputedMemberExpression(member) =
-                        &update.argument
-                    {
-                        self.key_coercion(Some((member.object.span(), member.expression.span())));
-                    }
-                    self.mark(update.argument.span(), "PutValue target", "setter may run");
-                } else {
-                    self.opaque(update.span, "extended update expression");
-                }
-            }
+            Expression::UpdateExpression(update) => self.update(update),
             // Delete/typeof and coercing unary operators, optional chains,
             // templates and class initializers remain opaque rather than
             // pretending we know their effect/exception order.
@@ -520,7 +518,7 @@ impl<'a> Visit<'a> for Collector<'_> {
         walk::walk_assignment_expression(self, assign);
     }
 }
-pub(crate) fn ordered_assignment_phases(
+pub fn ordered_assignment_phases(
     source: &str,
     program: &Program<'_>,
     lines: &SourceLineIndex,
@@ -1258,6 +1256,10 @@ console.log(JSON.stringify({call,objectTrace,arrayTrace,memberTrace,
 
     #[test]
     #[ignore = "requires installed Node; differential runtime oracle"]
+    #[expect(
+        clippy::literal_string_with_formatting_args,
+        reason = "JavaScript fixture braces are source syntax, not Rust format placeholders"
+    )]
     fn node_confirms_computed_key_getvalue_vs_putvalue_coercion_order() -> anyhow::Result<()> {
         use std::process::Command;
         let script = r"

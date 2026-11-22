@@ -523,208 +523,230 @@ struct FastLazyCellCandidateCollector<'c, 'p> {
     returned_symbol: SymbolId,
     candidates: Vec<FastLazyCellCandidate>,
 }
-impl<'a> Visit<'a> for FastLazyCellCandidateCollector<'_, '_> {
-    fn visit_logical_expression(&mut self, logical: &oxc_ast::ast::LogicalExpression<'a>) {
-        if logical.operator.as_str() == "&&" {
-            if let Expression::SequenceExpression(sequence) = strip_parentheses(&logical.right) {
-                let mode_refs =
-                    direct_parameter_references(self.scoping, &logical.left, self.parameters);
-                let mode_refs = mode_refs.into_iter().collect::<Vec<_>>();
-                let [mode_parameter_index] = mode_refs.as_slice() else {
-                    walk::walk_logical_expression(self, logical);
+struct FastCellConstruction {
+    symbol: SymbolId,
+    state_parameter_index: usize,
+    prototype_field: String,
+    method_key_field: String,
+    assignment: Span,
+    object_constructor_symbol: SymbolId,
+}
+
+struct FastCellGetter {
+    value_parameter_index: usize,
+    assignment: Span,
+    function: Span,
+    entry_condition: Option<Span>,
+}
+
+struct FastCellUpdater {
+    value_parameter_index: usize,
+    property: String,
+    assignment: Span,
+    function: Span,
+}
+
+#[derive(Default)]
+struct FastCellEvidence {
+    cell: Option<FastCellConstruction>,
+    getter: Option<FastCellGetter>,
+    updater: Option<FastCellUpdater>,
+    returned_cell_assignment: Option<Span>,
+}
+
+impl FastLazyCellCandidateCollector<'_, '_> {
+    fn cell_construction(
+        &self,
+        target: SymbolId,
+        assignment: &oxc_ast::ast::AssignmentExpression<'_>,
+        call: &oxc_ast::ast::CallExpression<'_>,
+    ) -> Option<FastCellConstruction> {
+        let argument = call.arguments.first()?.as_expression()?;
+        let (state_parameter_index, prototype_field) =
+            parameter_member(self.scoping, argument, self.parameters)?;
+        let Expression::ComputedMemberExpression(callee) = last_sequence_expression(&call.callee)
+        else {
+            return None;
+        };
+        if callee.optional {
+            return None;
+        }
+        let object_constructor_symbol = reference_symbol(self.scoping, &callee.object)?;
+        let (method_state_index, method_key_field) =
+            parameter_member(self.scoping, &callee.expression, self.parameters)?;
+        if method_state_index != state_parameter_index {
+            return None;
+        }
+        Some(FastCellConstruction {
+            symbol: target,
+            state_parameter_index,
+            prototype_field,
+            method_key_field,
+            assignment: assignment.span,
+            object_constructor_symbol,
+        })
+    }
+
+    fn record_member_assignment(
+        &self,
+        evidence: &mut FastCellEvidence,
+        assignment: &oxc_ast::ast::AssignmentExpression<'_>,
+    ) {
+        let Some(cell) = evidence.cell.as_ref() else {
+            return;
+        };
+        match &assignment.left {
+            AssignmentTarget::ComputedMemberExpression(member)
+                if !member.optional
+                    && reference_symbol(self.scoping, &member.object) == Some(cell.symbol) =>
+            {
+                let Some((key_state_index, key_field)) =
+                    parameter_member(self.scoping, &member.expression, self.parameters)
+                else {
                     return;
                 };
-                let mode_parameter_index = *mode_parameter_index;
-                let mut cell = None;
-                let mut getter = None;
-                let mut updater = None;
-                let mut returned_cell_assignment = None;
-
-                for expression in &sequence.expressions {
-                    let Some(assignment) = assignment_expression(expression) else {
-                        continue;
-                    };
-                    if let Some(target) = assignment_symbol(self.scoping, &assignment.left) {
-                        if let Expression::CallExpression(call) =
-                            last_sequence_expression(&assignment.right)
-                        {
-                            if !call.optional && call.arguments.len() == 1 {
-                                let Some(argument) = call.arguments[0].as_expression() else {
-                                    continue;
-                                };
-                                let Some((state_parameter_index, prototype_field)) =
-                                    parameter_member(self.scoping, argument, self.parameters)
-                                else {
-                                    continue;
-                                };
-                                let Expression::ComputedMemberExpression(callee) =
-                                    last_sequence_expression(&call.callee)
-                                else {
-                                    continue;
-                                };
-                                if callee.optional {
-                                    continue;
-                                }
-                                let Some(object_constructor_symbol) =
-                                    reference_symbol(self.scoping, &callee.object)
-                                else {
-                                    continue;
-                                };
-                                let Some((method_state_index, method_key_field)) = parameter_member(
-                                    self.scoping,
-                                    &callee.expression,
-                                    self.parameters,
-                                ) else {
-                                    continue;
-                                };
-                                if method_state_index != state_parameter_index {
-                                    continue;
-                                }
-                                cell = Some((
-                                    target,
-                                    state_parameter_index,
-                                    prototype_field,
-                                    method_key_field,
-                                    assignment.span,
-                                    object_constructor_symbol,
-                                ));
-                                continue;
-                            }
-                        }
-                        if target == self.returned_symbol {
-                            if let Some((cell_symbol, ..)) = cell.as_ref() {
-                                if reference_symbol(self.scoping, &assignment.right)
-                                    == Some(*cell_symbol)
-                                {
-                                    returned_cell_assignment = Some(assignment.span);
-                                }
-                            }
-                        }
-                        continue;
-                    }
-
-                    let Some((cell_symbol, state_parameter_index, _, method_key_field, _, _)) =
-                        cell.as_ref()
-                    else {
-                        continue;
-                    };
-                    match &assignment.left {
-                        AssignmentTarget::ComputedMemberExpression(member)
-                            if !member.optional
-                                && reference_symbol(self.scoping, &member.object)
-                                    == Some(*cell_symbol) =>
-                        {
-                            let Some((key_state_index, key_field)) =
-                                parameter_member(self.scoping, &member.expression, self.parameters)
-                            else {
-                                continue;
-                            };
-                            if key_state_index != *state_parameter_index
-                                || key_field != *method_key_field
-                            {
-                                continue;
-                            }
-                            let Expression::FunctionExpression(function) =
-                                last_sequence_expression(&assignment.right)
-                            else {
-                                continue;
-                            };
-                            let mut value_matches = Vec::new();
-                            for (index, parameter) in self.parameters.iter().enumerate() {
-                                if let Some(entry_condition) =
-                                    fast_getter_return(self.scoping, function, *parameter)
-                                {
-                                    value_matches.push((index, entry_condition));
-                                }
-                            }
-                            let [(value_parameter_index, entry_condition)] =
-                                value_matches.as_slice()
-                            else {
-                                continue;
-                            };
-                            getter = Some((
-                                *value_parameter_index,
-                                assignment.span,
-                                function.span,
-                                entry_condition.guard(),
-                            ));
-                        }
-                        AssignmentTarget::StaticMemberExpression(member)
-                            if !member.optional
-                                && reference_symbol(self.scoping, &member.object)
-                                    == Some(*cell_symbol) =>
-                        {
-                            let Expression::FunctionExpression(function) =
-                                last_sequence_expression(&assignment.right)
-                            else {
-                                continue;
-                            };
-                            let mut value_matches = Vec::new();
-                            for (index, parameter) in self.parameters.iter().enumerate() {
-                                if fast_updater_replaces_capture(self.scoping, function, *parameter)
-                                {
-                                    value_matches.push(index);
-                                }
-                            }
-                            let [value_parameter_index] = value_matches.as_slice() else {
-                                continue;
-                            };
-                            updater = Some((
-                                *value_parameter_index,
-                                member.property.name.to_string(),
-                                assignment.span,
-                                function.span,
-                            ));
-                        }
-                        _ => {}
-                    }
-                }
-
-                if let (
-                    Some((
-                        cell_symbol,
-                        state_parameter_index,
-                        prototype_field,
-                        method_key_field,
-                        cell_construction,
-                        object_constructor_symbol,
-                    )),
-                    Some((
-                        getter_value,
-                        getter_assignment,
-                        getter_function,
-                        getter_entry_condition,
-                    )),
-                    Some((updater_value, updater_property, updater_assignment, updater_function)),
-                    Some(returned_cell_assignment),
-                ) = (cell, getter, updater, returned_cell_assignment)
+                if key_state_index != cell.state_parameter_index
+                    || key_field != cell.method_key_field
                 {
-                    if getter_value == updater_value
-                        && getter_value != mode_parameter_index
-                        && state_parameter_index != mode_parameter_index
-                        && state_parameter_index != getter_value
-                    {
-                        self.candidates.push(FastLazyCellCandidate {
-                            guard: logical.left.span(),
-                            mode_parameter_index,
-                            value_parameter_index: getter_value,
-                            state_parameter_index,
-                            prototype_field,
-                            method_key_field,
-                            updater_property,
-                            cell_construction,
-                            getter_function,
-                            getter_entry_condition,
-                            updater_function,
-                            returned_cell_assignment,
-                            object_constructor_symbol,
-                            cell_symbol,
-                            getter_assignment,
-                            updater_assignment,
-                        });
+                    return;
+                }
+                let Expression::FunctionExpression(function) =
+                    last_sequence_expression(&assignment.right)
+                else {
+                    return;
+                };
+                let value_matches = self
+                    .parameters
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, parameter)| {
+                        fast_getter_return(self.scoping, function, *parameter)
+                            .map(|condition| (index, condition))
+                    })
+                    .collect::<Vec<_>>();
+                let [(value_parameter_index, entry_condition)] = value_matches.as_slice() else {
+                    return;
+                };
+                evidence.getter = Some(FastCellGetter {
+                    value_parameter_index: *value_parameter_index,
+                    assignment: assignment.span,
+                    function: function.span,
+                    entry_condition: entry_condition.guard(),
+                });
+            }
+            AssignmentTarget::StaticMemberExpression(member)
+                if !member.optional
+                    && reference_symbol(self.scoping, &member.object) == Some(cell.symbol) =>
+            {
+                let Expression::FunctionExpression(function) =
+                    last_sequence_expression(&assignment.right)
+                else {
+                    return;
+                };
+                let value_matches = self
+                    .parameters
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, parameter)| {
+                        fast_updater_replaces_capture(self.scoping, function, *parameter)
+                            .then_some(index)
+                    })
+                    .collect::<Vec<_>>();
+                let [value_parameter_index] = value_matches.as_slice() else {
+                    return;
+                };
+                evidence.updater = Some(FastCellUpdater {
+                    value_parameter_index: *value_parameter_index,
+                    property: member.property.name.to_string(),
+                    assignment: assignment.span,
+                    function: function.span,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    fn candidate(
+        &self,
+        logical: &oxc_ast::ast::LogicalExpression<'_>,
+    ) -> Option<FastLazyCellCandidate> {
+        if logical.operator.as_str() != "&&" {
+            return None;
+        }
+        let Expression::SequenceExpression(sequence) = strip_parentheses(&logical.right) else {
+            return None;
+        };
+        let mode_refs = direct_parameter_references(self.scoping, &logical.left, self.parameters)
+            .into_iter()
+            .collect::<Vec<_>>();
+        let [mode_parameter_index] = mode_refs.as_slice() else {
+            return None;
+        };
+        let mode_parameter_index = *mode_parameter_index;
+        let mut evidence = FastCellEvidence::default();
+        for expression in &sequence.expressions {
+            let Some(assignment) = assignment_expression(expression) else {
+                continue;
+            };
+            if let Some(target) = assignment_symbol(self.scoping, &assignment.left) {
+                if let Expression::CallExpression(call) =
+                    last_sequence_expression(&assignment.right)
+                {
+                    if !call.optional && call.arguments.len() == 1 {
+                        if let Some(cell) = self.cell_construction(target, assignment, call) {
+                            evidence.cell = Some(cell);
+                        }
+                        continue;
                     }
                 }
+                if target == self.returned_symbol {
+                    if let Some(cell) = evidence.cell.as_ref() {
+                        if reference_symbol(self.scoping, &assignment.right) == Some(cell.symbol) {
+                            evidence.returned_cell_assignment = Some(assignment.span);
+                        }
+                    }
+                }
+            } else {
+                self.record_member_assignment(&mut evidence, assignment);
             }
+        }
+
+        let cell = evidence.cell?;
+        let getter = evidence.getter?;
+        let updater = evidence.updater?;
+        let returned_cell_assignment = evidence.returned_cell_assignment?;
+        if getter.value_parameter_index != updater.value_parameter_index
+            || getter.value_parameter_index == mode_parameter_index
+            || cell.state_parameter_index == mode_parameter_index
+            || cell.state_parameter_index == getter.value_parameter_index
+        {
+            return None;
+        }
+        Some(FastLazyCellCandidate {
+            guard: logical.left.span(),
+            mode_parameter_index,
+            value_parameter_index: getter.value_parameter_index,
+            state_parameter_index: cell.state_parameter_index,
+            prototype_field: cell.prototype_field,
+            method_key_field: cell.method_key_field,
+            updater_property: updater.property,
+            cell_construction: cell.assignment,
+            getter_function: getter.function,
+            getter_entry_condition: getter.entry_condition,
+            updater_function: updater.function,
+            returned_cell_assignment,
+            object_constructor_symbol: cell.object_constructor_symbol,
+            cell_symbol: cell.symbol,
+            getter_assignment: getter.assignment,
+            updater_assignment: updater.assignment,
+        })
+    }
+}
+
+impl<'a> Visit<'a> for FastLazyCellCandidateCollector<'_, '_> {
+    fn visit_logical_expression(&mut self, logical: &oxc_ast::ast::LogicalExpression<'a>) {
+        if let Some(candidate) = self.candidate(logical) {
+            self.candidates.push(candidate);
         }
         walk::walk_logical_expression(self, logical);
     }
@@ -859,7 +881,7 @@ fn collect_factory_shapes<T: PartialEq>(
     collector.shapes
 }
 
-#[must_use]
+#[must_use = "Use the returned shape evidence; structural recognition alone does not prove execution"]
 pub fn structurally_proven_fast_lazy_cell_factory_shapes(
     program: &Program<'_>,
     scoping: &Scoping,
@@ -869,7 +891,7 @@ pub fn structurally_proven_fast_lazy_cell_factory_shapes(
     })
 }
 
-#[must_use]
+#[must_use = "Only a returned proof establishes the specialized fast factory call"]
 pub fn proven_fast_lazy_cell_factory_call(
     source: &str,
     program: &Program<'_>,
@@ -954,6 +976,222 @@ pub fn proven_fast_lazy_cell_factory_call(
     })
 }
 
+struct SlowCellConstruction {
+    symbol: SymbolId,
+    state_parameter_index: usize,
+    prototype_field: String,
+    method_key_field: String,
+    assignment: Span,
+}
+
+#[derive(Default)]
+struct SlowCellEvidence {
+    handler: Option<(usize, usize, Span)>,
+    index_state: Option<(SymbolId, Span)>,
+    phase: Option<(SymbolId, SymbolId, Span)>,
+    cell: Option<SlowCellConstruction>,
+    update: Option<Span>,
+    resolver: Option<(String, Span)>,
+    returned_alias: bool,
+}
+
+struct SlowCellScope<'a> {
+    scoping: &'a Scoping,
+    parameters: &'a [SymbolId],
+    function_span: Span,
+    returned_symbol: SymbolId,
+}
+
+impl SlowCellEvidence {
+    fn record_binding(
+        &mut self,
+        scope: &SlowCellScope<'_>,
+        target_symbol: SymbolId,
+        assignment: &oxc_ast::ast::AssignmentExpression<'_>,
+    ) -> Option<()> {
+        let scoping = scope.scoping;
+        if let Expression::ArrayExpression(array) = last_sequence_expression(&assignment.right) {
+            if let Some(parameter_index) = scope
+                .parameters
+                .iter()
+                .position(|parameter| *parameter == target_symbol)
+            {
+                if let Some(slot) = direct_identifier_array_slot(scoping, array, target_symbol) {
+                    return self
+                        .handler
+                        .replace((parameter_index, slot, assignment.span))
+                        .is_none()
+                        .then_some(());
+                }
+            }
+        }
+        if let Some(rhs_symbol) = reference_symbol(scoping, &assignment.right) {
+            let rhs_declaration = scoping.symbol_span(rhs_symbol);
+            if !(scope.function_span.start <= rhs_declaration.start
+                && rhs_declaration.end <= scope.function_span.end)
+            {
+                return self
+                    .phase
+                    .replace((target_symbol, rhs_symbol, assignment.span))
+                    .is_none()
+                    .then_some(());
+            }
+        }
+        if !matches!(
+            last_sequence_expression(&assignment.right),
+            Expression::Identifier(_)
+        ) && pure_integer_expression(&assignment.right)
+        {
+            return self
+                .index_state
+                .replace((target_symbol, assignment.span))
+                .is_none()
+                .then_some(());
+        }
+        if let Expression::CallExpression(call) = last_sequence_expression(&assignment.right) {
+            if !call.optional && call.arguments.len() == 1 {
+                let argument = call.arguments[0].as_expression()?;
+                let (state_parameter_index, prototype_field) =
+                    parameter_member(scoping, argument, scope.parameters)?;
+                let Expression::ComputedMemberExpression(callee) =
+                    last_sequence_expression(&call.callee)
+                else {
+                    return Some(());
+                };
+                if callee.optional {
+                    return Some(());
+                }
+                let (method_state_index, method_key_field) =
+                    parameter_member(scoping, &callee.expression, scope.parameters)?;
+                if state_parameter_index != method_state_index {
+                    return None;
+                }
+                return self
+                    .cell
+                    .replace(SlowCellConstruction {
+                        symbol: target_symbol,
+                        state_parameter_index,
+                        prototype_field,
+                        method_key_field,
+                        assignment: assignment.span,
+                    })
+                    .is_none()
+                    .then_some(());
+            }
+        }
+        if scope.returned_symbol == target_symbol {
+            if let Some(cell) = self.cell.as_ref() {
+                if reference_symbol(scoping, &assignment.right) == Some(cell.symbol) {
+                    self.returned_alias = true;
+                }
+            }
+        }
+        Some(())
+    }
+
+    fn record_member(
+        &mut self,
+        scope: &SlowCellScope<'_>,
+        assignment: &oxc_ast::ast::AssignmentExpression<'_>,
+    ) -> Option<()> {
+        let Some(cell) = self.cell.as_ref() else {
+            return Some(());
+        };
+        let scoping = scope.scoping;
+        match &assignment.left {
+            AssignmentTarget::ComputedMemberExpression(member) if !member.optional => {
+                if reference_symbol(scoping, &member.object) != Some(cell.symbol) {
+                    return Some(());
+                }
+                let Some((key_state_index, key_field)) =
+                    parameter_member(scoping, &member.expression, scope.parameters)
+                else {
+                    return Some(());
+                };
+                if key_state_index != cell.state_parameter_index
+                    || key_field != cell.method_key_field
+                {
+                    return Some(());
+                }
+                let Expression::FunctionExpression(function) =
+                    last_sequence_expression(&assignment.right)
+                else {
+                    return Some(());
+                };
+                self.update.replace(function.span).is_none().then_some(())
+            }
+            AssignmentTarget::StaticMemberExpression(member) if !member.optional => {
+                if reference_symbol(scoping, &member.object) != Some(cell.symbol) {
+                    return Some(());
+                }
+                let Expression::FunctionExpression(function) =
+                    last_sequence_expression(&assignment.right)
+                else {
+                    return Some(());
+                };
+                self.resolver
+                    .replace((member.property.name.to_string(), function.span))
+                    .is_none()
+                    .then_some(())
+            }
+            _ => Some(()),
+        }
+    }
+
+    fn finish(
+        self,
+        function_span: Span,
+        returned_symbol: SymbolId,
+        logical: &oxc_ast::ast::LogicalExpression<'_>,
+    ) -> Option<SlowLazyCellFactoryShape> {
+        let (handler_parameter_index, handler_slot, handler_capture) = self.handler?;
+        let (index_state_symbol, index_state_initialization) = self.index_state?;
+        let (phase_local_symbol, phase_binding_symbol, phase_capture) = self.phase?;
+        let SlowCellConstruction {
+            symbol: cell_symbol,
+            state_parameter_index,
+            prototype_field,
+            method_key_field,
+            assignment: cell_construction,
+        } = self.cell?;
+        let update_function = self.update?;
+        let (resolver_property, resolver_function) = self.resolver?;
+        if returned_symbol != cell_symbol && !self.returned_alias {
+            return None;
+        }
+
+        Some(SlowLazyCellFactoryShape {
+            function_start: function_span.start,
+            function_end: function_span.end,
+            guard_start: logical.left.span().start,
+            guard_end: logical.left.span().end,
+            slow_sequence_start: logical.right.span().start,
+            slow_sequence_end: logical.right.span().end,
+            state_parameter_index,
+            handler_parameter_index,
+            handler_slot,
+            handler_capture_start: handler_capture.start,
+            handler_capture_end: handler_capture.end,
+            index_state_symbol,
+            index_state_initialization_start: index_state_initialization.start,
+            index_state_initialization_end: index_state_initialization.end,
+            prototype_field,
+            method_key_field,
+            phase_local_symbol,
+            phase_binding_symbol,
+            phase_capture_start: phase_capture.start,
+            phase_capture_end: phase_capture.end,
+            cell_construction_start: cell_construction.start,
+            cell_construction_end: cell_construction.end,
+            update_function_start: update_function.start,
+            update_function_end: update_function.end,
+            resolver_property,
+            resolver_function_start: resolver_function.start,
+            resolver_function_end: resolver_function.end,
+        })
+    }
+}
+
 fn shape_for_function(
     function: &Function<'_>,
     scoping: &Scoping,
@@ -991,204 +1229,24 @@ fn shape_for_function(
         return None;
     };
 
-    let mut handler = None;
-    let mut index_state = None;
-    let mut phase = None;
-    let mut cell = None;
-    let mut update = None;
-    let mut resolver = None;
-    let mut returned_alias = false;
-
+    let scope = SlowCellScope {
+        scoping,
+        parameters: &parameters,
+        function_span: function.span,
+        returned_symbol,
+    };
+    let mut evidence = SlowCellEvidence::default();
     for expression in &slow_sequence.expressions {
         let Some(assignment) = assignment_expression(expression) else {
             continue;
         };
         if let Some(target_symbol) = assignment_symbol(scoping, &assignment.left) {
-            if let Expression::ArrayExpression(array) = last_sequence_expression(&assignment.right)
-            {
-                if let Some(parameter_index) = parameters
-                    .iter()
-                    .position(|parameter| *parameter == target_symbol)
-                {
-                    if let Some(slot) = direct_identifier_array_slot(scoping, array, target_symbol)
-                    {
-                        if handler
-                            .replace((target_symbol, parameter_index, slot, assignment.span))
-                            .is_some()
-                        {
-                            return None;
-                        }
-                        continue;
-                    }
-                }
-            }
-
-            if let Some(rhs_symbol) = reference_symbol(scoping, &assignment.right) {
-                let rhs_declaration = scoping.symbol_span(rhs_symbol);
-                if !(function.span.start <= rhs_declaration.start
-                    && rhs_declaration.end <= function.span.end)
-                {
-                    if phase
-                        .replace((target_symbol, rhs_symbol, assignment.span))
-                        .is_some()
-                    {
-                        return None;
-                    }
-                    continue;
-                }
-            }
-
-            if !matches!(
-                last_sequence_expression(&assignment.right),
-                Expression::Identifier(_)
-            ) && pure_integer_expression(&assignment.right)
-            {
-                if index_state
-                    .replace((target_symbol, assignment.span))
-                    .is_some()
-                {
-                    return None;
-                }
-                continue;
-            }
-
-            if let Expression::CallExpression(call) = last_sequence_expression(&assignment.right) {
-                if !call.optional && call.arguments.len() == 1 {
-                    let argument = call.arguments[0].as_expression()?;
-                    let (state_parameter_index, prototype_field) =
-                        parameter_member(scoping, argument, &parameters)?;
-                    let Expression::ComputedMemberExpression(callee) =
-                        last_sequence_expression(&call.callee)
-                    else {
-                        continue;
-                    };
-                    if callee.optional {
-                        continue;
-                    }
-                    let (method_state_index, method_key_field) =
-                        parameter_member(scoping, &callee.expression, &parameters)?;
-                    if state_parameter_index != method_state_index {
-                        return None;
-                    }
-                    if cell
-                        .replace((
-                            target_symbol,
-                            state_parameter_index,
-                            prototype_field,
-                            method_key_field,
-                            assignment.span,
-                        ))
-                        .is_some()
-                    {
-                        return None;
-                    }
-                    continue;
-                }
-            }
-
-            if returned_symbol == target_symbol {
-                if let Some((cell_symbol, ..)) = cell.as_ref() {
-                    if reference_symbol(scoping, &assignment.right) == Some(*cell_symbol) {
-                        returned_alias = true;
-                    }
-                }
-            }
-            continue;
-        }
-
-        match &assignment.left {
-            AssignmentTarget::ComputedMemberExpression(member) if !member.optional => {
-                let Some((cell_symbol, state_parameter_index, _, method_key_field, _)) =
-                    cell.as_ref()
-                else {
-                    continue;
-                };
-                if reference_symbol(scoping, &member.object) != Some(*cell_symbol) {
-                    continue;
-                }
-                let Some((key_state_index, key_field)) =
-                    parameter_member(scoping, &member.expression, &parameters)
-                else {
-                    continue;
-                };
-                if key_state_index != *state_parameter_index || key_field != *method_key_field {
-                    continue;
-                }
-                let Expression::FunctionExpression(function) =
-                    last_sequence_expression(&assignment.right)
-                else {
-                    continue;
-                };
-                if update.replace(function.span).is_some() {
-                    return None;
-                }
-            }
-            AssignmentTarget::StaticMemberExpression(member) if !member.optional => {
-                let Some((cell_symbol, ..)) = cell.as_ref() else {
-                    continue;
-                };
-                if reference_symbol(scoping, &member.object) != Some(*cell_symbol) {
-                    continue;
-                }
-                let Expression::FunctionExpression(function) =
-                    last_sequence_expression(&assignment.right)
-                else {
-                    continue;
-                };
-                if resolver
-                    .replace((member.property.name.to_string(), function.span))
-                    .is_some()
-                {
-                    return None;
-                }
-            }
-            _ => {}
+            evidence.record_binding(&scope, target_symbol, assignment)?;
+        } else {
+            evidence.record_member(&scope, assignment)?;
         }
     }
-
-    let (_, handler_parameter_index, handler_slot, handler_capture) = handler?;
-    let (index_state_symbol, index_state_initialization) = index_state?;
-    let (phase_local_symbol, phase_binding_symbol, phase_capture) = phase?;
-    let (cell_symbol, state_parameter_index, prototype_field, method_key_field, cell_construction) =
-        cell?;
-    let update_function = update?;
-    let (resolver_property, resolver_function) = resolver?;
-    if returned_symbol == cell_symbol {
-        returned_alias = true;
-    }
-    if !returned_alias {
-        return None;
-    }
-
-    Some(SlowLazyCellFactoryShape {
-        function_start: function.span.start,
-        function_end: function.span.end,
-        guard_start: logical.left.span().start,
-        guard_end: logical.left.span().end,
-        slow_sequence_start: logical.right.span().start,
-        slow_sequence_end: logical.right.span().end,
-        state_parameter_index,
-        handler_parameter_index,
-        handler_slot,
-        handler_capture_start: handler_capture.start,
-        handler_capture_end: handler_capture.end,
-        index_state_symbol,
-        index_state_initialization_start: index_state_initialization.start,
-        index_state_initialization_end: index_state_initialization.end,
-        prototype_field,
-        method_key_field,
-        phase_local_symbol,
-        phase_binding_symbol,
-        phase_capture_start: phase_capture.start,
-        phase_capture_end: phase_capture.end,
-        cell_construction_start: cell_construction.start,
-        cell_construction_end: cell_construction.end,
-        update_function_start: update_function.start,
-        update_function_end: update_function.end,
-        resolver_property,
-        resolver_function_start: resolver_function.start,
-        resolver_function_end: resolver_function.end,
-    })
+    evidence.finish(function.span, returned_symbol, logical)
 }
 
 fn pure_integer_expression(expression: &Expression<'_>) -> bool {
@@ -1548,7 +1606,7 @@ fn specialize_exact_slow_factory_shape(
 /// the state binding nor the incoming handler binding may have a reachable
 /// write before their respective capture events. Property contents and cell
 /// resolver semantics remain separate obligations.
-#[must_use]
+#[must_use = "Only a returned proof establishes the specialized slow factory call"]
 pub fn proven_slow_lazy_cell_factory_call(
     source: &str,
     program: &Program<'_>,
@@ -1669,6 +1727,56 @@ fn update_selector_capture_symbol(
     Some(*target)
 }
 
+fn exact_update_writes(
+    semantic: &Semantic<'_>,
+    symbol: SymbolId,
+    update_span: Span,
+    first: Span,
+    second: Span,
+) -> Option<()> {
+    let expected_writes = HashSet::from([(first.start, first.end), (second.start, second.end)]);
+    let mut actual_writes = HashSet::new();
+    for reference_id in semantic.scoping().get_resolved_reference_ids(symbol) {
+        let reference = semantic.scoping().get_reference(*reference_id);
+        if !reference.is_write()
+            || enclosing_function_span(semantic, reference.node_id()) != Some(update_span)
+        {
+            continue;
+        }
+        let span = enclosing_write_event_span(semantic, reference.node_id())?;
+        actual_writes.insert((span.start, span.end));
+    }
+    (actual_writes == expected_writes).then_some(())
+}
+
+fn unique_assigned_closure<'a>(
+    sequence: &'a oxc_ast::ast::SequenceExpression<'a>,
+    span: Span,
+) -> Option<&'a Function<'a>> {
+    let mut functions = sequence.expressions.iter().filter_map(|expression| {
+        let assignment = assignment_expression(expression)?;
+        let Expression::FunctionExpression(resolver) = last_sequence_expression(&assignment.right)
+        else {
+            return None;
+        };
+        (resolver.span.start == span.start && resolver.span.end == span.end).then_some(resolver)
+    });
+    let resolver = functions.next()?;
+    if functions.next().is_some()
+        || resolver.r#async
+        || resolver.generator
+        || function_subtree_has_dynamic_scope(resolver)
+        || resolver
+            .body
+            .as_deref()
+            .is_none_or(function_body_uses_arguments)
+    {
+        return None;
+    }
+
+    Some(resolver)
+}
+
 fn analyze_slow_lazy_cell_update_state(
     function: &Function<'_>,
     semantic: &Semantic<'_>,
@@ -1696,28 +1804,10 @@ fn analyze_slow_lazy_cell_update_state(
         IntegerPolynomial::constant(i128::from(initial_state_value)),
     );
 
-    let mut updates = sequence.expressions.iter().filter_map(|expression| {
-        let assignment = assignment_expression(expression)?;
-        let Expression::FunctionExpression(update) = last_sequence_expression(&assignment.right)
-        else {
-            return None;
-        };
-        (update.span.start == shape.update_function_start
-            && update.span.end == shape.update_function_end)
-            .then_some(update)
-    });
-    let update = updates.next()?;
-    if updates.next().is_some()
-        || update.r#async
-        || update.generator
-        || function_subtree_has_dynamic_scope(update)
-        || update
-            .body
-            .as_deref()
-            .is_none_or(function_body_uses_arguments)
-    {
-        return None;
-    }
+    let update = unique_assigned_closure(
+        sequence,
+        Span::new(shape.update_function_start, shape.update_function_end),
+    )?;
     let update_parameters = parameter_symbols(update)?;
     let [update_parameter] = update_parameters.as_slice() else {
         return None;
@@ -1745,27 +1835,13 @@ fn analyze_slow_lazy_cell_update_state(
         return None;
     }
 
-    let expected_writes = HashSet::from([
-        (first.span.start, first.span.end),
-        (second.span.start, second.span.end),
-    ]);
-    let mut actual_writes = HashSet::new();
-    for reference_id in semantic
-        .scoping()
-        .get_resolved_reference_ids(shape.index_state_symbol)
-    {
-        let reference = semantic.scoping().get_reference(*reference_id);
-        if !reference.is_write()
-            || enclosing_function_span(semantic, reference.node_id()) != Some(update.span)
-        {
-            continue;
-        }
-        let span = enclosing_write_event_span(semantic, reference.node_id())?;
-        actual_writes.insert((span.start, span.end));
-    }
-    if actual_writes != expected_writes {
-        return None;
-    }
+    exact_update_writes(
+        semantic,
+        shape.index_state_symbol,
+        update.span,
+        first.span,
+        second.span,
+    )?;
 
     let selector_capture_symbol =
         update_selector_capture_symbol(&first.right, semantic.scoping(), *update_parameter)?;
@@ -1803,7 +1879,7 @@ fn analyze_slow_lazy_cell_update_state(
 /// integer result under the call's exact arguments. A direct assignment from
 /// the update parameter must occur inside the `+=` RHS, and no additional
 /// writes to the index-state binding are allowed in the update body.
-#[must_use]
+#[must_use = "Use the returned update-state proof before relying on the computed state"]
 pub fn proven_slow_lazy_cell_update_state(
     program: &Program<'_>,
     semantic: &Semantic<'_>,
@@ -1872,44 +1948,32 @@ fn unique_factory_registry_assignment(
         proven: Vec<ProvenSlowLazyCellRegistryAssignment>,
         factory_call: &'c ProvenSlowLazyCellFactoryCall,
     }
-    impl<'a> Visit<'a> for Collector<'_, '_, '_> {
-        fn visit_assignment_expression(
-            &mut self,
-            assignment: &oxc_ast::ast::AssignmentExpression<'a>,
-        ) {
+    impl Collector<'_, '_, '_> {
+        fn match_assignment(
+            &self,
+            assignment: &oxc_ast::ast::AssignmentExpression<'_>,
+        ) -> Option<ProvenSlowLazyCellRegistryAssignment> {
             if !assignment.operator.is_assign() {
-                walk::walk_assignment_expression(self, assignment);
-                return;
+                return None;
             }
             let Expression::CallExpression(call) = last_sequence_expression(&assignment.right)
             else {
-                walk::walk_assignment_expression(self, assignment);
-                return;
+                return None;
             };
             if call.span.start != self.call.call_start || call.span.end != self.call.call_end {
-                walk::walk_assignment_expression(self, assignment);
-                return;
+                return None;
             }
             let AssignmentTarget::ComputedMemberExpression(member) = &assignment.left else {
-                walk::walk_assignment_expression(self, assignment);
-                return;
+                return None;
             };
             if member.optional {
-                walk::walk_assignment_expression(self, assignment);
-                return;
+                return None;
             }
-            let Some((receiver, registry_path)) = registry_receiver_and_path(&member.object) else {
-                walk::walk_assignment_expression(self, assignment);
-                return;
-            };
+            let (receiver, registry_path) = registry_receiver_and_path(&member.object)?;
             if registry_path.is_empty() {
-                walk::walk_assignment_expression(self, assignment);
-                return;
+                return None;
             }
-            let Some(receiver_symbol) = reference_symbol(self.scoping, receiver) else {
-                walk::walk_assignment_expression(self, assignment);
-                return;
-            };
+            let receiver_symbol = reference_symbol(self.scoping, receiver)?;
             let state_symbol = call.arguments.iter().find_map(|argument| {
                 let expression = argument.as_expression()?;
                 let span = expression.span();
@@ -1918,13 +1982,9 @@ fn unique_factory_registry_assignment(
                     .flatten()
             });
             if state_symbol != Some(receiver_symbol) {
-                walk::walk_assignment_expression(self, assignment);
-                return;
+                return None;
             }
-            let Some(key_symbol) = reference_symbol(self.scoping, &member.expression) else {
-                walk::walk_assignment_expression(self, assignment);
-                return;
-            };
+            let key_symbol = reference_symbol(self.scoping, &member.expression)?;
             let matching_arguments = call
                 .arguments
                 .iter()
@@ -1936,14 +1996,10 @@ fn unique_factory_registry_assignment(
                 })
                 .collect::<Vec<_>>();
             let [key_parameter_index] = matching_arguments.as_slice() else {
-                walk::walk_assignment_expression(self, assignment);
-                return;
+                return None;
             };
-            let Some(factory_key_symbol) = self.factory_parameters.get(*key_parameter_index) else {
-                walk::walk_assignment_expression(self, assignment);
-                return;
-            };
-            self.proven.push(ProvenSlowLazyCellRegistryAssignment {
+            let factory_key_symbol = self.factory_parameters.get(*key_parameter_index)?;
+            Some(ProvenSlowLazyCellRegistryAssignment {
                 factory_call: self.factory_call.clone(),
                 registry_path,
                 receiver_start: receiver.span().start,
@@ -1953,7 +2009,17 @@ fn unique_factory_registry_assignment(
                 registry_key_symbol: key_symbol,
                 factory_key_parameter_index: *key_parameter_index,
                 factory_key_symbol: *factory_key_symbol,
-            });
+            })
+        }
+    }
+    impl<'a> Visit<'a> for Collector<'_, '_, '_> {
+        fn visit_assignment_expression(
+            &mut self,
+            assignment: &oxc_ast::ast::AssignmentExpression<'a>,
+        ) {
+            if let Some(proof) = self.match_assignment(assignment) {
+                self.proven.push(proof);
+            }
             walk::walk_assignment_expression(self, assignment);
         }
     }
@@ -1980,7 +2046,7 @@ fn unique_factory_registry_assignment(
 /// exact-origin state argument. The computed key must be the unique
 /// symbol-resolved call argument matching the assignment key. This establishes
 /// the structural key bridge only; it does not prove later reads see this write.
-#[must_use]
+#[must_use = "Only a returned proof links the factory result to a registry assignment"]
 pub fn proven_slow_lazy_cell_registry_assignment(
     program: &Program<'_>,
     semantic: &Semantic<'_>,
@@ -2346,7 +2412,7 @@ fn exact_integer_parameter_provenance(
 /// proof records the exact chain that carries the unchanged key into the
 /// enclosing M-style installer, so downstream handler provenance can use the
 /// same path rather than joining unrelated calls that happen to share a helper.
-#[must_use]
+#[must_use = "Use the exact-key assignment proofs rather than assuming registry identity"]
 pub fn proven_slow_lazy_cell_exact_registry_assignments(
     source: &str,
     program: &Program<'_>,
@@ -2452,6 +2518,129 @@ struct RegistryInstallFacts<'a> {
     exact_key: i64,
 }
 
+#[derive(Clone, Copy)]
+struct CapturedPathCursor<'a> {
+    incoming: &'a ProvenOriginDirectCall,
+    value_symbol: SymbolId,
+    key_parameter_index: usize,
+    key_symbol: SymbolId,
+}
+
+struct CapturedPathProof<'a, 'ast> {
+    source: &'a str,
+    program: &'a Program<'ast>,
+    semantic: &'a Semantic<'ast>,
+    exact_key: i64,
+}
+
+impl CapturedPathProof<'_, '_> {
+    fn unique_argument_for_symbol(
+        &self,
+        call: &ProvenOriginDirectCall,
+        symbol: SymbolId,
+    ) -> Option<usize> {
+        let mut matches = (0..call.argument_spans.len()).filter(|index| {
+            call_argument_symbol_at(
+                self.program,
+                self.semantic.scoping(),
+                call.call_start,
+                call.call_end,
+                *index,
+            ) == Some(symbol)
+        });
+        let first = matches.next()?;
+        matches.next().is_none().then_some(first)
+    }
+
+    fn binding_preserved(
+        &self,
+        cursor: CapturedPathCursor<'_>,
+        call: &ProvenOriginDirectCall,
+    ) -> bool {
+        let context = &cursor.incoming.callee;
+        parameter_binding_preserved_before_event(
+            self.source,
+            self.program,
+            self.semantic,
+            cursor.incoming,
+            Span::new(context.function_start, context.function_end),
+            cursor.value_symbol,
+            Span::new(call.call_start, call.call_end),
+        )
+    }
+
+    fn only_forwarded(
+        &self,
+        cursor: CapturedPathCursor<'_>,
+        call: &ProvenOriginDirectCall,
+        argument_index: usize,
+    ) -> bool {
+        let context = &cursor.incoming.callee;
+        symbol_only_forwarded_at_direct_call(
+            self.source,
+            self.program,
+            self.semantic,
+            ForwardedSymbolQuery {
+                symbol: cursor.value_symbol,
+                function_span: Span::new(context.function_start, context.function_end),
+                incoming: cursor.incoming,
+                exact_integer_parameter: (cursor.key_parameter_index, self.exact_key),
+                call,
+                argument_index,
+            },
+        )
+    }
+
+    fn advance<'a>(
+        &self,
+        cursor: CapturedPathCursor<'a>,
+        next: &'a ProvenOriginDirectCall,
+    ) -> Option<CapturedPathCursor<'a>> {
+        if next.caller != cursor.incoming.callee || !self.binding_preserved(cursor, next) {
+            return None;
+        }
+        let value_index = self.unique_argument_for_symbol(next, cursor.value_symbol)?;
+        if !self.only_forwarded(cursor, next, value_index) {
+            return None;
+        }
+        let key_index = self.unique_argument_for_symbol(next, cursor.key_symbol)?;
+        let parameters = function_parameter_symbols_at(
+            self.program,
+            next.callee.function_start,
+            next.callee.function_end,
+        )?;
+        Some(CapturedPathCursor {
+            incoming: next,
+            value_symbol: *parameters.get(value_index)?,
+            key_parameter_index: key_index,
+            key_symbol: *parameters.get(key_index)?,
+        })
+    }
+
+    fn verify_factory(
+        &self,
+        cursor: CapturedPathCursor<'_>,
+        factory: &ProvenSlowLazyCellFactoryCall,
+    ) -> Option<()> {
+        let call = &factory.call;
+        let value_index = factory.shape.handler_parameter_index;
+        if cursor.incoming.callee != call.caller
+            || call_argument_symbol_at(
+                self.program,
+                self.semantic.scoping(),
+                call.call_start,
+                call.call_end,
+                value_index,
+            ) != Some(cursor.value_symbol)
+            || !self.only_forwarded(cursor, call, value_index)
+            || !self.binding_preserved(cursor, call)
+        {
+            return None;
+        }
+        Some(())
+    }
+}
+
 fn proven_slow_lazy_cell_captured_value_path(
     source: &str,
     program: &Program<'_>,
@@ -2489,150 +2678,23 @@ fn proven_slow_lazy_cell_captured_value_path(
         root.callee.function_start,
         root.callee.function_end,
     )?;
-    let mut current_symbol = *root_parameters.get(root_value_parameter_index)?;
-    let mut current_key_parameter_index = root_key_parameter_index;
-    let mut current_key_symbol = *root_parameters.get(root_key_parameter_index)?;
-    let mut current_context = root.callee.clone();
-    let mut incoming = root.clone();
-
-    for next in chain.iter().skip(1) {
-        if next.caller != current_context {
-            return None;
-        }
-        let event = Span::new(next.call_start, next.call_end);
-        if !parameter_binding_preserved_before_event(
-            source,
-            program,
-            semantic,
-            &incoming,
-            Span::new(current_context.function_start, current_context.function_end),
-            current_symbol,
-            event,
-        ) {
-            return None;
-        }
-        let matching_arguments = (0..next.argument_spans.len())
-            .filter(|index| {
-                call_argument_symbol_at(
-                    program,
-                    semantic.scoping(),
-                    next.call_start,
-                    next.call_end,
-                    *index,
-                ) == Some(current_symbol)
-            })
-            .collect::<Vec<_>>();
-        let [next_parameter_index] = matching_arguments.as_slice() else {
-            return None;
-        };
-        if !symbol_only_forwarded_at_direct_call(
-            source,
-            program,
-            semantic,
-            ForwardedSymbolQuery {
-                symbol: current_symbol,
-                function_span: Span::new(
-                    current_context.function_start,
-                    current_context.function_end,
-                ),
-                incoming: &incoming,
-                exact_integer_parameter: (
-                    current_key_parameter_index,
-                    exact_assignment.exact_key_value,
-                ),
-                call: next,
-                argument_index: *next_parameter_index,
-            },
-        ) {
-            return None;
-        }
-        let matching_key_arguments = (0..next.argument_spans.len())
-            .filter(|index| {
-                call_argument_symbol_at(
-                    program,
-                    semantic.scoping(),
-                    next.call_start,
-                    next.call_end,
-                    *index,
-                ) == Some(current_key_symbol)
-            })
-            .collect::<Vec<_>>();
-        let [next_key_parameter_index] = matching_key_arguments.as_slice() else {
-            return None;
-        };
-        let next_parameters = function_parameter_symbols_at(
-            program,
-            next.callee.function_start,
-            next.callee.function_end,
-        )?;
-        current_symbol = *next_parameters.get(*next_parameter_index)?;
-        current_key_symbol = *next_parameters.get(*next_key_parameter_index)?;
-        current_key_parameter_index = *next_key_parameter_index;
-        current_context = next.callee.clone();
-        incoming = next.clone();
-    }
-
-    let factory_caller = &exact_assignment.assignment.factory_call.call.caller;
-    if current_context != *factory_caller {
-        return None;
-    }
-
-    let nested_value_symbol = call_argument_symbol_at(
-        program,
-        semantic.scoping(),
-        exact_assignment.assignment.factory_call.call.call_start,
-        exact_assignment.assignment.factory_call.call.call_end,
-        exact_assignment
-            .assignment
-            .factory_call
-            .shape
-            .handler_parameter_index,
-    );
-    if nested_value_symbol != Some(current_symbol)
-        || !symbol_only_forwarded_at_direct_call(
-            source,
-            program,
-            semantic,
-            ForwardedSymbolQuery {
-                symbol: current_symbol,
-                function_span: Span::new(
-                    factory_caller.function_start,
-                    factory_caller.function_end,
-                ),
-                incoming: &incoming,
-                exact_integer_parameter: (
-                    current_key_parameter_index,
-                    exact_assignment.exact_key_value,
-                ),
-                call: &exact_assignment.assignment.factory_call.call,
-                argument_index: exact_assignment
-                    .assignment
-                    .factory_call
-                    .shape
-                    .handler_parameter_index,
-            },
-        )
-    {
-        return None;
-    }
-
-    let event = Span::new(
-        exact_assignment.assignment.factory_call.call.call_start,
-        exact_assignment.assignment.factory_call.call.call_end,
-    );
-    if !parameter_binding_preserved_before_event(
+    let mut cursor = CapturedPathCursor {
+        incoming: root,
+        value_symbol: *root_parameters.get(root_value_parameter_index)?,
+        key_parameter_index: root_key_parameter_index,
+        key_symbol: *root_parameters.get(root_key_parameter_index)?,
+    };
+    let proof = CapturedPathProof {
         source,
         program,
         semantic,
-        &incoming,
-        Span::new(factory_caller.function_start, factory_caller.function_end),
-        current_symbol,
-        event,
-    ) {
-        return None;
+        exact_key: exact_assignment.exact_key_value,
+    };
+    for next in chain.iter().skip(1) {
+        cursor = proof.advance(cursor, next)?;
     }
-
-    Some((root_value_parameter_index, current_symbol))
+    proof.verify_factory(cursor, &exact_assignment.assignment.factory_call)?;
+    Some((root_value_parameter_index, cursor.value_symbol))
 }
 
 /// Join one exact slow-cell registry assignment to any logical forwarding install
@@ -2641,7 +2703,7 @@ fn proven_slow_lazy_cell_captured_value_path(
 /// The same exact object-origin, key-provenance, binding-preservation, and
 /// no-use-before-forwarding barriers used for logical function handlers are
 /// required for arbitrary values.
-#[must_use]
+#[must_use = "Only a returned proof establishes the installed value flows into the cell"]
 pub fn proven_slow_lazy_cell_captured_value_install(
     source: &str,
     program: &Program<'_>,
@@ -2680,7 +2742,7 @@ pub fn proven_slow_lazy_cell_captured_value_install(
 /// object origin, and exact key. This is therefore only a lossless view change;
 /// it adds independently proven function-literal metadata and no new flow
 /// assumption.
-#[must_use]
+#[must_use = "Only a returned proof specializes the captured value to the handler"]
 pub fn proven_slow_lazy_cell_captured_handler_from_value(
     captured_value: &ProvenSlowLazyCellCapturedValueInstall,
     install: &crate::registry_identity::ProvenOriginRegistryHandlerInstall,
@@ -2696,8 +2758,8 @@ pub fn proven_slow_lazy_cell_captured_handler_from_value(
         || value_call.receiver_end != handler_call.receiver_end
         || value_call.key_start != handler_call.key_start
         || value_call.key_end != handler_call.key_end
-        || value_call.value_start != handler_call.handler_start
-        || value_call.value_end != handler_call.handler_end
+        || Span::new(value_call.value_start, value_call.value_end)
+            != Span::new(handler_call.handler_start, handler_call.handler_end)
         || value_call.registry_path != handler_call.registry_path
     {
         return None;
@@ -2714,8 +2776,8 @@ pub fn proven_slow_lazy_cell_captured_handler_from_value(
 /// install whose original handler feeds the wrapper.
 ///
 /// This is the function-valued specialization of the generic captured-value
-/// theorem above; it intentionally preserves the old handler-only API.
-#[must_use]
+/// theorem above, using the same exact value-flow proof.
+#[must_use = "Only a returned proof establishes the captured handler identity"]
 pub fn proven_slow_lazy_cell_captured_handler_install(
     source: &str,
     program: &Program<'_>,
@@ -2723,34 +2785,22 @@ pub fn proven_slow_lazy_cell_captured_handler_install(
     exact_assignment: &ProvenSlowLazyCellExactRegistryAssignment,
     install: &crate::registry_identity::ProvenOriginRegistryHandlerInstall,
 ) -> Option<ProvenSlowLazyCellCapturedHandlerInstall> {
-    let (caller_handler_parameter_index, caller_handler_symbol) =
-        proven_slow_lazy_cell_captured_value_path(
-            source,
-            program,
-            semantic,
-            exact_assignment,
-            RegistryInstallFacts {
-                call: Span::new(install.install.call_start, install.install.call_end),
-                key: Span::new(install.install.key_start, install.install.key_end),
-                value: Span::new(install.install.handler_start, install.install.handler_end),
-                registry_path: &install.install.registry_path,
-                origin: &install.origin,
-                exact_key: install.exact_key,
-            },
-        )?;
-    Some(ProvenSlowLazyCellCapturedHandlerInstall {
-        exact_assignment: exact_assignment.clone(),
-        install: install.clone(),
-        caller_handler_parameter_index,
-        caller_handler_symbol,
-    })
+    let value = install.into();
+    let captured = proven_slow_lazy_cell_captured_value_install(
+        source,
+        program,
+        semantic,
+        exact_assignment,
+        &value,
+    )?;
+    proven_slow_lazy_cell_captured_handler_from_value(&captured, install)
 }
 
 /// Join the independently proven resolver index and captured logical handler.
 ///
 /// Slot equality is already discharged by the resolver theorem; this step only
 /// requires both proofs to refer to the same exact wrapper assignment.
-#[must_use]
+#[must_use = "Only a returned proof links the resolver slot to the original handler"]
 pub fn proven_slow_lazy_cell_resolved_handler(
     resolver: &ProvenSlowLazyCellResolverIndex,
     captured_handler: &ProvenSlowLazyCellCapturedHandlerInstall,
@@ -2767,7 +2817,7 @@ pub fn proven_slow_lazy_cell_resolved_handler(
 ///
 /// This is not a read-site identity theorem: receiver/key origin and registry-slot
 /// preservation must be supplied by distinct proofs before a handler can be named.
-#[must_use]
+#[must_use = "Use the returned compatibility evidence without assuming runtime dispatch"]
 pub fn structurally_compatible_slow_lazy_cell_read(
     resolved_handler: &ProvenSlowLazyCellResolvedHandler,
     carrier: &ProvenSlowLazyCellPrototypeCarrier,
@@ -3157,6 +3207,49 @@ fn resolver_index_value(
     Some((*span, *value))
 }
 
+#[derive(Clone, Copy)]
+struct ResolverCaptureBindings {
+    handler: (SymbolId, Span),
+    phase: (SymbolId, Span),
+    factory_key_symbol: SymbolId,
+}
+
+fn resolver_bindings_stable(
+    source: &str,
+    program: &Program<'_>,
+    semantic: &Semantic<'_>,
+    factory_call: &ProvenSlowLazyCellFactoryCall,
+    function_span: Span,
+    bindings: ResolverCaptureBindings,
+) -> bool {
+    let ResolverCaptureBindings {
+        handler,
+        phase,
+        factory_key_symbol,
+    } = bindings;
+    if !binding_stable_after_capture(
+        source,
+        program,
+        semantic,
+        factory_call,
+        handler.0,
+        handler.1,
+    ) || !binding_stable_after_capture(source, program, semantic, factory_call, phase.0, phase.1)
+    {
+        return false;
+    }
+
+    let key_declaration = semantic.scoping().symbol_span(factory_key_symbol);
+    function_span.contains_inclusive(key_declaration)
+        && binding_stable_from_factory_entry(
+            source,
+            program,
+            semantic,
+            factory_call,
+            factory_key_symbol,
+        )
+}
+
 fn analyze_slow_lazy_cell_resolver_index(
     source: &str,
     program: &Program<'_>,
@@ -3195,34 +3288,21 @@ fn analyze_slow_lazy_cell_resolver_index(
     else {
         return None;
     };
-    if !binding_stable_after_capture(
+    if !resolver_bindings_stable(
         source,
         program,
         semantic,
         factory_call,
-        handler_symbol,
-        handler_capture.span,
-    ) || !binding_stable_after_capture(
-        source,
-        program,
-        semantic,
-        factory_call,
-        shape.phase_local_symbol,
-        Span::new(shape.phase_capture_start, shape.phase_capture_end),
-    ) {
-        return None;
-    }
-
-    let key_declaration = semantic.scoping().symbol_span(factory_key_symbol);
-    if !(function.span.start <= key_declaration.start && key_declaration.end <= function.span.end)
-        || !binding_stable_from_factory_entry(
-            source,
-            program,
-            semantic,
-            factory_call,
+        function.span,
+        ResolverCaptureBindings {
+            handler: (handler_symbol, handler_capture.span),
+            phase: (
+                shape.phase_local_symbol,
+                Span::new(shape.phase_capture_start, shape.phase_capture_end),
+            ),
             factory_key_symbol,
-        )
-    {
+        },
+    ) {
         return None;
     }
 
@@ -3235,28 +3315,10 @@ fn analyze_slow_lazy_cell_resolver_index(
         exact_key_value,
     )?;
 
-    let mut resolvers = sequence.expressions.iter().filter_map(|expression| {
-        let assignment = assignment_expression(expression)?;
-        let Expression::FunctionExpression(resolver) = last_sequence_expression(&assignment.right)
-        else {
-            return None;
-        };
-        (resolver.span.start == shape.resolver_function_start
-            && resolver.span.end == shape.resolver_function_end)
-            .then_some(resolver)
-    });
-    let resolver = resolvers.next()?;
-    if resolvers.next().is_some()
-        || resolver.r#async
-        || resolver.generator
-        || function_subtree_has_dynamic_scope(resolver)
-        || resolver
-            .body
-            .as_deref()
-            .is_none_or(function_body_uses_arguments)
-    {
-        return None;
-    }
+    let resolver = unique_assigned_closure(
+        sequence,
+        Span::new(shape.resolver_function_start, shape.resolver_function_end),
+    )?;
 
     let mut bindings = exact_integer_scalar_bindings(&parameters, &factory_call.call);
     bindings.insert(
@@ -3345,7 +3407,7 @@ impl<'a> Visit<'a> for SlowResolverIndexHarness<'_, 'a, '_, '_> {
 /// does not claim that a particular accessor reaches this cell, that the update
 /// occurs exactly once before the resolver, or that the resulting handler survives
 /// in the registry; those remain separate provenance/temporal obligations.
-#[must_use]
+#[must_use = "Only a returned proof establishes the exact resolver index"]
 pub fn proven_slow_lazy_cell_resolver_index(
     source: &str,
     program: &Program<'_>,
@@ -3973,7 +4035,7 @@ fn helper_state_for_create_event(
         states: Vec<u64>,
     }
     impl MachineProbe<'_> {
-        fn inspect<'a>(&mut self, statements: &[Statement<'a>]) {
+        fn inspect(&mut self, statements: &[Statement<'_>]) {
             for pair in statements.windows(2) {
                 let [init, Statement::WhileStatement(while_statement)] = pair else {
                     continue;
@@ -4436,7 +4498,7 @@ fn parameter_symbols_for_span(program: &Program<'_>, span: Span) -> Option<Vec<S
     output
 }
 
-#[must_use]
+#[must_use = "Use the returned shape evidence; structural recognition alone does not prove execution"]
 pub fn structurally_proven_slow_lazy_cell_factory_shapes(
     program: &Program<'_>,
     scoping: &Scoping,
@@ -4522,7 +4584,7 @@ mod tests {
     }
 
     #[test]
-    fn proves_structural_slow_cell_factory_shape() -> TestResult {
+    fn proves_structural_slow_cell_factory_shape() {
         let source = r"
             let phase;
             function make(mode, state, handler, s, q, cell, out) {
@@ -4546,12 +4608,10 @@ mod tests {
         assert_eq!(shape.prototype_field, "base");
         assert_eq!(shape.method_key_field, "method");
         assert_eq!(shape.resolver_property, "resolve");
-
-        Ok(())
     }
 
     #[test]
-    fn rejects_factory_when_handler_is_not_captured_directly() -> TestResult {
+    fn rejects_factory_when_handler_is_not_captured_directly() {
         assert_eq!(
             shapes(
                 r"
@@ -4571,8 +4631,6 @@ mod tests {
             .len(),
             0
         );
-
-        Ok(())
     }
 
     fn specialized_call(source: &str, needle: &str) -> Result<bool, TestFailure> {
@@ -4694,9 +4752,67 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn proves_state_fields_along_concrete_forwarding_chain() -> TestResult {
-        let source = r#"
+    fn exact_factory_registry(
+        source: &str,
+        program: &oxc_ast::ast::Program<'_>,
+        semantic: &oxc_semantic::Semantic<'_>,
+        flow: &crate::receiver_identity::ProvenOriginFlow,
+    ) -> Result<
+        (
+            super::ProvenSlowLazyCellFactoryCall,
+            super::ProvenSlowLazyCellRegistryAssignment,
+        ),
+        TestFailure,
+    > {
+        let start = source_offset(source, "make(\n                    48", "factory call")?;
+        let call = flow
+            .direct_calls
+            .iter()
+            .find(|call| call.call_start == start)
+            .test_value("origin factory call")?;
+        let factory = proven_slow_lazy_cell_factory_call(source, program, semantic, call)
+            .test_value("slow-cell factory")?;
+        let registry = proven_slow_lazy_cell_registry_assignment(program, semantic, &factory)
+            .test_value("registry assignment")?;
+        Ok((factory, registry))
+    }
+
+    fn with_factory_fixture(
+        source: &str,
+        check: impl FnOnce(
+            &oxc_ast::ast::Program<'_>,
+            &oxc_semantic::Semantic<'_>,
+            &crate::receiver_identity::ProvenOriginFlow,
+            super::ProvenSlowLazyCellFactoryCall,
+            super::ProvenSlowLazyCellRegistryAssignment,
+        ) -> TestResult,
+    ) -> TestResult {
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new()
+            .with_build_nodes(true)
+            .with_cfg(true)
+            .build(&parsed.program);
+        assert!(semantic.diagnostics.is_empty());
+        let flow = structurally_proven_origin_flow(
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &test_budget(),
+        )
+        .test_value("origin flow")?;
+        let (factory, registry) =
+            exact_factory_registry(source, &parsed.program, &semantic.semantic, &flow)?;
+        check(
+            &parsed.program,
+            &semantic.semantic,
+            &flow,
+            factory,
+            registry,
+        )
+    }
+
+    const FORWARDED_VALUE_SOURCE: &str = r#"
             let outer_phase;
             const C = function() {
                 this.base = {};
@@ -4724,91 +4840,60 @@ mod tests {
             }
             new C();
         "#;
-        let allocator = Allocator::default();
-        let parsed = parse_program(&allocator, source, SourceType::cjs());
-        assert!(parsed.is_clean());
-        let semantic = SemanticBuilder::new()
-            .with_build_nodes(true)
-            .with_cfg(true)
-            .build(&parsed.program);
-        assert!(semantic.diagnostics.is_empty());
-        let flow = structurally_proven_origin_flow(
-            &parsed.program,
-            semantic.semantic.scoping(),
-            &test_budget(),
-        )
-        .test_value("origin flow")?;
-        let start = source_offset(source, "make(\n                    48", "factory call")?;
-        let call = flow
-            .direct_calls
-            .iter()
-            .find(|call| call.call_start == start)
-            .test_value("origin factory call")?;
-        let factory =
-            proven_slow_lazy_cell_factory_call(source, &parsed.program, &semantic.semantic, call)
-                .test_value("slow-cell factory")?;
-        let registry = proven_slow_lazy_cell_registry_assignment(
-            &parsed.program,
-            &semantic.semantic,
-            &factory,
-        )
-        .test_value("registry assignment")?;
-        let exact = proven_slow_lazy_cell_exact_registry_assignments(
-            source,
-            &parsed.program,
-            &semantic.semantic,
-            &flow,
-            &registry,
-        )
-        .into_iter()
-        .find(|proof| proof.exact_key_value == 7)
-        .test_value("exact assignment")?;
-        assert_eq!(exact.provenance_calls.len(), 2);
-        let fields = proven_slow_lazy_cell_state_fields_for_exact_assignment(
-            source,
-            &parsed.program,
-            &semantic.semantic,
-            &exact,
-            &test_budget(),
-        )
-        .test_value("path state fields budget")?
-        .test_value("path state fields")?;
-        assert_eq!(fields.fields.method_key.string.assignment.value, "create");
-        assert_eq!(
-            fields.fields.prototype_field.initialization.property,
-            "base"
-        );
-        let values = proven_origin_registry_value_installs(
-            &parsed.program,
-            semantic.semantic.scoping(),
-            &flow,
-            &test_budget(),
-        )
-        .test_value("proven_origin_registry_value_installs")?;
-        let value = values
-            .iter()
-            .find(|proof| {
-                proof.exact_key == 7
-                    && source_slice(
-                        source,
-                        proof.install.value_start,
-                        proof.install.value_end,
-                        "logical value span",
-                    )
-                    .is_ok_and(|value| value == "\"payload\"")
-            })
-            .test_value("logical value install")?;
-        let captured = proven_slow_lazy_cell_captured_value_install(
-            source,
-            &parsed.program,
-            &semantic.semantic,
-            &exact,
-            value,
-        )
-        .test_value("captured non-function value")?;
-        assert_eq!(captured.exact_assignment.exact_key_value, 7);
 
-        Ok(())
+    #[test]
+    fn proves_state_fields_along_concrete_forwarding_chain() -> TestResult {
+        let source = FORWARDED_VALUE_SOURCE;
+        with_factory_fixture(source, |program, semantic, flow, _factory, registry| {
+            let exact = proven_slow_lazy_cell_exact_registry_assignments(
+                source, program, semantic, flow, &registry,
+            )
+            .into_iter()
+            .find(|proof| proof.exact_key_value == 7)
+            .test_value("exact assignment")?;
+            assert_eq!(exact.provenance_calls.len(), 2);
+            let fields = proven_slow_lazy_cell_state_fields_for_exact_assignment(
+                source,
+                program,
+                semantic,
+                &exact,
+                &test_budget(),
+            )
+            .test_value("path state fields budget")?
+            .test_value("path state fields")?;
+            assert_eq!(fields.fields.method_key.string.assignment.value, "create");
+            assert_eq!(
+                fields.fields.prototype_field.initialization.property,
+                "base"
+            );
+            let values = proven_origin_registry_value_installs(
+                program,
+                semantic.scoping(),
+                flow,
+                &test_budget(),
+            )
+            .test_value("proven_origin_registry_value_installs")?;
+            let value = values
+                .iter()
+                .find(|proof| {
+                    proof.exact_key == 7
+                        && source_slice(
+                            source,
+                            proof.install.value_start,
+                            proof.install.value_end,
+                            "logical value span",
+                        )
+                        .is_ok_and(|value| value == "\"payload\"")
+                })
+                .test_value("logical value install")?;
+            let captured = proven_slow_lazy_cell_captured_value_install(
+                source, program, semantic, &exact, value,
+            )
+            .test_value("captured non-function value")?;
+            assert_eq!(captured.exact_assignment.exact_key_value, 7);
+
+            Ok(())
+        })
     }
 
     #[test]
@@ -4888,7 +4973,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_fast_lazy_cell_updater_that_transforms_capture() -> TestResult {
+    fn rejects_fast_lazy_cell_updater_that_transforms_capture() {
         let source = r"
             const Maker = Object;
             function make(value, mode, state) {
@@ -4914,8 +4999,6 @@ mod tests {
             .len(),
             0
         );
-
-        Ok(())
     }
 
     #[test]
@@ -4969,9 +5052,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn proves_object_create_carrier_getter_delegation() -> TestResult {
-        let source = r#"
+    const CARRIER_DELEGATION_SOURCE: &str = r#"
             let outer_phase;
             const Seed = {};
             const Maker = Seed.constructor;
@@ -5046,139 +5127,140 @@ mod tests {
             function run(state) { return access(state, 7); }
             new C();
         "#;
-        let allocator = Allocator::default();
-        let parsed = parse_program(&allocator, source, SourceType::cjs());
-        assert!(parsed.is_clean());
-        let semantic = SemanticBuilder::new()
-            .with_build_nodes(true)
-            .with_cfg(true)
-            .build(&parsed.program);
-        assert!(semantic.diagnostics.is_empty());
-        let scoping = semantic.semantic.scoping();
-        let flow = structurally_proven_origin_flow(&parsed.program, scoping, &test_budget())
-            .test_value("origin flow")?;
-        let start = source_offset(source, "make(\n                    48", "factory call")?;
-        let call = flow
-            .direct_calls
-            .iter()
-            .find(|call| call.call_start == start)
-            .test_value("origin factory call")?;
-        let factory =
-            proven_slow_lazy_cell_factory_call(source, &parsed.program, &semantic.semantic, call)
-                .test_value("slow-cell factory")?;
-        let registry = proven_slow_lazy_cell_registry_assignment(
-            &parsed.program,
-            &semantic.semantic,
-            &factory,
-        )
-        .test_value("registry assignment")?;
-        let exact = proven_slow_lazy_cell_exact_registry_assignments(
-            source,
-            &parsed.program,
-            &semantic.semantic,
-            &flow,
-            &registry,
-        )
-        .into_iter()
-        .find(|proof| proof.exact_key_value == 7)
-        .test_value("exact assignment")?;
-        let fields = proven_slow_lazy_cell_state_fields_for_exact_assignment(
-            source,
-            &parsed.program,
-            &semantic.semantic,
-            &exact,
-            &test_budget(),
-        )
-        .test_value("path state fields budget")?
-        .test_value("path state fields")?;
-        let reads =
-            structurally_proven_lazy_registry_read_calls(&parsed.program, scoping, &test_budget())
-                .test_value("lazy registry proof")?;
-        let accessor = reads.first().test_value("lazy accessor")?;
-        let carrier = proven_slow_lazy_cell_prototype_carrier(
-            source,
-            &parsed.program,
-            &semantic.semantic,
-            &fields,
-            accessor,
-            &test_budget(),
-        )
-        .test_value("prototype carrier budget")?
-        .test_value("prototype carrier")?;
-        assert_eq!(carrier.method_name, "create");
-        assert_eq!(carrier.projection_property, "prototype");
-        assert_eq!(carrier.resolver_property, "resolve");
-        assert!(carrier.standard_object_prototype_semantics_required);
 
-        let update =
-            proven_slow_lazy_cell_update_state(&parsed.program, &semantic.semantic, &factory)
-                .test_value("update state")?;
-        let installs = proven_origin_registry_handler_installs(
-            &parsed.program,
-            scoping,
-            &flow,
+    fn capture_exact_handler(
+        source: &str,
+        program: &oxc_ast::ast::Program<'_>,
+        semantic: &oxc_semantic::Semantic<'_>,
+        flow: &crate::receiver_identity::ProvenOriginFlow,
+        exact: &super::ProvenSlowLazyCellExactRegistryAssignment,
+    ) -> Result<
+        (
+            crate::registry_identity::ProvenOriginRegistryHandlerInstall,
+            super::ProvenSlowLazyCellCapturedHandlerInstall,
+        ),
+        TestFailure,
+    > {
+        let install = proven_origin_registry_handler_installs(
+            program,
+            semantic.scoping(),
+            flow,
             &test_budget(),
         )
-        .test_value("proven_origin_registry_handler_installs")?;
-        let install = installs
-            .iter()
-            .find(|install| install.exact_key == 7)
-            .test_value("logical handler install")?;
+        .test_value("proven_origin_registry_handler_installs")?
+        .into_iter()
+        .find(|install| install.exact_key == exact.exact_key_value)
+        .test_value("logical handler install")?;
         let captured = proven_slow_lazy_cell_captured_handler_install(
-            source,
-            &parsed.program,
-            &semantic.semantic,
-            &exact,
-            install,
+            source, program, semantic, exact, &install,
         )
         .test_value("captured handler")?;
-        let values =
-            proven_origin_registry_value_installs(&parsed.program, scoping, &flow, &test_budget())
-                .test_value("proven_origin_registry_value_installs")?;
+        Ok((install, captured))
+    }
+
+    fn assert_generic_handler_capture(
+        source: &str,
+        program: &oxc_ast::ast::Program<'_>,
+        semantic: &oxc_semantic::Semantic<'_>,
+        flow: &crate::receiver_identity::ProvenOriginFlow,
+        exact: &super::ProvenSlowLazyCellExactRegistryAssignment,
+        install: &crate::registry_identity::ProvenOriginRegistryHandlerInstall,
+        captured: &super::ProvenSlowLazyCellCapturedHandlerInstall,
+    ) -> TestResult {
+        let scoping = semantic.scoping();
+        let values = proven_origin_registry_value_installs(program, scoping, flow, &test_budget())
+            .test_value("proven_origin_registry_value_installs")?;
         let value = values
             .iter()
             .find(|value| {
                 value.exact_key == install.exact_key
                     && value.install.call_start == install.install.call_start
                     && value.install.call_end == install.install.call_end
-                    && value.install.value_start == install.install.handler_start
-                    && value.install.value_end == install.install.handler_end
+                    && Span::new(value.install.value_start, value.install.value_end)
+                        == Span::new(install.install.handler_start, install.install.handler_end)
             })
             .test_value("same generic value install")?;
-        let captured_value = proven_slow_lazy_cell_captured_value_install(
-            source,
-            &parsed.program,
-            &semantic.semantic,
-            &exact,
-            value,
-        )
-        .test_value("captured generic handler value")?;
+        let captured_value =
+            proven_slow_lazy_cell_captured_value_install(source, program, semantic, exact, value)
+                .test_value("captured generic handler value")?;
         let specialized =
             proven_slow_lazy_cell_captured_handler_from_value(&captured_value, install)
                 .test_value("handler specialization")?;
-        assert_eq!(specialized, captured);
-        let resolver_index_proof = proven_slow_lazy_cell_resolver_index(
-            source,
-            &parsed.program,
-            &semantic.semantic,
-            &update,
-            SlowLazyCellResolverIndexFacts {
-                selector: Span::new(accessor.selector_start, accessor.selector_end),
-                selector_key_symbol: accessor.selector_key_symbol,
-                exact_assignment: &exact,
-                phase_value: 23,
-            },
-        )
-        .test_value("resolver slot")?;
-        let resolved_handler_proof =
-            proven_slow_lazy_cell_resolved_handler(&resolver_index_proof, &captured)
-                .test_value("resolved handler")?;
-        let read = structurally_compatible_slow_lazy_cell_read(&resolved_handler_proof, &carrier)
-            .test_value("end-to-end lazy read")?;
-        assert_eq!(read.resolved_handler.resolver.exact_key_value, 7);
-        assert_eq!(read.resolved_handler.resolver.handler_slot, 6);
-
+        assert_eq!(&specialized, captured);
         Ok(())
+    }
+
+    #[test]
+    fn proves_object_create_carrier_getter_delegation() -> TestResult {
+        let source = CARRIER_DELEGATION_SOURCE;
+        with_factory_fixture(source, |program, semantic, flow, factory, registry| {
+            let scoping = semantic.scoping();
+
+            let exact = proven_slow_lazy_cell_exact_registry_assignments(
+                source, program, semantic, flow, &registry,
+            )
+            .into_iter()
+            .find(|proof| proof.exact_key_value == 7)
+            .test_value("exact assignment")?;
+            let fields = proven_slow_lazy_cell_state_fields_for_exact_assignment(
+                source,
+                program,
+                semantic,
+                &exact,
+                &test_budget(),
+            )
+            .test_value("path state fields budget")?
+            .test_value("path state fields")?;
+            let reads =
+                structurally_proven_lazy_registry_read_calls(program, scoping, &test_budget())
+                    .test_value("lazy registry proof")?;
+            let accessor = reads.first().test_value("lazy accessor")?;
+            let carrier = proven_slow_lazy_cell_prototype_carrier(
+                source,
+                program,
+                semantic,
+                &fields,
+                accessor,
+                &test_budget(),
+            )
+            .test_value("prototype carrier budget")?
+            .test_value("prototype carrier")?;
+            assert_eq!(carrier.method_name, "create");
+            assert_eq!(carrier.projection_property, "prototype");
+            assert_eq!(carrier.resolver_property, "resolve");
+            assert!(carrier.standard_object_prototype_semantics_required);
+
+            let update = proven_slow_lazy_cell_update_state(program, semantic, &factory)
+                .test_value("update state")?;
+            let (install, captured) =
+                capture_exact_handler(source, program, semantic, flow, &exact)?;
+            assert_generic_handler_capture(
+                source, program, semantic, flow, &exact, &install, &captured,
+            )?;
+            let resolver_index_proof = proven_slow_lazy_cell_resolver_index(
+                source,
+                program,
+                semantic,
+                &update,
+                SlowLazyCellResolverIndexFacts {
+                    selector: Span::new(accessor.selector_start, accessor.selector_end),
+                    selector_key_symbol: accessor.selector_key_symbol,
+                    exact_assignment: &exact,
+                    phase_value: 23,
+                },
+            )
+            .test_value("resolver slot")?;
+            let resolved_handler_proof =
+                proven_slow_lazy_cell_resolved_handler(&resolver_index_proof, &captured)
+                    .test_value("resolved handler")?;
+            let read =
+                structurally_compatible_slow_lazy_cell_read(&resolved_handler_proof, &carrier)
+                    .test_value("end-to-end lazy read")?;
+            assert_eq!(read.resolved_handler.resolver.exact_key_value, 7);
+            assert_eq!(read.resolved_handler.resolver.handler_slot, 6);
+
+            Ok(())
+        })
     }
 
     #[test]
@@ -5250,9 +5332,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn proves_real_style_resolver_index_cancellation() -> TestResult {
-        let source = r"
+    const RESOLVER_CANCELLATION_SOURCE: &str = r"
             let outer_phase;
             const C = function() { enter(this); };
             function enter(state) {
@@ -5301,82 +5381,11 @@ mod tests {
             }
             new C();
         ";
-        let allocator = Allocator::default();
-        let parsed = parse_program(&allocator, source, SourceType::cjs());
-        assert!(parsed.is_clean());
-        let semantic = SemanticBuilder::new()
-            .with_build_nodes(true)
-            .with_cfg(true)
-            .build(&parsed.program);
-        assert!(semantic.diagnostics.is_empty());
-        let scoping = semantic.semantic.scoping();
-        let flow = structurally_proven_origin_flow(&parsed.program, scoping, &test_budget())
-            .test_value("origin flow")?;
-        let start = source_offset(source, "make(\n                    48", "call")?;
-        let call = flow
-            .direct_calls
-            .iter()
-            .find(|call| call.call_start == start)
-            .test_value("origin call")?;
-        let factory =
-            proven_slow_lazy_cell_factory_call(source, &parsed.program, &semantic.semantic, call)
-                .test_value("factory proof")?;
-        let update =
-            proven_slow_lazy_cell_update_state(&parsed.program, &semantic.semantic, &factory)
-                .test_value("update proof")?;
 
-        let registry = proven_slow_lazy_cell_registry_assignment(
-            &parsed.program,
-            &semantic.semantic,
-            &factory,
-        )
-        .test_value("registry assignment")?;
-        assert_eq!(registry.registry_path, vec!["T"]);
-        assert_eq!(registry.factory_key_parameter_index, 4);
-        let exact_assignments = proven_slow_lazy_cell_exact_registry_assignments(
-            source,
-            &parsed.program,
-            &semantic.semantic,
-            &flow,
-            &registry,
-        );
-        assert_eq!(
-            exact_assignments
-                .iter()
-                .map(|proof| proof.exact_key_value)
-                .collect::<Vec<_>>(),
-            vec![7, 1_000_000]
-        );
-        let exact_seven = exact_assignments
-            .iter()
-            .find(|proof| proof.exact_key_value == 7)
-            .test_value("small exact key")?;
-        let exact_large = exact_assignments
-            .iter()
-            .find(|proof| proof.exact_key_value == 1_000_000)
-            .test_value("large exact key")?;
-        let origin_installs = proven_origin_registry_handler_installs(
-            &parsed.program,
-            scoping,
-            &flow,
-            &test_budget(),
-        )
-        .test_value("proven_origin_registry_handler_installs")?;
-        let install_seven = origin_installs
-            .iter()
-            .find(|install| install.exact_key == 7)
-            .test_value("logical install")?;
-        let captured_handler = proven_slow_lazy_cell_captured_handler_install(
-            source,
-            &parsed.program,
-            &semantic.semantic,
-            exact_seven,
-            install_seven,
-        )
-        .test_value("captured logical handler")?;
-
-        let selector = parsed
-            .program
+    fn fixture_selector(
+        program: &oxc_ast::ast::Program<'_>,
+    ) -> Result<(Span, oxc_syntax::symbol::SymbolId), TestFailure> {
+        let selector = program
             .body
             .iter()
             .find_map(|statement| match statement {
@@ -5409,51 +5418,86 @@ mod tests {
         let selector_expression = ret.argument.as_ref().test_value("selector expression")?;
         let selector_span = selector_expression.span();
 
-        let proof = proven_slow_lazy_cell_resolver_index(
-            source,
-            &parsed.program,
-            &semantic.semantic,
-            &update,
-            SlowLazyCellResolverIndexFacts {
-                selector: selector_span,
-                selector_key_symbol,
-                exact_assignment: exact_seven,
-                phase_value: 23,
-            },
-        )
-        .test_value("resolver cancellation")?;
-        assert_eq!(proof.handler_slot, 6);
-        let resolved = proven_slow_lazy_cell_resolved_handler(&proof, &captured_handler)
-            .test_value("resolved original handler")?;
-        assert_eq!(resolved.captured_handler.install.exact_key, 7);
-        assert!(proven_slow_lazy_cell_resolver_index(
-            source,
-            &parsed.program,
-            &semantic.semantic,
-            &update,
-            SlowLazyCellResolverIndexFacts {
-                selector: selector_span,
-                selector_key_symbol,
-                exact_assignment: exact_seven,
-                phase_value: 50,
-            },
-        )
-        .is_none());
-        assert!(proven_slow_lazy_cell_resolver_index(
-            source,
-            &parsed.program,
-            &semantic.semantic,
-            &update,
-            SlowLazyCellResolverIndexFacts {
-                selector: selector_span,
-                selector_key_symbol,
-                exact_assignment: exact_large,
-                phase_value: 23,
-            },
-        )
-        .is_none());
+        Ok((selector_span, selector_key_symbol))
+    }
 
-        Ok(())
+    #[test]
+    fn proves_real_style_resolver_index_cancellation() -> TestResult {
+        let source = RESOLVER_CANCELLATION_SOURCE;
+        with_factory_fixture(source, |program, semantic, flow, factory, registry| {
+            let update = proven_slow_lazy_cell_update_state(program, semantic, &factory)
+                .test_value("update proof")?;
+
+            assert_eq!(registry.registry_path, vec!["T"]);
+            assert_eq!(registry.factory_key_parameter_index, 4);
+            let exact_assignments = proven_slow_lazy_cell_exact_registry_assignments(
+                source, program, semantic, flow, &registry,
+            );
+            assert_eq!(
+                exact_assignments
+                    .iter()
+                    .map(|proof| proof.exact_key_value)
+                    .collect::<Vec<_>>(),
+                vec![7, 1_000_000]
+            );
+            let exact_seven = exact_assignments
+                .iter()
+                .find(|proof| proof.exact_key_value == 7)
+                .test_value("small exact key")?;
+            let exact_large = exact_assignments
+                .iter()
+                .find(|proof| proof.exact_key_value == 1_000_000)
+                .test_value("large exact key")?;
+            let (_, captured_handler) =
+                capture_exact_handler(source, program, semantic, flow, exact_seven)?;
+
+            let (selector_span, selector_key_symbol) = fixture_selector(program)?;
+            let proof = proven_slow_lazy_cell_resolver_index(
+                source,
+                program,
+                semantic,
+                &update,
+                SlowLazyCellResolverIndexFacts {
+                    selector: selector_span,
+                    selector_key_symbol,
+                    exact_assignment: exact_seven,
+                    phase_value: 23,
+                },
+            )
+            .test_value("resolver cancellation")?;
+            assert_eq!(proof.handler_slot, 6);
+            let resolved = proven_slow_lazy_cell_resolved_handler(&proof, &captured_handler)
+                .test_value("resolved original handler")?;
+            assert_eq!(resolved.captured_handler.install.exact_key, 7);
+            assert!(proven_slow_lazy_cell_resolver_index(
+                source,
+                program,
+                semantic,
+                &update,
+                SlowLazyCellResolverIndexFacts {
+                    selector: selector_span,
+                    selector_key_symbol,
+                    exact_assignment: exact_seven,
+                    phase_value: 50,
+                },
+            )
+            .is_none());
+            assert!(proven_slow_lazy_cell_resolver_index(
+                source,
+                program,
+                semantic,
+                &update,
+                SlowLazyCellResolverIndexFacts {
+                    selector: selector_span,
+                    selector_key_symbol,
+                    exact_assignment: exact_large,
+                    phase_value: 23,
+                },
+            )
+            .is_none());
+
+            Ok(())
+        })
     }
 
     #[test]
@@ -5810,7 +5854,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_factory_when_phase_value_is_local() -> TestResult {
+    fn rejects_factory_when_phase_value_is_local() {
         assert_eq!(
             shapes(
                 r"
@@ -5829,7 +5873,5 @@ mod tests {
             .len(),
             0
         );
-
-        Ok(())
     }
 }

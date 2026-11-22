@@ -60,7 +60,7 @@ fn compared_number(expr: &Expression<'_>, strict: bool) -> Option<f64> {
     let value = eval(expr)?;
     match value {
         Value::Number(number) => Some(number),
-        Value::String(_) | Value::Bool(_) if !strict => value.number(),
+        Value::String(_) | Value::Bool(_) if !strict => Some(value.number()),
         _ => None,
     }
 }

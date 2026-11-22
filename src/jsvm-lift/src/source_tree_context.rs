@@ -219,65 +219,39 @@ fn handler_free_references(source: &str) -> Result<BTreeSet<String>> {
         .collect())
 }
 
-/// Bind references from extracted handlers to uniquely named original source
-/// declarations, and follow *exact* resolved symbols inside those declarations.
-///
-/// The entrypoint matches by unique name because a standalone extracted
-/// function no longer carries its old lexical IDs. After that initial join,
-/// traversal stays inside the original semantic symbol graph.
-///
-/// # Errors
-///
-/// Rejects invalid original JavaScript and propagates contextual handler/source-validation
-/// failures; missing or ambiguous joins are handled without inventing source identities.
-pub fn reconstruct_context(
-    original: &str,
-    handler_sources: &[(String, String)],
-) -> Result<ContextSourceTree> {
-    let allocator = Allocator::default();
-    let parsed = parse_program(&allocator, original, SourceType::unambiguous());
-    ensure!(
-        parsed.is_clean(),
-        "original context is not valid JavaScript"
-    );
-    let semantic = SemanticBuilder::new().build(&parsed.program);
-    let scoping = semantic.semantic.scoping();
+struct DefinitionIndex {
+    by_name: BTreeMap<String, Vec<Definition>>,
+    by_symbol: BTreeMap<SymbolId, Definition>,
+}
 
-    let mut definitions = DefinitionVisitor::default();
-    definitions.visit_program(&parsed.program);
-    let mut by_name: BTreeMap<String, Vec<Definition>> = BTreeMap::new();
-    let mut by_symbol = BTreeMap::new();
-    for definition in definitions.definitions {
-        by_symbol.insert(definition.symbol, definition.clone());
-        by_name
-            .entry(definition.name.clone())
-            .or_default()
-            .push(definition);
+impl DefinitionIndex {
+    fn collect(program: &oxc_ast::ast::Program<'_>) -> Self {
+        let mut definitions = DefinitionVisitor::default();
+        definitions.visit_program(program);
+        let mut by_name: BTreeMap<String, Vec<Definition>> = BTreeMap::new();
+        let mut by_symbol = BTreeMap::new();
+        for definition in definitions.definitions {
+            by_symbol.insert(definition.symbol, definition.clone());
+            by_name
+                .entry(definition.name.clone())
+                .or_default()
+                .push(definition);
+        }
+
+        Self { by_name, by_symbol }
     }
+}
 
-    let function_names = by_symbol
-        .values()
-        .map(|definition| {
-            (
-                (definition.value_span.start, definition.value_span.end),
-                definition.name.clone(),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    let mut mutations = MutationCollector {
-        scoping,
-        function_names: &function_names,
-        functions: Vec::new(),
-        operations: Vec::new(),
-        writes: BTreeMap::new(),
-    };
-    mutations.visit_program(&parsed.program);
-    let mut references = ReferenceVisitor {
-        scoping,
-        references: Vec::new(),
-    };
-    references.visit_program(&parsed.program);
+struct HandlerSeeds {
+    queue: VecDeque<SymbolId>,
+    handlers: Vec<HandlerContext>,
+    unmatched_names: BTreeSet<String>,
+}
 
+fn handler_seeds(
+    handler_sources: &[(String, String)],
+    by_name: &BTreeMap<String, Vec<Definition>>,
+) -> Result<HandlerSeeds> {
     let mut queue = VecDeque::new();
     let mut handlers = Vec::new();
     let mut unmatched_names = BTreeSet::new();
@@ -303,6 +277,66 @@ pub fn reconstruct_context(
         });
     }
 
+    Ok(HandlerSeeds {
+        queue,
+        handlers,
+        unmatched_names,
+    })
+}
+
+/// Bind references from extracted handlers to uniquely named original source
+/// declarations, and follow *exact* resolved symbols inside those declarations.
+///
+/// The entrypoint matches by unique name because a standalone extracted
+/// function no longer carries its old lexical IDs. After that initial join,
+/// traversal stays inside the original semantic symbol graph.
+///
+/// # Errors
+///
+/// Rejects invalid original JavaScript and propagates contextual handler/source-validation
+/// failures; missing or ambiguous joins are handled without inventing source identities.
+pub fn reconstruct_context(
+    original: &str,
+    handler_sources: &[(String, String)],
+) -> Result<ContextSourceTree> {
+    let allocator = Allocator::default();
+    let parsed = parse_program(&allocator, original, SourceType::unambiguous());
+    ensure!(
+        parsed.is_clean(),
+        "original context is not valid JavaScript"
+    );
+    let semantic = SemanticBuilder::new().build(&parsed.program);
+    let scoping = semantic.semantic.scoping();
+
+    let DefinitionIndex { by_name, by_symbol } = DefinitionIndex::collect(&parsed.program);
+    let function_names = by_symbol
+        .values()
+        .map(|definition| {
+            (
+                (definition.value_span.start, definition.value_span.end),
+                definition.name.clone(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut mutations = MutationCollector {
+        scoping,
+        function_names: &function_names,
+        functions: Vec::new(),
+        operations: Vec::new(),
+        writes: BTreeMap::new(),
+    };
+    mutations.visit_program(&parsed.program);
+    let mut references = ReferenceVisitor {
+        scoping,
+        references: Vec::new(),
+    };
+    references.visit_program(&parsed.program);
+
+    let HandlerSeeds {
+        mut queue,
+        handlers,
+        unmatched_names,
+    } = handler_seeds(handler_sources, &by_name)?;
     let mut visited = BTreeSet::new();
     let mut helpers = Vec::new();
     while let Some(symbol) = queue.pop_front() {
@@ -465,14 +499,13 @@ impl<'a> Visit<'a> for HandlerCallAnnotator<'_> {
                                         self.specialized.get(&(name.to_owned(), constants.clone()))
                                     {
                                         details.push(format!(
-                                            "specialized at {} => {}{}",
+                                            "specialized at {} => {}{path}",
                                             constants
                                                 .iter()
                                                 .map(|(index, value)| format!("arg{index}={value}"))
                                                 .collect::<Vec<_>>()
                                                 .join(", "),
-                                            self.helper_prefix,
-                                            path
+                                            self.helper_prefix
                                         ));
                                     }
                                 }
@@ -842,7 +875,7 @@ mod tests {
         let shadowed = context
             .helpers
             .iter()
-            .find(|helper| helper.name == "Hm" && helper.source.contains("3"))
+            .find(|helper| helper.name == "Hm" && helper.source.contains('3'))
             .context("missing shadowed Hm")?;
         assert_eq!(shadowed.write_sites.len(), 1);
         assert_eq!(

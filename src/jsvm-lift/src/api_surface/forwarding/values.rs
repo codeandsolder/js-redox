@@ -1,11 +1,15 @@
 //! Materialized value origins and bounded positional argument construction.
 use super::super::{
     callables::{ForwardedValue, PositionalArguments},
-    *,
+    expression_symbol, literal_data_key, unparenthesized, Expression, GetSpan, ObjectPropertyKind,
+    ProvenConstantEnvironment, Result, Scoping, Span, StaticPrimitiveValue, SymbolId, WorkBudget,
 };
 use jsvm_safe_core::eval_static_primitive_with_resolver;
 use oxc_ast::ast::{Argument, ArrayExpression, ArrayExpressionElement};
-use std::{collections::BTreeMap, rc::Rc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    rc::Rc,
+};
 
 pub(super) type ArgumentList<'a> = PositionalArguments<'a, 'a>;
 pub(super) type ValueFrame<'a> = BTreeMap<SymbolId, ForwardedValue<'a, 'a>>;
@@ -20,11 +24,11 @@ pub(super) struct ValueBuilder<'s, 'a> {
     constants: &'s ProvenConstantEnvironment,
     limit: usize,
     pub(super) budget: &'s WorkBudget,
-    pub(super) used_iterator: bool,
+    used_iterator: bool,
 }
 
 impl<'s, 'a> ValueBuilder<'s, 'a> {
-    pub(super) fn new(
+    pub(super) const fn new(
         frame: Option<ValueFrame<'a>>,
         scoping: &'s Scoping,
         constants: &'s ProvenConstantEnvironment,
@@ -38,6 +42,14 @@ impl<'s, 'a> ValueBuilder<'s, 'a> {
             limit,
             budget,
             used_iterator: false,
+        }
+    }
+
+    /// Any spread that consumes known array positions still relies on the
+    /// standard iterator. Keep this proof dependency with value construction.
+    pub(super) fn record_dependencies(&self, dependencies: &mut BTreeSet<String>) {
+        if self.used_iterator {
+            dependencies.insert("rest_iterator".into());
         }
     }
 
@@ -177,7 +189,7 @@ impl<'s, 'a> ValueBuilder<'s, 'a> {
         Ok(())
     }
 
-    fn full(&self, result: &mut ArgumentList<'a>, span: Span) -> bool {
+    const fn full(&self, result: &mut ArgumentList<'a>, span: Span) -> bool {
         if result.values.len() >= self.limit {
             result.unknown_tail = Some(span);
         }
@@ -212,7 +224,7 @@ impl<'s, 'a> ValueBuilder<'s, 'a> {
             }
             match element {
                 ArrayExpressionElement::Elision(_) => {
-                    result.values.push(ForwardedValue::Unknown(None))
+                    result.values.push(ForwardedValue::Unknown(None));
                 }
                 ArrayExpressionElement::SpreadElement(spread) => {
                     self.spread(&mut result, &spread.argument, spread.span)?;

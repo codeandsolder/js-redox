@@ -511,6 +511,100 @@ fn provider_tail(
     provider_installation(installation, provider, table, scoping, facts)
 }
 
+struct ProviderTable {
+    table: SymbolId,
+    values: LocalStaticArrayInfo,
+    installation: ReferenceId,
+}
+
+/// A zero-argument provider must allocate a dense literal table before
+/// installing the exact returning replacement.
+fn literal_provider_table(
+    statements: &[Statement<'_>],
+    provider: SymbolId,
+    scoping: &Scoping,
+    facts: &BindingFacts,
+) -> Option<ProviderTable> {
+    let (first, tail) = statements.split_first()?;
+    let Statement::VariableDeclaration(declaration) = first else {
+        return None;
+    };
+    if !rotation_proof::ordinary_declaration(declaration) {
+        return None;
+    }
+    let [declarator] = declaration.declarations.as_slice() else {
+        return None;
+    };
+    let table = declarator.id.get_binding_identifier()?.symbol_id.get()?;
+    let Expression::ArrayExpression(array) = unparenthesized(declarator.init.as_ref()?) else {
+        return None;
+    };
+    let values = array
+        .elements
+        .iter()
+        .map(array_element)
+        .collect::<Option<Vec<_>>>()?;
+    if values.is_empty() || !facts.binding_has_stable_value(scoping, table) {
+        return None;
+    }
+    let installation = provider_tail(tail, provider, table, scoping, facts)?;
+    Some(ProviderTable {
+        table,
+        values: LocalStaticArrayInfo {
+            values,
+            span: array.span,
+        },
+        installation,
+    })
+}
+
+/// A parameter-initializing provider permits exactly the table assignment,
+/// self-installation and tail invocation. The sole table write is proved.
+fn split_provider_table(
+    statements: &[Statement<'_>],
+    table: SymbolId,
+    provider: SymbolId,
+    scoping: &Scoping,
+    facts: &BindingFacts,
+) -> Option<ProviderTable> {
+    let [Statement::ReturnStatement(ret)] = statements else {
+        return None;
+    };
+    let Expression::SequenceExpression(sequence) = unparenthesized(ret.argument.as_ref()?) else {
+        return None;
+    };
+    let [assign, install, tail] = sequence.expressions.as_slice() else {
+        return None;
+    };
+    let (target, value) = assignment_identifier(assign)?;
+    let reference = target.reference_id.get()?;
+    if facts.resolved_symbol(scoping, reference) != Some(table)
+        || !scoping.get_reference(reference).is_write()
+        || exact_identifier(zero_argument_call(tail)?, scoping, facts) != Some(provider)
+        || !scoping
+            .get_resolved_reference_ids(table)
+            .iter()
+            .all(|&candidate| {
+                candidate == reference
+                    || (scoping.get_reference(candidate).is_read()
+                        && !scoping.get_reference(candidate).is_write()
+                        && !scoping
+                            .get_reference(candidate)
+                            .flags()
+                            .is_member_write_target()
+                        && facts.resolved_symbol(scoping, candidate) == Some(table))
+            })
+    {
+        return None;
+    }
+    let values = static_string_split(value)?;
+    Some(ProviderTable {
+        table,
+        values,
+        installation: provider_installation(install, provider, table, scoping, facts)?,
+    })
+}
+
 fn self_rewriting_provider(
     function: &oxc_ast::ast::Function<'_>,
     scoping: &Scoping,
@@ -534,84 +628,19 @@ fn self_rewriting_provider(
     if !body.directives.is_empty() {
         return None;
     }
-    let (table, values, installation) = match function.params.items.as_slice() {
-        [] => {
-            let (first, tail) = body.statements.split_first()?;
-            let Statement::VariableDeclaration(declaration) = first else {
-                return None;
-            };
-            if !rotation_proof::ordinary_declaration(declaration) {
-                return None;
-            }
-            let [declarator] = declaration.declarations.as_slice() else {
-                return None;
-            };
-            let table = declarator.id.get_binding_identifier()?.symbol_id.get()?;
-            let Expression::ArrayExpression(array) = unparenthesized(declarator.init.as_ref()?)
-            else {
-                return None;
-            };
-            let values = array
-                .elements
-                .iter()
-                .map(array_element)
-                .collect::<Option<Vec<_>>>()?;
-            if values.is_empty() || !facts.binding_has_stable_value(scoping, table) {
-                return None;
-            }
-            let installation = provider_tail(tail, provider, table, scoping, facts)?;
-            (
-                table,
-                LocalStaticArrayInfo {
-                    values,
-                    span: array.span,
-                },
-                installation,
-            )
-        }
+    let ProviderTable {
+        table,
+        values,
+        installation,
+    } = match function.params.items.as_slice() {
+        [] => literal_provider_table(&body.statements, provider, scoping, facts)?,
         [parameter] => {
             let table = parameter
                 .pattern
                 .get_binding_identifier()?
                 .symbol_id
                 .get()?;
-            let [Statement::ReturnStatement(ret)] = body.statements.as_slice() else {
-                return None;
-            };
-            let Expression::SequenceExpression(sequence) = unparenthesized(ret.argument.as_ref()?)
-            else {
-                return None;
-            };
-            let [assign, install, tail] = sequence.expressions.as_slice() else {
-                return None;
-            };
-            let (target, value) = assignment_identifier(assign)?;
-            let reference = target.reference_id.get()?;
-            if facts.resolved_symbol(scoping, reference) != Some(table)
-                || !scoping.get_reference(reference).is_write()
-                || exact_identifier(zero_argument_call(tail)?, scoping, facts) != Some(provider)
-                || !scoping
-                    .get_resolved_reference_ids(table)
-                    .iter()
-                    .all(|&candidate| {
-                        candidate == reference
-                            || (scoping.get_reference(candidate).is_read()
-                                && !scoping.get_reference(candidate).is_write()
-                                && !scoping
-                                    .get_reference(candidate)
-                                    .flags()
-                                    .is_member_write_target()
-                                && facts.resolved_symbol(scoping, candidate) == Some(table))
-                    })
-            {
-                return None;
-            }
-            let values = static_string_split(value)?;
-            (
-                table,
-                values,
-                provider_installation(install, provider, table, scoping, facts)?,
-            )
+            split_provider_table(&body.statements, table, provider, scoping, facts)?
         }
         _ => return None,
     };
@@ -1080,7 +1109,7 @@ fn eval_from_char_code_concat(
                 .iter()
                 .map(|argument| {
                     let expression = argument.as_expression()?;
-                    let number = eval(expression)?.number()?;
+                    let number = eval(expression)?.number();
                     Some((js_to_uint32(number) & 0xffff) as u16)
                 })
                 .collect::<Option<Vec<_>>>()?;
@@ -1820,27 +1849,23 @@ pub struct Decoder {
 impl DecoderTransform {
     fn transform_value(&self, value: Value, key: Option<&str>) -> Option<Value> {
         match (self, value) {
-            (DecoderTransform::LowerAlphabetBase64Uri, Value::String(encoded)) => {
+            (Self::LowerAlphabetBase64Uri, Value::String(encoded)) => {
                 decode_lower_alphabet_base64_uri(&encoded).map(Value::String)
             }
-            (DecoderTransform::LowerAlphabetBase64Rc4, Value::String(encoded)) => {
+            (Self::LowerAlphabetBase64Rc4, Value::String(encoded)) => {
                 decode_lower_alphabet_base64_rc4(&encoded, key?).map(Value::String)
             }
-            (DecoderTransform::StandardBase64, Value::String(encoded)) => {
+            (Self::StandardBase64, Value::String(encoded)) => {
                 decode_standard_base64_latin1(&encoded).map(Value::String)
             }
-            (DecoderTransform::FixedBase64Alphabet(alphabet), Value::String(encoded)) => {
+            (Self::FixedBase64Alphabet(alphabet), Value::String(encoded)) => {
                 decode_fixed_base64_latin1(&encoded, alphabet).map(Value::String)
             }
             (
-                DecoderTransform::LowerAlphabetBase64Uri
-                | DecoderTransform::LowerAlphabetBase64Rc4
-                | DecoderTransform::StandardBase64,
+                Self::LowerAlphabetBase64Uri | Self::LowerAlphabetBase64Rc4 | Self::StandardBase64,
                 _,
             ) => None,
-            (DecoderTransform::Plain | DecoderTransform::FixedBase64Alphabet(_), value) => {
-                Some(value)
-            }
+            (Self::Plain | Self::FixedBase64Alphabet(_), value) => Some(value),
         }
     }
 }
@@ -1911,16 +1936,17 @@ pub fn decoder_call_rewrite(
         None => None,
     };
     let argument = call.arguments.first()?;
-    let primitive_number = |expression: &Expression<'_>| eval(expression)?.number();
+    let primitive_number =
+        |expression: &Expression<'_>| eval(expression).map(|value| value.number());
     if let Some(raw) = argument.as_expression().and_then(primitive_number) {
-        return literal_decoder_rewrite(decoder.value_for_call(raw, key.as_deref())?);
+        return literal_decoder_rewrite(&decoder.value_for_call(raw, key.as_deref())?);
     }
     conditional_decoder_rewrite(source, argument, |expression| {
         decoder.value_for_call(primitive_number(expression)?, key.as_deref())
     })
 }
 
-fn literal_decoder_rewrite(value: Value) -> Option<DecoderCallRewrite> {
+fn literal_decoder_rewrite(value: &Value) -> Option<DecoderCallRewrite> {
     Some(DecoderCallRewrite {
         text: value.render_expression()?,
         stop: false,
@@ -2093,7 +2119,7 @@ impl DirectTableDecoder {
         }
         let argument = call.arguments.first()?;
         if let Some(value) = self.value(argument.as_expression()?) {
-            return literal_decoder_rewrite(value);
+            return literal_decoder_rewrite(&value);
         }
         conditional_decoder_rewrite(source, argument, |expression| self.value(expression))
     }
@@ -2278,12 +2304,10 @@ pub fn js_parse_int(text: &str, mut radix: u32) -> Option<f64> {
     }
     let hexadecimal = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X"));
     let text = if inferred || radix == 16 {
-        if let Some(rest) = hexadecimal {
+        hexadecimal.map_or(text, |rest| {
             radix = 16;
             rest
-        } else {
-            text
-        }
+        })
     } else {
         text
     };
@@ -2379,7 +2403,7 @@ fn guaranteed_expression_calls(expression: &Expression<'_>, visit: &mut impl FnM
         }
         Expression::LogicalExpression(logical) => guaranteed_expression_calls(&logical.left, visit),
         Expression::ConditionalExpression(conditional) => {
-            guaranteed_expression_calls(&conditional.test, visit)
+            guaranteed_expression_calls(&conditional.test, visit);
         }
         Expression::AssignmentExpression(assignment) if !assignment.operator.is_logical() => {
             guaranteed_expression_calls(&assignment.right, visit);
@@ -2450,10 +2474,10 @@ impl<'a> Visit<'a> for RotationStatementSpanCollector {
                         }
                     }
                     Statement::IfStatement(statement) => {
-                        guaranteed_expression_calls(&statement.test, &mut record)
+                        guaranteed_expression_calls(&statement.test, &mut record);
                     }
                     Statement::SwitchStatement(statement) => {
-                        guaranteed_expression_calls(&statement.discriminant, &mut record)
+                        guaranteed_expression_calls(&statement.discriminant, &mut record);
                     }
                     _ => {}
                 }
@@ -2635,6 +2659,77 @@ fn fixed_rotation_references_confined(
         })
 }
 
+struct FixedRotation<'a> {
+    rotation: &'a RotationIife,
+    amount: usize,
+}
+
+fn prove_fixed_decoder_rotation<'a>(
+    source: &str,
+    array: &StaticArrayInfo,
+    function: &FixedDirectDecoder,
+    rotations: &'a [RotationIife],
+    context: &DecoderBindingContext<'_>,
+) -> Result<Option<FixedRotation<'a>>, BudgetExceeded> {
+    let DecoderBindingContext {
+        scoping,
+        facts,
+        reference_spans,
+        budget,
+    } = *context;
+    let mut matching_rotations = rotations.iter().filter(|rotation| {
+        rotation.provider == array.symbol && rotation.statement_span.end <= function.span.start
+    });
+    let Some(rotation) = matching_rotations.next() else {
+        return Ok(None);
+    };
+    if matching_rotations.next().is_some() {
+        return Ok(None);
+    }
+    let Some(execution) = rotation.execution else {
+        return Ok(None);
+    };
+    if execution.owner != scoping.symbol_scope_id(array.symbol) {
+        return Ok(None);
+    }
+    for &reference in scoping.get_resolved_reference_ids(function.symbol) {
+        let Some(&span) = reference_spans.get(&reference) else {
+            return Ok(None);
+        };
+        let scope = scoping.get_reference(reference).scope_id();
+        if !facts.proves_execution_region_through_calls(
+            scoping,
+            execution.owner,
+            execution.after,
+            (scope, span),
+            budget,
+        )? {
+            return Ok(None);
+        }
+    }
+    let Some(amount) = fixed_count_rotation(rotation, array.values.len()) else {
+        return Ok(None);
+    };
+
+    // The table must become observable only through the proven rotation
+    // IIFE and the direct decoder. In particular, require the rotation
+    // to be adjacent to the literal declaration so pre-materializing the
+    // final table cannot change an intervening observation (including
+    // direct eval or another aliasing call).
+    let Some(between) = source.get(array.span.end as usize..rotation.statement_span.start as usize)
+    else {
+        return Ok(None);
+    };
+    if !between.chars().all(|ch| ch.is_whitespace() || ch == ';') {
+        return Ok(None);
+    }
+    if !fixed_rotation_references_confined(array, function, rotation, scoping) {
+        return Ok(None);
+    }
+
+    Ok(Some(FixedRotation { rotation, amount }))
+}
+
 fn detect_fixed_rotated_direct_decoders(
     source: &str,
     program: &oxc_ast::ast::Program<'_>,
@@ -2645,7 +2740,7 @@ fn detect_fixed_rotated_direct_decoders(
         scoping,
         facts,
         reference_spans,
-        budget,
+        ..
     } = *context;
     let arrays = all_static_arrays(program);
     let functions = fixed_direct_decoders(program, scoping, facts);
@@ -2686,65 +2781,11 @@ fn detect_fixed_rotated_direct_decoders(
             continue;
         }
         let offset = function.offset;
-        let matching_rotations = rotations
-            .iter()
-            .filter(|rotation| {
-                rotation.provider == array.symbol
-                    && rotation.statement_span.end <= function.span.start
-            })
-            .collect::<Vec<_>>();
-        if matching_rotations.len() != 1 {
-            continue;
-        }
-        let rotation = matching_rotations[0];
-        let Some(execution) = rotation.execution else {
-            continue;
-        };
-        if execution.owner != scoping.symbol_scope_id(array.symbol) {
-            continue;
-        }
-        let mut ordered = true;
-        for &reference in scoping.get_resolved_reference_ids(function.symbol) {
-            let Some(&span) = reference_spans.get(&reference) else {
-                ordered = false;
-                break;
-            };
-            let scope = scoping.get_reference(reference).scope_id();
-            if !facts.proves_execution_region_through_calls(
-                scoping,
-                execution.owner,
-                execution.after,
-                (scope, span),
-                budget,
-            )? {
-                ordered = false;
-                break;
-            }
-        }
-        if !ordered {
-            continue;
-        }
-        let Some(amount) = fixed_count_rotation(rotation, array.values.len()) else {
-            continue;
-        };
-
-        // The table must become observable only through the proven rotation
-        // IIFE and the direct decoder. In particular, require the rotation
-        // to be adjacent to the literal declaration so pre-materializing the
-        // final table cannot change an intervening observation (including
-        // direct eval or another aliasing call).
-        let Some(between) =
-            source.get(array.span.end as usize..rotation.statement_span.start as usize)
+        let Some(FixedRotation { rotation, amount }) =
+            prove_fixed_decoder_rotation(source, array, function, rotations, context)?
         else {
             continue;
         };
-        if !between.chars().all(|ch| ch.is_whitespace() || ch == ';') {
-            continue;
-        }
-        if !fixed_rotation_references_confined(array, function, rotation, scoping) {
-            continue;
-        }
-
         let mut values = array.values.clone();
         values.rotate_left(amount);
         let Some(array_text) = render_value_array(&values) else {
@@ -3315,6 +3356,87 @@ fn prove_rotation_order(
     Ok(())
 }
 
+fn retain_unobservable_installations(
+    functions: &[FnInfo],
+    program: &oxc_ast::ast::Program<'_>,
+    decoders: &mut HashMap<SymbolId, Decoder>,
+    context: &DecoderBindingContext<'_>,
+) -> Result<(), BudgetExceeded> {
+    // Pure return-value semantics do not justify deleting an observable
+    // self-installation. Classify source-local alias/call uses before proving
+    // rotations, because removing the setup can suppress installation too.
+    let installations = functions
+        .iter()
+        .filter_map(|function| {
+            let installation = function.plain_decoder.as_ref()?.installation?;
+            decoders
+                .contains_key(&function.symbol)
+                .then_some((function.symbol, installation))
+        })
+        .collect::<Vec<_>>();
+    if !installations.is_empty() {
+        let uses = callable_observation::CallableUses::collect(program, context);
+        for (symbol, installation) in installations {
+            if !uses.installation_unobservable(symbol, installation)? {
+                decoders.remove(&symbol);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn retain_confined_providers(
+    functions: &[FnInfo],
+    rotations: &[RotationIife],
+    decoders: &mut HashMap<SymbolId, Decoder>,
+    context: &DecoderBindingContext<'_>,
+) {
+    let DecoderBindingContext {
+        scoping,
+        reference_spans,
+        ..
+    } = *context;
+    // A self-installing provider returns the same mutable allocation to
+    // every caller. A reference outside its own installation, a proved
+    // decoder, or a recorded rotation can expose or mutate that table.
+    let mut allowed: HashMap<SymbolId, Vec<Span>> = HashMap::new();
+    for function in functions {
+        if function.provider.is_some() {
+            allowed
+                .entry(function.symbol)
+                .or_default()
+                .push(function.span);
+        }
+        if let Some(decoder) = decoders.get(&function.symbol) {
+            allowed
+                .entry(decoder.provider)
+                .or_default()
+                .push(function.span);
+        }
+    }
+    let rotation_references: HashSet<_> = rotations
+        .iter()
+        .map(|rotation| rotation.provider_reference)
+        .collect();
+    let invalid: HashSet<_> = allowed
+        .iter()
+        .filter_map(|(&provider, spans)| {
+            scoping
+                .get_resolved_reference_ids(provider)
+                .iter()
+                .any(|reference| {
+                    !rotation_references.contains(reference)
+                        && !reference_spans.get(reference).is_some_and(|span| {
+                            spans.iter().any(|region| span_contains(*region, *span))
+                        })
+                })
+                .then_some(provider)
+        })
+        .collect();
+    decoders.retain(|_, decoder| !invalid.contains(&decoder.provider));
+}
+
 fn detect_decoders(
     source: &str,
     functions: &[FnInfo],
@@ -3379,65 +3501,8 @@ fn detect_decoders(
         })
         .collect::<HashMap<_, _>>();
 
-    // Pure return-value semantics do not justify deleting an observable
-    // self-installation. Classify source-local alias/call uses before proving
-    // rotations, because removing the setup can suppress installation too.
-    let installations = functions
-        .iter()
-        .filter_map(|function| {
-            let installation = function.plain_decoder.as_ref()?.installation?;
-            decoders
-                .contains_key(&function.symbol)
-                .then_some((function.symbol, installation))
-        })
-        .collect::<Vec<_>>();
-    if !installations.is_empty() {
-        let uses = callable_observation::CallableUses::collect(program, context);
-        for (symbol, installation) in installations {
-            if !uses.installation_unobservable(symbol, installation)? {
-                decoders.remove(&symbol);
-            }
-        }
-    }
-
-    // A self-installing provider returns the same mutable allocation to
-    // every caller. A reference outside its own installation, a proved
-    // decoder, or a recorded rotation can expose or mutate that table.
-    let mut allowed: HashMap<SymbolId, Vec<Span>> = HashMap::new();
-    for function in functions {
-        if function.provider.is_some() {
-            allowed
-                .entry(function.symbol)
-                .or_default()
-                .push(function.span);
-        }
-        if let Some(decoder) = decoders.get(&function.symbol) {
-            allowed
-                .entry(decoder.provider)
-                .or_default()
-                .push(function.span);
-        }
-    }
-    let rotation_references: HashSet<_> = rotations
-        .iter()
-        .map(|rotation| rotation.provider_reference)
-        .collect();
-    let invalid: HashSet<_> = allowed
-        .iter()
-        .filter_map(|(&provider, spans)| {
-            scoping
-                .get_resolved_reference_ids(provider)
-                .iter()
-                .any(|reference| {
-                    !rotation_references.contains(reference)
-                        && !reference_spans.get(reference).is_some_and(|span| {
-                            spans.iter().any(|region| span_contains(*region, *span))
-                        })
-                })
-                .then_some(provider)
-        })
-        .collect();
-    decoders.retain(|_, decoder| !invalid.contains(&decoder.provider));
+    retain_unobservable_installations(functions, program, &mut decoders, context)?;
+    retain_confined_providers(functions, rotations, &mut decoders, context);
     prove_rotation_order(functions, rotations, &mut decoders, context)?;
     let RotationApplication {
         protected_spans,

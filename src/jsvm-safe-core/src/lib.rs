@@ -41,7 +41,7 @@ use control_flow::{
 use decoder::{analyze_decoders, decoder_call_rewrite, js_parse_int, static_decoder_pass, Decoder};
 pub use iteration_history::IterationCycle;
 use iteration_history::IterationHistory;
-pub use numeric::{exact_i64, exact_u32, exact_u64, exact_usize};
+pub use numeric::{exact_i64, exact_u32, exact_u64, exact_usize, js_number_equal};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, ArrayExpressionElement, BindingPattern, CallExpression, ComputedMemberExpression,
@@ -86,7 +86,7 @@ pub use base91_recovery::{
     Base91RecoveryResult,
 };
 
-#[must_use]
+#[must_use = "Use the decoded string only when decoding proves valid ASCII"]
 pub fn decode_base91_ascii(encoded: &str, alphabet: &str) -> Option<String> {
     base91::Base91Alphabet::parse(alphabet)?.decode_ascii(encoded)
 }
@@ -124,7 +124,7 @@ fn symbol_of(scoping: &Scoping, expr: &Expression<'_>) -> Option<SymbolId> {
 
 /// Resolve a reference to its lexical symbol only when dynamic `with` scope
 /// cannot intercept the lookup before the symbol's declaration scope.
-#[must_use]
+#[must_use = "Use the returned symbol only when static resolution succeeds"]
 pub fn statically_resolved_symbol(
     scoping: &Scoping,
     reference_id: ReferenceId,
@@ -145,7 +145,7 @@ pub fn statically_resolved_symbol(
 
 /// Prove an unresolved identifier lookup reaches the host/global environment
 /// without crossing dynamic `with` scope.
-#[must_use]
+#[must_use = "Check the returned proof before assuming global resolution"]
 pub fn statically_unresolved_global_reference(
     scoping: &Scoping,
     reference_id: ReferenceId,
@@ -157,7 +157,7 @@ pub fn statically_unresolved_global_reference(
             .all(|scope_id| !scoping.scope_flags(scope_id).is_with())
 }
 
-#[must_use]
+#[must_use = "Check the returned proof before treating a reference as a read"]
 pub fn reference_is_statically_resolved_read(
     scoping: &Scoping,
     reference_id: ReferenceId,
@@ -220,7 +220,7 @@ impl<'a> Visit<'a> for ConstValueCollector<'_, '_> {
 }
 
 impl ProvenConstantEnvironment {
-    #[must_use]
+    #[must_use = "Use the returned environment to justify constant substitutions"]
     pub fn collect(program: &oxc_ast::ast::Program<'_>, scoping: &Scoping) -> Self {
         let mut constants = Self {
             bindings: HashMap::new(),
@@ -239,7 +239,7 @@ impl ProvenConstantEnvironment {
 
     /// Resolve a lexical primitive only when its initialization is proved
     /// for this exact reference, including across later-created closures.
-    #[must_use]
+    #[must_use = "Use the returned value only when identifier resolution is proven"]
     pub fn resolve_identifier(
         &self,
         id: &oxc_ast::ast::IdentifierReference<'_>,
@@ -251,7 +251,7 @@ impl ProvenConstantEnvironment {
         self.bindings.get(&symbol).cloned()
     }
 
-    #[must_use]
+    #[must_use = "Use the returned primitive only when its value is proven"]
     pub fn exact_primitive(
         &self,
         expr: &Expression<'_>,
@@ -265,7 +265,7 @@ impl ProvenConstantEnvironment {
         })
     }
 
-    #[must_use]
+    #[must_use = "Use the returned string only when its value is proven"]
     pub fn exact_string(&self, expr: &Expression<'_>, scoping: &Scoping) -> Option<String> {
         match self.exact_primitive(expr, scoping)? {
             Value::String(value) => Some(value),
@@ -589,6 +589,14 @@ impl NumericStateAliasRisks {
     }
 }
 
+impl NumericStateAliasRisks {
+    fn analyze(program: &oxc_ast::ast::Program<'_>) -> Self {
+        let mut risks = Self::default();
+        risks.visit_program(program);
+        risks
+    }
+}
+
 impl<'a> Visit<'a> for NumericStateAliasRisks {
     fn visit_function(&mut self, function: &oxc_ast::ast::Function<'a>, flags: ScopeFlags) {
         self.stack.push((function.span, true));
@@ -662,6 +670,52 @@ struct Collector<'s, 'c> {
 }
 
 impl Collector<'_, '_> {
+    fn select_rewrite(
+        &mut self,
+        program: &oxc_ast::ast::Program<'_>,
+        mut initial_replacements: Vec<Replacement>,
+        counts: &mut Counts,
+        arithmetic_state_proofs: &mut Vec<ArithmeticStateProof>,
+        iteration: usize,
+    ) -> Result<Option<String>, BudgetExceeded> {
+        // All facts above are immutable and indexed to this source/AST. A
+        // semantic no-op leaves their byte spans and symbol identities valid,
+        // so reuse them for a fresh presentation traversal instead of parsing
+        // and deriving the entire environment again. Any source change returns
+        // immediately and the next iteration rebuilds every fact.
+        for allow_effect_statements in [false, true] {
+            self.budget.checkpoint()?;
+            self.allow_effect_statements = allow_effect_statements;
+            self.flattened_blocks.clear();
+            self.replacements = if allow_effect_statements {
+                std::mem::take(&mut initial_replacements)
+            } else {
+                initial_replacements.clone()
+            };
+            self.visit_program(program);
+            self.budget.checkpoint()?;
+            let replacements = std::mem::take(&mut self.replacements);
+            if replacements.is_empty() {
+                continue;
+            }
+            let Some(next) = apply(
+                program,
+                replacements,
+                counts,
+                arithmetic_state_proofs,
+                iteration,
+                self.budget,
+            )?
+            else {
+                return Ok(None);
+            };
+            if next != self.source {
+                return Ok(Some(next));
+            }
+        }
+        Ok(Some(self.source.to_owned()))
+    }
+
     /// Apply the same lexical-risk envelope to ordinary and arrow functions.
     fn within_function(
         &mut self,
@@ -1287,7 +1341,7 @@ impl Collector<'_, '_> {
             .arguments
             .iter()
             .map(|argument| {
-                let number = eval_static_argument(argument)?.number()?;
+                let number = eval_static_argument(argument)?.number();
                 Some((js_to_uint32(number) & 0xffff) as u16)
             })
             .collect::<Option<Vec<_>>>()?;
@@ -1826,10 +1880,12 @@ fn argument_integer(arg: &Argument<'_>) -> Option<i64> {
 }
 
 /// Whether a call's syntax permits intrinsic eval to access its caller's
-/// lexical environment. Parentheses preserve the reference; optional calls,
+/// lexical environment.
+///
+/// Parentheses preserve the reference; optional calls,
 /// sequences and member calls do not. A shadowed binding may still hold the
 /// intrinsic, so this deliberately does not assert the callee's identity.
-#[must_use]
+#[must_use = "Check this result before treating the call as lexically inert"]
 pub fn is_potential_direct_eval(call: &CallExpression<'_>) -> bool {
     if call.optional {
         return false;
@@ -1938,7 +1994,7 @@ pub enum SafeSourceRecovery {
 }
 
 impl SafeSourceRecovery {
-    #[must_use]
+    #[must_use = "Use the returned stable spelling when serializing or displaying this value"]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::BrowserLegacyCallAssignment => "browser-legacy-call-assignment",
@@ -1947,7 +2003,7 @@ impl SafeSourceRecovery {
 }
 
 impl SafeSourceRejection {
-    #[must_use]
+    #[must_use = "Use the returned stable spelling when serializing or displaying this value"]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ParseFailure => "parse-failure",
@@ -2027,7 +2083,7 @@ fn semantically_valid_source_type(source: &str, mode: SafeSourceMode) -> Option<
     validate_source_type(source, mode).ok()
 }
 
-#[must_use]
+#[must_use = "Inspect the rejection before attempting a safe rewrite"]
 pub fn safe_source_rejection(source: &str, mode: SafeSourceMode) -> Option<SafeSourceRejection> {
     match validate_source_type(source, mode) {
         Ok(_) => None,
@@ -2108,14 +2164,12 @@ fn transform_once(
     let var_number_initializers = collect_var_number_initializers(&program);
     let selector_dispatchers = collect_selector_dispatchers(&program, scoping, &stable_var_numbers);
     budget.checkpoint()?;
-    let direct_eval_present = has_direct_eval(&program);
-    let mut numeric_state_risks = NumericStateAliasRisks::default();
-    numeric_state_risks.visit_program(&program);
+    let numeric_state_risks = NumericStateAliasRisks::analyze(&program);
     initial_replacements.extend(remove_unused_proven_helpers(
         scoping,
         &decoder_analysis.removable_helpers,
         &pure_functions,
-        direct_eval_present,
+        has_direct_eval(&program),
     ));
     budget.checkpoint()?;
 
@@ -2151,42 +2205,13 @@ fn transform_once(
         flattened_blocks: HashSet::new(),
         replacements: Vec::new(),
     };
-    // All facts above are immutable and indexed to this source/AST. A
-    // semantic no-op leaves their byte spans and symbol identities valid,
-    // so reuse them for a fresh presentation traversal instead of parsing
-    // and deriving the entire environment again. Any source change returns
-    // immediately and the next iteration rebuilds every fact.
-    for allow_effect_statements in [false, true] {
-        budget.checkpoint()?;
-        collector.allow_effect_statements = allow_effect_statements;
-        collector.flattened_blocks.clear();
-        collector.replacements = if allow_effect_statements {
-            std::mem::take(&mut initial_replacements)
-        } else {
-            initial_replacements.clone()
-        };
-        collector.visit_program(&program);
-        budget.checkpoint()?;
-        let replacements = std::mem::take(&mut collector.replacements);
-        if replacements.is_empty() {
-            continue;
-        }
-        let Some(next) = apply(
-            &program,
-            replacements,
-            counts,
-            arithmetic_state_proofs,
-            iteration,
-            budget,
-        )?
-        else {
-            return Ok(None);
-        };
-        if next != source {
-            return Ok(Some(next));
-        }
-    }
-    Ok(Some(source.to_owned()))
+    collector.select_rewrite(
+        &program,
+        initial_replacements,
+        counts,
+        arithmetic_state_proofs,
+        iteration,
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -7312,6 +7337,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::literal_string_with_formatting_args,
+        reason = "JavaScript fixture braces are source syntax, not Rust format placeholders"
+    )]
     fn unused_numeric_write_requires_binding_initialization_on_its_execution_path() {
         for source in [
             "{x=7;let x;}",
@@ -7890,6 +7919,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::literal_string_with_formatting_args,
+        reason = "JavaScript fixture braces are source syntax, not Rust format placeholders"
+    )]
     fn own_member_facts_require_private_initialized_allocations() {
         for source in [
             "function f(){sink(a[0]);const a=[7];}",
@@ -8485,12 +8518,44 @@ sink(decode(0x10), decode(0x11));
         }
     }
 
+    const FIXED_ROTATION_PREFIX: &str = "const table=['a','b','c'];";
+    const FIXED_ROTATION: &str = "(function(a,n){const rotate=function(k){while(--k){a.push(a.shift());}};rotate(++n);})(table,4);";
+    const FIXED_DECODER: &str =
+        "const decode=function(i,_unused){i=i-0;let value=table[i];return value;};sink(decode(0));";
+
+    fn check_fixed_rotation_cases(cases: impl IntoIterator<Item = (String, String, usize)>) {
+        for (rotation, decoder, expected) in cases {
+            let source = format!("{FIXED_ROTATION_PREFIX}{rotation}{decoder}");
+            let result =
+                recover_static_decoders(&source, 8).unwrap_or_else(|| unreachable!("{source}"));
+            assert_eq!(
+                result
+                    .transforms
+                    .get("remove_fixed_decoder_rotation_iife")
+                    .copied()
+                    .unwrap_or_default(),
+                expected,
+                "{source}: {}",
+                result.source
+            );
+            assert_eq!(
+                result
+                    .transforms
+                    .get("string_array_decode")
+                    .copied()
+                    .unwrap_or_default(),
+                expected,
+                "{source}: {}",
+                result.source
+            );
+        }
+    }
+
     #[test]
     fn fixed_decoder_rotation_proves_countdown_and_exact_table_reader() {
-        let prefix = "const table=['a','b','c'];";
-        let rotation = "(function(a,n){const rotate=function(k){while(--k){a.push(a.shift());}};rotate(++n);})(table,4);";
-        let decoder = "const decode=function(i,_unused){i=i-0;let value=table[i];return value;};sink(decode(0));";
-        for (rotation, decoder, expected) in [
+        let rotation = FIXED_ROTATION;
+        let decoder = FIXED_DECODER;
+        check_fixed_rotation_cases([
             (rotation.to_string(), decoder.to_string(), 1),
             (
                 rotation.replace("a.push(a.shift())", "a['push'](a['shift']())"),
@@ -8520,6 +8585,14 @@ sink(decode(0x10), decode(0x11));
                 decoder.to_string(),
                 1,
             ),
+        ]);
+    }
+
+    #[test]
+    fn fixed_decoder_rotation_rejects_unproven_counts_and_effects() {
+        let rotation = FIXED_ROTATION;
+        let decoder = FIXED_DECODER;
+        check_fixed_rotation_cases([
             (
                 rotation.replace("(table,4)", "(table,-1)"),
                 decoder.to_string(),
@@ -8580,38 +8653,18 @@ sink(decode(0x10), decode(0x11));
                 decoder.replace("sink(decode(0))", "sink(table,decode(0))"),
                 0,
             ),
-        ] {
-            let source = format!("{prefix}{rotation}{decoder}");
-            let result =
-                recover_static_decoders(&source, 8).unwrap_or_else(|| unreachable!("{source}"));
-            assert_eq!(
-                result
-                    .transforms
-                    .get("remove_fixed_decoder_rotation_iife")
-                    .copied()
-                    .unwrap_or_default(),
-                expected,
-                "{source}: {}",
-                result.source
-            );
-            assert_eq!(
-                result
-                    .transforms
-                    .get("string_array_decode")
-                    .copied()
-                    .unwrap_or_default(),
-                expected,
-                "{source}: {}",
-                result.source
-            );
-        }
+        ]);
     }
+
+    const CHECKSUM_PREFIX: &str = "function p(){var t=['11','22','33'];p=function(){return t;};return p();}function d(i,t,v){return i=i-0,t=p(),v=t[i],v;}";
+    const CHECKSUM_SETUP: &str = "var alias=d,table=provider();";
+    const CHECKSUM_LOOP: &str = "while(true){try{var checksum=parseInt(alias(0));if(checksum===target)break;else table.push(table.shift());}catch(err){table.push(table.shift());}}";
 
     #[test]
     fn decoder_rotation_requires_complete_structural_effect_proof() {
-        let prefix = "function p(){var t=['11','22','33'];p=function(){return t;};return p();}function d(i,t,v){return i=i-0,t=p(),v=t[i],v;}";
-        let setup = "var alias=d,table=provider();";
-        let body = "while(true){try{var checksum=parseInt(alias(0));if(checksum===target)break;else table.push(table.shift());}catch(err){table.push(table.shift());}}";
+        let prefix = CHECKSUM_PREFIX;
+        let setup = CHECKSUM_SETUP;
+        let body = CHECKSUM_LOOP;
         for (initialization, loop_body, expected) in [
             (setup.to_string(), body.to_string(), 1),
             (setup.to_string(), body.replace("while(true)", "for(;;)"), 1),
@@ -8706,6 +8759,13 @@ sink(decode(0x10), decode(0x11));
                 result.source
             );
         }
+    }
+
+    #[test]
+    fn decoder_rotation_uses_exact_checksum_coercion_and_all_decoder_calls() {
+        let prefix = CHECKSUM_PREFIX;
+        let setup = CHECKSUM_SETUP;
+        let body = CHECKSUM_LOOP;
         for (first, target, expected) in [
             ("bad", 22, 1),
             ("0x10", 16, 1),

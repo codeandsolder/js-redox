@@ -584,6 +584,112 @@ fn insert_problem(row: &mut Map<String, Value>, values: Map<String, Value>) {
     row.extend(values);
 }
 
+enum UpstreamLink {
+    Unavailable(Map<String, Value>),
+    Loaded {
+        map: Box<LoadedMap>,
+        row: Map<String, Value>,
+    },
+}
+
+struct MapExpansion<'a> {
+    by_url: &'a CapturedByUrl,
+    project: &'a Path,
+    stack: &'a BTreeSet<String>,
+    depth: usize,
+    budget: &'a WorkBudget,
+}
+
+impl MapExpansion<'_> {
+    fn upstream_link(
+        &self,
+        normalized: &Value,
+        ordinal: usize,
+        source: &Value,
+    ) -> Result<Option<UpstreamLink>> {
+        let Self {
+            by_url,
+            project,
+            stack,
+            depth,
+            budget,
+        } = *self;
+        let logical_source = value_text(source);
+        let (code, code_origin, code_resource_id, code_resource_ids) = match source_code(
+            normalized,
+            ordinal,
+            &logical_source,
+            by_url,
+            project,
+            budget,
+        ) {
+            Ok(Some(source)) => source,
+            Ok(None) => return Ok(None),
+            Err(CapturedLookupError::Budget(error)) => return Err(error.into()),
+            Err(CapturedLookupError::Resource(mut values)) => {
+                let mut row = Map::new();
+                row.insert("depth".into(), json!(depth + 1));
+                row.insert("source_ordinal".into(), json!(ordinal));
+                row.insert("logical_source".into(), json!(logical_source));
+                row.insert("code_url".into(), json!(logical_source));
+                if let Some(ids) = values.remove("candidate_resource_ids") {
+                    values.insert("candidate_code_resource_ids".into(), ids);
+                }
+                insert_problem(&mut row, values);
+                return Ok(Some(UpstreamLink::Unavailable(row)));
+            }
+        };
+        let Some(raw_reference) = last_source_map_directive(&code) else {
+            return Ok(None);
+        };
+        let mut row = Map::new();
+        row.insert("depth".into(), Value::from(depth + 1));
+        row.insert("source_ordinal".into(), Value::from(ordinal));
+        row.insert(
+            "logical_source".into(),
+            Value::String(logical_source.clone()),
+        );
+        row.insert("code_origin".into(), Value::String(code_origin.into()));
+        row.insert(
+            "code_resource_id".into(),
+            code_resource_id.map_or(Value::Null, Value::from),
+        );
+        row.insert("code_resource_ids".into(), json!(code_resource_ids));
+        row.insert("raw_reference".into(), Value::String(raw_reference.clone()));
+
+        let upstream = match load_map(&raw_reference, &logical_source, by_url, project, budget) {
+            Ok(upstream) => upstream,
+            Err(CapturedLookupError::Budget(error)) => return Err(error.into()),
+            Err(CapturedLookupError::Resource(values)) => {
+                insert_problem(&mut row, values);
+                return Ok(Some(UpstreamLink::Unavailable(row)));
+            }
+        };
+        row.insert(
+            "map_url".into(),
+            upstream.map_url.clone().map_or(Value::Null, Value::String),
+        );
+        row.insert(
+            "map_resource_id".into(),
+            upstream.map_resource_id.map_or(Value::Null, Value::from),
+        );
+        row.insert("map_resource_ids".into(), json!(upstream.map_resource_ids));
+        row.insert(
+            "map_origin".into(),
+            Value::String(upstream.map_origin.into()),
+        );
+        if stack.contains(&upstream.identity) {
+            row.insert("status".into(), Value::String("cycle".into()));
+            return Ok(Some(UpstreamLink::Unavailable(row)));
+        }
+
+        Ok(Some(UpstreamLink::Loaded {
+            map: Box::new(upstream),
+            row,
+        }))
+    }
+}
+
 fn expand_map(
     loaded: &LoadedMap,
     by_url: &CapturedByUrl,
@@ -606,80 +712,25 @@ fn expand_map(
         return Ok((composed, links, compositions));
     }
 
+    let expansion = MapExpansion {
+        by_url,
+        project,
+        stack,
+        depth,
+        budget,
+    };
     for ordinal in (0..sources.len()).rev() {
         budget.checkpoint()?;
-        let logical_source = value_text(&sources[ordinal]);
-        let (code, code_origin, code_resource_id, code_resource_ids) = match source_code(
-            &normalized,
-            ordinal,
-            &logical_source,
-            by_url,
-            project,
-            budget,
-        ) {
-            Ok(Some(source)) => source,
-            Ok(None) => continue,
-            Err(CapturedLookupError::Budget(error)) => return Err(error.into()),
-            Err(CapturedLookupError::Resource(mut values)) => {
-                let mut row = Map::new();
-                row.insert("depth".into(), json!(depth + 1));
-                row.insert("source_ordinal".into(), json!(ordinal));
-                row.insert("logical_source".into(), json!(logical_source));
-                row.insert("code_url".into(), json!(logical_source));
-                if let Some(ids) = values.remove("candidate_resource_ids") {
-                    values.insert("candidate_code_resource_ids".into(), ids);
-                }
-                insert_problem(&mut row, values);
+        let Some(link) = expansion.upstream_link(&normalized, ordinal, &sources[ordinal])? else {
+            continue;
+        };
+        let (upstream, mut row) = match link {
+            UpstreamLink::Unavailable(row) => {
                 links.push(Value::Object(row));
                 continue;
             }
+            UpstreamLink::Loaded { map, row } => (map, row),
         };
-        let Some(raw_reference) = last_source_map_directive(&code) else {
-            continue;
-        };
-        let mut row = Map::new();
-        row.insert("depth".into(), Value::from(depth + 1));
-        row.insert("source_ordinal".into(), Value::from(ordinal));
-        row.insert(
-            "logical_source".into(),
-            Value::String(logical_source.clone()),
-        );
-        row.insert("code_origin".into(), Value::String(code_origin.into()));
-        row.insert(
-            "code_resource_id".into(),
-            code_resource_id.map_or(Value::Null, Value::from),
-        );
-        row.insert("code_resource_ids".into(), json!(code_resource_ids));
-        row.insert("raw_reference".into(), Value::String(raw_reference.clone()));
-
-        let upstream = match load_map(&raw_reference, &logical_source, by_url, project, budget) {
-            Ok(upstream) => upstream,
-            Err(CapturedLookupError::Budget(error)) => return Err(error.into()),
-            Err(CapturedLookupError::Resource(values)) => {
-                insert_problem(&mut row, values);
-                links.push(Value::Object(row));
-                continue;
-            }
-        };
-        row.insert(
-            "map_url".into(),
-            upstream.map_url.clone().map_or(Value::Null, Value::String),
-        );
-        row.insert(
-            "map_resource_id".into(),
-            upstream.map_resource_id.map_or(Value::Null, Value::from),
-        );
-        row.insert("map_resource_ids".into(), json!(upstream.map_resource_ids));
-        row.insert(
-            "map_origin".into(),
-            Value::String(upstream.map_origin.into()),
-        );
-        if stack.contains(&upstream.identity) {
-            row.insert("status".into(), Value::String("cycle".into()));
-            links.push(Value::Object(row));
-            continue;
-        }
-
         let mut nested_stack = stack.clone();
         nested_stack.insert(upstream.identity.clone());
         let (expanded_upstream, nested_links, nested_compositions) =
@@ -778,6 +829,160 @@ fn recovered_count(rows: &[Value]) -> usize {
         .count()
 }
 
+struct ComposedPublication {
+    recovered: Vec<Value>,
+    map_path: Value,
+    status: &'static str,
+}
+
+fn publish_composed_map(
+    project: &Path,
+    source_root: &Path,
+    file_stem: &str,
+    composed: &Value,
+    links: &[Value],
+    compositions: usize,
+    budget: &WorkBudget,
+) -> Result<ComposedPublication> {
+    let mut composed_recovered = Vec::new();
+    let mut composed_map_path = Value::Null;
+    if compositions > 0 {
+        let composed_root = project.join("analysis/sourcemap-composed");
+        fs::create_dir_all(&composed_root)?;
+        let map_destination = composed_root.join(format!("{file_stem}.map"));
+        let mut encoded = serde_json::to_string(composed)?;
+        encoded.push('\n');
+        crate::report_file::write_text(&map_destination, &encoded)?;
+        composed_map_path = Value::String(
+            map_destination
+                .strip_prefix(project)?
+                .to_string_lossy()
+                .into_owned(),
+        );
+        composed_recovered =
+            materialize_sources(composed, &source_root.join("final"), project, budget)?;
+    }
+    let composition_status = if links.is_empty() {
+        "not_needed"
+    } else if links
+        .iter()
+        .all(|link| link.get("status").and_then(Value::as_str) == Some("composed"))
+    {
+        "composed"
+    } else {
+        "partial"
+    };
+    Ok(ComposedPublication {
+        recovered: composed_recovered,
+        map_path: composed_map_path,
+        status: composition_status,
+    })
+}
+
+fn document_counts(document: &Value) -> (usize, usize) {
+    let sources = document
+        .get("sources")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let contents = document
+        .get("sourcesContent")
+        .and_then(Value::as_array)
+        .map_or(0, |contents| {
+            contents.iter().filter(|value| !value.is_null()).count()
+        });
+    (sources, contents)
+}
+
+fn recover_resource_map(
+    resource: &Value,
+    project: &Path,
+    by_url: &CapturedByUrl,
+    stage_budget: &WorkBudget,
+) -> Result<Option<Value>> {
+    stage_budget.checkpoint()?;
+    if resource.get("kind").and_then(Value::as_str) != Some("javascript") {
+        return Ok(None);
+    }
+    let Some(raw_reference) = manifest_source_map_reference(resource) else {
+        return Ok(None);
+    };
+    let Some(code_url) = resource.get("url").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let Some(resource_id) = resource_id(resource) else {
+        return Ok(None);
+    };
+    let budget = AnalysisOperation::SourcemapRecovery
+        .under(stage_budget, format!("{resource_id}:{code_url}"));
+    budget.checkpoint()?;
+    let loaded = match load_map(&raw_reference, code_url, by_url, project, &budget) {
+        Ok(loaded) => loaded,
+        Err(CapturedLookupError::Budget(error)) => return Err(error.into()),
+        Err(CapturedLookupError::Resource(values)) => {
+            let mut row = Map::new();
+            row.insert("resource_id".into(), Value::from(resource_id));
+            row.insert("url".into(), Value::String(code_url.into()));
+            row.insert("raw_reference".into(), Value::String(raw_reference));
+            row.extend(values);
+            return Ok(Some(Value::Object(row)));
+        }
+    };
+
+    let direct_document = normalize_map_document(&loaded)?;
+    let digest = &sha256_hex(&loaded.raw_bytes)[..12];
+    let file_stem = format!("{resource_id:04}-{digest}");
+    let source_root = project.join("src/_sourcemap").join(&file_stem);
+    let recovered = materialize_sources(&direct_document, &source_root, project, &budget)?;
+    let mut stack = BTreeSet::new();
+    stack.insert(loaded.identity.clone());
+    let (composed, links, compositions) = expand_map(&loaded, by_url, project, &stack, 0, &budget)?;
+
+    let publication = publish_composed_map(
+        project,
+        &source_root,
+        &file_stem,
+        &composed,
+        &links,
+        compositions,
+        &budget,
+    )?;
+    let source_root_value = loaded
+        .document
+        .get("sourceRoot")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let (direct_sources, direct_contents) = document_counts(&direct_document);
+    let (composed_sources, composed_contents) = document_counts(&composed);
+    let status = if recovered_count(&recovered) > 0 {
+        "recovered"
+    } else {
+        "no_sources_content"
+    };
+    Ok(Some(json!({
+        "resource_id": resource_id,
+        "url": code_url,
+        "raw_reference": raw_reference,
+        "map_url": loaded.map_url,
+        "map_resource_id": loaded.map_resource_id,
+        "map_resource_ids": loaded.map_resource_ids,
+        "map_origin": loaded.map_origin,
+        "source_root": source_root_value,
+        "sources": direct_sources,
+        "sources_content": direct_contents,
+        "recovered": recovered,
+        "composition": {
+            "status": publication.status,
+            "links": links,
+            "composed_links": compositions,
+            "composed_sources": composed_sources,
+            "composed_sources_content": composed_contents,
+            "composed_map_path": publication.map_path,
+        },
+        "composed_recovered": publication.recovered,
+        "status": status,
+    })))
+}
+
 /// Recover and compose chained source maps for the capture project.
 ///
 /// # Errors
@@ -810,131 +1015,9 @@ pub fn recover_project_sourcemaps(
 
     let mut results = Vec::new();
     for resource in &manifest.resources {
-        stage_budget.checkpoint()?;
-        if resource.get("kind").and_then(Value::as_str) != Some("javascript") {
-            continue;
+        if let Some(row) = recover_resource_map(resource, &project, &by_url, &stage_budget)? {
+            results.push(row);
         }
-        let Some(raw_reference) = manifest_source_map_reference(resource) else {
-            continue;
-        };
-        let Some(code_url) = resource.get("url").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some(resource_id) = resource_id(resource) else {
-            continue;
-        };
-        let budget = budgets.operation_under(
-            &stage_budget,
-            AnalysisOperation::SourcemapRecovery,
-            format!("{resource_id}:{code_url}"),
-        );
-        budget.checkpoint()?;
-        let loaded = match load_map(&raw_reference, code_url, &by_url, &project, &budget) {
-            Ok(loaded) => loaded,
-            Err(CapturedLookupError::Budget(error)) => return Err(error.into()),
-            Err(CapturedLookupError::Resource(values)) => {
-                let mut row = Map::new();
-                row.insert("resource_id".into(), Value::from(resource_id));
-                row.insert("url".into(), Value::String(code_url.into()));
-                row.insert("raw_reference".into(), Value::String(raw_reference));
-                row.extend(values);
-                results.push(Value::Object(row));
-                continue;
-            }
-        };
-
-        let direct_document = normalize_map_document(&loaded)?;
-        let digest = &sha256_hex(&loaded.raw_bytes)[..12];
-        let source_root = project
-            .join("src/_sourcemap")
-            .join(format!("{resource_id:04}-{digest}"));
-        let recovered = materialize_sources(&direct_document, &source_root, &project, &budget)?;
-        let mut stack = BTreeSet::new();
-        stack.insert(loaded.identity.clone());
-        let (composed, links, compositions) =
-            expand_map(&loaded, &by_url, &project, &stack, 0, &budget)?;
-
-        let mut composed_recovered = Vec::new();
-        let mut composed_map_path = Value::Null;
-        if compositions > 0 {
-            let composed_root = project.join("analysis/sourcemap-composed");
-            fs::create_dir_all(&composed_root)?;
-            let map_destination = composed_root.join(format!("{resource_id:04}-{digest}.map"));
-            let mut encoded = serde_json::to_string(&composed)?;
-            encoded.push('\n');
-            crate::report_file::write_text(&map_destination, &encoded)?;
-            composed_map_path = Value::String(
-                map_destination
-                    .strip_prefix(&project)?
-                    .to_string_lossy()
-                    .into_owned(),
-            );
-            composed_recovered =
-                materialize_sources(&composed, &source_root.join("final"), &project, &budget)?;
-        }
-        let composition_status = if links.is_empty() {
-            "not_needed"
-        } else if links
-            .iter()
-            .all(|link| link.get("status").and_then(Value::as_str) == Some("composed"))
-        {
-            "composed"
-        } else {
-            "partial"
-        };
-        let source_root_value = loaded
-            .document
-            .get("sourceRoot")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let direct_sources = direct_document
-            .get("sources")
-            .and_then(Value::as_array)
-            .map_or(0, Vec::len);
-        let direct_contents = direct_document
-            .get("sourcesContent")
-            .and_then(Value::as_array)
-            .map_or(0, |contents| {
-                contents.iter().filter(|value| !value.is_null()).count()
-            });
-        let composed_sources = composed
-            .get("sources")
-            .and_then(Value::as_array)
-            .map_or(0, Vec::len);
-        let composed_contents = composed
-            .get("sourcesContent")
-            .and_then(Value::as_array)
-            .map_or(0, |contents| {
-                contents.iter().filter(|value| !value.is_null()).count()
-            });
-        let status = if recovered_count(&recovered) > 0 {
-            "recovered"
-        } else {
-            "no_sources_content"
-        };
-        results.push(json!({
-            "resource_id": resource_id,
-            "url": code_url,
-            "raw_reference": raw_reference,
-            "map_url": loaded.map_url,
-            "map_resource_id": loaded.map_resource_id,
-            "map_resource_ids": loaded.map_resource_ids,
-            "map_origin": loaded.map_origin,
-            "source_root": source_root_value,
-            "sources": direct_sources,
-            "sources_content": direct_contents,
-            "recovered": recovered,
-            "composition": {
-                "status": composition_status,
-                "links": links,
-                "composed_links": compositions,
-                "composed_sources": composed_sources,
-                "composed_sources_content": composed_contents,
-                "composed_map_path": composed_map_path,
-            },
-            "composed_recovered": composed_recovered,
-            "status": status,
-        }));
     }
 
     let direct_recovered = results

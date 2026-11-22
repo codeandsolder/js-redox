@@ -46,7 +46,7 @@ pub struct ApiCallsite {
     /// "candidate" retains syntax and arguments without proving the API binding.
     pub binding_status: String,
     pub standard_browser_api_semantics_required: bool,
-    /// Stable ordinals into the same source unit's mutation_sites collection.
+    /// Stable ordinals into the same source unit's `mutation_sites` collection.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub mutation_site_ordinals: Vec<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -903,18 +903,15 @@ type MethodEvidence = (Option<String>, Option<String>, Option<String>);
 
 fn xhr_method(arguments: &ApiArguments) -> MethodEvidence {
     let (literal, expression) = arguments.exact(0);
-    let (method, status) = literal.map_or_else(
-        || (None, "unknown"),
-        |literal| {
-            let normalized = effective_http_method(&literal);
-            let status = if normalized.is_some() {
-                "exact"
-            } else {
-                "invalid"
-            };
-            (normalized, status)
-        },
-    );
+    let (method, status) = literal.map_or((None, "unknown"), |literal| {
+        let normalized = effective_http_method(&literal);
+        let status = if normalized.is_some() {
+            "exact"
+        } else {
+            "invalid"
+        };
+        (normalized, status)
+    });
     (method, expression, Some(status.into()))
 }
 
@@ -941,17 +938,17 @@ impl Collector<'_, '_> {
         callable
             .prefix
             .append(arguments, self.source, self.scoping, self.constants);
-        self.emit_invocation(callee, callable, span);
+        self.emit_invocation(callee, &callable, span);
     }
 
-    fn emit_invocation(&mut self, callee: &Expression<'_>, callable: Callable, span: Span) {
+    fn emit_invocation(&mut self, callee: &Expression<'_>, callable: &Callable, span: Span) {
         self.emit_forwarded(callee, callable, span, &BTreeSet::new());
     }
 
     fn emit_forwarded(
         &mut self,
         callee: &Expression<'_>,
-        callable: Callable,
+        callable: &Callable,
         span: Span,
         forwarding_dependencies: &BTreeSet<String>,
     ) {
@@ -963,8 +960,10 @@ impl Collector<'_, '_> {
         let mut mutated = false;
         // Captured function values may outlive replacement of their original
         // global property. Do not discard their potentially real invocation.
-        let mut binding_families =
-            vec![(family, callable.captured || callable.constructor_captured)];
+        let mut binding_families = vec![(
+            family,
+            callable.is_captured() || callable.constructor_captured,
+        )];
         if callable.kind == ApiKind::XhrOpen {
             binding_families.push(("xhr", callable.constructor_captured));
         }
@@ -1009,40 +1008,7 @@ impl Collector<'_, '_> {
         if candidate && method.2.as_deref() == Some("exact") {
             method.2 = Some("conditional".into());
         }
-        let proof = if mutated {
-            if callable.invocation_form() == "wrapper" {
-                "forwarded_api_binding_or_local_wrapper_may_be_mutated"
-            } else if callable.captured || callable.constructor_captured {
-                "captured_api_binding_or_native_dispatch_may_be_mutated"
-            } else {
-                match callable.kind {
-                    ApiKind::Fetch => "unresolved_global_member_mutation_may_replace_fetch",
-                    ApiKind::Beacon => "unresolved_global_member_mutation_may_replace_sendBeacon",
-                    ApiKind::WebSocket => "unresolved_global_member_mutation_may_replace_WebSocket",
-                    ApiKind::XhrOpen => {
-                        "unresolved_global_member_mutation_may_replace_XMLHttpRequest_or_open"
-                    }
-                    ApiKind::XhrConstructor => STANDARD_BROWSER_API_ASSUMPTION,
-                }
-            }
-        } else if escaped {
-            "unreassigned_binding_initialized_from_standard_XMLHttpRequest_but_receiver_escapes_or_is_mutable"
-        } else if callable.invocation_form() == "wrapper" {
-            "stable_local_wrapper_with_semantically_forwarded_arguments"
-        } else if matches!(
-            callable.invocation_form(),
-            "call" | "apply" | "reflect_apply"
-        ) {
-            "native_api_dispatch_with_proven_receiver"
-        } else if callable.bound {
-            "native_bound_api_with_proven_receiver"
-        } else if callable.captured {
-            "immutable_lexical_api_alias"
-        } else if callable.kind == ApiKind::XhrOpen {
-            "stable_symbol_initialized_from_standard_XMLHttpRequest"
-        } else {
-            STANDARD_BROWSER_API_ASSUMPTION
-        };
+        let proof = invocation_proof(callable, mutated, escaped);
         let callee_text = global_path(self.scoping, self.constants, callee)
             .unwrap_or_else(|| source_fragment(self.source, callee.span()));
         let (line, column) = self.lines.byte_line_column(span.start as usize);
@@ -1072,6 +1038,44 @@ impl Collector<'_, '_> {
     }
 }
 
+/// Classify the assumptions of a call after collecting its source evidence.
+fn invocation_proof(callable: &Callable, mutated: bool, escaped: bool) -> &'static str {
+    if mutated {
+        if callable.invocation_form() == "wrapper" {
+            "forwarded_api_binding_or_local_wrapper_may_be_mutated"
+        } else if callable.is_captured() || callable.constructor_captured {
+            "captured_api_binding_or_native_dispatch_may_be_mutated"
+        } else {
+            match callable.kind {
+                ApiKind::Fetch => "unresolved_global_member_mutation_may_replace_fetch",
+                ApiKind::Beacon => "unresolved_global_member_mutation_may_replace_sendBeacon",
+                ApiKind::WebSocket => "unresolved_global_member_mutation_may_replace_WebSocket",
+                ApiKind::XhrOpen => {
+                    "unresolved_global_member_mutation_may_replace_XMLHttpRequest_or_open"
+                }
+                ApiKind::XhrConstructor => STANDARD_BROWSER_API_ASSUMPTION,
+            }
+        }
+    } else if escaped {
+        "unreassigned_binding_initialized_from_standard_XMLHttpRequest_but_receiver_escapes_or_is_mutable"
+    } else if callable.invocation_form() == "wrapper" {
+        "stable_local_wrapper_with_semantically_forwarded_arguments"
+    } else if matches!(
+        callable.invocation_form(),
+        "call" | "apply" | "reflect_apply"
+    ) {
+        "native_api_dispatch_with_proven_receiver"
+    } else if callable.is_bound() {
+        "native_bound_api_with_proven_receiver"
+    } else if callable.is_captured() {
+        "immutable_lexical_api_alias"
+    } else if callable.kind == ApiKind::XhrOpen {
+        "stable_symbol_initialized_from_standard_XMLHttpRequest"
+    } else {
+        STANDARD_BROWSER_API_ASSUMPTION
+    }
+}
+
 impl<'a> Visit<'a> for Collector<'_, '_> {
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         if !call.optional {
@@ -1079,7 +1083,7 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
                 self.callables
                     .resolve_dispatch(call, self.source, self.scoping, self.constants)
             {
-                self.emit_invocation(&call.callee, dispatch.callable, call.span);
+                self.emit_invocation(&call.callee, &dispatch.callable, call.span);
             } else {
                 self.visit_invocation(&call.callee, &call.arguments, call.span, false);
             }
@@ -1124,6 +1128,108 @@ fn contains_with_statement(program: &Program<'_>) -> bool {
     detector.found
 }
 
+fn analyze_validated_program<'a>(
+    source: &str,
+    program: &'a Program<'a>,
+    semantic: &oxc_semantic::Semantic<'a>,
+    budget: &WorkBudget,
+) -> Result<ApiSurfaceAnalysis> {
+    let scoping = semantic.scoping();
+    budget.checkpoint()?;
+    let constants = ProvenConstantEnvironment::collect(program, scoping);
+    budget.checkpoint()?;
+
+    let mut callables = CallableIndex::collect(program, source, scoping, &constants);
+    budget.checkpoint()?;
+
+    let wrappers = forwarding::WrapperIndex::collect(semantic, budget)?;
+    forwarding::collect_returned_values(
+        semantic,
+        &wrappers,
+        &mut callables,
+        source,
+        &constants,
+        budget,
+    )?;
+    let wrapper_globals = wrappers
+        .root_mutation_targets()
+        .map(|(name, family)| (name.to_owned(), family))
+        .collect();
+
+    let lines = SourceLineIndex::new(source);
+    let mut mutations = SinkMutationCollector {
+        source,
+        lines: &lines,
+        scoping,
+        constants: &constants,
+        callables: &callables,
+        mutations: SinkMutations {
+            wrapper_globals,
+            ..SinkMutations::default()
+        },
+    };
+    mutations.visit_program(program);
+    budget.checkpoint()?;
+
+    let mut safe_member_refs = SafeMemberReferenceCollector {
+        source,
+        scoping,
+        constants: &constants,
+        callables: &callables,
+        mutations: &mutations.mutations,
+        refs: BTreeSet::new(),
+    };
+    safe_member_refs.visit_program(program);
+    budget.checkpoint()?;
+
+    let mut collector = Collector {
+        source,
+        scoping,
+        constants: &constants,
+        mutations: &mutations.mutations,
+        callables: &callables,
+        safe_member_refs: &safe_member_refs.refs,
+        lines: &lines,
+        callsites: BTreeSet::new(),
+    };
+    collector.visit_program(program);
+    budget.checkpoint()?;
+    for node in semantic.nodes().iter() {
+        budget.consume(1)?;
+        let site = match node.kind() {
+            oxc_ast::AstKind::CallExpression(call) if !call.optional => {
+                forwarding::InvocationSite {
+                    callee: &call.callee,
+                    arguments: &call.arguments,
+                    span: call.span,
+                    constructor: false,
+                }
+            }
+            oxc_ast::AstKind::NewExpression(new) => forwarding::InvocationSite {
+                callee: &new.callee,
+                arguments: &new.arguments,
+                span: new.span,
+                constructor: true,
+            },
+            _ => continue,
+        };
+        forwarding::specialize(site, semantic, &wrappers, &mut collector, budget)?;
+    }
+    budget.checkpoint()?;
+    let mut callsites = collector.callsites.into_iter().collect::<Vec<_>>();
+    callsites.sort_by(|left, right| {
+        (left.start, left.end, left.kind.as_str()).cmp(&(
+            right.start,
+            right.end,
+            right.kind.as_str(),
+        ))
+    });
+    Ok(ApiSurfaceAnalysis {
+        callsites,
+        mutation_sites: mutations.mutations.sites.into_iter().collect(),
+    })
+}
+
 /// Recover source-proven browser API call sites under a bounded analysis.
 ///
 /// # Errors
@@ -1152,100 +1258,7 @@ pub fn analyze_api_surface(source: &str, budget: &WorkBudget) -> Result<ApiSurfa
         if !semantic.diagnostics.is_empty() {
             continue;
         }
-        let scoping = semantic.semantic.scoping();
-        budget.checkpoint()?;
-        let constants = ProvenConstantEnvironment::collect(&program, scoping);
-        budget.checkpoint()?;
-
-        let mut callables = CallableIndex::collect(&program, source, scoping, &constants);
-        budget.checkpoint()?;
-
-        let wrappers = forwarding::WrapperIndex::collect(&semantic.semantic, budget)?;
-        forwarding::collect_returned_values(
-            &semantic.semantic,
-            &wrappers,
-            &mut callables,
-            source,
-            &constants,
-            budget,
-        )?;
-        let wrapper_globals = wrappers
-            .root_mutation_targets()
-            .map(|(name, family)| (name.to_owned(), family))
-            .collect();
-
-        let lines = SourceLineIndex::new(source);
-        let mut mutations = SinkMutationCollector {
-            source,
-            lines: &lines,
-            scoping,
-            constants: &constants,
-            callables: &callables,
-            mutations: SinkMutations {
-                wrapper_globals,
-                ..SinkMutations::default()
-            },
-        };
-        mutations.visit_program(&program);
-        budget.checkpoint()?;
-
-        let mut safe_member_refs = SafeMemberReferenceCollector {
-            source,
-            scoping,
-            constants: &constants,
-            callables: &callables,
-            mutations: &mutations.mutations,
-            refs: BTreeSet::new(),
-        };
-        safe_member_refs.visit_program(&program);
-        budget.checkpoint()?;
-
-        let mut collector = Collector {
-            source,
-            scoping,
-            constants: &constants,
-            mutations: &mutations.mutations,
-            callables: &callables,
-            safe_member_refs: &safe_member_refs.refs,
-            lines: &lines,
-            callsites: BTreeSet::new(),
-        };
-        collector.visit_program(&program);
-        budget.checkpoint()?;
-        for node in semantic.semantic.nodes().iter() {
-            budget.consume(1)?;
-            let site = match node.kind() {
-                oxc_ast::AstKind::CallExpression(call) if !call.optional => {
-                    forwarding::InvocationSite {
-                        callee: &call.callee,
-                        arguments: &call.arguments,
-                        span: call.span,
-                        constructor: false,
-                    }
-                }
-                oxc_ast::AstKind::NewExpression(new) => forwarding::InvocationSite {
-                    callee: &new.callee,
-                    arguments: &new.arguments,
-                    span: new.span,
-                    constructor: true,
-                },
-                _ => continue,
-            };
-            forwarding::specialize(site, &semantic.semantic, &wrappers, &mut collector, budget)?;
-        }
-        budget.checkpoint()?;
-        let mut callsites = collector.callsites.into_iter().collect::<Vec<_>>();
-        callsites.sort_by(|left, right| {
-            (left.start, left.end, left.kind.as_str()).cmp(&(
-                right.start,
-                right.end,
-                right.kind.as_str(),
-            ))
-        });
-        return Ok(ApiSurfaceAnalysis {
-            callsites,
-            mutation_sites: mutations.mutations.sites.into_iter().collect(),
-        });
+        return analyze_validated_program(source, &program, &semantic.semantic, budget);
     }
 
     Err(anyhow!(
@@ -1798,7 +1811,10 @@ request.call(window, "/call");
                 .affected_families
                 .iter()
                 .any(|family| family.starts_with("wrapper_global:"))));
-        assert!(analysis.callsites[1].mutation_site_ordinals.is_empty());
+        assert_eq!(
+            analysis.callsites[1].mutation_site_ordinals,
+            [] as [usize; 0]
+        );
         assert_eq!(
             analysis.callsites[2].method_status.as_deref(),
             Some("conditional")
@@ -1875,7 +1891,10 @@ safe(fetch)("/standard");
             .iter()
             .any(|family| family.starts_with("wrapper_global:")));
         assert_eq!(analysis.callsites[1].kind, "fetch");
-        assert!(analysis.callsites[1].mutation_site_ordinals.is_empty());
+        assert_eq!(
+            analysis.callsites[1].mutation_site_ordinals,
+            [] as [usize; 0]
+        );
         Ok(())
     }
 
@@ -2078,7 +2097,7 @@ reflect(Reflect, request, window, ["/reflect"]);
                 [family]
             );
         }
-        assert!(rows[1].mutation_site_ordinals.is_empty());
+        assert_eq!(rows[1].mutation_site_ordinals, [] as [usize; 0]);
         Ok(())
     }
 
@@ -2098,7 +2117,7 @@ alias();
         let rebound = &analysis.callsites[1];
         assert_eq!(direct.kind, "fetch");
         assert_eq!(direct.url.as_deref(), Some("/chain"));
-        assert!(direct.mutation_site_ordinals.is_empty());
+        assert_eq!(direct.mutation_site_ordinals, [] as [usize; 0]);
         assert_eq!(rebound.kind, "fetch_candidate");
         let site = &analysis.mutation_sites[rebound.mutation_site_ordinals[0]];
         let [start, end] = site
@@ -2280,7 +2299,7 @@ Array.prototype[Symbol.iterator] = unsafeIterator;
             .find(|row| row.callee == "omitted")
             .context("missing omitted initializer wrapper")?;
         assert_eq!(omitted.method.as_deref(), Some("GET"));
-        assert!(omitted.mutation_site_ordinals.is_empty());
+        assert_eq!(omitted.mutation_site_ordinals, [] as [usize; 0]);
         Ok(())
     }
 
@@ -2334,7 +2353,7 @@ fetch.call(window, "/receiver");
             result.mutation_sites[0].affected_families,
             ["namespace_window"]
         );
-        assert!(rows[2].mutation_site_ordinals.is_empty());
+        assert_eq!(rows[2].mutation_site_ordinals, [] as [usize; 0]);
         assert_eq!(rows[4].mutation_site_ordinals, [0]);
         Ok(())
     }
@@ -2479,7 +2498,7 @@ nav.sendBeacon("/beacon", payload);
         assert_eq!(rows.len(), 5, "{rows:#?}");
         assert!(rows[..3].iter().all(|row| row.kind == "fetch_candidate"));
         assert_eq!(rows[3].kind, "fetch");
-        assert!(rows[3].mutation_site_ordinals.is_empty());
+        assert_eq!(rows[3].mutation_site_ordinals, [] as [usize; 0]);
         for (row, family) in rows[..3]
             .iter()
             .zip(["function_call", "fetch_apply", "reflect_apply"])
@@ -2703,7 +2722,7 @@ original("https://example.test/direct");
         assert_eq!(rows.len(), 5, "{rows:#?}");
         assert!(rows[..4].iter().all(|row| row.kind == "fetch_candidate"));
         assert_eq!(rows[4].kind, "fetch");
-        assert!(rows[4].mutation_site_ordinals.is_empty());
+        assert_eq!(rows[4].mutation_site_ordinals, [] as [usize; 0]);
         let own = analysis
             .mutation_sites
             .iter()
@@ -2734,7 +2753,10 @@ navigator.sendBeacon("https://example.test/direct", payload);
         assert_eq!(analysis.callsites[0].kind, "send_beacon_candidate");
         assert_eq!(analysis.callsites[0].mutation_site_ordinals, [0]);
         assert_eq!(analysis.callsites[1].kind, "send_beacon");
-        assert!(analysis.callsites[1].mutation_site_ordinals.is_empty());
+        assert_eq!(
+            analysis.callsites[1].mutation_site_ordinals,
+            [] as [usize; 0]
+        );
         assert_eq!(
             analysis.mutation_sites[0].affected_families,
             ["function_bind"]
@@ -2794,7 +2816,7 @@ navigator.sendBeacon("https://api.example.test/two", payload);
         );
         assert_eq!(result.callsites[0].mutation_site_ordinals, [0]);
         assert_eq!(result.callsites[1].kind, "send_beacon");
-        assert!(result.callsites[1].mutation_site_ordinals.is_empty());
+        assert_eq!(result.callsites[1].mutation_site_ordinals, [] as [usize; 0]);
         Ok(())
     }
 
@@ -2916,10 +2938,10 @@ xhr.open("POST", "https://api.example.test/xhr");
             Some("unknown")
         );
         assert_eq!(result.callsites[1].method.as_deref(), Some("PATCH"));
-        assert!(result.callsites[1].mutation_site_ordinals.is_empty());
+        assert_eq!(result.callsites[1].mutation_site_ordinals, [] as [usize; 0]);
         assert_eq!(result.callsites[0].mutation_site_ordinals.len(), 1);
         assert_eq!(result.callsites[2].method.as_deref(), Some("GET"));
-        assert!(result.callsites[2].mutation_site_ordinals.is_empty());
+        assert_eq!(result.callsites[2].mutation_site_ordinals, [] as [usize; 0]);
         assert_eq!(result.callsites[3].kind, "xhr_open_candidate");
         assert_eq!(
             result.callsites[3].method_status.as_deref(),
@@ -2978,7 +3000,7 @@ new WebSocket("wss://api.example.test/c");
         assert_eq!(result.mutation_sites.len(), 2);
         assert!(result.mutation_sites.iter().any(|site| {
             site.target_pattern == [Some("globalThis".into()), None]
-                && site.affected_families.contains(&"fetch".to_string())
+                && site.affected_families.iter().any(|i: &String| i == "fetch")
         }));
         assert!(result.mutation_sites.iter().any(|site| {
             site.target_pattern == [Some("navigator".into()), None]

@@ -51,43 +51,23 @@ fn runtime_source(
     })
 }
 
-#[test]
-fn runtime_wasm_provenance_is_exact_and_fails_closed() -> Result<()> {
-    let workspace = tempfile::tempdir()?;
-    let capture = workspace.path().join("capture");
-    let project = workspace.path().join("project");
-    fs::create_dir_all(capture.join("runtime-scripts"))?;
-    fs::create_dir_all(capture.join("bodies"))?;
-    fs::create_dir_all(project.join("analysis"))?;
+struct FixtureDigests {
+    js: String,
+    wasm: String,
+    bridge_wasm: String,
+}
 
-    let js_sha = sha256_hex(JS.as_bytes());
-    let wasm_sha = sha256_hex(WASM);
-    let bridge_wasm_sha = sha256_hex(BRIDGE_WASM);
-    fs::write(capture.join(format!("runtime-scripts/{js_sha}.js")), JS)?;
-    fs::write(capture.join(format!("bodies/{js_sha}")), JS)?;
-    fs::write(capture.join(format!("bodies/{wasm_sha}")), WASM)?;
-    fs::write(
-        capture.join(format!("bodies/{bridge_wasm_sha}")),
-        BRIDGE_WASM,
-    )?;
+impl FixtureDigests {
+    fn new() -> Self {
+        Self {
+            js: sha256_hex(JS.as_bytes()),
+            wasm: sha256_hex(WASM),
+            bridge_wasm: sha256_hex(BRIDGE_WASM),
+        }
+    }
+}
 
-    let runtime_event = json!({
-        "cdpSession": "main",
-        "scriptId": "606",
-        "url": JS_URL,
-        "executionContextId": 1,
-        "captured": {
-            "kind": "javascript",
-            "sha256": js_sha,
-            "size": JS.len(),
-            "path": format!("runtime-scripts/{js_sha}.js"),
-        },
-    });
-    write_json(
-        &capture.join("runtime-scripts.json"),
-        &json!([runtime_event]),
-    )?;
-
+fn write_stream_fixture(capture: &Path, wasm_sha: &str) -> Result<()> {
     let good = json!({
         "cdpSession": "main",
         "requestId": "req-good",
@@ -132,6 +112,15 @@ fn runtime_wasm_provenance_is_exact_and_fails_closed() -> Result<()> {
         &json!([good, bridge, bad, head, no_content]),
     )?;
 
+    Ok(())
+}
+
+fn write_manifest_fixture(capture: &Path, project: &Path, digests: &FixtureDigests) -> Result<()> {
+    let FixtureDigests {
+        js: js_sha,
+        wasm: wasm_sha,
+        bridge_wasm: bridge_wasm_sha,
+    } = digests;
     write_json(
         &project.join("capture-manifest.json"),
         &json!({
@@ -200,11 +189,55 @@ fn runtime_wasm_provenance_is_exact_and_fails_closed() -> Result<()> {
         }),
     )?;
 
-    let mut runtime_artifact = json!({
+    Ok(())
+}
+
+fn write_capture_fixture(
+    capture: &Path,
+    project: &Path,
+    digests: &FixtureDigests,
+) -> Result<(Value, Value)> {
+    fs::create_dir_all(capture.join("runtime-scripts"))?;
+    fs::create_dir_all(capture.join("bodies"))?;
+    fs::create_dir_all(project.join("analysis"))?;
+
+    let FixtureDigests {
+        js: js_sha,
+        wasm: wasm_sha,
+        bridge_wasm: bridge_wasm_sha,
+    } = digests;
+    fs::write(capture.join(format!("runtime-scripts/{js_sha}.js")), JS)?;
+    fs::write(capture.join(format!("bodies/{js_sha}")), JS)?;
+    fs::write(capture.join(format!("bodies/{wasm_sha}")), WASM)?;
+    fs::write(
+        capture.join(format!("bodies/{bridge_wasm_sha}")),
+        BRIDGE_WASM,
+    )?;
+
+    let runtime_event = json!({
+        "cdpSession": "main",
+        "scriptId": "606",
+        "url": JS_URL,
+        "executionContextId": 1,
+        "captured": {
+            "kind": "javascript",
+            "sha256": js_sha,
+            "size": JS.len(),
+            "path": format!("runtime-scripts/{js_sha}.js"),
+        },
+    });
+    write_json(
+        &capture.join("runtime-scripts.json"),
+        &json!([runtime_event]),
+    )?;
+
+    write_stream_fixture(capture, wasm_sha)?;
+    write_manifest_fixture(capture, project, digests)?;
+    let runtime_artifact = json!({
         "schema": "js-redox-runtime-scripts/v2",
         "script_identity_conflicts": [],
         "sources": [runtime_source(
-            &js_sha,
+            js_sha,
             &format!("runtime-scripts/{js_sha}.js"),
             1,
             "network_response",
@@ -218,8 +251,17 @@ fn runtime_wasm_provenance_is_exact_and_fails_closed() -> Result<()> {
         &runtime_artifact,
     )?;
 
+    Ok((runtime_event, runtime_artifact))
+}
+
+fn assert_response_provenance(project: &Path, digests: &FixtureDigests) -> Result<()> {
+    let FixtureDigests {
+        js: js_sha,
+        bridge_wasm: bridge_wasm_sha,
+        ..
+    } = digests;
     let summary = correlate_wasm_resource_provenance(
-        &project,
+        project,
         &AnalysisBudgets::standard("wasm-resource-provenance-test"),
     )?;
     assert_eq!(summary.observations, 2);
@@ -257,22 +299,31 @@ fn runtime_wasm_provenance_is_exact_and_fails_closed() -> Result<()> {
         .context("good observation missing")?;
     assert_eq!(observation["wasm_resource_ids"], json!([2]));
     assert_eq!(observation["response_identity_basis"], "cdp_body_sha256");
-    assert_eq!(observation["initiator_runtime_sha256"], js_sha);
+    assert_eq!(observation["initiator_runtime_sha256"], *js_sha);
     assert_eq!(observation["initiator_resource_ids"], json!([]));
     let bridge_observation = observations
         .iter()
         .find(|row| row["request_id"] == "req-bridge")
         .context("bridge observation missing")?;
     assert_eq!(bridge_observation["wasm_resource_ids"], json!([3]));
-    assert_eq!(bridge_observation["sha256"], bridge_wasm_sha);
+    assert_eq!(bridge_observation["sha256"], *bridge_wasm_sha);
     assert_eq!(
         bridge_observation["response_identity_basis"],
         "unique_url_body_and_request_cardinality"
     );
     assert_eq!(provenance["unmatched"][0]["request_id"], "req-bad");
 
+    Ok(())
+}
+
+fn assert_graph_provenance(project: &Path, digests: &FixtureDigests) -> Result<()> {
+    let FixtureDigests {
+        js: js_sha,
+        wasm: wasm_sha,
+        bridge_wasm: bridge_wasm_sha,
+    } = digests;
     build_source_graph(
-        &project,
+        project,
         &AnalysisBudgets::standard("wasm-provenance-graph-test"),
     )?;
     let graph = read_json(&project.join("analysis/source-graph.json"))?;
@@ -322,6 +373,16 @@ fn runtime_wasm_provenance_is_exact_and_fails_closed() -> Result<()> {
         .iter()
         .all(|edge| edge.get("sha256") != Some(&json!("f".repeat(64)))));
 
+    Ok(())
+}
+
+fn assert_conflicting_runtime_identity(
+    capture: &Path,
+    project: &Path,
+    js_sha: &str,
+    runtime_event: &Value,
+    mut runtime_artifact: Value,
+) -> Result<()> {
     let conflict_sha = sha256_hex(CONFLICT_JS.as_bytes());
     fs::write(
         capture.join(format!("runtime-scripts/{conflict_sha}.js")),
@@ -355,7 +416,7 @@ fn runtime_wasm_provenance_is_exact_and_fails_closed() -> Result<()> {
     )?;
 
     let conflicted = correlate_wasm_resource_provenance(
-        &project,
+        project,
         &AnalysisBudgets::standard("wasm-resource-provenance-test"),
     )?;
     assert_eq!(conflicted.observations, 2);
@@ -367,7 +428,7 @@ fn runtime_wasm_provenance_is_exact_and_fails_closed() -> Result<()> {
         .iter()
         .all(|row| row["initiator_runtime_sha256"].is_null()));
     build_source_graph(
-        &project,
+        project,
         &AnalysisBudgets::standard("wasm-provenance-graph-test"),
     )?;
     let conflict_graph = read_json(&project.join("analysis/source-graph.json"))?;
@@ -386,6 +447,25 @@ fn runtime_wasm_provenance_is_exact_and_fails_closed() -> Result<()> {
                     .any(|node| edge["from"] == node.as_str())
         }));
 
+    Ok(())
+}
+
+#[test]
+fn runtime_wasm_provenance_is_exact_and_fails_closed() -> Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let capture = workspace.path().join("capture");
+    let project = workspace.path().join("project");
+    let digests = FixtureDigests::new();
+    let (runtime_event, runtime_artifact) = write_capture_fixture(&capture, &project, &digests)?;
+    assert_response_provenance(&project, &digests)?;
+    assert_graph_provenance(&project, &digests)?;
+    assert_conflicting_runtime_identity(
+        &capture,
+        &project,
+        &digests.js,
+        &runtime_event,
+        runtime_artifact,
+    )?;
     fs::remove_file(capture.join("cdp-streams.json"))?;
     let unavailable = correlate_wasm_resource_provenance(
         &project,

@@ -107,7 +107,7 @@ fn event_reachable_from(semantic: &Semantic<'_>, from: BlockNodeId, event: Block
 /// the query fails closed. Events and barriers sharing a basic block are
 /// ordered by source position, matching JavaScript's left-to-right evaluation
 /// inside a straight-line block.
-#[must_use]
+#[must_use = "Only a true result proves the event precedes the barriers"]
 pub fn prove_event_before_barriers(
     semantic: &Semantic<'_>,
     event: Span,
@@ -260,7 +260,7 @@ fn prove_required_before_node(
 /// This is a conditional dominance-style proof over Oxc's CFG. Cycles are
 /// handled by carrying whether the requirement has been crossed as part of the
 /// traversal state. Cross-function requirements and unresolved spans fail closed.
-#[must_use]
+#[must_use = "Only a true result proves all required events precede the target"]
 pub fn prove_events_before_event(semantic: &Semantic<'_>, required: &[Span], event: Span) -> bool {
     let Some(event_node) = deepest_exact_span_node(semantic, event) else {
         return false;
@@ -301,7 +301,7 @@ fn has_enclosing_try_before_execution_context(
 /// make entry dominance look like effect dominance. We fail closed when the
 /// required node is enclosed by `try`; without a local catcher, any abrupt
 /// completion leaves the execution context and cannot reach the later event.
-#[must_use]
+#[must_use = "Only a true result proves normal completion before the target event"]
 pub fn prove_event_completion_before_event(
     semantic: &Semantic<'_>,
     required: Span,
@@ -574,8 +574,10 @@ pub fn cfg_has_write_free_path(
         // writes in other blocks conservatively block the entire block.
         let killed = barriers_by_block.get(&block).is_some_and(|writes| {
             writes.iter().any(|write| {
-                (block != source_block || write.start >= source.end)
-                    && (block != sink_block || write.start < sink.start)
+                let write_start = write.start;
+                let after_source = block != source_block || write_start >= source.end;
+                let before_sink = block != sink_block || write_start < sink.start;
+                after_source && before_sink
             })
         });
         if killed {

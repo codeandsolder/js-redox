@@ -28,7 +28,7 @@ fn identities<'a>(directives: &[Directive<'a>]) -> Vec<DirectiveIdentity<'a>> {
 }
 
 /// Root directives and function bodies with actual source brace anchors.
-/// Expression-bodied arrows have synthesized FunctionBody nodes without
+/// Expression-bodied arrows have synthesized `FunctionBody` nodes without
 /// brace anchors and cannot contain directive prologues.
 #[derive(Default)]
 pub(super) struct DirectiveInventory<'a> {

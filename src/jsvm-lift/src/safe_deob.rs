@@ -17,7 +17,7 @@ pub enum SourceMode {
 }
 
 impl SourceMode {
-    #[must_use]
+    #[must_use = "Use the returned stable spelling when serializing or displaying this value"]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Auto => "auto",
@@ -26,7 +26,7 @@ impl SourceMode {
         }
     }
 
-    #[must_use]
+    #[must_use = "Use the returned suffix for the selected source mode"]
     pub const fn suffix(self) -> &'static str {
         match self {
             Self::Auto => ".js",
@@ -35,7 +35,7 @@ impl SourceMode {
         }
     }
 
-    #[must_use]
+    #[must_use = "Use the converted mode when invoking the safe analysis"]
     pub const fn safe_mode(self) -> SafeSourceMode {
         match self {
             Self::Auto => SafeSourceMode::Auto,
@@ -44,7 +44,7 @@ impl SourceMode {
         }
     }
 
-    #[must_use]
+    #[must_use = "Use the returned parser source type to preserve language semantics"]
     pub const fn source_type(self) -> SourceType {
         match self {
             Self::Auto => SourceType::unambiguous(),
@@ -53,7 +53,7 @@ impl SourceMode {
         }
     }
 
-    #[must_use]
+    #[must_use = "Use the inferred source mode when parsing this path"]
     pub fn for_path(path: &Path) -> Self {
         match path.extension().and_then(|extension| extension.to_str()) {
             Some(extension) if extension.eq_ignore_ascii_case("mjs") => Self::Module,
@@ -92,6 +92,24 @@ pub struct StaticAliasInstallerCallReport {
     pub semantics_proven: bool,
 }
 
+/// Guarantees of the emitted source, independent of iteration convergence.
+#[derive(Debug, Clone, Serialize)]
+pub struct OutputGuarantees {
+    pub safe_static_only: bool,
+    pub presentation_formatted: bool,
+    pub runtime_semantics_preserved_by_design: bool,
+}
+
+impl OutputGuarantees {
+    const fn new(format_output: bool) -> Self {
+        Self {
+            safe_static_only: true,
+            presentation_formatted: format_output,
+            runtime_semantics_preserved_by_design: !format_output,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SafeDeobReport {
     pub schema: &'static str,
@@ -108,9 +126,8 @@ pub struct SafeDeobReport {
     pub arithmetic_state_proofs: Vec<ArithmeticStateProofReport>,
     pub analysis_source_sha256: String,
     pub static_alias_installer_calls: Vec<StaticAliasInstallerCallReport>,
-    pub safe_static_only: bool,
-    pub presentation_formatted: bool,
-    pub runtime_semantics_preserved_by_design: bool,
+    #[serde(flatten)]
+    pub guarantees: OutputGuarantees,
     /// A validated no-op pass was observed before the iteration limit.
     pub analysis_complete: bool,
     /// Nontrivial multi-pass cycle (the ordinary no-op fixed point is separate).
@@ -247,9 +264,7 @@ pub fn deobfuscate_source(
         arithmetic_state_proofs,
         analysis_source_sha256,
         static_alias_installer_calls,
-        safe_static_only: true,
-        presentation_formatted: format_output,
-        runtime_semantics_preserved_by_design: !format_output,
+        guarantees: OutputGuarantees::new(format_output),
         analysis_complete,
         iteration_cycle,
         source_recovery,
@@ -363,8 +378,13 @@ mod tests {
         let budget = WorkBudget::unlimited("safe-deob-test");
         let outcome =
             deobfuscate_source(source, "fixture.js", SourceMode::Auto, 8, false, &budget)?;
-        assert!(outcome.report.safe_static_only);
-        assert!(outcome.report.runtime_semantics_preserved_by_design);
+        assert!(outcome.report.guarantees.safe_static_only);
+        assert!(
+            outcome
+                .report
+                .guarantees
+                .runtime_semantics_preserved_by_design
+        );
         assert_eq!(
             outcome.report.analysis_source_sha256,
             sha256_hex(outcome.source.as_bytes())

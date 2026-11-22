@@ -2,29 +2,36 @@ use anyhow::{ensure, Context, Result};
 use clap::Parser;
 use jsvm_lift::{
     forwarding_semantics::structurally_proven_lazy_registry_read_calls,
-    function_surface::analyze_function_source_surfaces,
+    function_surface::{analyze_function_source_surfaces, FunctionSourceSurface},
     lazy_cell::{
         proven_slow_lazy_cell_captured_handler_install,
         proven_slow_lazy_cell_exact_registry_assignments, proven_slow_lazy_cell_factory_call,
         proven_slow_lazy_cell_registry_assignment, proven_slow_lazy_cell_update_state,
-        structurally_proven_slow_lazy_cell_factory_shapes,
+        structurally_proven_slow_lazy_cell_factory_shapes, SlowLazyCellFactoryShape,
     },
     lexical_mutation::audit_lexical_binding_mutation,
     receiver_identity::{
         structurally_proven_prototype_method_phase_closures,
-        structurally_proven_runtime_origin_flow,
+        structurally_proven_runtime_origin_flow, ProvenOriginFlow,
     },
-    registry_identity::proven_origin_registry_handler_installs,
+    registry_identity::{
+        proven_origin_registry_handler_installs, ProvenOriginRegistryHandlerInstall,
+    },
 };
 use jsvm_lift::{js_format::format_source, safe_deob::SourceMode, sha256_hex};
 use oxc_allocator::Allocator;
-use oxc_semantic::SemanticBuilder;
+use oxc_ast::ast::Program;
+use oxc_semantic::{Semantic, SemanticBuilder};
 use oxc_span::Span;
 use rolldown_redox::ecmascript::parse_program;
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::fmt::Write as _;
-use std::{fs, path::PathBuf, time::Duration};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 use work_budget::{BudgetLimits, WorkBudget};
 
 /// Deliberately separate from the cheap browser-project scan: proving
@@ -53,35 +60,16 @@ struct HandlerCapture {
     constructor: [u32; 2],
 }
 
-fn main() -> Result<()> {
-    let args = Args::parse();
-    let source = fs::read_to_string(&args.input)
-        .with_context(|| format!("reading {}", args.input.display()))?;
-    let allocator = Allocator::default();
-    let parsed = parse_program(
-        &allocator,
-        &source,
-        SourceMode::for_path(&args.input).source_type(),
-    );
-    anyhow::ensure!(parsed.is_clean(), "unparseable input");
-    let result = SemanticBuilder::new()
-        .with_build_nodes(true)
-        .with_cfg(true)
-        .with_check_syntax_error(true)
-        .build(&parsed.program);
-    anyhow::ensure!(result.diagnostics.is_empty(), "semantic diagnostics");
-    let semantic = &result.semantic;
-    let scoping = semantic.scoping();
-    let budget = WorkBudget::new(
-        "lazy-cell-proof-inventory",
-        BudgetLimits::wall_time(Duration::from_secs(180)),
-    );
-    let flow = structurally_proven_runtime_origin_flow(&parsed.program, semantic, &budget)?;
-    let shapes = structurally_proven_slow_lazy_cell_factory_shapes(&parsed.program, scoping);
+fn audit_phase_mutations(
+    program: &Program<'_>,
+    semantic: &Semantic<'_>,
+    shapes: &[SlowLazyCellFactoryShape],
+    budget: &WorkBudget,
+) -> Result<Vec<Value>> {
     // Report unresolved mutation hazards on the captured phase closure.
     // A syntactically unique assignment is not an immutable-value theorem.
     let phase_closures =
-        structurally_proven_prototype_method_phase_closures(&parsed.program, scoping, &budget)?;
+        structurally_proven_prototype_method_phase_closures(program, semantic.scoping(), budget)?;
     let mut phase_mutation_audits = Vec::new();
     for closure in phase_closures.iter().filter(|closure| {
         shapes
@@ -92,7 +80,7 @@ fn main() -> Result<()> {
             semantic,
             closure.phase_binding_symbol,
             oxc_span::Span::new(closure.phase_assignment_start, closure.phase_assignment_end),
-            &budget,
+            budget,
         )?;
         phase_mutation_audits.push(json!({
             "phase_assignment": [closure.phase_assignment_start, closure.phase_assignment_end],
@@ -114,16 +102,26 @@ fn main() -> Result<()> {
             "initialization_before_later_capture_proven": false,
         }));
     }
-    let reads = structurally_proven_lazy_registry_read_calls(&parsed.program, scoping, &budget)?;
-    let installs =
-        proven_origin_registry_handler_installs(&parsed.program, scoping, &flow, &budget)?;
-    eprintln!(
-        "shapes={} direct_calls={} lazy_reads={} installs={}",
-        shapes.len(),
-        flow.direct_calls.len(),
-        reads.len(),
-        installs.len()
-    );
+    Ok(phase_mutation_audits)
+}
+
+struct CaptureInventory {
+    proven_calls: Vec<Value>,
+    with_registry: Vec<Value>,
+    with_update: Vec<Value>,
+    exact: Vec<Value>,
+    captured_handlers: Vec<HandlerCapture>,
+}
+
+fn collect_captures(
+    source: &str,
+    program: &Program<'_>,
+    semantic: &Semantic<'_>,
+    flow: &ProvenOriginFlow,
+    shapes: &[SlowLazyCellFactoryShape],
+    installs: &[ProvenOriginRegistryHandlerInstall],
+    budget: &WorkBudget,
+) -> Result<CaptureInventory> {
     let mut proven_calls = Vec::new();
     let mut with_registry = Vec::new();
     let mut with_update = Vec::new();
@@ -137,27 +135,20 @@ fn main() -> Result<()> {
         }) {
             continue;
         }
-        let Some(factory) =
-            proven_slow_lazy_cell_factory_call(&source, &parsed.program, semantic, call)
+        let Some(factory) = proven_slow_lazy_cell_factory_call(source, program, semantic, call)
         else {
             continue;
         };
         proven_calls.push(json!({"call":[call.call_start,call.call_end], "factory":[call.callee.function_start,call.callee.function_end],"arg_int":call.exact_integer_arguments}));
-        if let Some(update) =
-            proven_slow_lazy_cell_update_state(&parsed.program, semantic, &factory)
-        {
+        if let Some(update) = proven_slow_lazy_cell_update_state(program, semantic, &factory) {
             with_update.push(json!({"call":[call.call_start,call.call_end],"initial":update.initial_state_value,"updated":update.post_update_state_value}));
         }
         if let Some(registry) =
-            proven_slow_lazy_cell_registry_assignment(&parsed.program, semantic, &factory)
+            proven_slow_lazy_cell_registry_assignment(program, semantic, &factory)
         {
             with_registry.push(json!({"call":[call.call_start,call.call_end],"path":registry.registry_path,"key_span":[registry.key_start,registry.key_end]}));
             for item in proven_slow_lazy_cell_exact_registry_assignments(
-                &source,
-                &parsed.program,
-                semantic,
-                &flow,
-                &registry,
+                source, program, semantic, flow, &registry,
             ) {
                 budget.consume(1)?;
                 for install in installs.iter().filter(|install| {
@@ -170,11 +161,7 @@ fn main() -> Result<()> {
                 }) {
                     budget.consume(1)?;
                     if let Some(proven) = proven_slow_lazy_cell_captured_handler_install(
-                        &source,
-                        &parsed.program,
-                        semantic,
-                        &item,
-                        install,
+                        source, program, semantic, &item, install,
                     ) {
                         captured_handlers.push(HandlerCapture {
                             exact_key: proven.install.exact_key,
@@ -208,29 +195,24 @@ fn main() -> Result<()> {
     captured_handlers.sort();
     captured_handlers.dedup();
 
-    // Source behavior annotations are deliberately independent of the proof
-    // that the original function is captured or ever executed. All nested
-    // effects are tagged with their lexical function depth.
-    let spans = captured_handlers
-        .iter()
-        .map(|capture| Span::new(capture.handler[0], capture.handler[1]))
-        .collect::<Vec<_>>();
-    let handler_surfaces = analyze_function_source_surfaces(&source, semantic, &spans, &budget)?
-        .into_iter()
-        .zip(&captured_handlers)
-        .map(|(surface, capture)| {
-            surface.with_context(|| {
-                format!(
-                    "handler source is not an exact unique function at {}..{}",
-                    capture.handler[0], capture.handler[1]
-                )
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
+    Ok(CaptureInventory {
+        proven_calls,
+        with_registry,
+        with_update,
+        exact,
+        captured_handlers,
+    })
+}
+
+fn annotate_phase_audits(
+    phase_mutation_audits: &mut [Value],
+    captured_handlers: &[HandlerCapture],
+    budget: &WorkBudget,
+) -> Result<()> {
     // Associate dynamic-source sites with captured functions only when the
     // exact source interval contains the entire hazard. This is provenance,
     // not an assertion that the handler was invoked or the site was reached.
-    for audit in &mut phase_mutation_audits {
+    for audit in phase_mutation_audits {
         for kind in ["lexical_direct_eval_calls", "lexical_with_statements"] {
             if let Some(sites) = audit
                 .get_mut(kind)
@@ -258,57 +240,83 @@ fn main() -> Result<()> {
         }
     }
 
-    let source_sha256 = sha256_hex(source.as_bytes());
-    let report = json!({
-        "schema": "jsvm-lazy-cell-proof/v2",
-        "input": args.input,
-        "source_sha256": source_sha256,
-        "source_bytes": source.len(),
-        "shape_count": shapes.len(),
-        "shapes": shapes.iter().map(|s|json!({
-            "span":[s.function_start,s.function_end],
-            "slot":s.handler_slot,
-            "state_param":s.state_parameter_index,
-            "handler_param":s.handler_parameter_index,
-            "resolver":s.resolver_property
-        })).collect::<Vec<_>>(),
-        "proven_calls_count":proven_calls.len(),"proven_calls":proven_calls,
-        "registry_bindings_count":with_registry.len(),"registry_bindings":with_registry,
-        "update_state_count":with_update.len(),"update_state":with_update,
-        "captured_handler_count":captured_handlers.len(), "captured_handlers":captured_handlers,
-        "handler_source_surfaces": captured_handlers.iter().zip(&handler_surfaces)
-            .map(|(capture, surface)| json!({"exact_key": capture.exact_key, "surface":surface}))
-            .collect::<Vec<_>>(),
-        "exact_assignment_count":exact.len(),"exact_assignments":exact,
-        "lazy_read_count":reads.len(),"origin_handler_installs_count":installs.len(),
-        "phase_binding_mutation_audits": phase_mutation_audits,
-        "limitations": [
-            "Binding mutation hazards include scope-visible eval and with even when no second explicit assignment is found.",
-            "No assertion that an indirect call executed or a selected branch was taken.",
-            "No proof of registry-slot persistence from installation to read.",
-            "No proof that a lazy-cell returned the captured original handler at a particular runtime phase.",
-            "Function-surface evidence includes non-executed branches and nested closures; syntax is not observed behavior.",
-            "Source spans refer to the exact SHA-256 input, not the formatted view."
-        ]
-    });
+    Ok(())
+}
 
-    if args.output.exists() {
-        ensure!(
-            fs::read_dir(&args.output)
-                .with_context(|| format!("reading output directory {}", args.output.display()))?
-                .next()
-                .is_none(),
-            "output directory is not empty: {}",
-            args.output.display()
-        );
+#[derive(Clone, Copy)]
+struct ReportContext<'a> {
+    input: &'a Path,
+    source_sha256: &'a str,
+    source_bytes: usize,
+    shapes: &'a [SlowLazyCellFactoryShape],
+    handler_surfaces: &'a [FunctionSourceSurface],
+    lazy_read_count: usize,
+    install_count: usize,
+    phase_mutation_audits: &'a [Value],
+}
+
+impl CaptureInventory {
+    fn report(&self, context: ReportContext<'_>) -> Value {
+        let Self {
+            proven_calls,
+            with_registry,
+            with_update,
+            exact,
+            captured_handlers,
+        } = self;
+        let ReportContext {
+            input,
+            source_sha256,
+            source_bytes,
+            shapes,
+            handler_surfaces,
+            lazy_read_count,
+            install_count,
+            phase_mutation_audits,
+        } = context;
+        json!({
+            "schema": "jsvm-lazy-cell-proof/v2",
+            "input": input,
+            "source_sha256": source_sha256,
+            "source_bytes": source_bytes,
+            "shape_count": shapes.len(),
+            "shapes": shapes.iter().map(|s|json!({
+                "span":[s.function_start,s.function_end],
+                "slot":s.handler_slot,
+                "state_param":s.state_parameter_index,
+                "handler_param":s.handler_parameter_index,
+                "resolver":s.resolver_property
+            })).collect::<Vec<_>>(),
+            "proven_calls_count":proven_calls.len(),"proven_calls":proven_calls,
+            "registry_bindings_count":with_registry.len(),"registry_bindings":with_registry,
+            "update_state_count":with_update.len(),"update_state":with_update,
+            "captured_handler_count":captured_handlers.len(), "captured_handlers":captured_handlers,
+            "handler_source_surfaces": captured_handlers.iter().zip(handler_surfaces)
+                .map(|(capture, surface)| json!({"exact_key": capture.exact_key, "surface":surface}))
+                .collect::<Vec<_>>(),
+            "exact_assignment_count":exact.len(),"exact_assignments":exact,
+            "lazy_read_count":lazy_read_count,"origin_handler_installs_count":install_count,
+            "phase_binding_mutation_audits": phase_mutation_audits,
+            "limitations": [
+                "Binding mutation hazards include scope-visible eval and with even when no second explicit assignment is found.",
+                "No assertion that an indirect call executed or a selected branch was taken.",
+                "No proof of registry-slot persistence from installation to read.",
+                "No proof that a lazy-cell returned the captured original handler at a particular runtime phase.",
+                "Function-surface evidence includes non-executed branches and nested closures; syntax is not observed behavior.",
+                "Source spans refer to the exact SHA-256 input, not the formatted view."
+            ]
+        })
     }
-    let handlers_dir = args.output.join("handlers");
-    fs::create_dir_all(&handlers_dir)?;
-    fs::write(
-        args.output.join("analysis.json"),
-        serde_json::to_vec_pretty(&report)?,
-    )?;
+}
 
+fn write_handler_views(
+    handlers_dir: &Path,
+    source: &str,
+    source_sha256: &str,
+    captured_handlers: &[HandlerCapture],
+    handler_surfaces: &[FunctionSourceSurface],
+    budget: &WorkBudget,
+) -> Result<String> {
     let mut index = String::from(
         r"# Proven lazy-cell handler captures
 
@@ -332,13 +340,13 @@ For the complete evidence, see the per-handler evidence JSON files and analysis.
 ",
     );
     let mut written = std::collections::BTreeSet::new();
-    for (capture, surface) in captured_handlers.iter().zip(&handler_surfaces) {
+    for (capture, surface) in captured_handlers.iter().zip(handler_surfaces) {
         budget.consume(1)?;
         let [start, end] = capture.handler;
-        let name = format!("key-{}-source-{}-{}.js", capture.exact_key, start, end);
+        let name = format!("key-{}-source-{start}-{end}.js", capture.exact_key);
         let evidence_name = format!(
-            "key-{}-source-{}-{}-evidence.json",
-            capture.exact_key, start, end
+            "key-{}-source-{start}-{end}-evidence.json",
+            capture.exact_key
         );
         let eval_sites = surface
             .effects
@@ -354,7 +362,7 @@ For the complete evidence, see the per-handler evidence JSON files and analysis.
                 .get(start as usize..end as usize)
                 .with_context(|| format!("invalid handler source span {start}..{end}"))?;
             let wrapped = format!("const capturedHandler = {source_code};\n");
-            let readable = format_source(&wrapped, &budget)
+            let readable = format_source(&wrapped, budget)
                 .with_context(|| format!("formatting handler key {}", capture.exact_key))?;
             let header = format!(
                 "// Readable, non-devirtualized provenance view. Original SHA-256: {source_sha256}\n                 // Handler key: {}. Original bytes: {start}..{end}. Factory call: {}..{}.\n                 // This proves capture into a wrapper, not which handler ran.\n",
@@ -364,18 +372,22 @@ For the complete evidence, see the per-handler evidence JSON files and analysis.
         }
         let _ =
             writeln!(index,
-            "| {} | [view](handlers/{}) | [evidence](handlers/{}) | {} | {} | {}..{} | {}..{} |",
+            "| {} | [view](handlers/{name}) | [evidence](handlers/{evidence_name}) | {eval_sites} | {} | {start}..{end} | {}..{} |",
             capture.exact_key,
-            name,
-            evidence_name,
-            eval_sites,
             surface.external_references.len(),
-            start,
-            end,
             capture.factory_call[0],
             capture.factory_call[1]
         );
     }
+    Ok(index)
+}
+
+fn append_hazard_index(
+    index: &mut String,
+    phase_mutation_audits: &[Value],
+    captured_handlers: &[HandlerCapture],
+    budget: &WorkBudget,
+) -> Result<()> {
     index.push_str(
         "\n## Dynamic-source lexical mutation hazards\n\n\
          The following sites are syntactically capable of affecting captured bindings.\n\
@@ -385,7 +397,7 @@ For the complete evidence, see the per-handler evidence JSON files and analysis.
          |---|---|---|---|---|\n",
     );
     let mut hazard_count = 0_usize;
-    for audit in &phase_mutation_audits {
+    for audit in phase_mutation_audits {
         let phase_start = audit["phase_function"][0].as_u64();
         let phase_end = audit["phase_function"][1].as_u64();
         let phase_label = match (phase_start, phase_end) {
@@ -444,11 +456,133 @@ For the complete evidence, see the per-handler evidence JSON files and analysis.
     if hazard_count == 0 {
         index.push_str("| — | No syntactic hazard found | — | — | — |\n");
     }
+    Ok(())
+}
+
+fn handler_surfaces(
+    source: &str,
+    semantic: &Semantic<'_>,
+    captured_handlers: &[HandlerCapture],
+    budget: &WorkBudget,
+) -> Result<Vec<FunctionSourceSurface>> {
+    // Source behavior annotations are deliberately independent of the proof
+    // that the original function is captured or ever executed. All nested
+    // effects are tagged with their lexical function depth.
+    let spans = captured_handlers
+        .iter()
+        .map(|capture| Span::new(capture.handler[0], capture.handler[1]))
+        .collect::<Vec<_>>();
+    analyze_function_source_surfaces(source, semantic, &spans, budget)?
+        .into_iter()
+        .zip(captured_handlers)
+        .map(|(surface, capture)| {
+            surface.with_context(|| {
+                format!(
+                    "handler source is not an exact unique function at {}..{}",
+                    capture.handler[0], capture.handler[1]
+                )
+            })
+        })
+        .collect::<Result<Vec<_>>>()
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+    let source = fs::read_to_string(&args.input)
+        .with_context(|| format!("reading {}", args.input.display()))?;
+    let allocator = Allocator::default();
+    let parsed = parse_program(
+        &allocator,
+        &source,
+        SourceMode::for_path(&args.input).source_type(),
+    );
+    anyhow::ensure!(parsed.is_clean(), "unparseable input");
+    let result = SemanticBuilder::new()
+        .with_build_nodes(true)
+        .with_cfg(true)
+        .with_check_syntax_error(true)
+        .build(&parsed.program);
+    anyhow::ensure!(result.diagnostics.is_empty(), "semantic diagnostics");
+    let semantic = &result.semantic;
+    let scoping = semantic.scoping();
+    let budget = WorkBudget::new(
+        "lazy-cell-proof-inventory",
+        BudgetLimits::wall_time(Duration::from_secs(180)),
+    );
+    let flow = structurally_proven_runtime_origin_flow(&parsed.program, semantic, &budget)?;
+    let shapes = structurally_proven_slow_lazy_cell_factory_shapes(&parsed.program, scoping);
+    let mut phase_mutation_audits =
+        audit_phase_mutations(&parsed.program, semantic, &shapes, &budget)?;
+    let reads = structurally_proven_lazy_registry_read_calls(&parsed.program, scoping, &budget)?;
+    let installs =
+        proven_origin_registry_handler_installs(&parsed.program, scoping, &flow, &budget)?;
+    eprintln!(
+        "shapes={} direct_calls={} lazy_reads={} installs={}",
+        shapes.len(),
+        flow.direct_calls.len(),
+        reads.len(),
+        installs.len()
+    );
+    let inventory = collect_captures(
+        &source,
+        &parsed.program,
+        semantic,
+        &flow,
+        &shapes,
+        &installs,
+        &budget,
+    )?;
+    let captured_handlers = &inventory.captured_handlers;
+    let handler_surfaces = handler_surfaces(&source, semantic, captured_handlers, &budget)?;
+    annotate_phase_audits(&mut phase_mutation_audits, captured_handlers, &budget)?;
+    let source_sha256 = sha256_hex(source.as_bytes());
+    let report = inventory.report(ReportContext {
+        input: &args.input,
+        source_sha256: &source_sha256,
+        source_bytes: source.len(),
+        shapes: &shapes,
+        handler_surfaces: &handler_surfaces,
+        lazy_read_count: reads.len(),
+        install_count: installs.len(),
+        phase_mutation_audits: &phase_mutation_audits,
+    });
+
+    if args.output.exists() {
+        ensure!(
+            fs::read_dir(&args.output)
+                .with_context(|| format!("reading output directory {}", args.output.display()))?
+                .next()
+                .is_none(),
+            "output directory is not empty: {}",
+            args.output.display()
+        );
+    }
+    let handlers_dir = args.output.join("handlers");
+    fs::create_dir_all(&handlers_dir)?;
+    fs::write(
+        args.output.join("analysis.json"),
+        serde_json::to_vec_pretty(&report)?,
+    )?;
+
+    let mut index = write_handler_views(
+        &handlers_dir,
+        &source,
+        &source_sha256,
+        captured_handlers,
+        &handler_surfaces,
+        &budget,
+    )?;
+    append_hazard_index(
+        &mut index,
+        &phase_mutation_audits,
+        captured_handlers,
+        &budget,
+    )?;
     fs::write(args.output.join("README.md"), index)?;
     println!(
         "Proved {} captured handlers across {} exact-key assignment paths; report: {}",
         captured_handlers.len(),
-        exact.len(),
+        inventory.exact.len(),
         args.output.display()
     );
     Ok(())

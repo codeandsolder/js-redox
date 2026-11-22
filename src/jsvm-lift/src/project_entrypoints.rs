@@ -33,11 +33,10 @@ fn path_link(unit: &Value, readable: &BTreeMap<&str, &str>) -> String {
             continue;
         }
         // This page is under src/. Non-src paths must be rooted one level up.
-        let (label, destination) = if let Some(relative) = path.strip_prefix("src/") {
-            (relative, link_destination(relative))
-        } else {
-            (path, format!("../{}", link_destination(path)))
-        };
+        let (label, destination) = path.strip_prefix("src/").map_or_else(
+            || (path, format!("../{}", link_destination(path))),
+            |relative| (relative, link_destination(relative)),
+        );
         return format!("[{}]({destination})", code_span(label));
     }
     format!(
@@ -47,12 +46,186 @@ fn path_link(unit: &Value, readable: &BTreeMap<&str, &str>) -> String {
 }
 
 struct NavigationIndex<'a> {
+    js_units: Vec<&'a Value>,
+    by_raw: BTreeMap<&'a str, &'a Value>,
     by_url: BTreeMap<&'a str, Vec<&'a Value>>,
     references: BTreeMap<&'a str, &'a [Value]>,
     readable: BTreeMap<&'a str, &'a str>,
 }
 
 impl<'a> NavigationIndex<'a> {
+    fn new(source_index: &'a Value, deob: &'a Value, references: &'a Value) -> Self {
+        let js_units = fields(source_index, "units")
+            .iter()
+            .filter(|unit| string(unit, "kind") == Some("javascript"))
+            .collect::<Vec<_>>();
+        let mut by_url = BTreeMap::<&str, Vec<&Value>>::new();
+        let mut by_raw = BTreeMap::<&str, &Value>::new();
+        for unit in &js_units {
+            // Inline script bodies share their document URL but must not be treated
+            // as importable modules at that URL.
+            if string(unit, "origin") != Some("inline_script") {
+                if let Some(url) = string(unit, "url") {
+                    by_url.entry(url).or_default().push(unit);
+                }
+            }
+            if let Some(raw) = string(unit, "raw_path") {
+                by_raw.insert(raw, unit);
+            }
+        }
+        let readable = fields(deob, "units")
+            .iter()
+            .filter_map(|row| {
+                Some((
+                    string(row, "raw_path")?,
+                    string(row, "readable_output_path")?,
+                ))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let references = fields(references, "code_units")
+            .iter()
+            .filter_map(|unit| Some((string(unit, "raw_path")?, fields(unit, "references"))))
+            .collect::<BTreeMap<_, _>>();
+        Self {
+            js_units,
+            by_raw,
+            by_url,
+            references,
+            readable,
+        }
+    }
+
+    fn append_declared(
+        &self,
+        manifest: &Value,
+        lines: &mut Vec<String>,
+        global_seen: &mut BTreeSet<&'a str>,
+        budget: &WorkBudget,
+    ) -> Result<usize> {
+        let documents = fields(manifest, "resources")
+            .iter()
+            .filter_map(|row| Some((row.get("id")?.as_u64()?, string(row, "url")?)))
+            .collect::<BTreeMap<_, _>>();
+        let mut roots = 0;
+        for script in fields(manifest, "inline_scripts") {
+            budget.consume(1)?;
+            if !is_executable_script(string(script, "script_type")) {
+                continue;
+            }
+            roots += 1;
+            let document = script
+                .get("parent_resource_id")
+                .and_then(Value::as_u64)
+                .and_then(|id| documents.get(&id).copied())
+                .unwrap_or("unknown document");
+            let ordinal = script.get("ordinal").and_then(Value::as_u64).unwrap_or(0);
+            lines.push(format!("## {} — script {ordinal}", code_span(document)));
+            lines.push(String::new());
+            let inline_root =
+                string(script, "output_path").and_then(|raw| self.by_raw.get(raw).copied());
+            let roots_for_script =
+                string(script, "resolved_src").map_or(inline_root.as_slice(), |src| {
+                    lines.push(format!("HTML `src`: {}", code_span(src)));
+                    self.by_url.get(src).map_or_default(Vec::as_slice)
+                });
+            if roots_for_script.is_empty() {
+                lines.push("Source body not present in this capture.".into());
+                lines.push(String::new());
+                continue;
+            }
+            self.append_reachable(
+                lines,
+                roots_for_script,
+                "declared entrypoint",
+                global_seen,
+                budget,
+            )?;
+            lines.push(String::new());
+        }
+        if roots == 0 {
+            lines.push("No executable HTML script declarations were found in this capture.".into());
+            lines.push(String::new());
+        }
+        Ok(roots)
+    }
+
+    fn append_preloads(
+        &self,
+        manifest: &Value,
+        lines: &mut Vec<String>,
+        global_seen: &mut BTreeSet<&'a str>,
+        budget: &WorkBudget,
+    ) -> Result<()> {
+        let mut preloads = Vec::new();
+        for document in fields(manifest, "resources") {
+            let refs = fields(document, "references");
+            budget.consume(u64::try_from(refs.len())?)?;
+            preloads.extend(
+                refs.iter()
+                    .filter(|reference| {
+                        matches!(
+                            string(reference, "kind"),
+                            Some("modulepreload" | "script_preload")
+                        )
+                    })
+                    .map(|reference| (document, reference)),
+            );
+        }
+        if !preloads.is_empty() {
+            lines.extend([
+                "## HTML script preload hints".into(),
+                String::new(),
+                "These resources were declared in HTML `<link rel=modulepreload>` or `<link rel=preload as=script>` tags. Preloading is not proof of execution; the listed dependencies are statically discoverable source code.".into(),
+                String::new(),
+            ]);
+            for (document, reference) in preloads {
+                let document_url = string(document, "url").unwrap_or("unknown document");
+                let kind = string(reference, "kind").unwrap_or("preload");
+                let url = string(reference, "resolved_url").unwrap_or_default();
+                lines.push(format!(
+                    "### {} — {} {}",
+                    code_span(document_url),
+                    code_span(kind),
+                    code_span(url)
+                ));
+                lines.push(String::new());
+                if let Some(units) = self.by_url.get(url) {
+                    self.append_reachable(
+                        lines,
+                        units,
+                        &format!("HTML {} hint", code_span(kind)),
+                        global_seen,
+                        budget,
+                    )?;
+                } else {
+                    lines.push("Preloaded script body not present in this capture.".into());
+                }
+                lines.push(String::new());
+            }
+        }
+        Ok(())
+    }
+
+    fn append_unlinked(&self, lines: &mut Vec<String>, global_seen: &BTreeSet<&str>) {
+        let unlinked = self
+            .js_units
+            .iter()
+            .filter(|unit| string(unit, "raw_path").is_some_and(|path| !global_seen.contains(path)))
+            .collect::<Vec<_>>();
+        if !unlinked.is_empty() {
+            lines.extend([
+                "## Other captured JavaScript".into(),
+                String::new(),
+                "These files are not reached from an HTML-declared script through the statically resolved edges above. They may be preloads, workers, runtime-loaded resources or unrelated captured pages.".into(),
+                String::new(),
+            ]);
+            for unit in unlinked {
+                lines.push(format!("- {}", path_link(unit, &self.readable)));
+            }
+            lines.push(String::new());
+        }
+    }
+
     fn append_reachable(
         &self,
         lines: &mut Vec<String>,
@@ -115,7 +288,7 @@ impl<'a> NavigationIndex<'a> {
     }
 }
 
-pub(crate) struct EntrypointIndex {
+pub struct EntrypointIndex {
     pub(crate) markdown: String,
     pub(crate) declared_scripts: usize,
 }
@@ -124,7 +297,7 @@ pub(crate) struct EntrypointIndex {
 /// statically resolved transitive JavaScript imports. Returns the number of
 /// distinct declared script entries; an empty index is still useful for
 /// explaining why there is no HTML-root code path in a capture.
-pub(crate) fn render_entrypoint_index(
+pub fn render_entrypoint_index(
     manifest: &Value,
     source_index: &Value,
     deob: &Value,
@@ -135,46 +308,7 @@ pub(crate) fn render_entrypoint_index(
     budget.consume(u64::try_from(fields(deob, "units").len())?)?;
     budget.consume(u64::try_from(fields(references, "code_units").len())?)?;
     budget.consume(u64::try_from(fields(manifest, "resources").len())?)?;
-    let js_units = fields(source_index, "units")
-        .iter()
-        .filter(|unit| string(unit, "kind") == Some("javascript"))
-        .collect::<Vec<_>>();
-    let mut by_url = BTreeMap::<&str, Vec<&Value>>::new();
-    let mut by_raw = BTreeMap::<&str, &Value>::new();
-    for unit in &js_units {
-        // Inline script bodies share their document URL but must not be treated
-        // as importable modules at that URL.
-        if string(unit, "origin") != Some("inline_script") {
-            if let Some(url) = string(unit, "url") {
-                by_url.entry(url).or_default().push(unit);
-            }
-        }
-        if let Some(raw) = string(unit, "raw_path") {
-            by_raw.insert(raw, unit);
-        }
-    }
-    let readable = fields(deob, "units")
-        .iter()
-        .filter_map(|row| {
-            Some((
-                string(row, "raw_path")?,
-                string(row, "readable_output_path")?,
-            ))
-        })
-        .collect::<BTreeMap<_, _>>();
-    let references = fields(references, "code_units")
-        .iter()
-        .filter_map(|unit| Some((string(unit, "raw_path")?, fields(unit, "references"))))
-        .collect::<BTreeMap<_, _>>();
-    let navigation = NavigationIndex {
-        by_url,
-        references,
-        readable,
-    };
-    let documents = fields(manifest, "resources")
-        .iter()
-        .filter_map(|row| Some((row.get("id")?.as_u64()?, string(row, "url")?)))
-        .collect::<BTreeMap<_, _>>();
+    let navigation = NavigationIndex::new(source_index, deob, references);
     let mut lines = vec![
         "# JavaScript source entrypoints".to_owned(),
         String::new(),
@@ -182,109 +316,9 @@ pub(crate) fn render_entrypoint_index(
         String::new(),
     ];
     let mut global_seen = BTreeSet::<&str>::new();
-    let mut roots = 0;
-    for script in fields(manifest, "inline_scripts") {
-        budget.consume(1)?;
-        if !is_executable_script(string(script, "script_type")) {
-            continue;
-        }
-        roots += 1;
-        let document = script
-            .get("parent_resource_id")
-            .and_then(Value::as_u64)
-            .and_then(|id| documents.get(&id).copied())
-            .unwrap_or("unknown document");
-        let ordinal = script.get("ordinal").and_then(Value::as_u64).unwrap_or(0);
-        lines.push(format!("## {} — script {ordinal}", code_span(document)));
-        lines.push(String::new());
-        let inline_root = string(script, "output_path").and_then(|raw| by_raw.get(raw).copied());
-        let roots_for_script = if let Some(src) = string(script, "resolved_src") {
-            lines.push(format!("HTML `src`: {}", code_span(src)));
-            navigation.by_url.get(src).map_or_default(Vec::as_slice)
-        } else {
-            inline_root.as_slice()
-        };
-        if roots_for_script.is_empty() {
-            lines.push("Source body not present in this capture.".into());
-            lines.push(String::new());
-            continue;
-        }
-        navigation.append_reachable(
-            &mut lines,
-            roots_for_script,
-            "declared entrypoint",
-            &mut global_seen,
-            budget,
-        )?;
-        lines.push(String::new());
-    }
-    if roots == 0 {
-        lines.push("No executable HTML script declarations were found in this capture.".into());
-        lines.push(String::new());
-    }
-    let mut preloads = Vec::new();
-    for document in fields(manifest, "resources") {
-        let refs = fields(document, "references");
-        budget.consume(u64::try_from(refs.len())?)?;
-        preloads.extend(
-            refs.iter()
-                .filter(|reference| {
-                    matches!(
-                        string(reference, "kind"),
-                        Some("modulepreload" | "script_preload")
-                    )
-                })
-                .map(|reference| (document, reference)),
-        );
-    }
-    if !preloads.is_empty() {
-        lines.extend([
-            "## HTML script preload hints".into(),
-            String::new(),
-            "These resources were declared in HTML `<link rel=modulepreload>` or `<link rel=preload as=script>` tags. Preloading is not proof of execution; the listed dependencies are statically discoverable source code.".into(),
-            String::new(),
-        ]);
-        for (document, reference) in preloads {
-            let document_url = string(document, "url").unwrap_or("unknown document");
-            let kind = string(reference, "kind").unwrap_or("preload");
-            let url = string(reference, "resolved_url").unwrap_or_default();
-            lines.push(format!(
-                "### {} — {} {}",
-                code_span(document_url),
-                code_span(kind),
-                code_span(url)
-            ));
-            lines.push(String::new());
-            if let Some(units) = navigation.by_url.get(url) {
-                navigation.append_reachable(
-                    &mut lines,
-                    units,
-                    &format!("HTML {} hint", code_span(kind)),
-                    &mut global_seen,
-                    budget,
-                )?;
-            } else {
-                lines.push("Preloaded script body not present in this capture.".into());
-            }
-            lines.push(String::new());
-        }
-    }
-    let unlinked = js_units
-        .iter()
-        .filter(|unit| string(unit, "raw_path").is_some_and(|path| !global_seen.contains(path)))
-        .collect::<Vec<_>>();
-    if !unlinked.is_empty() {
-        lines.extend([
-            "## Other captured JavaScript".into(),
-            String::new(),
-            "These files are not reached from an HTML-declared script through the statically resolved edges above. They may be preloads, workers, runtime-loaded resources or unrelated captured pages.".into(),
-            String::new(),
-        ]);
-        for unit in unlinked {
-            lines.push(format!("- {}", path_link(unit, &navigation.readable)));
-        }
-        lines.push(String::new());
-    }
+    let roots = navigation.append_declared(manifest, &mut lines, &mut global_seen, budget)?;
+    navigation.append_preloads(manifest, &mut lines, &mut global_seen, budget)?;
+    navigation.append_unlinked(&mut lines, &global_seen);
     budget.checkpoint()?;
     Ok(EntrypointIndex {
         markdown: lines.join("\n"),

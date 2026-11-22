@@ -106,7 +106,7 @@ impl ObservedResponse {
             && !ids.is_empty()
             && array_field(row, "wasm_resource_ids")
                 .iter()
-                .all(|value| value.is_u64());
+                .all(serde_json::Value::is_u64);
         Ok(Self {
             resource_ids: ids,
             exact_body,

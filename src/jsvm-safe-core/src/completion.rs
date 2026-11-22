@@ -30,7 +30,7 @@ impl Demand {
 }
 
 #[derive(Default)]
-pub(crate) struct CompletionLiveness {
+pub struct CompletionLiveness {
     live: HashSet<(u32, u32)>,
 }
 
@@ -149,14 +149,14 @@ impl CompletionLiveness {
 /// Start a statement-list result with undefined, so an empty selected body
 /// behaves like the original UpdateEmpty(undefined) construct. The outer
 /// block also protects dangling-else and direct-child statement boundaries.
-pub(crate) fn seed_undefined(body: &str) -> String {
+pub fn seed_undefined(body: &str) -> String {
     format!("{{\nvoid 0;\n{body}\n}}")
 }
 
-/// Selecting a known branch must preserve both UpdateEmpty and the statement
+/// Selecting a known branch must preserve both `UpdateEmpty` and the statement
 /// grammar around it. Simple value-producing/abrupt statements need no seed;
 /// an explicit terminator prevents new ASI continuations after a removed else.
-pub(crate) fn selected_if_branch(
+pub fn selected_if_branch(
     selected: Option<&Statement<'_>>,
     source: &str,
     completion_live: bool,
@@ -194,10 +194,6 @@ mod tests {
     use rolldown_redox::ecmascript::parse_program;
 
     fn live_expressions(source: &str) -> Vec<String> {
-        let allocator = Allocator::default();
-        let parsed = parse_program(&allocator, source, SourceType::cjs());
-        assert!(parsed.is_clean());
-        let analysis = CompletionLiveness::analyze(&parsed.program);
         struct Probe<'a> {
             source: &'a str,
             analysis: &'a CompletionLiveness,
@@ -212,6 +208,10 @@ mod tests {
                 walk::walk_expression_statement(self, node);
             }
         }
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let analysis = CompletionLiveness::analyze(&parsed.program);
         let mut probe = Probe {
             source,
             analysis: &analysis,

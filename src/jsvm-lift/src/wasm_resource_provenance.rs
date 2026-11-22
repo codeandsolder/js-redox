@@ -614,9 +614,8 @@ pub fn correlate_wasm_resource_provenance(
         return unavailable_result(&project, "missing_cdp_stream");
     }
     budget.checkpoint()?;
-    let cdp_document = match load_json(&cdp_path) {
-        Ok(document) => document,
-        Err(_) => return unavailable_result(&project, "invalid_cdp_stream"),
+    let Ok(cdp_document) = load_json(&cdp_path) else {
+        return unavailable_result(&project, "invalid_cdp_stream");
     };
     let Some(cdp_rows) = cdp_document.as_array() else {
         return unavailable_result(&project, "invalid_cdp_stream_shape");

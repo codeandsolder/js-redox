@@ -66,6 +66,53 @@ fn usable_name(name: &str) -> bool {
         && !keyword::is_reserved_keyword(name)
 }
 
+impl ModuleExports {
+    fn record_declaration(&mut self, declaration: &Declaration<'_>) {
+        match declaration {
+            Declaration::VariableDeclaration(vars) => {
+                for declarator in &vars.declarations {
+                    if let BindingPattern::BindingIdentifier(id) = &declarator.id {
+                        let name = id.name.to_string();
+                        self.local.push((name.clone(), name));
+                    }
+                }
+            }
+            Declaration::FunctionDeclaration(function) => {
+                if let Some(id) = &function.id {
+                    let name = id.name.to_string();
+                    self.local.push((name.clone(), name));
+                }
+            }
+            Declaration::ClassDeclaration(class) => {
+                if let Some(id) = &class.id {
+                    let name = id.name.to_string();
+                    self.local.push((name.clone(), name));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn record_default(&mut self, declaration: &ExportDefaultDeclarationKind<'_>) {
+        match declaration {
+            ExportDefaultDeclarationKind::Identifier(id) => {
+                self.local.push(("default".to_owned(), id.name.to_string()));
+            }
+            ExportDefaultDeclarationKind::FunctionDeclaration(function) => {
+                if let Some(id) = &function.id {
+                    self.local.push(("default".to_owned(), id.name.to_string()));
+                }
+            }
+            ExportDefaultDeclarationKind::ClassDeclaration(class) => {
+                if let Some(id) = &class.id {
+                    self.local.push(("default".to_owned(), id.name.to_string()));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn parse_exports(source: &str) -> Option<ModuleExports> {
     let allocator = Allocator::default();
     let parsed = parse_program(&allocator, source, SourceType::mjs());
@@ -124,51 +171,12 @@ fn parse_exports(source: &str) -> Option<ModuleExports> {
                     .star_reexports
                     .push(star.source.value.as_str()?.to_owned());
             }
-            Statement::ExportDeclaration(declaration) => match &declaration.declaration {
-                Declaration::VariableDeclaration(vars) => {
-                    for declarator in &vars.declarations {
-                        if let BindingPattern::BindingIdentifier(id) = &declarator.id {
-                            let name = id.name.to_string();
-                            exports.local.push((name.clone(), name));
-                        }
-                    }
-                }
-                Declaration::FunctionDeclaration(function) => {
-                    if let Some(id) = &function.id {
-                        let name = id.name.to_string();
-                        exports.local.push((name.clone(), name));
-                    }
-                }
-                Declaration::ClassDeclaration(class) => {
-                    if let Some(id) = &class.id {
-                        let name = id.name.to_string();
-                        exports.local.push((name.clone(), name));
-                    }
-                }
-                _ => {}
-            },
-            Statement::ExportDefaultDeclaration(default) => match &default.declaration {
-                ExportDefaultDeclarationKind::Identifier(id) => {
-                    exports
-                        .local
-                        .push(("default".to_owned(), id.name.to_string()));
-                }
-                ExportDefaultDeclarationKind::FunctionDeclaration(function) => {
-                    if let Some(id) = &function.id {
-                        exports
-                            .local
-                            .push(("default".to_owned(), id.name.to_string()));
-                    }
-                }
-                ExportDefaultDeclarationKind::ClassDeclaration(class) => {
-                    if let Some(id) = &class.id {
-                        exports
-                            .local
-                            .push(("default".to_owned(), id.name.to_string()));
-                    }
-                }
-                _ => {}
-            },
+            Statement::ExportDeclaration(declaration) => {
+                exports.record_declaration(&declaration.declaration);
+            }
+            Statement::ExportDefaultDeclaration(default) => {
+                exports.record_default(&default.declaration);
+            }
             _ => {}
         }
     }
@@ -490,23 +498,7 @@ Names come from readable source and statically resolved captured ESM exports. Th
     crate::report_file::write_text(&path, &output)
 }
 
-/// Make downstream imports use descriptive component names in the readable
-/// view only. The existing module resolution artifact is authoritative.
-///
-/// # Errors
-///
-/// Fails if existing project artifacts cannot be loaded, an indexed readable module cannot be
-/// read, or renamed output and related artifacts cannot be persisted.
-pub fn propagate_imported_names(project: &Path) -> Result<usize> {
-    let Some(refs) = load_optional_artifact(project, JS_REFERENCES)? else {
-        return Ok(0);
-    };
-    let Some(deob) = load_optional_artifact(project, DEOBFUSCATION)? else {
-        return Ok(0);
-    };
-    let Some(source_index) = load_optional_artifact(project, SOURCE_INDEX)? else {
-        return Ok(0);
-    };
+fn unique_module_urls(source_index: &Value) -> BTreeMap<String, Option<String>> {
     let mut urls = BTreeMap::<String, Option<String>>::new();
     for unit in source_index["units"].as_array().into_iter().flatten() {
         if field(unit, "kind") != Some("javascript") {
@@ -523,6 +515,10 @@ pub fn propagate_imported_names(project: &Path) -> Result<usize> {
             }
         }
     }
+    urls
+}
+
+fn readable_modules(project: &Path, deob: &Value) -> Result<BTreeMap<String, (String, String)>> {
     let mut by_raw = BTreeMap::<String, (String, String)>::new();
     for unit in deob["units"].as_array().into_iter().flatten() {
         if let (Some(raw), Some(readable)) =
@@ -539,7 +535,13 @@ pub fn propagate_imported_names(project: &Path) -> Result<usize> {
             }
         }
     }
-    let mut resolutions = BTreeMap::<String, BTreeMap<String, Option<String>>>::new();
+    Ok(by_raw)
+}
+
+type Resolutions = BTreeMap<String, Option<String>>;
+
+fn module_resolutions(refs: &Value) -> BTreeMap<String, Resolutions> {
+    let mut resolutions = BTreeMap::<String, Resolutions>::new();
     for unit in refs["code_units"].as_array().into_iter().flatten() {
         let Some(raw) = field(unit, "raw_path") else {
             continue;
@@ -564,6 +566,18 @@ pub fn propagate_imported_names(project: &Path) -> Result<usize> {
             }
         }
     }
+    resolutions
+}
+
+fn collect_modules(
+    project: &Path,
+    refs: &Value,
+    deob: &Value,
+    source_index: &Value,
+) -> Result<BTreeMap<String, SourceModule>> {
+    let urls = unique_module_urls(source_index);
+    let by_raw = readable_modules(project, deob)?;
+    let mut resolutions = module_resolutions(refs);
     let mut modules = BTreeMap::<String, SourceModule>::new();
     for (url, raw) in urls {
         let Some(raw) = raw else { continue };
@@ -583,6 +597,27 @@ pub fn propagate_imported_names(project: &Path) -> Result<usize> {
             },
         );
     }
+    Ok(modules)
+}
+
+/// Make downstream imports use descriptive component names in the readable
+/// view only. The existing module resolution artifact is authoritative.
+///
+/// # Errors
+///
+/// Fails if existing project artifacts cannot be loaded, an indexed readable module cannot be
+/// read, or renamed output and related artifacts cannot be persisted.
+pub fn propagate_imported_names(project: &Path) -> Result<usize> {
+    let Some(refs) = load_optional_artifact(project, JS_REFERENCES)? else {
+        return Ok(0);
+    };
+    let Some(deob) = load_optional_artifact(project, DEOBFUSCATION)? else {
+        return Ok(0);
+    };
+    let Some(source_index) = load_optional_artifact(project, SOURCE_INDEX)? else {
+        return Ok(0);
+    };
+    let mut modules = collect_modules(project, &refs, &deob, &source_index)?;
     let mut count = 0;
     // Renaming one module can reveal a descriptive local export name to an
     // upstream consumer. Reparse the renamed modules and rerun graph linking
@@ -654,11 +689,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn propagates_component_names_through_reexports_and_star_barrels() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let project = temp.path();
-        let files = [
+    const NAMING_INDEX_SOURCE: &str =
+        "import {u as b} from './Star.js'; const obj={b}; export {b}; console.log(b);";
+    const NAMING_FILES: &[(&str, &str)] = &[
             (
                 "Footer.js",
                 "const Footer={label:'Footer'}; export {Footer as t}; export default Footer;",
@@ -680,7 +713,7 @@ mod tests {
             ),
             (
                 "index.js",
-                "import {u as b} from './Star.js'; const obj={b}; export {b}; console.log(b);",
+                NAMING_INDEX_SOURCE,
             ),
             ("shorthand.js", "import {t} from './Footer.js'; use(t);"),
             ("default.js", "import x from './Footer.js'; use(x);"),
@@ -737,71 +770,73 @@ mod tests {
                 "import {x as v} from './Decorated.js'; use(v);",
             ),
         ];
-        let refs = [
-            ("Barrel.js", "./Footer.js", "reexport_named", "Footer.js"),
-            ("Star.js", "./Barrel.js", "reexport_all", "Barrel.js"),
-            ("Aliased.js", "./Footer.js", "import_static", "Footer.js"),
-            ("consumer.js", "./Aliased.js", "import_static", "Aliased.js"),
-            ("Conflicted.js", "./Star.js", "reexport_all", "Star.js"),
-            ("Conflicted.js", "./Other.js", "reexport_all", "Other.js"),
-            ("index.js", "./Star.js", "import_static", "Star.js"),
-            ("shorthand.js", "./Footer.js", "import_static", "Footer.js"),
-            ("default.js", "./Footer.js", "import_static", "Footer.js"),
-            (
-                "conflict.js",
-                "./Conflicted.js",
-                "import_static",
-                "Conflicted.js",
-            ),
-            ("collision.js", "./Star.js", "import_static", "Star.js"),
-            (
-                "ApiBarrel.js",
-                "./PublicApi.js",
-                "reexport_named",
-                "PublicApi.js",
-            ),
-            (
-                "ApiConsumer.js",
-                "./ApiBarrel.js",
-                "import_static",
-                "ApiBarrel.js",
-            ),
-            (
-                "DirectApiConsumer.js",
-                "./PublicApi.js",
-                "import_static",
-                "PublicApi.js",
-            ),
-            (
-                "ApiCollision.js",
-                "./ApiBarrel.js",
-                "import_static",
-                "ApiBarrel.js",
-            ),
-            (
-                "LocalConsumer.js",
-                "./DescriptiveLocal.js",
-                "import_static",
-                "DescriptiveLocal.js",
-            ),
-            (
-                "TransitionConsumer.js",
-                "./Transition.js",
-                "import_static",
-                "Transition.js",
-            ),
-            ("Decorated.js", "./Footer.js", "import_static", "Footer.js"),
-            (
-                "DeferredConsumer.js",
-                "./Decorated.js",
-                "import_static",
-                "Decorated.js",
-            ),
-        ];
+    const NAMING_REFS: &[(&str, &str, &str, &str)] = &[
+        ("Barrel.js", "./Footer.js", "reexport_named", "Footer.js"),
+        ("Star.js", "./Barrel.js", "reexport_all", "Barrel.js"),
+        ("Aliased.js", "./Footer.js", "import_static", "Footer.js"),
+        ("consumer.js", "./Aliased.js", "import_static", "Aliased.js"),
+        ("Conflicted.js", "./Star.js", "reexport_all", "Star.js"),
+        ("Conflicted.js", "./Other.js", "reexport_all", "Other.js"),
+        ("index.js", "./Star.js", "import_static", "Star.js"),
+        ("shorthand.js", "./Footer.js", "import_static", "Footer.js"),
+        ("default.js", "./Footer.js", "import_static", "Footer.js"),
+        (
+            "conflict.js",
+            "./Conflicted.js",
+            "import_static",
+            "Conflicted.js",
+        ),
+        ("collision.js", "./Star.js", "import_static", "Star.js"),
+        (
+            "ApiBarrel.js",
+            "./PublicApi.js",
+            "reexport_named",
+            "PublicApi.js",
+        ),
+        (
+            "ApiConsumer.js",
+            "./ApiBarrel.js",
+            "import_static",
+            "ApiBarrel.js",
+        ),
+        (
+            "DirectApiConsumer.js",
+            "./PublicApi.js",
+            "import_static",
+            "PublicApi.js",
+        ),
+        (
+            "ApiCollision.js",
+            "./ApiBarrel.js",
+            "import_static",
+            "ApiBarrel.js",
+        ),
+        (
+            "LocalConsumer.js",
+            "./DescriptiveLocal.js",
+            "import_static",
+            "DescriptiveLocal.js",
+        ),
+        (
+            "TransitionConsumer.js",
+            "./Transition.js",
+            "import_static",
+            "Transition.js",
+        ),
+        ("Decorated.js", "./Footer.js", "import_static", "Footer.js"),
+        (
+            "DeferredConsumer.js",
+            "./Decorated.js",
+            "import_static",
+            "Decorated.js",
+        ),
+    ];
+
+    fn write_naming_fixture(project: &std::path::Path) -> Result<()> {
         let mut source_units = Vec::new();
         let mut deob_units = Vec::new();
         let mut ref_units = Vec::new();
-        for (name, source) in files {
+        for &(name, source) in NAMING_FILES {
             let raw = format!("resources/{name}");
             let readable = format!("src/_readable/{name}");
             let deob = format!("src/_deobfuscated/{name}");
@@ -817,15 +852,17 @@ mod tests {
                 .push(json!({"raw_path":raw,"readable_output_path":readable,"output_path":deob}));
             ref_units.push(json!({
                 "raw_path":raw,
-                "references":refs.iter().filter(|(unit,_,_,_)| *unit==name).map(|(_,specifier,kind,to)| json!({
+                "references":NAMING_REFS.iter().filter(|(unit,_,_,_)| *unit==name).map(|(_,specifier,kind,to)| json!({
                     "specifier":specifier,"kind":kind,
                     "resolved_url":format!("https://fixture.test/{to}"),
                 })).collect::<Vec<_>>(),
             }));
         }
         // Capture deob's real shared-formatting-cache hardlink semantics.
-        let shared_cache = project.join("shared-readable-cache.js");
-        fs::hard_link(project.join("src/_readable/index.js"), &shared_cache)?;
+        fs::hard_link(
+            project.join("src/_readable/index.js"),
+            project.join("shared-readable-cache.js"),
+        )?;
         write_artifact(
             project,
             SOURCE_INDEX,
@@ -847,37 +884,10 @@ mod tests {
                 "schema":JS_REFERENCES.schema,"code_units":ref_units,"summary":{}
             }),
         )?;
-        assert_eq!(propagate_imported_names(project)?, 12);
-        let index = fs::read_to_string(project.join("src/_readable/index.js"))?;
-        assert!(index.contains("import {u as Footer}"), "{index}");
-        assert!(index.contains("const obj={b: Footer}"), "{index}");
-        assert!(index.contains("export {Footer as b}"), "{index}");
-        assert!(index.contains("console.log(Footer)"), "{index}");
-        let direct = fs::read_to_string(project.join("src/_readable/shorthand.js"))?;
-        assert!(direct.contains("import {t as Footer}"), "{direct}");
-        let default = fs::read_to_string(project.join("src/_readable/default.js"))?;
-        assert!(default.contains("import Footer from"), "{default}");
-        let aliased = fs::read_to_string(project.join("src/_readable/Aliased.js"))?;
-        assert!(aliased.contains("import {t as Footer}"), "{aliased}");
-        assert!(
-            aliased.contains("export {Footer as forwarded}"),
-            "{aliased}"
-        );
-        let consumer = fs::read_to_string(project.join("src/_readable/consumer.js"))?;
-        assert!(
-            consumer.contains("import {forwarded as Footer}"),
-            "{consumer}"
-        );
-        assert!(consumer.contains("use(Footer)"), "{consumer}");
-        let ambiguous = fs::read_to_string(project.join("src/_readable/conflict.js"))?;
-        assert!(ambiguous.contains("import {u as b}"), "{ambiguous}");
-        let collision = fs::read_to_string(project.join("src/_readable/collision.js"))?;
-        assert!(collision.contains("import {u as b}"), "{collision}");
-        assert_eq!(
-            fs::read_to_string(&shared_cache)?,
-            files[7].1,
-            "cross-module naming mutated the deduplicated formatter cache"
-        );
+        Ok(())
+    }
+
+    fn assert_public_api_names(project: &std::path::Path) -> Result<String> {
         let consumer = fs::read_to_string(project.join("src/_readable/ApiConsumer.js"))?;
         assert!(
             consumer.contains("import {createApplication as createApp}"),
@@ -951,9 +961,49 @@ mod tests {
             "{collision}"
         );
         assert!(collision.contains("console.log(q())"), "{collision}");
+        Ok(index_doc)
+    }
+
+    #[test]
+    fn propagates_component_names_through_reexports_and_star_barrels() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let project = temp.path();
+        write_naming_fixture(project)?;
+        assert_eq!(propagate_imported_names(project)?, 12);
+        let index = fs::read_to_string(project.join("src/_readable/index.js"))?;
+        assert!(index.contains("import {u as Footer}"), "{index}");
+        assert!(index.contains("const obj={b: Footer}"), "{index}");
+        assert!(index.contains("export {Footer as b}"), "{index}");
+        assert!(index.contains("console.log(Footer)"), "{index}");
+        let direct = fs::read_to_string(project.join("src/_readable/shorthand.js"))?;
+        assert!(direct.contains("import {t as Footer}"), "{direct}");
+        let default = fs::read_to_string(project.join("src/_readable/default.js"))?;
+        assert!(default.contains("import Footer from"), "{default}");
+        let aliased = fs::read_to_string(project.join("src/_readable/Aliased.js"))?;
+        assert!(aliased.contains("import {t as Footer}"), "{aliased}");
+        assert!(
+            aliased.contains("export {Footer as forwarded}"),
+            "{aliased}"
+        );
+        let consumer = fs::read_to_string(project.join("src/_readable/consumer.js"))?;
+        assert!(
+            consumer.contains("import {forwarded as Footer}"),
+            "{consumer}"
+        );
+        assert!(consumer.contains("use(Footer)"), "{consumer}");
+        let ambiguous = fs::read_to_string(project.join("src/_readable/conflict.js"))?;
+        assert!(ambiguous.contains("import {u as b}"), "{ambiguous}");
+        let collision = fs::read_to_string(project.join("src/_readable/collision.js"))?;
+        assert!(collision.contains("import {u as b}"), "{collision}");
+        assert_eq!(
+            fs::read_to_string(project.join("shared-readable-cache.js"))?,
+            NAMING_INDEX_SOURCE,
+            "cross-module naming mutated the deduplicated formatter cache"
+        );
+        let index_doc = assert_public_api_names(project)?;
         // Only `_readable` is rewritten; source bytes used for safe analysis are not.
         let exact = fs::read_to_string(project.join("src/_deobfuscated/index.js"))?;
-        assert_eq!(exact, files[7].1);
+        assert_eq!(exact, NAMING_INDEX_SOURCE);
         // Idempotence of the presentation pass, even for import shorthand.
         assert_eq!(propagate_imported_names(project)?, 0);
         assert_eq!(

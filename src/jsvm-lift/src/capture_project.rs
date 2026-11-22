@@ -9,7 +9,7 @@ use std::{
 pub const SCHEMA: &str = "capture-project/v1";
 pub const MANIFEST_NAME: &str = "capture-manifest.json";
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CaptureSource {
     pub kind: String,
     pub input: String,
@@ -18,7 +18,7 @@ pub struct CaptureSource {
     pub extra: Map<String, Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CaptureManifest {
     pub schema: String,
     pub source: CaptureSource,
@@ -232,7 +232,7 @@ pub fn read_manifest(path: &Path) -> Result<CaptureManifest> {
 pub(crate) fn write_editor_settings(project: &Path) -> Result<()> {
     crate::report_file::write_json(
         &project.join(".vscode/settings.json"),
-        &serde_json::json!({"editor.maxTokenizationLineLength": 200000}),
+        &serde_json::json!({"editor.maxTokenizationLineLength": 200_000}),
     )
 }
 
@@ -246,7 +246,7 @@ pub fn write_manifest(path: &Path, manifest: &CaptureManifest) -> Result<()> {
     crate::report_file::write_json(path, manifest)
 }
 
-#[must_use]
+#[must_use = "Use the returned path to address the capture manifest"]
 pub fn manifest_path(project: &Path) -> PathBuf {
     project.join(MANIFEST_NAME)
 }

@@ -2,7 +2,7 @@ use crate::{
     analysis_artifacts::{load_artifact, write_artifact, RUNTIME_SCRIPTS, SOURCE_INDEX},
     analysis_budget::{recoverable_unit_error, AnalysisBudgets, AnalysisOperation},
     browser_script_types::{inline_script_kind, InlineScriptKind},
-    capture_project::load_manifest,
+    capture_project::{load_manifest, CaptureManifest},
     content_dedup::{default_jobs, link_or_copy, sha256_path, Materialization},
     js_format::format_source,
     sha256_hex,
@@ -17,6 +17,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
 };
+use work_budget::WorkBudget;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceMaterializeSummary {
@@ -209,14 +210,9 @@ fn materialize_text(
 fn format_javascript(
     source: &Path,
     resource: Option<&Value>,
-    budgets: &AnalysisBudgets,
     parent_budget: &work_budget::WorkBudget,
 ) -> Result<JsGroupResult> {
-    let budget = budgets.operation_under(
-        parent_budget,
-        AnalysisOperation::Format,
-        source.display().to_string(),
-    );
+    let budget = AnalysisOperation::Format.under(parent_budget, source.display().to_string());
     let raw = fs::read(source).with_context(|| format!("reading {}", source.display()))?;
     let decoded = decode_text_bytes(&raw, resource)?;
     let formatted = format_source(&decoded.text, &budget);
@@ -264,6 +260,418 @@ const fn materialization_name(value: Materialization) -> &'static str {
     }
 }
 
+#[derive(Default)]
+struct SourceUnitCollector {
+    units: Vec<Unit>,
+    seen: BTreeSet<String>,
+}
+
+impl SourceUnitCollector {
+    fn resource_units(&mut self, manifest: &CaptureManifest) -> Result<()> {
+        for resource in &manifest.resources {
+            let Some(raw_path) = object_string(resource, "output_path") else {
+                continue;
+            };
+            // Capture records may intentionally share one on-disk body. Each
+            // identity still needs an independent source-index row.
+            self.seen.insert(raw_path.clone());
+            let kind = object_string(resource, "kind").context("resource.kind must be a string")?;
+            if !matches!(
+                kind.as_str(),
+                "javascript" | "html" | "json" | "css" | "text"
+            ) {
+                continue;
+            }
+            let resource_id = object_u64(resource, "id")?;
+            let url = object_string(resource, "url").unwrap_or_default();
+            let transport_kind =
+                object_string(resource, "transport_kind").unwrap_or_else(|| kind.clone());
+            if resource.get("body_complete").and_then(Value::as_bool) == Some(false) {
+                self.units.push(Unit {
+                    kind: "incomplete".into(),
+                    captured_kind: kind,
+                    transport_kind,
+                    origin: "resource",
+                    ordinal: None,
+                    raw_path,
+                    resource_id: Some(resource_id),
+                    url,
+                    resource: None,
+                });
+                continue;
+            }
+            self.units.push(Unit {
+                kind: kind.clone(),
+                captured_kind: kind,
+                transport_kind,
+                origin: "resource",
+                ordinal: None,
+                raw_path,
+                resource_id: Some(resource_id),
+                url,
+                resource: Some(resource.clone()),
+            });
+        }
+
+        Ok(())
+    }
+
+    fn inline_units(&mut self, manifest: &CaptureManifest) -> Result<()> {
+        let mut resources_by_id = BTreeMap::<u64, &Value>::new();
+        for resource in &manifest.resources {
+            let id = object_u64(resource, "id")?;
+            resources_by_id.insert(id, resource);
+        }
+
+        for script in &manifest.inline_scripts {
+            let Some(raw_path) = object_string(script, "output_path") else {
+                continue;
+            };
+            // Capture records may intentionally share one on-disk body. Each
+            // identity still needs an independent source-index row.
+            self.seen.insert(raw_path.clone());
+            let parent_id = object_u64(script, "parent_resource_id")?;
+            let parent = resources_by_id.get(&parent_id).with_context(|| {
+                format!("inline script parent resource id {parent_id} is missing")
+            })?;
+            let script_type = script.get("script_type").and_then(Value::as_str);
+            let kind = match inline_script_kind(script_type) {
+                InlineScriptKind::JavaScript => "javascript",
+                InlineScriptKind::Json => "json",
+                InlineScriptKind::Text => "text",
+            };
+            self.units.push(Unit {
+                kind: kind.into(),
+                captured_kind: kind.into(),
+                transport_kind: "inline_script".into(),
+                origin: "inline_script",
+                ordinal: Some(object_u64(script, "ordinal")?),
+                raw_path,
+                resource_id: Some(parent_id),
+                url: object_string(parent, "url").unwrap_or_default(),
+                resource: None,
+            });
+        }
+
+        Ok(())
+    }
+
+    fn runtime_units(
+        &mut self,
+        project: &Path,
+        manifest: &CaptureManifest,
+        budget: &WorkBudget,
+    ) -> Result<()> {
+        // CDP runtime sources are real script bodies, not synthetic HTTP responses.
+        // Materialize them as separate code units, retaining the recorder's exact
+        // content-addressed bytes and their independent source-graph provenance.
+        if manifest.source.kind == "recorder" {
+            let runtime = load_artifact(project, RUNTIME_SCRIPTS)?;
+            let sources = runtime
+                .get("sources")
+                .and_then(Value::as_array)
+                .context("recorder runtime source index missing sources[]")?;
+            let capture = Path::new(&manifest.source.input);
+            for source in sources {
+                budget.checkpoint()?;
+                if source.get("classification").and_then(Value::as_str)
+                    == Some("capture_instrumentation")
+                {
+                    continue;
+                }
+                let digest = source
+                    .get("sha256")
+                    .and_then(Value::as_str)
+                    .context("runtime source missing sha256")?;
+                if !crate::content_dedup::is_canonical_sha256(digest) {
+                    bail!("invalid runtime script SHA-256");
+                }
+                let capture_path = format!("runtime-scripts/{digest}.js");
+                if source.get("path").and_then(Value::as_str) != Some(capture_path.as_str()) {
+                    bail!("runtime script path is not content-addressed");
+                }
+                let raw_path = format!("resources/{capture_path}");
+                if !self.seen.insert(raw_path.clone()) {
+                    bail!("duplicate runtime script input path");
+                }
+                let bytes = fs::read(capture.join(&capture_path))
+                    .with_context(|| format!("reading captured runtime script {digest}"))?;
+                if sha256_hex(&bytes) != digest {
+                    bail!("runtime script digest mismatch {digest}");
+                }
+                let output = project.join(&raw_path);
+                crate::report_file::write_bytes(&output, &bytes)?;
+                self.units.push(Unit {
+                    kind: "javascript".into(),
+                    captured_kind: "javascript".into(),
+                    transport_kind: "cdp_runtime_script".into(),
+                    origin: "runtime_script",
+                    ordinal: None,
+                    raw_path,
+                    resource_id: None,
+                    url: source
+                        .get("urls")
+                        .and_then(Value::as_array)
+                        .and_then(|urls| urls.iter().find_map(Value::as_str))
+                        .unwrap_or("")
+                        .to_owned(),
+                    resource: None,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    fn collect(
+        project: &Path,
+        manifest: &CaptureManifest,
+        budget: &WorkBudget,
+    ) -> Result<Vec<Unit>> {
+        let mut collector = Self::default();
+        collector.resource_units(manifest)?;
+        collector.inline_units(manifest)?;
+        collector.runtime_units(project, manifest, budget)?;
+        Ok(collector.units)
+    }
+}
+
+struct SourcePaths {
+    reserved: BTreeSet<String>,
+    materialized_raw: BTreeSet<String>,
+}
+
+impl SourcePaths {
+    fn new(units: &[Unit]) -> Self {
+        let reserved = units
+            .iter()
+            .map(|unit| src_path(&unit.raw_path))
+            .collect::<BTreeSet<_>>();
+
+        Self {
+            reserved,
+            materialized_raw: BTreeSet::new(),
+        }
+    }
+
+    fn assign(&mut self, raw_path: &str, row_index: usize) -> String {
+        if self.materialized_raw.insert(raw_path.to_owned()) {
+            src_path(raw_path)
+        } else {
+            let mut index = row_index;
+            let source_suffix = raw_path.strip_prefix("resources/").unwrap_or(raw_path);
+            loop {
+                let candidate = format!("src/_capture_aliases/{index:08}/{source_suffix}");
+                if self.reserved.insert(candidate.clone()) {
+                    break candidate;
+                }
+                index += 1;
+            }
+        }
+    }
+}
+
+type JsContentKey = (String, Option<String>);
+
+#[derive(Default)]
+struct SourceMaterialization {
+    rows: Vec<Value>,
+    groups: BTreeMap<JsContentKey, Vec<JsTask>>,
+}
+
+impl SourceMaterialization {
+    fn plan(project: &Path, units: Vec<Unit>, budget: &WorkBudget) -> Result<Self> {
+        let mut paths = SourcePaths::new(&units);
+        let mut materialization = Self::default();
+        for unit in units {
+            materialization.add_unit(project, unit, &mut paths, budget)?;
+        }
+        Ok(materialization)
+    }
+
+    fn add_unit(
+        &mut self,
+        project: &Path,
+        unit: Unit,
+        paths: &mut SourcePaths,
+        budget: &WorkBudget,
+    ) -> Result<()> {
+        if unit.kind == "incomplete" {
+            self.rows.push(json!({
+                "kind": "incomplete", "captured_kind": unit.captured_kind,
+                "transport_kind": unit.transport_kind, "origin": unit.origin, "ordinal": unit.ordinal,
+                "raw_path": unit.raw_path,
+                "source_path": Value::Null, "resource_id": unit.resource_id, "url": unit.url,
+                "transform": "skipped_incomplete_network_response", "formatted": false,
+            }));
+            return Ok(());
+        }
+        let source = project.join(&unit.raw_path);
+        let dest_rel = paths.assign(&unit.raw_path, self.rows.len());
+        let dest = project.join(&dest_rel);
+        let mut row = json!({
+            "kind": unit.kind, "captured_kind": unit.captured_kind,
+            "transport_kind": unit.transport_kind, "origin": unit.origin, "ordinal": unit.ordinal,
+            "raw_path": unit.raw_path,
+            "resource_id": unit.resource_id, "url": unit.url, "source_path": dest_rel,
+        });
+        let row_index = self.rows.len();
+        if unit.kind == "javascript" {
+            let digest = sha256_path(&source)?;
+            row.as_object_mut()
+                .context("source row must be an object")?
+                .insert("input_sha256".into(), Value::String(digest.clone()));
+            let charset = declared_charset(unit.resource.as_ref());
+            self.groups
+                .entry((digest, charset))
+                .or_default()
+                .push(JsTask {
+                    row_index,
+                    source,
+                    dest,
+                    raw_path: unit.raw_path,
+                    resource: unit.resource,
+                });
+        } else {
+            budget.checkpoint()?;
+            let extra = materialize_text(&source, &dest, &unit.kind, unit.resource.as_ref())?;
+            budget.checkpoint()?;
+            row.as_object_mut()
+                .context("source row must be an object")?
+                .extend(extra);
+        }
+        self.rows.push(row);
+        Ok(())
+    }
+
+    fn format_javascript_groups(&mut self, jobs: usize, budget: &WorkBudget) -> Result<()> {
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(jobs)
+            .build()
+            .context("building source-materialization thread pool")?;
+        let group_refs = self.groups.iter().collect::<Vec<_>>();
+        let results = pool.install(|| {
+            group_refs
+                .par_iter()
+                .map(|(key, group)| {
+                    let canonical = group.first().context("empty JavaScript content group")?;
+                    let result =
+                        format_javascript(&canonical.source, canonical.resource.as_ref(), budget)?;
+                    Ok::<_, anyhow::Error>(((*key).clone(), result))
+                })
+                .collect::<Vec<_>>()
+        });
+        let results = results
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        budget.checkpoint()?;
+
+        for (key, group) in &self.groups {
+            let result = results
+                .get(key)
+                .context("missing JavaScript group result")?;
+            let canonical = group.first().context("empty JavaScript content group")?;
+            crate::report_file::write_text(&canonical.dest, &result.output)?;
+            let (digest, charset_hint) = key;
+            for (occurrence, task) in group.iter().enumerate() {
+                let row = self
+                    .rows
+                    .get_mut(task.row_index)
+                    .and_then(Value::as_object_mut)
+                    .context("source row missing")?;
+                row.insert("transform".into(), Value::String(result.transform.into()));
+                row.insert("formatted".into(), Value::Bool(result.formatted));
+                row.insert(
+                    "source_encoding".into(),
+                    Value::String(result.source_encoding.clone()),
+                );
+                row.insert(
+                    "encoding_fallback".into(),
+                    Value::Bool(result.encoding_fallback),
+                );
+                row.insert(
+                    "declared_charset".into(),
+                    charset_hint.clone().map_or(Value::Null, Value::String),
+                );
+                row.insert("content_sha256".into(), Value::String(digest.clone()));
+                row.insert("content_group_size".into(), Value::from(group.len()));
+                row.insert("deduplicated".into(), Value::Bool(occurrence > 0));
+                row.insert(
+                    "deduplicated_from".into(),
+                    if occurrence > 0 {
+                        Value::String(canonical.raw_path.clone())
+                    } else {
+                        Value::Null
+                    },
+                );
+                if let Some(error) = &result.format_error {
+                    row.insert("format_error".into(), Value::String(error.clone()));
+                    row.insert("kind".into(), Value::String("javascript_unparsed".into()));
+                }
+                if occurrence == 0 {
+                    row.insert("materialization".into(), Value::String("canonical".into()));
+                } else {
+                    let materialization = link_or_copy(&canonical.dest, &task.dest)?;
+                    row.insert(
+                        "materialization".into(),
+                        Value::String(materialization_name(materialization).into()),
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn publish(&self, project: &Path, jobs: usize) -> Result<SourceMaterializeSummary> {
+        let js_units = self
+            .rows
+            .iter()
+            .filter(|row| row.get("kind").and_then(Value::as_str) == Some("javascript"))
+            .count();
+        let unparsed_js_units = self
+            .rows
+            .iter()
+            .filter(|row| row.get("kind").and_then(Value::as_str) == Some("javascript_unparsed"))
+            .count();
+        let captured_js_units = js_units + unparsed_js_units;
+        let unique_js_inputs = self
+            .rows
+            .iter()
+            .filter(|row| {
+                row.get("kind").and_then(Value::as_str) == Some("javascript")
+                    && row.get("materialization").and_then(Value::as_str) == Some("canonical")
+            })
+            .count();
+        let incomplete_units = self
+            .rows
+            .iter()
+            .filter(|row| row.get("kind").and_then(Value::as_str) == Some("incomplete"))
+            .count();
+        let summary = json!({
+            "units": self.rows.len(), "javascript_units": js_units,
+            "runtime_javascript_units": self.rows.iter().filter(|row| row["origin"] == "runtime_script").count(),
+            "captured_javascript_units": captured_js_units,
+            "unparsed_javascript_units": unparsed_js_units, "unique_javascript_inputs": unique_js_inputs,
+            "captured_unique_javascript_inputs": self.groups.len(),
+            "deduplicated_javascript_units": js_units.saturating_sub(unique_js_inputs),
+            "incomplete_network_units": incomplete_units, "formatter_jobs": jobs,
+        });
+        let document =
+            json!({"schema": SOURCE_INDEX.schema, "units": self.rows, "summary": summary});
+        write_artifact(project, SOURCE_INDEX, &document)?;
+        Ok(SourceMaterializeSummary {
+            units: document["units"].as_array().map_or(0, Vec::len),
+            javascript_units: js_units,
+            unique_javascript_inputs: unique_js_inputs,
+            incomplete_units,
+            jobs,
+        })
+    }
+}
+
 /// Materialize the captured source tree with verified source identities.
 ///
 /// # Errors
@@ -284,334 +692,10 @@ pub fn materialize_capture_source(
     stage_budget.checkpoint()?;
     let manifest = load_manifest(project)?;
     stage_budget.checkpoint()?;
-    let mut resources_by_id = BTreeMap::<u64, &Value>::new();
-    for resource in &manifest.resources {
-        let id = object_u64(resource, "id")?;
-        resources_by_id.insert(id, resource);
-    }
-
-    let mut units = Vec::<Unit>::new();
-    let mut seen = BTreeSet::<String>::new();
-    for resource in &manifest.resources {
-        let Some(raw_path) = object_string(resource, "output_path") else {
-            continue;
-        };
-        // Capture records may intentionally share one on-disk body. Each
-        // identity still needs an independent source-index row.
-        seen.insert(raw_path.clone());
-        let kind = object_string(resource, "kind").context("resource.kind must be a string")?;
-        if !matches!(
-            kind.as_str(),
-            "javascript" | "html" | "json" | "css" | "text"
-        ) {
-            continue;
-        }
-        let resource_id = object_u64(resource, "id")?;
-        let url = object_string(resource, "url").unwrap_or_default();
-        let transport_kind =
-            object_string(resource, "transport_kind").unwrap_or_else(|| kind.clone());
-        if resource.get("body_complete").and_then(Value::as_bool) == Some(false) {
-            units.push(Unit {
-                kind: "incomplete".into(),
-                captured_kind: kind,
-                transport_kind,
-                origin: "resource",
-                ordinal: None,
-                raw_path,
-                resource_id: Some(resource_id),
-                url,
-                resource: None,
-            });
-            continue;
-        }
-        units.push(Unit {
-            kind: kind.clone(),
-            captured_kind: kind,
-            transport_kind,
-            origin: "resource",
-            ordinal: None,
-            raw_path,
-            resource_id: Some(resource_id),
-            url,
-            resource: Some(resource.clone()),
-        });
-    }
-
-    for script in &manifest.inline_scripts {
-        let Some(raw_path) = object_string(script, "output_path") else {
-            continue;
-        };
-        // Capture records may intentionally share one on-disk body. Each
-        // identity still needs an independent source-index row.
-        seen.insert(raw_path.clone());
-        let parent_id = object_u64(script, "parent_resource_id")?;
-        let parent = resources_by_id
-            .get(&parent_id)
-            .with_context(|| format!("inline script parent resource id {parent_id} is missing"))?;
-        let script_type = script.get("script_type").and_then(Value::as_str);
-        let kind = match inline_script_kind(script_type) {
-            InlineScriptKind::JavaScript => "javascript",
-            InlineScriptKind::Json => "json",
-            InlineScriptKind::Text => "text",
-        };
-        units.push(Unit {
-            kind: kind.into(),
-            captured_kind: kind.into(),
-            transport_kind: "inline_script".into(),
-            origin: "inline_script",
-            ordinal: Some(object_u64(script, "ordinal")?),
-            raw_path,
-            resource_id: Some(parent_id),
-            url: object_string(parent, "url").unwrap_or_default(),
-            resource: None,
-        });
-    }
-
-    // CDP runtime sources are real script bodies, not synthetic HTTP responses.
-    // Materialize them as separate code units, retaining the recorder's exact
-    // content-addressed bytes and their independent source-graph provenance.
-    if manifest.source.kind == "recorder" {
-        let runtime = load_artifact(project, RUNTIME_SCRIPTS)?;
-        let sources = runtime
-            .get("sources")
-            .and_then(Value::as_array)
-            .context("recorder runtime source index missing sources[]")?;
-        let capture = Path::new(&manifest.source.input);
-        for source in sources {
-            stage_budget.checkpoint()?;
-            if source.get("classification").and_then(Value::as_str)
-                == Some("capture_instrumentation")
-            {
-                continue;
-            }
-            let digest = source
-                .get("sha256")
-                .and_then(Value::as_str)
-                .context("runtime source missing sha256")?;
-            if !crate::content_dedup::is_canonical_sha256(digest) {
-                bail!("invalid runtime script SHA-256");
-            }
-            let capture_path = format!("runtime-scripts/{digest}.js");
-            if source.get("path").and_then(Value::as_str) != Some(capture_path.as_str()) {
-                bail!("runtime script path is not content-addressed");
-            }
-            let raw_path = format!("resources/{capture_path}");
-            if !seen.insert(raw_path.clone()) {
-                bail!("duplicate runtime script input path");
-            }
-            let bytes = fs::read(capture.join(&capture_path))
-                .with_context(|| format!("reading captured runtime script {digest}"))?;
-            if sha256_hex(&bytes) != digest {
-                bail!("runtime script digest mismatch {digest}");
-            }
-            let output = project.join(&raw_path);
-            crate::report_file::write_bytes(&output, &bytes)?;
-            units.push(Unit {
-                kind: "javascript".into(),
-                captured_kind: "javascript".into(),
-                transport_kind: "cdp_runtime_script".into(),
-                origin: "runtime_script",
-                ordinal: None,
-                raw_path,
-                resource_id: None,
-                url: source
-                    .get("urls")
-                    .and_then(Value::as_array)
-                    .and_then(|urls| urls.iter().find_map(Value::as_str))
-                    .unwrap_or("")
-                    .to_owned(),
-                resource: None,
-            });
-        }
-    }
-
-    let mut rows = Vec::<Value>::new();
-    let mut groups = BTreeMap::<(String, Option<String>), Vec<JsTask>>::new();
-    // Sharing captured raw bytes must not merge provenance or charset. All
-    // non-alias output paths are reserved before assigning alias destinations.
-    let mut reserved_sources = units
-        .iter()
-        .map(|unit| src_path(&unit.raw_path))
-        .collect::<BTreeSet<_>>();
-    let mut materialized_raw = BTreeSet::<String>::new();
-    for unit in units {
-        if unit.kind == "incomplete" {
-            rows.push(json!({
-                "kind": "incomplete", "captured_kind": unit.captured_kind,
-                "transport_kind": unit.transport_kind, "origin": unit.origin, "ordinal": unit.ordinal,
-                "raw_path": unit.raw_path,
-                "source_path": Value::Null, "resource_id": unit.resource_id, "url": unit.url,
-                "transform": "skipped_incomplete_network_response", "formatted": false,
-            }));
-            continue;
-        }
-        let source = project.join(&unit.raw_path);
-        let dest_rel = if materialized_raw.insert(unit.raw_path.clone()) {
-            src_path(&unit.raw_path)
-        } else {
-            let mut index = rows.len();
-            let source_suffix = unit
-                .raw_path
-                .strip_prefix("resources/")
-                .unwrap_or(&unit.raw_path);
-            loop {
-                let candidate = format!("src/_capture_aliases/{index:08}/{source_suffix}");
-                if reserved_sources.insert(candidate.clone()) {
-                    break candidate;
-                }
-                index += 1;
-            }
-        };
-        let dest = project.join(&dest_rel);
-        let mut row = json!({
-            "kind": unit.kind, "captured_kind": unit.captured_kind,
-            "transport_kind": unit.transport_kind, "origin": unit.origin, "ordinal": unit.ordinal,
-            "raw_path": unit.raw_path,
-            "resource_id": unit.resource_id, "url": unit.url, "source_path": dest_rel,
-        });
-        let row_index = rows.len();
-        if unit.kind == "javascript" {
-            let digest = sha256_path(&source)?;
-            row.as_object_mut()
-                .context("source row must be an object")?
-                .insert("input_sha256".into(), Value::String(digest.clone()));
-            let charset = declared_charset(unit.resource.as_ref());
-            groups.entry((digest, charset)).or_default().push(JsTask {
-                row_index,
-                source,
-                dest,
-                raw_path: unit.raw_path,
-                resource: unit.resource,
-            });
-        } else {
-            stage_budget.checkpoint()?;
-            let extra = materialize_text(&source, &dest, &unit.kind, unit.resource.as_ref())?;
-            stage_budget.checkpoint()?;
-            row.as_object_mut()
-                .context("source row must be an object")?
-                .extend(extra);
-        }
-        rows.push(row);
-    }
-
-    let pool = ThreadPoolBuilder::new()
-        .num_threads(jobs)
-        .build()
-        .context("building source-materialization thread pool")?;
-    let group_refs = groups.iter().collect::<Vec<_>>();
-    let results = pool.install(|| {
-        group_refs
-            .par_iter()
-            .map(|(key, group)| {
-                let canonical = group.first().context("empty JavaScript content group")?;
-                let result = format_javascript(
-                    &canonical.source,
-                    canonical.resource.as_ref(),
-                    budgets,
-                    &stage_budget,
-                )?;
-                Ok::<_, anyhow::Error>(((*key).clone(), result))
-            })
-            .collect::<Vec<_>>()
-    });
-    let results = results
-        .into_iter()
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .collect::<BTreeMap<_, _>>();
-    stage_budget.checkpoint()?;
-
-    for (key, group) in &groups {
-        let result = results
-            .get(key)
-            .context("missing JavaScript group result")?;
-        let canonical = group.first().context("empty JavaScript content group")?;
-        crate::report_file::write_text(&canonical.dest, &result.output)?;
-        let (digest, charset_hint) = key;
-        for (occurrence, task) in group.iter().enumerate() {
-            let row = rows
-                .get_mut(task.row_index)
-                .and_then(Value::as_object_mut)
-                .context("source row missing")?;
-            row.insert("transform".into(), Value::String(result.transform.into()));
-            row.insert("formatted".into(), Value::Bool(result.formatted));
-            row.insert(
-                "source_encoding".into(),
-                Value::String(result.source_encoding.clone()),
-            );
-            row.insert(
-                "encoding_fallback".into(),
-                Value::Bool(result.encoding_fallback),
-            );
-            row.insert(
-                "declared_charset".into(),
-                charset_hint.clone().map_or(Value::Null, Value::String),
-            );
-            row.insert("content_sha256".into(), Value::String(digest.clone()));
-            row.insert("content_group_size".into(), Value::from(group.len()));
-            row.insert("deduplicated".into(), Value::Bool(occurrence > 0));
-            row.insert(
-                "deduplicated_from".into(),
-                if occurrence > 0 {
-                    Value::String(canonical.raw_path.clone())
-                } else {
-                    Value::Null
-                },
-            );
-            if let Some(error) = &result.format_error {
-                row.insert("format_error".into(), Value::String(error.clone()));
-                row.insert("kind".into(), Value::String("javascript_unparsed".into()));
-            }
-            if occurrence == 0 {
-                row.insert("materialization".into(), Value::String("canonical".into()));
-            } else {
-                let materialization = link_or_copy(&canonical.dest, &task.dest)?;
-                row.insert(
-                    "materialization".into(),
-                    Value::String(materialization_name(materialization).into()),
-                );
-            }
-        }
-    }
-
-    let js_units = rows
-        .iter()
-        .filter(|row| row.get("kind").and_then(Value::as_str) == Some("javascript"))
-        .count();
-    let unparsed_js_units = rows
-        .iter()
-        .filter(|row| row.get("kind").and_then(Value::as_str) == Some("javascript_unparsed"))
-        .count();
-    let captured_js_units = js_units + unparsed_js_units;
-    let unique_js_inputs = rows
-        .iter()
-        .filter(|row| {
-            row.get("kind").and_then(Value::as_str) == Some("javascript")
-                && row.get("materialization").and_then(Value::as_str) == Some("canonical")
-        })
-        .count();
-    let incomplete_units = rows
-        .iter()
-        .filter(|row| row.get("kind").and_then(Value::as_str) == Some("incomplete"))
-        .count();
-    let summary = json!({
-        "units": rows.len(), "javascript_units": js_units,
-        "runtime_javascript_units": rows.iter().filter(|row| row["origin"] == "runtime_script").count(),
-        "captured_javascript_units": captured_js_units,
-        "unparsed_javascript_units": unparsed_js_units, "unique_javascript_inputs": unique_js_inputs,
-        "captured_unique_javascript_inputs": groups.len(),
-        "deduplicated_javascript_units": js_units.saturating_sub(unique_js_inputs),
-        "incomplete_network_units": incomplete_units, "formatter_jobs": jobs,
-    });
-    let document = json!({"schema": SOURCE_INDEX.schema, "units": rows, "summary": summary});
-    write_artifact(project, SOURCE_INDEX, &document)?;
-    Ok(SourceMaterializeSummary {
-        units: document["units"].as_array().map_or(0, Vec::len),
-        javascript_units: js_units,
-        unique_javascript_inputs: unique_js_inputs,
-        incomplete_units,
-        jobs,
-    })
+    let units = SourceUnitCollector::collect(project, &manifest, &stage_budget)?;
+    let mut materialization = SourceMaterialization::plan(project, units, &stage_budget)?;
+    materialization.format_javascript_groups(jobs, &stage_budget)?;
+    materialization.publish(project, jobs)
 }
 
 #[cfg(test)]
@@ -700,47 +784,52 @@ mod tests {
         result
     }
 
+    fn write_sparse_source_fixture(project: &Path) -> Result<()> {
+        fs::write(project.join("resources/a.js"), "const x = 1;\n")?;
+        fs::write(project.join("resources/b.js"), "const x = 1;\n")?;
+        fs::write(
+            project.join("resources/legacy.js"),
+            b"// Copyright \xa9 2012\nconst y = 2;\n",
+        )?;
+        fs::write(project.join("resources/bad.js"), "const = ;\n")?;
+        fs::write(
+            project.join("resources/latin1.js"),
+            b"const marker = '\x81';\n",
+        )?;
+        fs::write(
+            project.join("resources/data.json"),
+            ")]}'\n{\"payload\":{\"value\":42}}",
+        )?;
+        fs::write(
+            project.join("resources/inline.json"),
+            "{\"hello\":\"world\"}",
+        )?;
+        let raw = json!({
+            "schema": "capture-project/v1",
+            "source": {"kind": "synthetic", "input": "test", "salvaged": false},
+            "pages": [],
+            "resources": [
+                {"id": 42, "kind": "javascript", "url": "https://x/a.js", "output_path": "resources/a.js"},
+                {"id": 7, "kind": "javascript", "url": "https://x/b.js", "output_path": "resources/b.js"},
+                {"id": 90, "kind": "javascript", "url": "https://x/legacy.js", "output_path": "resources/legacy.js", "mime_type": "text/javascript; charset=iso-8859-1"},
+                {"id": 91, "kind": "javascript", "url": "https://x/bad.js", "output_path": "resources/bad.js"},
+                {"id": 92, "kind": "javascript", "url": "https://x/latin1.js", "output_path": "resources/latin1.js"},
+                {"id": 5, "kind": "json", "url": "https://x/data", "output_path": "resources/data.json"},
+                {"id": 99, "kind": "javascript", "url": "https://x/incomplete.js", "output_path": "resources/missing.js", "body_complete": false}
+            ],
+            "inline_scripts": [{"parent_resource_id": 42, "ordinal": 3, "output_path": "resources/inline.json", "script_type": "application/json"}],
+            "counts": {}
+        });
+        let manifest = validate_manifest_value(&raw, "test")?;
+        write_manifest(&project.join("capture-manifest.json"), &manifest)?;
+        Ok(())
+    }
+
     #[test]
     fn materializes_sparse_ids_deduplicates_and_normalizes_text() -> Result<()> {
         let project = test_project()?;
         let result = (|| -> Result<()> {
-            fs::write(project.join("resources/a.js"), "const x = 1;\n")?;
-            fs::write(project.join("resources/b.js"), "const x = 1;\n")?;
-            fs::write(
-                project.join("resources/legacy.js"),
-                b"// Copyright \xa9 2012\nconst y = 2;\n",
-            )?;
-            fs::write(project.join("resources/bad.js"), "const = ;\n")?;
-            fs::write(
-                project.join("resources/latin1.js"),
-                b"const marker = '\x81';\n",
-            )?;
-            fs::write(
-                project.join("resources/data.json"),
-                ")]}'\n{\"payload\":{\"value\":42}}",
-            )?;
-            fs::write(
-                project.join("resources/inline.json"),
-                "{\"hello\":\"world\"}",
-            )?;
-            let raw = json!({
-                "schema": "capture-project/v1",
-                "source": {"kind": "synthetic", "input": "test", "salvaged": false},
-                "pages": [],
-                "resources": [
-                    {"id": 42, "kind": "javascript", "url": "https://x/a.js", "output_path": "resources/a.js"},
-                    {"id": 7, "kind": "javascript", "url": "https://x/b.js", "output_path": "resources/b.js"},
-                    {"id": 90, "kind": "javascript", "url": "https://x/legacy.js", "output_path": "resources/legacy.js", "mime_type": "text/javascript; charset=iso-8859-1"},
-                    {"id": 91, "kind": "javascript", "url": "https://x/bad.js", "output_path": "resources/bad.js"},
-                    {"id": 92, "kind": "javascript", "url": "https://x/latin1.js", "output_path": "resources/latin1.js"},
-                    {"id": 5, "kind": "json", "url": "https://x/data", "output_path": "resources/data.json"},
-                    {"id": 99, "kind": "javascript", "url": "https://x/incomplete.js", "output_path": "resources/missing.js", "body_complete": false}
-                ],
-                "inline_scripts": [{"parent_resource_id": 42, "ordinal": 3, "output_path": "resources/inline.json", "script_type": "application/json"}],
-                "counts": {}
-            });
-            let manifest = validate_manifest_value(&raw, "test")?;
-            write_manifest(&project.join("capture-manifest.json"), &manifest)?;
+            write_sparse_source_fixture(&project)?;
             let summary = materialize_capture_source(
                 &project,
                 Some(2),

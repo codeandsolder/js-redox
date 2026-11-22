@@ -1,4 +1,5 @@
 use crate::{safe_deob::SourceMode, sha256_hex};
+use jsvm_safe_core::{Base91RecoveryResult, StaticDecoderRecoveryResult};
 use serde_json::{json, Value};
 use work_budget::{BudgetExceeded, WorkBudget};
 
@@ -6,6 +7,165 @@ use work_budget::{BudgetExceeded, WorkBudget};
 pub struct StaticStringRecoveryOutcome {
     pub source: String,
     pub report: Value,
+}
+
+struct ClassicRecovery {
+    source: String,
+    iterations: usize,
+    candidates: usize,
+    transforms: std::collections::BTreeMap<String, usize>,
+    status: &'static str,
+    cycle: Option<Value>,
+}
+
+impl ClassicRecovery {
+    fn from_result(original: &str, result: Option<StaticDecoderRecoveryResult>) -> Self {
+        let Some(result) = result else {
+            return Self {
+                source: original.to_owned(),
+                iterations: 0,
+                candidates: 0,
+                transforms: std::collections::BTreeMap::new(),
+                status: "parse_or_semantic_rejected",
+                cycle: None,
+            };
+        };
+        let (source, transforms, status, cycle) = if let Some(cycle) = result.iteration_cycle {
+            (
+                original.to_owned(),
+                std::collections::BTreeMap::new(),
+                "iteration_cycle",
+                Some(json!({
+                    "first_seen_iteration": cycle.first_seen_iteration,
+                    "repeated_at_iteration": cycle.repeated_at_iteration,
+                    "period": cycle.period,
+                    "source_sha256": cycle.source_sha256,
+                })),
+            )
+        } else {
+            (result.source, result.transforms, "proven", None)
+        };
+        Self {
+            source,
+            iterations: result.iterations,
+            candidates: result.decoder_candidates,
+            transforms,
+            status,
+            cycle,
+        }
+    }
+
+    fn decoder_calls(&self) -> usize {
+        self.transforms
+            .get("string_array_decode")
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn report(&self, original: &str, input_label: &str, mode: SourceMode) -> Value {
+        let mut report = json!({
+            "schema": "js-static-decoder-recovery/v1",
+            "source_mode": mode.as_str(),
+            "input": input_label,
+            "input_sha256": sha256_hex(original.as_bytes()),
+            "output_sha256": sha256_hex(self.source.as_bytes()),
+            "changed": self.source != original,
+            "iterations": self.iterations,
+            "decoder_candidates": self.candidates,
+            "replacements": self.transforms.values().copied().sum::<usize>(),
+            "transforms": self.transforms,
+            "safe_static_only": true,
+            "status": self.status,
+        });
+        if let Some(cycle) = &self.cycle {
+            report["iteration_cycle"] = cycle.clone();
+        }
+        report
+    }
+}
+
+struct Base91Recovery {
+    source: String,
+    decoders: Vec<Value>,
+    iterations: Vec<Value>,
+    replacements: usize,
+    transforms: std::collections::BTreeMap<String, usize>,
+    decoder_calls: usize,
+    table_reads: usize,
+    concat_folds: usize,
+}
+
+impl Base91Recovery {
+    fn from_result(input: String, result: Option<Base91RecoveryResult>) -> Self {
+        let Some(result) = result else {
+            return Self {
+                source: input,
+                decoders: Vec::new(),
+                iterations: vec![json!({
+                    "iteration": 1, "preflight_skipped": true, "decoder_calls": 0,
+                    "immutable_string_table_replacements": 0, "literal_concat_folds": 0,
+                })],
+                replacements: 0,
+                transforms: std::collections::BTreeMap::new(),
+                decoder_calls: 0,
+                table_reads: 0,
+                concat_folds: 0,
+            };
+        };
+        let decoder_rows = result
+            .decoders
+            .iter()
+            .map(|decoder| {
+                json!({
+                    "decoder": decoder.decoder,
+                    "provider": decoder.provider,
+                    "mode": "rotated_base91",
+                    "offset": 0,
+                    "rotation": decoder.rotation,
+                    "table_entries": decoder.table_entries,
+                    "aliases": [decoder.decoder.clone()],
+                    "transform": decoder.transform,
+                    "declaration_start": decoder.declaration_start,
+                    "scope_start": decoder.scope_start,
+                    "scope_end": decoder.scope_end,
+                    "replacements": decoder.replacements,
+                    "iteration": decoder.iteration,
+                    "status": "proven",
+                })
+            })
+            .collect::<Vec<_>>();
+        let iteration_rows = result
+                .iterations
+                .iter()
+                .map(|iteration| {
+                    json!({
+                        "iteration": iteration.iteration,
+                        "preflight_skipped": iteration.preflight_skipped,
+                        "decoder_calls": iteration.decoder_calls,
+                        "immutable_string_table_replacements": iteration.immutable_string_table_replacements,
+                        "literal_concat_folds": iteration.literal_concat_folds,
+                    })
+                })
+                .collect::<Vec<_>>();
+        Self {
+            source: result.source,
+            decoders: decoder_rows,
+            iterations: iteration_rows,
+            replacements: result.replacements,
+            transforms: result.transforms,
+            decoder_calls: result.iterations.iter().map(|row| row.decoder_calls).sum(),
+            table_reads: result
+                .iterations
+                .iter()
+                .map(|row| row.immutable_string_table_replacements)
+                .sum(),
+            concat_folds: result
+                .iterations
+                .iter()
+                .map(|row| row.literal_concat_folds)
+                .sum(),
+        }
+    }
 }
 
 /// Recover statically provable string values from the program.
@@ -22,176 +182,43 @@ pub fn recover_static_strings(
 ) -> Result<StaticStringRecoveryOutcome, BudgetExceeded> {
     let input_label = input_label.into();
     let safe_mode = source_mode.safe_mode();
-    let classic = jsvm_safe_core::recover_static_decoders_with_source_mode(
+    let classic = ClassicRecovery::from_result(
         original,
-        max_iterations,
-        safe_mode,
-        budget,
-    )?;
-    let (
-        classic_source,
-        classic_iterations,
-        decoder_candidates,
-        classic_transforms,
-        classic_status,
-        classic_cycle,
-    ) = match classic {
-        Some(result) if result.iteration_cycle.is_some() => {
-            let Some(cycle) = result.iteration_cycle.as_ref() else {
-                unreachable!("guarded by cycle presence");
-            };
-            (
-                original.to_string(),
-                result.iterations,
-                result.decoder_candidates,
-                Default::default(),
-                "iteration_cycle",
-                Some(json!({
-                    "first_seen_iteration": cycle.first_seen_iteration,
-                    "repeated_at_iteration": cycle.repeated_at_iteration,
-                    "period": cycle.period,
-                    "source_sha256": cycle.source_sha256,
-                })),
-            )
-        }
-        Some(result) => (
-            result.source,
-            result.iterations,
-            result.decoder_candidates,
-            result.transforms,
-            "proven",
-            None,
-        ),
-        None => (
-            original.to_string(),
-            0,
-            0,
-            Default::default(),
-            "parse_or_semantic_rejected",
-            None,
-        ),
-    };
-    let classic_replacements = classic_transforms.values().copied().sum::<usize>();
-    let mut classic_report = json!({
-        "schema": "js-static-decoder-recovery/v1",
-        "source_mode": source_mode.as_str(),
-        "input": input_label,
-        "input_sha256": sha256_hex(original.as_bytes()),
-        "output_sha256": sha256_hex(classic_source.as_bytes()),
-        "changed": classic_source != original,
-        "iterations": classic_iterations,
-        "decoder_candidates": decoder_candidates,
-        "replacements": classic_replacements,
-        "transforms": classic_transforms,
-        "safe_static_only": true,
-        "status": classic_status,
-    });
-    if let Some(cycle) = classic_cycle {
-        classic_report["iteration_cycle"] = cycle;
-    }
-
+        jsvm_safe_core::recover_static_decoders_with_source_mode(
+            original,
+            max_iterations,
+            safe_mode,
+            budget,
+        )?,
+    );
+    let classic_report = classic.report(original, &input_label, source_mode);
+    let classic_calls = classic.decoder_calls();
     let base91 = jsvm_safe_core::recover_base91_strings_with_source_mode(
-        &classic_source,
+        &classic.source,
         4,
         safe_mode,
         budget,
     )?;
-    let (source, decoders, base91_iterations, base91_replacements, base91_transforms) = match base91
-    {
-        Some(result) => {
-            let decoder_rows = result
-                .decoders
-                .iter()
-                .map(|decoder| {
-                    json!({
-                        "decoder": decoder.decoder,
-                        "provider": decoder.provider,
-                        "mode": "rotated_base91",
-                        "offset": 0,
-                        "rotation": decoder.rotation,
-                        "table_entries": decoder.table_entries,
-                        "aliases": [decoder.decoder.clone()],
-                        "transform": decoder.transform,
-                        "declaration_start": decoder.declaration_start,
-                        "scope_start": decoder.scope_start,
-                        "scope_end": decoder.scope_end,
-                        "replacements": decoder.replacements,
-                        "iteration": decoder.iteration,
-                        "status": "proven",
-                    })
-                })
-                .collect::<Vec<_>>();
-            let iteration_rows = result
-                    .iterations
-                    .iter()
-                    .map(|iteration| {
-                        json!({
-                            "iteration": iteration.iteration,
-                            "preflight_skipped": iteration.preflight_skipped,
-                            "decoder_calls": iteration.decoder_calls,
-                            "immutable_string_table_replacements": iteration.immutable_string_table_replacements,
-                            "literal_concat_folds": iteration.literal_concat_folds,
-                        })
-                    })
-                    .collect::<Vec<_>>();
-            (
-                result.source,
-                decoder_rows,
-                iteration_rows,
-                result.replacements,
-                result.transforms,
-            )
-        }
-        None => (
-            classic_source,
-            Vec::new(),
-            vec![json!({
-                "iteration": 1,
-                "preflight_skipped": true,
-                "decoder_calls": 0,
-                "immutable_string_table_replacements": 0,
-                "literal_concat_folds": 0,
-            })],
-            0,
-            Default::default(),
-        ),
-    };
-    let decoder_call_replacements = classic_transforms
-        .get("string_array_decode")
-        .copied()
-        .unwrap_or(0)
-        + base91_iterations
-            .iter()
-            .filter_map(|row| row.get("decoder_calls").and_then(Value::as_u64))
-            .filter_map(|value| usize::try_from(value).ok())
-            .sum::<usize>();
-    let classic_decoder_calls = classic_transforms
-        .get("string_array_decode")
-        .copied()
-        .unwrap_or(0);
-    let replacements = classic_decoder_calls.saturating_add(base91_replacements);
+    let recovered = Base91Recovery::from_result(classic.source, base91);
     let report = json!({
         "schema": "js-static-string-recovery/v5",
         "safe_static_only": true,
-        "changed": source != original,
+        "changed": recovered.source != original,
         "input_sha256": sha256_hex(original.as_bytes()),
-        "output_sha256": sha256_hex(source.as_bytes()),
+        "output_sha256": sha256_hex(recovered.source.as_bytes()),
         "classic_decoder_recovery": classic_report,
-        "decoders": decoders,
-        "decoder_call_replacements": decoder_call_replacements,
-        "immutable_string_table_replacements": base91_iterations
-            .iter()
-            .filter_map(|row| row.get("immutable_string_table_replacements").and_then(Value::as_u64))
-            .sum::<u64>(),
-        "literal_concat_folds": base91_iterations
-            .iter()
-            .filter_map(|row| row.get("literal_concat_folds").and_then(Value::as_u64))
-            .sum::<u64>(),
-        "base91_iterations": base91_iterations,
-        "base91_transforms": base91_transforms,
-        "replacements": replacements,
+        "decoders": recovered.decoders,
+        "decoder_call_replacements": classic_calls + recovered.decoder_calls,
+        "immutable_string_table_replacements": recovered.table_reads,
+        "literal_concat_folds": recovered.concat_folds,
+        "base91_iterations": recovered.iterations,
+        "base91_transforms": recovered.transforms,
+        "replacements": classic_calls.saturating_add(recovered.replacements),
     });
-    Ok(StaticStringRecoveryOutcome { source, report })
+    Ok(StaticStringRecoveryOutcome {
+        source: recovered.source,
+        report,
+    })
 }
 
 #[cfg(test)]

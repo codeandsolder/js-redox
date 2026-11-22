@@ -42,7 +42,7 @@ pub struct FreshI32CallReport {
 }
 
 impl FreshI32CallReport {
-    #[must_use]
+    #[must_use = "Use the value only when evaluation proves a normal return"]
     pub fn proven_result(&self) -> Option<u32> {
         (self.outcome == FreshEvalOutcome::Returned)
             .then_some(self.i32_result)
@@ -107,7 +107,7 @@ pub struct FreshI32SequenceReport {
 }
 
 impl FreshI32SequenceReport {
-    #[must_use]
+    #[must_use = "Use the value only when evaluation proves a normal return"]
     pub fn proven_result(&self, step: usize) -> Option<u32> {
         (self.outcome == FreshEvalOutcome::Returned)
             .then(|| self.steps.get(step)?.i32_result)

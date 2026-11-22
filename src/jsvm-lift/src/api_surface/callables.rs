@@ -4,7 +4,15 @@
 //! object identity; binding creates a new function object. Prefix arguments are
 //! captured at the bind expression, and unknown spreads never shift a later
 //! argument into a falsely proven position.
-use super::*;
+use super::{
+    allowed_fetch_path, allowed_send_beacon_path, allowed_websocket_path, allowed_xhr_path,
+    direct_reference_id, exact_property_key, expression_symbol, fetch_init_method, global_path,
+    literal_method_evidence, method_from_init, method_value_evidence, source_fragment,
+    static_string, unparenthesized, walk, xhr_binding_is_not_reassigned, ApiBindingWitness,
+    BTreeSet, BindingPattern, CallExpression, Expression, FetchInitMethod, GetSpan, MutationPath,
+    Program, ProvenConstantEnvironment, ReferenceId, Scoping, Span, StaticPrimitiveValue, SymbolId,
+    VariableDeclarator, Visit,
+};
 use oxc_ast::ast::{
     Argument, ArrayExpression, ArrayExpressionElement, VariableDeclaration, VariableDeclarationKind,
 };
@@ -34,7 +42,7 @@ impl ApiKind {
         }
     }
 
-    pub(super) fn family(self) -> &'static str {
+    pub(super) const fn family(self) -> &'static str {
         match self {
             Self::Fetch => "fetch",
             Self::Beacon => "send_beacon",
@@ -44,7 +52,7 @@ impl ApiKind {
         }
     }
 
-    pub(super) fn canonical_path(self) -> &'static str {
+    pub(super) const fn canonical_path(self) -> &'static str {
         match self {
             Self::Fetch => "fetch",
             Self::Beacon => "navigator.sendBeacon",
@@ -54,15 +62,15 @@ impl ApiKind {
         }
     }
 
-    fn is_constructor(self) -> bool {
+    const fn is_constructor(self) -> bool {
         matches!(self, Self::WebSocket | Self::XhrConstructor)
     }
 
-    fn needs_receiver(self) -> bool {
+    const fn needs_receiver(self) -> bool {
         matches!(self, Self::Beacon | Self::XhrOpen)
     }
 
-    pub(super) fn callsite_kind(self, candidate: bool) -> &'static str {
+    pub(super) const fn callsite_kind(self, candidate: bool) -> &'static str {
         match (self, candidate) {
             (Self::Fetch, false) => "fetch",
             (Self::Fetch, true) => "fetch_candidate",
@@ -94,14 +102,14 @@ pub(super) enum ForwardedValue<'e, 'a> {
     },
     Object {
         span: Span,
-        fields: Rc<BTreeMap<String, ForwardedValue<'e, 'a>>>,
+        fields: Rc<BTreeMap<String, Self>>,
     },
     Unknown(Option<Span>),
     Missing,
 }
 
 impl<'e, 'a> ForwardedValue<'e, 'a> {
-    pub(super) fn expression(&self) -> Option<&'e Expression<'a>> {
+    pub(super) const fn expression(&self) -> Option<&'e Expression<'a>> {
         match self {
             Self::Expression(expression) => Some(expression),
             _ => None,
@@ -173,7 +181,7 @@ enum ArraySource<'e, 'a> {
     Unknown(Span),
 }
 
-/// Classify CreateListFromArrayLike inputs for both ordinary and forwarded
+/// Classify `CreateListFromArrayLike` inputs for both ordinary and forwarded
 /// dispatch. Only Function.prototype.apply treats null/undefined as empty.
 fn apply_array_source<'e, 'a>(
     value: ForwardedValue<'e, 'a>,
@@ -273,7 +281,7 @@ impl ApiArguments {
             }
             match value {
                 ForwardedValue::Expression(expr) => {
-                    self.push_expression(expr, source, scoping, constants)
+                    self.push_expression(expr, source, scoping, constants);
                 }
                 ForwardedValue::Primitive { value, span } => {
                     self.prefix.push(Rc::new(ArgumentEvidence {
@@ -283,7 +291,7 @@ impl ApiArguments {
                         },
                         expression: Some(source_fragment(source, span)),
                         init: FetchInitMethod::Unknown,
-                    }))
+                    }));
                 }
                 ForwardedValue::Array { span, .. } => self.prefix.push(Rc::new(ArgumentEvidence {
                     string: None,
@@ -299,7 +307,7 @@ impl ApiArguments {
                             .map_or(FetchInitMethod::NoOwnMethod, |value| {
                                 value.init_method(source, scoping, constants)
                             }),
-                    }))
+                    }));
                 }
                 ForwardedValue::Unknown(span) => self.prefix.push(Rc::new(ArgumentEvidence {
                     string: None,
@@ -318,7 +326,7 @@ impl ApiArguments {
         }
     }
 
-    fn complete(&self) -> bool {
+    const fn complete(&self) -> bool {
         self.prefix.len() >= 2 || self.unknown_tail.is_some()
     }
 
@@ -356,7 +364,7 @@ impl ApiArguments {
                                 string: None,
                                 expression: None,
                                 init: FetchInitMethod::Unknown,
-                            }))
+                            }));
                         }
                         ArrayExpressionElement::SpreadElement(_) => {
                             self.unknown_tail =
@@ -428,14 +436,23 @@ struct WitnessLink {
     dependency: Option<String>,
 }
 
+/// Receiver attachment and lexical capture describe one callable value.
+/// A bound function is always captured, and a detached alias is always
+/// captured but cannot be invoked directly with its original receiver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Binding {
+    Direct,
+    Captured,
+    Detached,
+    Bound,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct Callable {
     pub(super) kind: ApiKind,
     pub(super) receiver: Option<SymbolId>,
-    pub(super) captured: bool,
+    binding: Binding,
     pub(super) constructor_captured: bool,
-    pub(super) bound: bool,
-    detached: bool,
     pub(super) prefix: ApiArguments,
     witness: Option<Rc<WitnessLink>>,
     bound_object: Option<Span>,
@@ -450,10 +467,8 @@ impl Callable {
         Self {
             kind,
             receiver: None,
-            captured: false,
+            binding: Binding::Direct,
             constructor_captured: false,
-            bound: false,
-            detached: false,
             prefix: ApiArguments::default(),
             witness: None,
             bound_object: None,
@@ -503,9 +518,22 @@ impl Callable {
         self.dispatch == Some("wrapper")
     }
 
-    pub(super) fn capture_as_argument(&mut self) {
-        self.captured = true;
-        self.detached = !self.bound && self.kind.needs_receiver();
+    pub(super) const fn capture_as_argument(&mut self) {
+        if !self.is_bound() {
+            self.binding = if self.kind.needs_receiver() {
+                Binding::Detached
+            } else {
+                Binding::Captured
+            };
+        }
+    }
+
+    pub(super) const fn is_captured(&self) -> bool {
+        !matches!(self.binding, Binding::Direct)
+    }
+
+    pub(super) const fn is_bound(&self) -> bool {
+        matches!(self.binding, Binding::Bound)
     }
 
     pub(super) fn witnesses(&self) -> Vec<ApiBindingWitness> {
@@ -563,20 +591,20 @@ impl Callable {
         )
     }
 
-    pub(super) fn invocation_form(&self) -> &'static str {
+    pub(super) const fn invocation_form(&self) -> &'static str {
         if let Some(dispatch) = self.dispatch {
             dispatch
-        } else if self.bound {
+        } else if self.is_bound() {
             "bound"
-        } else if self.captured {
+        } else if self.is_captured() {
             "alias"
         } else {
             "direct"
         }
     }
 
-    pub(super) fn callable_as(&self, constructor: bool) -> bool {
-        self.kind.is_constructor() == constructor && !self.detached
+    pub(super) const fn callable_as(&self, constructor: bool) -> bool {
+        self.kind.is_constructor() == constructor && !matches!(self.binding, Binding::Detached)
     }
 }
 
@@ -609,12 +637,12 @@ fn global_root_dependency(path: &str) -> Option<&'static str> {
 }
 
 impl Namespace {
-    fn from_path(path: String, witness: Option<Rc<WitnessLink>>) -> Option<Self> {
+    fn from_path(path: &str, witness: Option<Rc<WitnessLink>>) -> Option<Self> {
         let relative = path
             .strip_prefix("window.")
             .or_else(|| path.strip_prefix("globalThis."))
             .or_else(|| path.strip_prefix("self."))
-            .unwrap_or(&path);
+            .unwrap_or(path);
         let canonical = match relative {
             "window" | "globalThis" | "self" => "globalThis",
             "navigator" | "Object" | "Reflect" | "Function" | "Object.prototype"
@@ -624,25 +652,27 @@ impl Namespace {
         Some(Self {
             path: canonical.to_owned(),
             witness,
-            dependencies: global_root_dependency(&path).into_iter().collect(),
+            dependencies: global_root_dependency(path).into_iter().collect(),
         })
     }
 
     fn property(&self, name: &str) -> Option<String> {
-        (!name.contains('.')).then(|| format!("{}.{}", self.path, name))
+        (!name.contains('.')).then(|| format!("{}.{name}", self.path))
     }
 
     fn child(&self, key: &str) -> Option<Self> {
-        let mut child = Self::from_path(self.property(key)?, self.witness.clone())?;
-        child.dependencies = self.dependencies.clone();
+        let mut child = Self::from_path(&self.property(key)?, self.witness.clone())?;
+        child.dependencies.clone_from(&self.dependencies);
         Some(child)
     }
 
     fn callable(&self, key: &str) -> Option<Callable> {
         let kind = ApiKind::from_global(&self.property(key)?)?;
         let mut callable = Callable::native(kind);
-        callable.captured = self.witness.is_some();
-        callable.witness = self.witness.clone();
+        if self.witness.is_some() {
+            callable.binding = Binding::Captured;
+        }
+        callable.witness.clone_from(&self.witness);
         callable
             .namespace_dependencies
             .clone_from(&self.dependencies);
@@ -672,7 +702,7 @@ impl DispatchMode {
         usize::from(self.reflect())
     }
 
-    fn name(self) -> &'static str {
+    const fn name(self) -> &'static str {
         match self {
             Self::Call => "call",
             Self::Apply => "apply",
@@ -689,6 +719,7 @@ pub(super) struct BindingSite {
     pub(super) allocation: Span,
 }
 
+#[derive(Clone, Copy)]
 pub(super) struct DispatchOperands<'s, 'e, 'a> {
     pub(super) original_object: &'e Expression<'a>,
     pub(super) object: &'e Expression<'a>,
@@ -697,6 +728,10 @@ pub(super) struct DispatchOperands<'s, 'e, 'a> {
     pub(super) args: &'s PositionalArguments<'e, 'a>,
     pub(super) span: Span,
 }
+
+/// The argument is neither a recognized receiver expression nor a
+/// receiver-independent value for this callable.
+struct UnsupportedReceiver;
 
 struct DispatchHead {
     mode: DispatchMode,
@@ -804,7 +839,7 @@ impl CallableIndex {
         constants: &ProvenConstantEnvironment,
     ) -> Option<Namespace> {
         if let Some(path) = global_path(scoping, constants, expr) {
-            return Namespace::from_path(path, None);
+            return Namespace::from_path(&path, None);
         }
         if let Some(symbol) = expression_symbol(scoping, expr) {
             return self.namespaces.get(&symbol)?.at(expr.span().start).cloned();
@@ -871,8 +906,8 @@ impl CallableIndex {
                 let constructor = self.xhr.get(&symbol)?.at(object.span().start)?;
                 let mut callable = Callable::native(ApiKind::XhrOpen);
                 callable.receiver = Some(symbol);
-                callable.constructor_captured = constructor.captured;
-                callable.witness = constructor.witness.clone();
+                callable.constructor_captured = constructor.is_captured();
+                callable.witness.clone_from(&constructor.witness);
                 callable
                     .namespace_dependencies
                     .clone_from(&constructor.namespace_dependencies);
@@ -931,7 +966,7 @@ impl CallableIndex {
         constants: &ProvenConstantEnvironment,
     ) -> Option<Callable> {
         let receiver_value = args.value(0);
-        let receiver = self.receiver_expression(&callable, &receiver_value)?;
+        let receiver = Self::receiver_expression(&callable, &receiver_value).ok()?;
         if !self.valid_receiver(&callable, receiver, scoping, constants) {
             return None;
         }
@@ -945,31 +980,28 @@ impl CallableIndex {
             scoping,
             constants,
         );
-        callable.bound = true;
-        callable.captured = true;
-        callable.detached = false;
+        callable.binding = Binding::Bound;
         callable.bound_object = Some(site.allocation);
         Some(callable)
     }
 
     fn receiver_expression<'e, 'a>(
-        &self,
         callable: &Callable,
         value: &ForwardedValue<'e, 'a>,
-    ) -> Option<Option<&'e Expression<'a>>> {
+    ) -> std::result::Result<Option<&'e Expression<'a>>, UnsupportedReceiver> {
         match value {
-            ForwardedValue::Expression(expr) => Some(Some(expr)),
-            ForwardedValue::Missing => Some(None),
+            ForwardedValue::Expression(expr) => Ok(Some(expr)),
+            ForwardedValue::Missing => Ok(None),
             ForwardedValue::Primitive { value, .. }
                 if matches!(
                     value.as_ref(),
                     StaticPrimitiveValue::Null | StaticPrimitiveValue::Undefined
                 ) =>
             {
-                Some(None)
+                Ok(None)
             }
-            _ if callable.bound || callable.kind.is_constructor() => Some(None),
-            _ => None,
+            _ if callable.is_bound() || callable.kind.is_constructor() => Ok(None),
+            _ => Err(UnsupportedReceiver),
         }
     }
 
@@ -982,17 +1014,14 @@ impl CallableIndex {
     ) -> bool {
         let namespace = receiver.and_then(|expr| self.namespace(expr, scoping, constants));
         let path = namespace.as_ref().map(|ns| ns.path.as_str());
-        callable.bound
+        callable.is_bound()
             || callable.kind.is_constructor()
             || match callable.kind {
                 ApiKind::Fetch => {
-                    receiver.is_none()
-                        || receiver.is_some_and(|expr| {
-                            matches!(unparenthesized(expr), Expression::NullLiteral(_))
-                                || global_path(scoping, constants, expr).as_deref()
-                                    == Some("undefined")
-                        })
-                        || path.is_some_and(is_global_receiver)
+                    receiver.is_none_or(|expr| {
+                        matches!(unparenthesized(expr), Expression::NullLiteral(_))
+                            || global_path(scoping, constants, expr).as_deref() == Some("undefined")
+                    }) || path.is_some_and(is_global_receiver)
                 }
                 ApiKind::Beacon => path.is_some_and(is_navigator_receiver),
                 ApiKind::XhrOpen => receiver
@@ -1009,7 +1038,7 @@ impl CallableIndex {
         constants: &ProvenConstantEnvironment,
     ) {
         // Rebinding an already bound function ignores the supplied receiver.
-        if callable.bound || callable.kind.is_constructor() {
+        if callable.is_bound() || callable.kind.is_constructor() {
             return;
         }
         if let Some(namespace) = receiver.and_then(|expr| self.namespace(expr, scoping, constants))
@@ -1076,7 +1105,9 @@ impl CallableIndex {
         } else {
             callable.dispatch_member_family(operation)
         };
-        callable.detached = false;
+        if matches!(callable.binding, Binding::Detached) {
+            callable.binding = Binding::Captured;
+        }
         if !callable.is_returned() {
             callable.dispatch = Some(operation);
         }
@@ -1121,7 +1152,7 @@ impl CallableIndex {
         }
         let offset = mode.receiver_index();
         let receiver_value = operands.args.value(offset);
-        let receiver = self.receiver_expression(&callable, &receiver_value)?;
+        let receiver = Self::receiver_expression(&callable, &receiver_value).ok()?;
         let mut dispatch =
             self.prepare_dispatch(head, callable, receiver, operands.span, scoping, constants)?;
         if mode == DispatchMode::Call {
@@ -1208,8 +1239,7 @@ impl BindingCollector<'_, '_> {
                 }
                 match value {
                     NamespaceValue::Callable(mut callable) => {
-                        callable.captured = true;
-                        callable.detached = !callable.bound && callable.kind.needs_receiver();
+                        callable.capture_as_argument();
                         callable.add_witness(kind, span, None);
                         self.index.aliases.insert(
                             symbol,

@@ -6,7 +6,7 @@ use jsvm_lift::{
         load_optional_artifact, EXECUTION_COVERAGE, JS_REFERENCES, RUNTIME_SCRIPTS, SOURCE_INDEX,
     },
     capture_project::read_manifest,
-    document_entrypoints::captured_document_entrypoints,
+    document_entrypoints::{captured_document_entrypoints, DocumentEntrypoints},
     safe_deob::SourceMode,
     sha256_hex,
     static_calls::analyze_static_calls,
@@ -78,6 +78,74 @@ fn analyze_source(
     }))
 }
 
+fn source_local_graphs(
+    project: &std::path::Path,
+    documents: &[DocumentEntrypoints],
+    budget: &WorkBudget,
+) -> Result<BTreeMap<String, Value>> {
+    let mut source_graphs = BTreeMap::<String, Value>::new();
+    let mut candidates = BTreeSet::<(String, bool)>::new();
+    for document in documents {
+        for script in &document.scripts {
+            budget.consume(1)?;
+            if !script.executable {
+                continue;
+            }
+            for source in &script.captured_sources {
+                candidates.insert((source.output_path.clone(), script.is_module));
+            }
+        }
+    }
+    for (output_path, is_module) in candidates {
+        budget.consume(1)?;
+        let file = project.join(&output_path);
+        let source = fs::read_to_string(&file)
+            .with_context(|| format!("reading captured script {}", file.display()))?;
+        let proof = analyze_source(&source, &file, is_module, budget)?;
+        let key = serde_json::to_string(&(&output_path, is_module))?;
+        source_graphs.insert(
+            key,
+            json!({
+                "output_path":output_path,
+                "is_module":is_module,
+                "analysis":proof
+            }),
+        );
+    }
+    Ok(source_graphs)
+}
+
+fn execution_correlations(
+    project: &std::path::Path,
+    documents: &[DocumentEntrypoints],
+    budget: &WorkBudget,
+) -> Result<Value> {
+    Ok(
+        match (
+            load_optional_artifact(project, EXECUTION_COVERAGE)?,
+            load_optional_artifact(project, RUNTIME_SCRIPTS)?,
+        ) {
+            (Some(coverage), Some(_)) if coverage["mode"] == "none" => json!({
+                "status":"disabled",
+                "coverage_mode":"none",
+                "reason":"V8 execution observation was disabled; parsed scripts do not prove execution",
+            }),
+            (Some(coverage), Some(runtime_sources)) => json!({
+                "status":"available",
+                "coverage_mode":coverage.get("mode"),
+
+                "analysis":join_initial_source_coverage(documents, &runtime_sources, budget)?,
+                "runtime_schema":RUNTIME_SCRIPTS.schema,
+                "coverage_schema":EXECUTION_COVERAGE.schema,
+            }),
+            _ => json!({
+                "status":"unavailable",
+                "reason":"Positive V8 script coverage and the runtime-script identity index are both required",
+            }),
+        },
+    )
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     ensure!(
@@ -95,35 +163,7 @@ fn main() -> Result<()> {
         BudgetLimits::wall_time(Duration::from_secs(args.max_secs)),
     );
     let documents = captured_document_entrypoints(&project, &manifest, &budget)?;
-    let mut source_graphs = BTreeMap::<String, Value>::new();
-    let mut candidates = BTreeSet::<(String, bool)>::new();
-    for document in &documents {
-        for script in &document.scripts {
-            budget.consume(1)?;
-            if !script.executable {
-                continue;
-            }
-            for source in &script.captured_sources {
-                candidates.insert((source.output_path.clone(), script.is_module));
-            }
-        }
-    }
-    for (output_path, is_module) in candidates {
-        budget.consume(1)?;
-        let file = project.join(&output_path);
-        let source = fs::read_to_string(&file)
-            .with_context(|| format!("reading captured script {}", file.display()))?;
-        let proof = analyze_source(&source, &file, is_module, &budget)?;
-        let key = serde_json::to_string(&(&output_path, is_module))?;
-        source_graphs.insert(
-            key,
-            json!({
-                "output_path":output_path,
-                "is_module":is_module,
-                "analysis":proof
-            }),
-        );
-    }
+    let source_graphs = source_local_graphs(&project, &documents, &budget)?;
     let module_graph = match (
         load_optional_artifact(&project, SOURCE_INDEX)?,
         load_optional_artifact(&project, JS_REFERENCES)?,
@@ -141,28 +181,7 @@ fn main() -> Result<()> {
             "reason":"Existing source-index and JS-reference artifacts are both required for contextual module resolution",
         }),
     };
-    let execution_correlations = match (
-        load_optional_artifact(&project, EXECUTION_COVERAGE)?,
-        load_optional_artifact(&project, RUNTIME_SCRIPTS)?,
-    ) {
-        (Some(coverage), Some(_)) if coverage["mode"] == "none" => json!({
-            "status":"disabled",
-            "coverage_mode":"none",
-            "reason":"V8 execution observation was disabled; parsed scripts do not prove execution",
-        }),
-        (Some(coverage), Some(runtime_sources)) => json!({
-            "status":"available",
-            "coverage_mode":coverage.get("mode"),
-
-            "analysis":join_initial_source_coverage(&documents, &runtime_sources, &budget)?,
-            "runtime_schema":RUNTIME_SCRIPTS.schema,
-            "coverage_schema":EXECUTION_COVERAGE.schema,
-        }),
-        _ => json!({
-            "status":"unavailable",
-            "reason":"Positive V8 script coverage and the runtime-script identity index are both required",
-        }),
-    };
+    let execution_correlations = execution_correlations(&project, &documents, &budget)?;
     let root_count: usize = documents
         .iter()
         .map(|document| {
@@ -199,10 +218,8 @@ fn main() -> Result<()> {
     });
     jsvm_lift::report_file::write_json(&args.output, &output)?;
     println!(
-        "Documents: {}; executable script roots: {}; source-local static graphs: {}; output: {}",
+        "Documents: {}; executable script roots: {root_count}; source-local static graphs: {analyzed_count}; output: {}",
         output["document_count"],
-        root_count,
-        analyzed_count,
         args.output.display()
     );
     Ok(())

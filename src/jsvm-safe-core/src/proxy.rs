@@ -64,7 +64,7 @@ impl<'a> Visit<'a> for MemberReferenceCollector {
     fn visit_computed_member_expression(&mut self, it: &ComputedMemberExpression<'a>) {
         self.record_object(
             &it.object,
-            eval(&it.expression).and_then(|value| value.js_string()),
+            eval(&it.expression).map(|value| value.js_string()),
         );
         walk::walk_computed_member_expression(self, it);
     }

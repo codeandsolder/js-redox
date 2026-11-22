@@ -53,7 +53,7 @@ pub struct PositiveCoverageWitness {
 }
 
 #[derive(Default)]
-pub(crate) struct RuntimeCoverageIndex {
+pub struct RuntimeCoverageIndex {
     by_digest: BTreeMap<String, Vec<PositiveCoverageWitness>>,
 }
 
@@ -84,7 +84,7 @@ impl RuntimeCoverageIndex {
                 if previous.0 != next.0 || previous.1 != next.1 || previous.2 != next.2 {
                     return false;
                 }
-                previous.3.retain_agreed(next.3);
+                previous.3.retain_agreed(&next.3);
                 true
             },
         )?;
@@ -132,7 +132,7 @@ mod tests {
         worker_profile["source_url"] = json!("w");
         let runtime = json!({"sources":[{"sha256":"body","script_instances":[
             one.clone(),one,instance("main","1","b",&profile),
-            two.clone(),instance("main","2","a",&json!({"status":"zero_only"})),
+            two,instance("main","2","a",&json!({"status":"zero_only"})),
             instance("main","3","a",&profile),instance("worker","3","",&worker_profile),
             instance("main","4","a",&json!({"status":"positive"})),
             instance("main","5","a",&profile)
@@ -148,7 +148,7 @@ mod tests {
         assert_eq!(witnesses[0].positive_ranges, 3);
         assert_eq!(witnesses[1].cdp_session, "worker");
         assert_eq!(witnesses[1].script_url.as_deref(), Some("w"));
-        assert!(index.witnesses("other").is_empty());
+        assert_eq!(index.witnesses("other"), []);
         Ok(())
     }
 }

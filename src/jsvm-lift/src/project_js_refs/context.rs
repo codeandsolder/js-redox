@@ -30,6 +30,7 @@ pub(super) struct ContextEvidence {
     candidates: CandidateStore,
 }
 
+#[derive(Clone, Copy, Default)]
 pub(super) struct ResolutionStatistics {
     pub(super) resolved_by_import_map: usize,
     pub(super) unresolved_bare: usize,
@@ -105,20 +106,14 @@ fn set_resolution_fields(target: &mut Map<String, Value>, source: &Value) {
     }
 }
 
-/// Collect document-context evidence for every reachable captured module.
-///
-/// No JSON artifact is emitted; candidates carry their proven document IDs.
-pub(super) fn propagate_context_evidence(
+fn seed_contexts(
     rows: &[Value],
     inline_scripts: &[Value],
     units_by_url: &BTreeMap<String, Vec<usize>>,
     units_by_raw: &BTreeMap<String, Vec<usize>>,
-    import_maps: &BTreeMap<u64, ImportMap>,
-    dynamic_glob_matches: &BTreeMap<ReferenceKey, Vec<String>>,
-    stage_budget: &WorkBudget,
-) -> Result<ContextEvidence> {
-    let mut queue = VecDeque::new();
-    let mut contexts = vec![BTreeSet::<u64>::new(); rows.len()];
+    contexts: &mut [BTreeSet<u64>],
+    queue: &mut VecDeque<(usize, u64)>,
+) -> Result<()> {
     for script in inline_scripts {
         if is_import_map(script)
             || !is_executable_script(script.get("script_type").and_then(Value::as_str))
@@ -156,6 +151,31 @@ pub(super) fn propagate_context_evidence(
         }
     }
 
+    Ok(())
+}
+
+/// Collect document-context evidence for every reachable captured module.
+///
+/// No JSON artifact is emitted; candidates carry their proven document IDs.
+pub(super) fn propagate_context_evidence(
+    rows: &[Value],
+    inline_scripts: &[Value],
+    units_by_url: &BTreeMap<String, Vec<usize>>,
+    units_by_raw: &BTreeMap<String, Vec<usize>>,
+    import_maps: &BTreeMap<u64, ImportMap>,
+    dynamic_glob_matches: &BTreeMap<ReferenceKey, Vec<String>>,
+    stage_budget: &WorkBudget,
+) -> Result<ContextEvidence> {
+    let mut queue = VecDeque::new();
+    let mut contexts = vec![BTreeSet::<u64>::new(); rows.len()];
+    seed_contexts(
+        rows,
+        inline_scripts,
+        units_by_url,
+        units_by_raw,
+        &mut contexts,
+        &mut queue,
+    )?;
     let mut candidates = BTreeMap::<(usize, usize), BTreeMap<String, Value>>::new();
     let mut seen_context = BTreeSet::<(usize, u64)>::new();
     while let Some((row_id, document_id)) = queue.pop_front() {
@@ -242,6 +262,151 @@ pub(super) fn propagate_context_evidence(
     })
 }
 
+fn apply_glob_resolution(
+    reference: &mut Value,
+    mut choices: Vec<Value>,
+    raw_matches: &[String],
+) -> Result<()> {
+    if choices.is_empty() {
+        choices = raw_matches.iter().map(|matched| json!({
+            "document_resource_id": Value::Null, "glob_match_url": matched,
+            "resolved_url": matched, "bare_specifier": false,
+            "resolution": "captured_dynamic_glob", "import_map_key": Value::Null, "scope": Value::Null,
+        })).collect();
+    }
+    choices.sort_by_key(|choice| {
+        (
+            choice
+                .get("document_resource_id")
+                .and_then(Value::as_u64)
+                .is_some(),
+            choice
+                .get("document_resource_id")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            choice
+                .get("resolved_url")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+        )
+    });
+    let mut resolved = choices
+        .iter()
+        .filter_map(|choice| {
+            choice
+                .get("resolved_url")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .collect::<BTreeSet<_>>();
+    let candidate_count = resolved.len();
+    let resolved_url = if candidate_count == 1 {
+        resolved.pop_first().map_or(Value::Null, Value::String)
+    } else {
+        Value::Null
+    };
+    let object = reference
+        .as_object_mut()
+        .context("reference must be object")?;
+    object.insert("resolution_candidates".into(), Value::Array(choices));
+    object.insert("candidate_count".into(), Value::from(candidate_count));
+    object.insert("resolved_url".into(), resolved_url);
+    object.insert("bare_specifier".into(), Value::Bool(false));
+    object.insert(
+        "resolution".into(),
+        Value::String(
+            if raw_matches.is_empty() {
+                "captured_dynamic_glob_unmatched"
+            } else {
+                "captured_dynamic_glob"
+            }
+            .into(),
+        ),
+    );
+    object.insert("import_map_key".into(), Value::Null);
+    object.insert("scope".into(), Value::Null);
+    Ok(())
+}
+
+impl ResolutionStatistics {
+    fn apply_contextual(&mut self, reference: &mut Value, mut choices: Vec<Value>) -> Result<()> {
+        choices.sort_by_key(|choice| {
+            choice
+                .get("document_resource_id")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        });
+        let signatures = choices
+            .iter()
+            .map(|choice| {
+                (
+                    choice
+                        .get("resolved_url")
+                        .cloned()
+                        .unwrap_or(Value::Null)
+                        .to_string(),
+                    choice
+                        .get("resolution")
+                        .cloned()
+                        .unwrap_or(Value::Null)
+                        .to_string(),
+                    choice
+                        .get("import_map_key")
+                        .cloned()
+                        .unwrap_or(Value::Null)
+                        .to_string(),
+                    choice
+                        .get("scope")
+                        .cloned()
+                        .unwrap_or(Value::Null)
+                        .to_string(),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        let object = reference
+            .as_object_mut()
+            .context("reference must be object")?;
+        if signatures.len() == 1 {
+            let only = choices.first().context("resolution choices disappeared")?;
+            set_resolution_fields(object, only);
+            if only
+                .get("resolution")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value.starts_with("import_map"))
+                && only
+                    .get("resolved_url")
+                    .is_some_and(|value| !value.is_null())
+            {
+                self.resolved_by_import_map += 1;
+            }
+            if only.get("resolution").and_then(Value::as_str) == Some("unresolved_bare") {
+                self.unresolved_bare += 1;
+            }
+        } else {
+            object.insert("resolved_url".into(), Value::Null);
+            object.insert(
+                "bare_specifier".into(),
+                Value::Bool(choices.iter().all(|choice| {
+                    choice
+                        .get("bare_specifier")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                })),
+            );
+            object.insert(
+                "resolution".into(),
+                Value::String("ambiguous_document_context".into()),
+            );
+            object.insert("import_map_key".into(), Value::Null);
+            object.insert("scope".into(), Value::Null);
+            self.ambiguous += 1;
+        }
+        object.insert("resolution_candidates".into(), Value::Array(choices));
+        Ok(())
+    }
+}
+
 /// Project contextual candidates to the existing JSON reference schema.
 ///
 /// A reference is unambiguous only when every recorded document context
@@ -251,9 +416,7 @@ pub(super) fn apply_reference_resolutions(
     evidence: &ContextEvidence,
     dynamic_glob_matches: &BTreeMap<ReferenceKey, Vec<String>>,
 ) -> Result<ResolutionStatistics> {
-    let mut resolved_by_import_map = 0_usize;
-    let mut unresolved_bare = 0_usize;
-    let mut ambiguous = 0_usize;
+    let mut statistics = ResolutionStatistics::default();
     for (row_id, row) in rows.iter_mut().enumerate() {
         row.as_object_mut()
             .context("reference row must be object")?
@@ -282,74 +445,15 @@ pub(super) fn apply_reference_resolutions(
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_owned();
-            let mut choices = evidence
+            let choices = evidence
                 .candidates
                 .get(&(row_id, ref_index))
                 .map_or_default(|map| map.values().cloned().collect::<Vec<_>>());
             if kind == DYNAMIC_GLOB_KIND {
                 let raw_matches = dynamic_glob_matches
                     .get(&(row_id, ref_index))
-                    .cloned()
-                    .unwrap_or_default();
-                if choices.is_empty() {
-                    choices = raw_matches.iter().map(|matched| json!({
-                        "document_resource_id": Value::Null, "glob_match_url": matched,
-                        "resolved_url": matched, "bare_specifier": false,
-                        "resolution": "captured_dynamic_glob", "import_map_key": Value::Null, "scope": Value::Null,
-                    })).collect();
-                }
-                choices.sort_by_key(|choice| {
-                    (
-                        choice
-                            .get("document_resource_id")
-                            .and_then(Value::as_u64)
-                            .is_some(),
-                        choice
-                            .get("document_resource_id")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0),
-                        choice
-                            .get("resolved_url")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_owned(),
-                    )
-                });
-                let mut resolved = choices
-                    .iter()
-                    .filter_map(|choice| {
-                        choice
-                            .get("resolved_url")
-                            .and_then(Value::as_str)
-                            .map(ToOwned::to_owned)
-                    })
-                    .collect::<BTreeSet<_>>();
-                let candidate_count = resolved.len();
-                let resolved_url = if candidate_count == 1 {
-                    resolved.pop_first().map_or(Value::Null, Value::String)
-                } else {
-                    Value::Null
-                };
-                let object = reference
-                    .as_object_mut()
-                    .context("reference must be object")?;
-                object.insert("resolution_candidates".into(), Value::Array(choices));
-                object.insert("candidate_count".into(), Value::from(candidate_count));
-                object.insert("resolved_url".into(), resolved_url);
-                object.insert("bare_specifier".into(), Value::Bool(false));
-                object.insert(
-                    "resolution".into(),
-                    Value::String(
-                        if raw_matches.is_empty() {
-                            "captured_dynamic_glob_unmatched"
-                        } else {
-                            "captured_dynamic_glob"
-                        }
-                        .into(),
-                    ),
-                );
-                object.insert("import_map_key".into(), Value::Null);
-                object.insert("scope".into(), Value::Null);
+                    .map_or(&[][..], Vec::as_slice);
+                apply_glob_resolution(reference, choices, raw_matches)?;
                 continue;
             }
             if !IMPORT_KINDS.contains(&kind.as_str()) || choices.is_empty() {
@@ -364,93 +468,15 @@ pub(super) fn apply_reference_resolutions(
                     .context("reference must be object")?;
                 set_resolution_fields(object, &result);
                 if result.get("resolution").and_then(Value::as_str) == Some("unresolved_bare") {
-                    unresolved_bare += 1;
+                    statistics.unresolved_bare += 1;
                 }
                 continue;
             }
-            choices.sort_by_key(|choice| {
-                choice
-                    .get("document_resource_id")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0)
-            });
-            let signatures = choices
-                .iter()
-                .map(|choice| {
-                    (
-                        choice
-                            .get("resolved_url")
-                            .cloned()
-                            .unwrap_or(Value::Null)
-                            .to_string(),
-                        choice
-                            .get("resolution")
-                            .cloned()
-                            .unwrap_or(Value::Null)
-                            .to_string(),
-                        choice
-                            .get("import_map_key")
-                            .cloned()
-                            .unwrap_or(Value::Null)
-                            .to_string(),
-                        choice
-                            .get("scope")
-                            .cloned()
-                            .unwrap_or(Value::Null)
-                            .to_string(),
-                    )
-                })
-                .collect::<BTreeSet<_>>();
-            let object = reference
-                .as_object_mut()
-                .context("reference must be object")?;
-            object.insert(
-                "resolution_candidates".into(),
-                Value::Array(choices.clone()),
-            );
-            if signatures.len() == 1 {
-                let only = choices.first().context("resolution choices disappeared")?;
-                set_resolution_fields(object, only);
-                if only
-                    .get("resolution")
-                    .and_then(Value::as_str)
-                    .is_some_and(|value| value.starts_with("import_map"))
-                    && only
-                        .get("resolved_url")
-                        .is_some_and(|value| !value.is_null())
-                {
-                    resolved_by_import_map += 1;
-                }
-                if only.get("resolution").and_then(Value::as_str) == Some("unresolved_bare") {
-                    unresolved_bare += 1;
-                }
-            } else {
-                object.insert("resolved_url".into(), Value::Null);
-                object.insert(
-                    "bare_specifier".into(),
-                    Value::Bool(choices.iter().all(|choice| {
-                        choice
-                            .get("bare_specifier")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false)
-                    })),
-                );
-                object.insert(
-                    "resolution".into(),
-                    Value::String("ambiguous_document_context".into()),
-                );
-                object.insert("import_map_key".into(), Value::Null);
-                object.insert("scope".into(), Value::Null);
-                ambiguous += 1;
-            }
+            statistics.apply_contextual(reference, choices)?;
         }
     }
 
-    Ok(ResolutionStatistics {
-        resolved_by_import_map,
-        unresolved_bare,
-        ambiguous,
-    })
+    Ok(statistics)
 }
 
 #[cfg(test)]

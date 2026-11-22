@@ -1792,7 +1792,7 @@ mod tests {
 
     #[test]
     fn literal_handler_tables_preserve_container_thresholds_and_inventory() -> TestResult {
-        let source = r#"
+        let source = r"
             const arrayFour = [() => 1, () => 2, () => 3, () => 4];
             const objectFour = {a: () => 1, b: () => 2, c: () => 3, d: () => 4};
             const objectEight = {
@@ -1800,7 +1800,7 @@ mod tests {
                 e: () => 5, f: () => 6, g: () => 7, h: () => 8
             };
             const arrayMinority = [() => 1, () => 2, 0, 0, 0];
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         assert!(parsed.is_clean());

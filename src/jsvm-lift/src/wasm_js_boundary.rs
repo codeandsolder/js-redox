@@ -1901,7 +1901,6 @@ impl CopyLimitations {
 
 struct BoundaryCorrelation<'a> {
     project: &'a Path,
-    budgets: &'a AnalysisBudgets,
     stage_budget: WorkBudget,
     deob_by_raw: BTreeMap<String, String>,
     targeted_cache: HashMap<(String, String, String, u32), Value>,
@@ -1989,7 +1988,6 @@ impl BoundaryCorrelation<'_> {
         let function_imports = scope.function_imports;
         let carrier_candidates = scope.carrier_candidates;
         let project = self.project;
-        let budgets = self.budgets;
         let stage_budget = &self.stage_budget;
         let targeted_cache = &mut self.targeted_cache;
         let carrier_sources = &mut self.carrier_sources;
@@ -2021,11 +2019,8 @@ impl BoundaryCorrelation<'_> {
                 );
                 if !targeted_cache.contains_key(&key) {
                     targeted_cache.insert(key.clone(), {
-                        let budget = budgets.operation_under(
-                            stage_budget,
-                            AnalysisOperation::WasmAnalysis,
-                            source.display().to_string(),
-                        );
+                        let budget = AnalysisOperation::WasmAnalysis
+                            .under(stage_budget, source.display().to_string());
                         targeted_semantics_for_source(
                             &source, raw_module, raw_import, offset, &budget,
                         )?
@@ -2035,10 +2030,8 @@ impl BoundaryCorrelation<'_> {
                 let writes = array_field(probe, "shapes");
                 anyhow::ensure!(
                     writes.len() <= 1,
-                    "ambiguous JS WASM-import proof for {}: {}@{}",
-                    source.display(),
-                    raw_import,
-                    offset
+                    "ambiguous JS WASM-import proof for {}: {raw_import}@{offset}",
+                    source.display()
                 );
                 if let Some(write) = writes.first() {
                     let mut proof = write.clone();
@@ -2254,11 +2247,8 @@ impl BoundaryCorrelation<'_> {
                 }
                 self.carrier_sources.insert(relative.clone());
                 if !self.full_cache.contains_key(relative) {
-                    let budget = self.budgets.operation_under(
-                        &self.stage_budget,
-                        AnalysisOperation::WasmAnalysis,
-                        source.display().to_string(),
-                    );
+                    let budget = AnalysisOperation::WasmAnalysis
+                        .under(&self.stage_budget, source.display().to_string());
                     self.full_cache
                         .insert(relative.clone(), semantics_for_source(&source, &budget)?);
                 }
@@ -2389,8 +2379,7 @@ impl BoundaryCorrelation<'_> {
             row["import_binding_identity_proven"] = false.into();
             let prefix = string_field(row, "ambiguity").unwrap_or_default();
             row["ambiguity"] = format!(
-                "{}{}multiple exact module/import-object binding proofs",
-                prefix,
+                "{prefix}{}multiple exact module/import-object binding proofs",
                 if prefix.is_empty() { "" } else { "; " }
             )
             .into();
@@ -2401,8 +2390,7 @@ impl BoundaryCorrelation<'_> {
                 "multiple carrier sources prove module-memory identity".into();
             let prefix = string_field(row, "ambiguity").unwrap_or_default();
             row["ambiguity"] = format!(
-                "{}{}multiple module-memory carrier proofs",
-                prefix,
+                "{prefix}{}multiple module-memory carrier proofs",
                 if prefix.is_empty() { "" } else { "; " }
             )
             .into();
@@ -2628,7 +2616,6 @@ pub fn correlate_project(
         .collect::<BTreeMap<_, _>>();
     let mut context = BoundaryCorrelation {
         project,
-        budgets,
         stage_budget,
         deob_by_raw,
         targeted_cache: HashMap::new(),
@@ -2652,7 +2639,7 @@ mod tests {
         CopyWordInterpretation, FreshCleanupRange, FreshCleanupSequence, FreshCleanupSetup,
         FreshDestinationProof,
     };
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     #[test]
     fn fresh_cleanup_range_rejects_overlapping_or_unproven_post_copy_accesses() {
@@ -2961,8 +2948,7 @@ mod tests {
         .is_none());
     }
 
-    #[test]
-    fn source_word_overlay_tracks_transitive_runtime_dependencies() {
+    fn transitive_word_fixture() -> (Value, Vec<Value>) {
         let analysis = json!({
             "runtime_bindings": [
                 {
@@ -3016,6 +3002,12 @@ mod tests {
             "source_element_index": 2,
             "source_conversion": "ToUint32",
         })];
+        (analysis, interpretations)
+    }
+
+    #[test]
+    fn source_word_overlay_tracks_transitive_runtime_dependencies() {
+        let (analysis, interpretations) = transitive_word_fixture();
         let (bindings, returns, proven) = source_word_semantic_overlay(&analysis, &interpretations);
         assert!(proven);
         assert_eq!(bindings.len(), 1);

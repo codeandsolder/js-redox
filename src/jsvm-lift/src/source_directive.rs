@@ -41,7 +41,7 @@ fn directive_from_comment(source: &str, start: u32, end: u32) -> Option<SourceDi
     })
 }
 
-#[must_use]
+#[must_use = "Use the returned directive inventory when checking prologue preservation"]
 pub fn source_directives(source: &str) -> Vec<SourceDirective> {
     let allocator = Allocator::default();
     let parsed = parse_program(&allocator, source, SourceType::unambiguous());

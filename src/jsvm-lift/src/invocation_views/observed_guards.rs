@@ -97,6 +97,178 @@ fn top_frame(step: &Value) -> Option<&Value> {
     step.get("frames")?.as_array()?.first()
 }
 
+struct VerifiedGuardLocation<'a> {
+    script: std::borrow::Cow<'a, str>,
+    sha: &'a str,
+    start_line: u64,
+    start_column: u64,
+    line: u64,
+    column: u64,
+}
+
+impl<'a> VerifiedGuardLocation<'a> {
+    fn from_step(
+        step: &'a Value,
+        identities: &RuntimeIdentityIndex,
+        session: &str,
+    ) -> Option<Self> {
+        let frame = top_frame(step)?;
+        if frame.get("source_identity").and_then(Value::as_str) != Some("exact") {
+            return None;
+        }
+        let script = frame
+            .pointer("/location/scriptId")
+            .and_then(script_id_text)?;
+        let sha = frame.get("sourceSha256").and_then(verified_sha)?;
+        let identity = identities.get(session, &script)?;
+        if identity.sha256 != sha || identity.capture_instrumentation != Some(false) {
+            return None;
+        }
+        let (start_line, start_column) = identity.start_line.zip(identity.start_column)?;
+        let line = frame
+            .pointer("/location/lineNumber")
+            .and_then(Value::as_u64)?;
+        let column = frame
+            .pointer("/location/columnNumber")
+            .and_then(Value::as_u64)?;
+        Some(Self {
+            script,
+            sha,
+            start_line,
+            start_column,
+            line,
+            column,
+        })
+    }
+
+    fn byte_offset(&self, snapshot: &super::source_cache::VerifiedSource) -> Option<usize> {
+        snapshot.lines.cdp_byte_offset(
+            &snapshot.text,
+            self.line,
+            self.column,
+            self.start_line,
+            self.start_column,
+        )
+    }
+}
+
+struct GuardObservation<'a> {
+    location: &'a VerifiedGuardLocation<'a>,
+    snapshot: &'a super::source_cache::VerifiedSource,
+    guards: &'a [Guard],
+    position: usize,
+    identities: &'a RuntimeIdentityIndex,
+    session: &'a str,
+    steps: &'a [Value],
+    step: &'a Value,
+    step_index: usize,
+    budget: &'a work_budget::WorkBudget,
+}
+
+impl GuardObservation<'_> {
+    fn next_pause_arm(&self, guard: &Guard, value: bool) -> Result<Option<&'static str>> {
+        let mut next_pause_arm = None;
+        let next = match self.steps.get(self.step_index + 1) {
+            Some(next)
+                if same_verified_stack_shape(self.step, next, self.budget, |script, sha| {
+                    self.identities
+                        .get(self.session, script)
+                        .is_some_and(|source| source.sha256 == sha)
+                })? =>
+            {
+                Some(next)
+            }
+            _ => None,
+        };
+        if let Some(location) = next
+            .and_then(top_frame)
+            .and_then(|frame| frame.get("location"))
+        {
+            let at = location
+                .get("lineNumber")
+                .and_then(Value::as_u64)
+                .zip(location.get("columnNumber").and_then(Value::as_u64))
+                .and_then(|(line, column)| {
+                    self.snapshot.lines.cdp_byte_offset(
+                        &self.snapshot.text,
+                        line,
+                        column,
+                        self.location.start_line,
+                        self.location.start_column,
+                    )
+                });
+            let arm = if value {
+                guard.consequent
+            } else {
+                guard.alternate
+            };
+            if at
+                .zip(arm)
+                .is_some_and(|(at, span)| span.start as usize <= at && at < span.end as usize)
+            {
+                next_pause_arm = Some(if value { "consequent" } else { "alternate" });
+            }
+        }
+        Ok(next_pause_arm)
+    }
+
+    fn append(&self, out: &mut Vec<Value>) -> Result<()> {
+        for expression in self
+            .step
+            .get("expressions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if expression.get("status").and_then(Value::as_str) != Some("observed")
+                || expression.pointer("/value/type").and_then(Value::as_str) != Some("boolean")
+            {
+                continue;
+            }
+            let (Some(condition), Some(value)) = (
+                expression.get("expression").and_then(Value::as_str),
+                expression.pointer("/value/value").and_then(Value::as_bool),
+            ) else {
+                continue;
+            };
+            self.budget
+                .consume(u64::try_from(self.guards.len()).unwrap_or(u64::MAX))?;
+            let matches: Vec<&Guard> = self
+                .guards
+                .iter()
+                .filter(|guard| {
+                    let test = guard.test;
+                    let site = guard.site;
+                    site.start as usize <= self.position
+                        && self.position <= test.end as usize
+                        && self
+                            .snapshot
+                            .text
+                            .get(test.start as usize..test.end as usize)
+                            .is_some_and(|code| code.trim() == condition.trim())
+                })
+                .collect();
+            // Multiple equally matching guards are ambiguous.
+            let [guard] = matches.as_slice() else {
+                continue;
+            };
+            let next_pause_arm = self.next_pause_arm(guard, value)?;
+            out.push(json!({
+                "step_index":self.step_index, "kind":guard.kind,
+                "script_id":self.location.script, "source_sha256":self.location.sha,
+                "guard_start_byte":guard.site.start, "test_start_byte":guard.test.start,
+                "test_end_byte":guard.test.end,
+                "expression":condition, "observed_value":value,
+                "next_pause_in_selected_arm":next_pause_arm,
+                "same_activation_proven":false,
+                "evidence":"exact_source_ast_and_boolean_pause",
+                "concrete_observation_only":true, "complete_execution_path":false,
+            }));
+        }
+        Ok(())
+    }
+}
+
 /// Only the original captured source, exact (CDP session, script, SHA), and
 /// observations at the guard's executing pause can produce a guard witness.
 /// A next pause in an AST arm is additional evidence, never a claim about all
@@ -115,138 +287,38 @@ pub(super) fn observe(
     let mut out = Vec::new();
     for (step_index, step) in steps.iter().enumerate() {
         budget.consume(1)?;
-        let Some(frame) = top_frame(step) else {
+        let Some(location) = VerifiedGuardLocation::from_step(step, identities, session) else {
             continue;
         };
-        if frame.get("source_identity").and_then(Value::as_str) != Some("exact") {
-            continue;
-        }
-        let Some(script) = frame.pointer("/location/scriptId").and_then(script_id_text) else {
-            continue;
-        };
-        let Some(sha) = frame.get("sourceSha256").and_then(verified_sha) else {
-            continue;
-        };
-        let Some(identity) = identities.get(session, &script) else {
-            continue;
-        };
-        if identity.sha256 != sha || identity.capture_instrumentation != Some(false) {
-            continue;
-        }
-        let (Some(start_line), Some(start_column)) = (identity.start_line, identity.start_column)
-        else {
-            continue;
-        };
-        let (Some(line), Some(column)) = (
-            frame
-                .pointer("/location/lineNumber")
-                .and_then(Value::as_u64),
-            frame
-                .pointer("/location/columnNumber")
-                .and_then(Value::as_u64),
-        ) else {
-            continue;
-        };
-        let snapshot = sources.load(sha)?;
+        let snapshot = sources.load(location.sha)?;
         let source = &snapshot.text;
-        let lines = &snapshot.lines;
-        if !by_sha.contains_key(sha) {
+        if !by_sha.contains_key(location.sha) {
             // Parsing work is independent of whether the source bytes are
             // already in the operation-local snapshot cache.
             budget.consume(u64::try_from(source.len().div_ceil(1024))?)?;
             let parsed = parse_guards(source);
             budget.checkpoint()?;
-            by_sha.insert(sha.to_owned(), parsed);
+            by_sha.insert(location.sha.to_owned(), parsed);
         }
-        let Some(Some(guards)) = by_sha.get(sha) else {
+        let Some(Some(guards)) = by_sha.get(location.sha) else {
             continue;
         };
-        let Some(position) = lines.cdp_byte_offset(source, line, column, start_line, start_column)
-        else {
+        let Some(position) = location.byte_offset(&snapshot) else {
             continue;
         };
-        for expression in step
-            .get("expressions")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            if expression.get("status").and_then(Value::as_str) != Some("observed")
-                || expression.pointer("/value/type").and_then(Value::as_str) != Some("boolean")
-            {
-                continue;
-            }
-            let (Some(condition), Some(value)) = (
-                expression.get("expression").and_then(Value::as_str),
-                expression.pointer("/value/value").and_then(Value::as_bool),
-            ) else {
-                continue;
-            };
-            budget.consume(u64::try_from(guards.len()).unwrap_or(u64::MAX))?;
-            let matches: Vec<&Guard> = guards
-                .iter()
-                .filter(|guard| {
-                    let test = guard.test;
-                    let site = guard.site;
-                    site.start as usize <= position
-                        && position <= test.end as usize
-                        && source
-                            .get(test.start as usize..test.end as usize)
-                            .is_some_and(|code| code.trim() == condition.trim())
-                })
-                .collect();
-            // Multiple equally matching guards are ambiguous.
-            let [guard] = matches.as_slice() else {
-                continue;
-            };
-            let mut next_pause_arm = None;
-            let next = match steps.get(step_index + 1) {
-                Some(next)
-                    if same_verified_stack_shape(step, next, budget, |script, sha| {
-                        identities
-                            .get(session, script)
-                            .is_some_and(|source| source.sha256 == sha)
-                    })? =>
-                {
-                    Some(next)
-                }
-                _ => None,
-            };
-            if let Some(location) = next
-                .and_then(top_frame)
-                .and_then(|frame| frame.get("location"))
-            {
-                let at = location
-                    .get("lineNumber")
-                    .and_then(Value::as_u64)
-                    .zip(location.get("columnNumber").and_then(Value::as_u64))
-                    .and_then(|(line, column)| {
-                        lines.cdp_byte_offset(source, line, column, start_line, start_column)
-                    });
-                let arm = if value {
-                    guard.consequent
-                } else {
-                    guard.alternate
-                };
-                if at
-                    .zip(arm)
-                    .is_some_and(|(at, span)| span.start as usize <= at && at < span.end as usize)
-                {
-                    next_pause_arm = Some(if value { "consequent" } else { "alternate" });
-                }
-            }
-            out.push(json!({
-                "step_index":step_index, "kind":guard.kind,
-                "script_id":script, "source_sha256":sha,
-                "guard_start_byte":guard.site.start, "test_start_byte":guard.test.start,
-                "test_end_byte":guard.test.end,
-                "expression":condition, "observed_value":value,
-                "next_pause_in_selected_arm":next_pause_arm,
-                "same_activation_proven":false,
-                "evidence":"exact_source_ast_and_boolean_pause",
-                "concrete_observation_only":true, "complete_execution_path":false,
-            }));
+        GuardObservation {
+            location: &location,
+            snapshot: &snapshot,
+            guards,
+            position,
+            identities,
+            session,
+            steps,
+            step,
+            step_index,
+            budget,
         }
+        .append(&mut out)?;
     }
     Ok(out)
 }
@@ -256,6 +328,25 @@ mod tests {
     use super::*;
     use crate::invocation_views::source_cache::SOURCE_CACHE_BYTES;
     use std::fs;
+
+    fn guard_fixture_identity(sha: &str) -> RuntimeIdentityIndex {
+        let mut identities = RuntimeIdentityIndex::default();
+        identities.register(
+            "main",
+            "7",
+            super::super::RuntimeSourceIdentity {
+                sha256: sha.to_owned(),
+                start_line: Some(10),
+                start_column: Some(0),
+                capture_instrumentation: Some(false),
+                origin: crate::runtime_identity::ScriptOriginContext {
+                    url: None,
+                    execution_context_id: None,
+                },
+            },
+        );
+        identities
+    }
 
     #[test]
     fn exact_boolean_guard_and_next_selected_arm_are_distinct_evidence() -> Result<()> {
@@ -270,21 +361,7 @@ mod tests {
             project.join(format!("resources/runtime-scripts/{sha}.js")),
             source,
         )?;
-        let mut identities = RuntimeIdentityIndex::default();
-        identities.register(
-            "main",
-            "7",
-            super::super::RuntimeSourceIdentity {
-                sha256: sha.clone(),
-                start_line: Some(10),
-                start_column: Some(0),
-                capture_instrumentation: Some(false),
-                origin: crate::runtime_identity::ScriptOriginContext {
-                    url: None,
-                    execution_context_id: None,
-                },
-            },
-        );
+        let identities = guard_fixture_identity(&sha);
         let frame = |col| {
             json!({
                 "functionName":"f",

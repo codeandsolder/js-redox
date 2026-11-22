@@ -124,13 +124,12 @@ fn print_array_candidates(report: &ScanReport) {
             .collect::<Vec<_>>()
             .join(",");
         println!(
-            "  array @{:x}-{:x}: n={} numeric={:.0}% bytes={} hints=[{}] {}",
+            "  array @{:x}-{:x}: n={} numeric={:.0}% bytes={} hints=[{hints}] {}",
             candidate.start,
             candidate.end,
             candidate.elements,
             candidate.numeric_ratio * 100.0,
             candidate.byte_values,
-            hints,
             candidate.preview
         );
     }

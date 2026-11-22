@@ -304,7 +304,7 @@ fn unique_direct_entry(machine: &StateMachineReport) -> Option<&NestedMachineEnt
     entries.next().is_none().then_some(first)
 }
 
-#[must_use]
+#[must_use = "Use the returned composition evidence when reporting machine pipelines"]
 pub fn compose_machine_pipelines(
     machines: &[StateMachineReport],
 ) -> Vec<StateMachinePipelineReport> {
@@ -413,7 +413,7 @@ pub(super) fn terminal_bindings(
     (bindings, reports)
 }
 
-#[must_use]
+#[must_use = "Use the returned root indices rather than treating every machine as a root"]
 pub fn root_machine_indices(machines: &[StateMachineReport]) -> Vec<usize> {
     (0..machines.len())
         .filter(|&candidate| {

@@ -662,7 +662,9 @@ mod tests {
     use super::link_static_modules;
     use crate::{
         capture_project::{CaptureManifest, CaptureSource},
-        document_entrypoints::{CapturedScriptSource, DocumentEntrypoints, DocumentScriptRoot},
+        document_entrypoints::{
+            CapturedScriptSource, DocumentEntrypoints, DocumentScriptRoot, ScriptAttributes,
+        },
         sha256_hex,
     };
     use serde_json::json;
@@ -712,168 +714,181 @@ mod tests {
         Ok((source_index_row, refs_row, sha256_hex(original.as_bytes())))
     }
 
-    #[test]
-    fn contextual_static_imports_follow_transformed_sources_not_original_offsets(
-    ) -> anyhow::Result<()> {
-        let root = tempfile::tempdir()?;
-        let project = root.path();
-        fs::create_dir(project.join("resources"))?;
-        fs::create_dir(project.join("src"))?;
-        let (main_unit, main_refs, main_sha) = pair(
-            project,
-            "main",
-            "import 'pkg';import('./lazy.js');import 'ghost';import 'blocked';",
-            "import 'pkg';\nimport('./lazy.js');\nimport 'ghost';\nimport 'blocked';\n",
-        )?;
-        let (first_unit, mut first_refs, _) = pair(
-            project,
-            "pkg-v1",
-            "export*from './dep.js'",
-            "export * from './dep.js';\n",
-        )?;
-        let (second_unit, second_refs, _) = pair(
-            project,
-            "pkg-v2",
-            "export const version=2",
-            "export const version = 2;\n",
-        )?;
-        let (dep_unit, dep_refs, _) =
-            pair(project, "dep", "export const d=1", "export const d = 1;\n")?;
-        let (lazy_unit, lazy_refs, _) = pair(
-            project,
-            "lazy",
-            "export const lazy=1",
-            "export const lazy = 1;\n",
-        )?;
-        // An inline JS body sharing an import URL is not a fetched module.
-        let (mut inline_unit, mut inline_refs, _) =
-            pair(project, "fake-inline", "const fake=1", "const fake = 1;\n")?;
-        inline_unit["origin"] = json!("inline_script");
-        inline_refs["url"] = json!("https://example.test/pkg.js");
+    struct ContextFixture {
+        index: serde_json::Value,
+        refs: serde_json::Value,
+        manifest: CaptureManifest,
+        source: CapturedScriptSource,
+    }
 
-        let mut main_refs = main_refs;
-        main_refs["references"] = json!([
-            {
-                "kind":"import_static", "specifier":"pkg", "start":0,"end":13,
-                "resolution_candidates":[
-                    {
-                        "document_resource_id":3,
-                        "resolution":"import_map",
-                        "resolved_url":"https://example.test/pkg.js",
-                        "import_map_key":"pkg",
-                        "scope":null
-                    }
-                ]
-            },
-            {
-                "kind":"import_dynamic", "specifier":"./lazy.js","start":14,"end":33,
-                "resolution":"url","resolved_url":"https://example.test/lazy.js"
-            },
-            {
-                "kind":"import_static", "specifier":"ghost", "start":35, "end":50,
-                "resolution_candidates":[],
-                "resolution":"url","resolved_url":"https://example.test/pkg.js"
-            },
-            {
-                "kind":"import_static", "specifier":"blocked", "start":51, "end":68,
-                "resolution_candidates":[{
-                    "document_resource_id":3,"resolution":"import_map_blocked",
-                    "resolved_url":"https://example.test/pkg.js"
-                }]
+    impl ContextFixture {
+        fn new(project: &Path) -> anyhow::Result<Self> {
+            fs::create_dir(project.join("resources"))?;
+            fs::create_dir(project.join("src"))?;
+            let (main_unit, main_refs, main_sha) = pair(
+                project,
+                "main",
+                "import 'pkg';import('./lazy.js');import 'ghost';import 'blocked';",
+                "import 'pkg';\nimport('./lazy.js');\nimport 'ghost';\nimport 'blocked';\n",
+            )?;
+            let (first_unit, mut first_refs, _) = pair(
+                project,
+                "pkg-v1",
+                "export*from './dep.js'",
+                "export * from './dep.js';\n",
+            )?;
+            let (second_unit, second_refs, _) = pair(
+                project,
+                "pkg-v2",
+                "export const version=2",
+                "export const version = 2;\n",
+            )?;
+            let (dep_unit, dep_refs, _) =
+                pair(project, "dep", "export const d=1", "export const d = 1;\n")?;
+            let (lazy_unit, lazy_refs, _) = pair(
+                project,
+                "lazy",
+                "export const lazy=1",
+                "export const lazy = 1;\n",
+            )?;
+            // An inline JS body sharing an import URL is not a fetched module.
+            let (mut inline_unit, mut inline_refs, _) =
+                pair(project, "fake-inline", "const fake=1", "const fake = 1;\n")?;
+            inline_unit["origin"] = json!("inline_script");
+            inline_refs["url"] = json!("https://example.test/pkg.js");
+
+            let mut main_refs = main_refs;
+            main_refs["references"] = json!([
+                {
+                    "kind":"import_static", "specifier":"pkg", "start":0,"end":13,
+                    "resolution_candidates":[
+                        {
+                            "document_resource_id":3,
+                            "resolution":"import_map",
+                            "resolved_url":"https://example.test/pkg.js",
+                            "import_map_key":"pkg",
+                            "scope":null
+                        }
+                    ]
+                },
+                {
+                    "kind":"import_dynamic", "specifier":"./lazy.js","start":14,"end":33,
+                    "resolution":"url","resolved_url":"https://example.test/lazy.js"
+                },
+                {
+                    "kind":"import_static", "specifier":"ghost", "start":35, "end":50,
+                    "resolution_candidates":[],
+                    "resolution":"url","resolved_url":"https://example.test/pkg.js"
+                },
+                {
+                    "kind":"import_static", "specifier":"blocked", "start":51, "end":68,
+                    "resolution_candidates":[{
+                        "document_resource_id":3,"resolution":"import_map_blocked",
+                        "resolved_url":"https://example.test/pkg.js"
+                    }]
+                }
+            ]);
+            main_refs["url"] = json!("https://example.test/main.js");
+            first_refs["url"] = json!("https://example.test/pkg.js");
+            first_refs["references"] = json!([{
+                "kind":"reexport_all","specifier":"./dep.js","start":0,"end":25,
+                "resolution":"url","resolved_url":"https://example.test/dep.js"
+            }]);
+            let mut second_refs = second_refs;
+            second_refs["url"] = json!("https://example.test/pkg.js");
+            let mut index =
+                json!({"units":[main_unit,first_unit,second_unit,dep_unit,lazy_unit,inline_unit]});
+            let mut refs = json!({"code_units":[main_refs,first_refs,second_refs,dep_refs,lazy_refs,inline_refs]});
+            for i in 0..5 {
+                index["units"][i]["resource_id"] = json!(i);
+                refs["code_units"][i]["resource_id"] = json!(i);
             }
-        ]);
-        main_refs["url"] = json!("https://example.test/main.js");
-        first_refs["url"] = json!("https://example.test/pkg.js");
-        first_refs["references"] = json!([{
-            "kind":"reexport_all","specifier":"./dep.js","start":0,"end":25,
-            "resolution":"url","resolved_url":"https://example.test/dep.js"
-        }]);
-        let mut second_refs = second_refs;
-        second_refs["url"] = json!("https://example.test/pkg.js");
-        let mut index =
-            json!({"units":[main_unit,first_unit,second_unit,dep_unit,lazy_unit,inline_unit]});
-        let mut refs =
-            json!({"code_units":[main_refs,first_refs,second_refs,dep_refs,lazy_refs,inline_refs]});
-        for i in 0..5 {
-            index["units"][i]["resource_id"] = json!(i);
-            refs["code_units"][i]["resource_id"] = json!(i);
+            index["units"][5]["resource_id"] = json!(3);
+            index["units"][5]["ordinal"] = json!(99);
+            refs["code_units"][5]["resource_id"] = json!(3);
+            refs["code_units"][5]["ordinal"] = json!(99);
+            let manifest = Self::manifest(project, &index, &refs)?;
+            let source = CapturedScriptSource {
+                resource_id: Some(0),
+                output_path: "resources/main.js".into(),
+                sha256: main_sha,
+                matches_manifest_sha256: true,
+            };
+            Ok(Self {
+                index,
+                refs,
+                manifest,
+                source,
+            })
         }
-        index["units"][5]["resource_id"] = json!(3);
-        index["units"][5]["ordinal"] = json!(99);
-        refs["code_units"][5]["resource_id"] = json!(3);
-        refs["code_units"][5]["ordinal"] = json!(99);
-        let mut resources = Vec::new();
-        let mut inline_scripts = Vec::new();
-        for (i, unit) in index["units"].as_array().into_iter().flatten().enumerate() {
-            let raw_path = unit["raw_path"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("fixture source raw path"))?;
-            let sha = sha256_hex(&fs::read(project.join(raw_path))?);
-            let url = refs["code_units"][i]["url"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("fixture source URL"))?;
-            if unit["origin"] == "inline_script" {
-                inline_scripts.push(json!({
-                    "output_path":raw_path,"sha256":sha,
-                    "parent_resource_id":3,"ordinal":99
-                }));
-            } else {
-                resources.push(json!({
-                    "output_path":raw_path,"sha256":sha,
-                    "id":i,"url":url,"kind":"javascript"
-                }));
+
+        fn manifest(
+            project: &Path,
+            index: &serde_json::Value,
+            refs: &serde_json::Value,
+        ) -> anyhow::Result<CaptureManifest> {
+            let mut resources = Vec::new();
+            let mut inline_scripts = Vec::new();
+            for (i, unit) in index["units"].as_array().into_iter().flatten().enumerate() {
+                let raw_path = unit["raw_path"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("fixture source raw path"))?;
+                let sha = sha256_hex(&fs::read(project.join(raw_path))?);
+                let url = refs["code_units"][i]["url"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("fixture source URL"))?;
+                if unit["origin"] == "inline_script" {
+                    inline_scripts.push(json!({
+                        "output_path":raw_path,"sha256":sha,
+                        "parent_resource_id":3,"ordinal":99
+                    }));
+                } else {
+                    resources.push(json!({
+                        "output_path":raw_path,"sha256":sha,
+                        "id":i,"url":url,"kind":"javascript"
+                    }));
+                }
+            }
+            Ok(CaptureManifest {
+                schema: "capture-project/v1".into(),
+                source: CaptureSource {
+                    kind: "test".into(),
+                    input: "synthetic".into(),
+                    salvaged: false,
+                    extra: serde_json::Map::new(),
+                },
+                pages: vec![],
+                resources,
+                inline_scripts,
+                counts: std::collections::BTreeMap::new(),
+                extra: serde_json::Map::new(),
+            })
+        }
+
+        fn document(&self, document_resource_id: u64) -> DocumentEntrypoints {
+            DocumentEntrypoints {
+                document_resource_id,
+                document_url: "https://example.test/".into(),
+                document_source_sha256: "unused".into(),
+                document_matches_manifest_sha256: true,
+                static_base_url: "https://example.test/".into(),
+                scripts: vec![DocumentScriptRoot {
+                    ordinal: 1,
+                    script_type: "module".into(),
+                    executable: true,
+                    is_module: true,
+                    attributes: ScriptAttributes::default(),
+                    scheduling_class: "deferred",
+                    src: Some("main.js".into()),
+                    resolved_url: Some("https://example.test/main.js".into()),
+                    captured_sources: vec![self.source.clone()],
+                    execution_observed: false,
+                }],
             }
         }
-        let manifest = CaptureManifest {
-            schema: "capture-project/v1".into(),
-            source: CaptureSource {
-                kind: "test".into(),
-                input: "synthetic".into(),
-                salvaged: false,
-                extra: Default::default(),
-            },
-            pages: vec![],
-            resources,
-            inline_scripts,
-            counts: Default::default(),
-            extra: Default::default(),
-        };
-        let source = CapturedScriptSource {
-            resource_id: Some(0),
-            output_path: "resources/main.js".into(),
-            sha256: main_sha,
-            matches_manifest_sha256: true,
-        };
-        let make_document = |document_resource_id| DocumentEntrypoints {
-            document_resource_id,
-            document_url: "https://example.test/".into(),
-            document_source_sha256: "unused".into(),
-            document_matches_manifest_sha256: true,
-            static_base_url: "https://example.test/".into(),
-            scripts: vec![DocumentScriptRoot {
-                ordinal: 1,
-                script_type: "module".into(),
-                executable: true,
-                is_module: true,
-                async_attribute: false,
-                defer_attribute: false,
-                nomodule_attribute: false,
-                scheduling_class: "deferred",
-                src: Some("main.js".into()),
-                resolved_url: Some("https://example.test/main.js".into()),
-                captured_sources: vec![source.clone()],
-                execution_observed: false,
-            }],
-        };
-        let budget = WorkBudget::unlimited("static-module-graph-test");
-        let result = link_static_modules(
-            project,
-            &[make_document(3), make_document(4)],
-            &index,
-            &refs,
-            &manifest,
-            &budget,
-        )?;
+    }
+
+    fn assert_contextual_graph(result: &super::StaticModuleGraph) {
         assert_eq!(result.roots.len(), 2);
         assert!(result.unmatched_module_roots.is_empty());
         let root_source = &result.roots[0].source;
@@ -954,18 +969,43 @@ mod tests {
             .any(|root| root.source.raw_path.contains("lazy")));
         assert_eq!(result.ambiguous_captured_targets, 1);
         assert!(!result.import_map_timing_proven);
-        let mut tampered = make_document(3);
+    }
+
+    #[test]
+    fn contextual_static_imports_follow_transformed_sources_not_original_offsets(
+    ) -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let project = root.path();
+        let fixture = ContextFixture::new(project)?;
+        let budget = WorkBudget::unlimited("static-module-graph-test");
+        let result = link_static_modules(
+            project,
+            &[fixture.document(3), fixture.document(4)],
+            &fixture.index,
+            &fixture.refs,
+            &fixture.manifest,
+            &budget,
+        )?;
+        assert_contextual_graph(&result);
+        let mut tampered = fixture.document(3);
         tampered.scripts[0].captured_sources[0].sha256 = "tampered".into();
-        assert!(
-            link_static_modules(project, &[tampered], &index, &refs, &manifest, &budget).is_err()
-        );
-        let mut changed_manifest = manifest;
+        assert!(link_static_modules(
+            project,
+            &[tampered],
+            &fixture.index,
+            &fixture.refs,
+            &fixture.manifest,
+            &budget
+        )
+        .is_err());
+        let document = fixture.document(3);
+        let mut changed_manifest = fixture.manifest;
         changed_manifest.resources[1]["sha256"] = json!("incorrect-target-hash");
         assert!(link_static_modules(
             project,
-            &[make_document(3)],
-            &index,
-            &refs,
+            &[document],
+            &fixture.index,
+            &fixture.refs,
             &changed_manifest,
             &budget
         )

@@ -19,7 +19,7 @@ pub struct EmbeddedCodeCandidate {
 }
 
 fn static_string_expression(expression: &Expression<'_>) -> Option<String> {
-    eval_static(expression)?.js_string()
+    Some(eval_static(expression)?.js_string())
 }
 
 fn static_join_element(element: &ArrayExpressionElement<'_>) -> Option<String> {
@@ -28,7 +28,7 @@ fn static_join_element(element: &ArrayExpressionElement<'_>) -> Option<String> {
     };
     match eval_static(expression)? {
         Value::Null | Value::Undefined => Some(String::new()),
-        value => value.js_string(),
+        value => Some(value.js_string()),
     }
 }
 
@@ -38,7 +38,7 @@ fn static_join_separator(argument: Option<&Argument<'_>>) -> Option<String> {
     };
     match eval_static(argument.as_expression()?)? {
         Value::Undefined => Some(",".to_string()),
-        value => value.js_string(),
+        value => Some(value.js_string()),
     }
 }
 
@@ -351,7 +351,7 @@ pub fn detect_static_string_join(call: &CallExpression<'_>) -> Option<EmbeddedCo
     })
 }
 
-#[must_use]
+#[must_use = "Use the returned constructor evidence only when detection succeeds"]
 pub fn detect_function_constructor(
     kind: &str,
     start: u32,

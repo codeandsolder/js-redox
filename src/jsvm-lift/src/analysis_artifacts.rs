@@ -195,7 +195,7 @@ pub const ALL_ARTIFACTS: &[ArtifactSpec] = &[
     API_SURFACE,
 ];
 
-#[must_use]
+#[must_use = "Use the returned path to address the selected analysis artifact"]
 pub fn artifact_path(project: &Path, spec: ArtifactSpec) -> PathBuf {
     project.join(spec.relative_path)
 }
@@ -215,11 +215,7 @@ pub fn validate_artifact<'a>(
     };
     let schema = object.get("schema").and_then(Value::as_str);
     if schema != Some(spec.schema) {
-        bail!(
-            "{label}: expected schema {:?}, got {:?}",
-            spec.schema,
-            schema
-        );
+        bail!("{label}: expected schema {:?}, got {schema:?}", spec.schema);
     }
     for &field in spec.record_fields {
         let Some(rows) = object.get(field).and_then(Value::as_array) else {

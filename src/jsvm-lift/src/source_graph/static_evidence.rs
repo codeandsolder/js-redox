@@ -58,20 +58,23 @@ pub(super) fn seed_safe_deobfuscation_sources(
             }),
         )?;
         let raw = string_field(unit, "raw_path");
-        let parent = if let Some(inline) = inline_nodes.for_record(unit) {
-            Some(inline)
-        } else if let Some(runtime_path) =
-            raw.and_then(|path| path.strip_prefix("resources/runtime-scripts/"))
-        {
+        let parent = inline_nodes.for_record(unit).or_else(|| {
             // A declared runtime source is never a captured HTTP resource.
             // Its source path and full input SHA must match an actual graph node.
-            runtime_path
-                .strip_suffix(".js")
-                .filter(|digest| string_field(unit, "input_sha256") == Some(*digest))
-                .and_then(|digest| captured_runtime_source(graph, digest))
-        } else {
-            u64_field(unit, "resource_id").map(|resource_id| format!("resource:{resource_id}"))
-        };
+            raw.and_then(|path| path.strip_prefix("resources/runtime-scripts/"))
+                .map_or_else(
+                    || {
+                        u64_field(unit, "resource_id")
+                            .map(|resource_id| format!("resource:{resource_id}"))
+                    },
+                    |runtime_path| {
+                        runtime_path
+                            .strip_suffix(".js")
+                            .filter(|digest| string_field(unit, "input_sha256") == Some(*digest))
+                            .and_then(|digest| captured_runtime_source(graph, digest))
+                    },
+                )
+        });
         if let Some(parent) = parent {
             graph.add_edge(
                 &parent,
@@ -104,16 +107,16 @@ fn api_source_parent(
         })
 }
 
-/// Attach browser API callsites and exact local mutation-site provenance to
-/// the selected source derivative. Static graph edges do not prove execution.
-pub(super) fn seed_browser_api_callsites(
+type MutationIndex<'a> = BTreeMap<(u64, u64), (String, &'a Value)>;
+
+fn seed_api_mutation_sites<'a>(
     graph: &mut GraphBuilder,
-    api_surface: &Value,
+    api_surface: &'a Value,
     deob_nodes: &BTreeMap<u64, String>,
     inline_nodes: &InlineSourceIndex,
     budget: &WorkBudget,
-) -> Result<()> {
-    let mut mutation_nodes = BTreeMap::<(u64, u64), (String, &Value)>::new();
+) -> Result<MutationIndex<'a>> {
+    let mut mutation_nodes = MutationIndex::new();
     for row in array_field(api_surface, "mutation_sites") {
         budget.checkpoint()?;
         let source_index_ordinal = required_u64(row, "source_index_ordinal", "api mutation site")?;
@@ -149,10 +152,95 @@ pub(super) fn seed_browser_api_callsites(
             graph.add_edge(&parent, &node_id, "api_mutation_site", json!({}))?;
         }
     }
+    Ok(mutation_nodes)
+}
+
+fn link_api_mutation_evidence(
+    graph: &mut GraphBuilder,
+    row: &Value,
+    source_index_ordinal: u64,
+    node_id: &str,
+    mutation_nodes: &MutationIndex<'_>,
+    budget: &WorkBudget,
+) -> Result<()> {
+    if let Some(ordinals) = row.get("mutation_site_ordinals") {
+        let Some(ordinals) = ordinals.as_array() else {
+            bail!("API callsite {node_id} has non-array mutation site ordinals");
+        };
+        for ordinal in ordinals {
+            budget.checkpoint()?;
+            let Some(site_ordinal) = ordinal.as_u64() else {
+                bail!("API callsite {node_id} has non-integer mutation site ordinal");
+            };
+            let Some((mutation_node, site)) =
+                mutation_nodes.get(&(source_index_ordinal, site_ordinal))
+            else {
+                bail!("API callsite {node_id} references missing mutation site {site_ordinal}");
+            };
+            graph.add_edge(
+                mutation_node,
+                node_id,
+                "api_mutation_evidence",
+                json!({
+                    "operation": field(site, "operation"),
+                    "certainty": field(site, "certainty"),
+                    "affected_families": field(site, "affected_families"),
+                    "source_mutation_span": [field(site, "start"), field(site, "end")],
+                }),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn link_api_targets(
+    graph: &mut GraphBuilder,
+    row: &Value,
+    node_id: &str,
+    budget: &WorkBudget,
+) -> Result<()> {
+    if bool_field(row, "absolute_network_url")
+        && !string_field(row, "kind").is_some_and(|kind| kind.ends_with("_candidate"))
+        && string_field(row, "binding_status") != Some("candidate")
+        && !matches!(
+            string_field(row, "method_status"),
+            Some("invalid" | "conditional")
+        )
+    {
+        if let Some(url) = string_field(row, "url") {
+            for target in graph.targets_for(url, budget)? {
+                graph.add_edge(
+                    node_id,
+                    &target,
+                    "api_target",
+                    json!({
+                        "sink_kind":field(row,"kind"),
+                        "method":field(row,"method"),
+                        "method_status":field(row,"method_status"),
+                        "standard_browser_api_semantics_required":bool_field(row,"standard_browser_api_semantics_required"),
+                    }),
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Attach browser API callsites and exact local mutation-site provenance to
+/// the selected source derivative. Static graph edges do not prove execution.
+pub(super) fn seed_browser_api_callsites(
+    graph: &mut GraphBuilder,
+    api_surface: &Value,
+    deob_nodes: &BTreeMap<u64, String>,
+    inline_nodes: &InlineSourceIndex,
+    budget: &WorkBudget,
+) -> Result<()> {
+    type SinkKey = (u64, u64, u64, String);
+    let mutation_nodes =
+        seed_api_mutation_sites(graph, api_surface, deob_nodes, inline_nodes, budget)?;
     // An original sink expression can have many specializing wrapper
     // invocations. Join by source identity, span and native API origin, never
     // by URL or text. Higher-order wrappers may have no direct sink row.
-    type SinkKey = (u64, u64, u64, String);
     let mut direct_sites = BTreeMap::<SinkKey, Vec<String>>::new();
     let mut forwarded_sites = Vec::<(SinkKey, String)>::new();
     // Static browser API callsites hang off the exact selected source derivative.
@@ -214,57 +302,15 @@ pub(super) fn seed_browser_api_callsites(
         if let Some(parent) = api_source_parent(row, deob_nodes, inline_nodes) {
             graph.add_edge(&parent, &node_id, "api_callsite", json!({}))?;
         }
-        if let Some(ordinals) = row.get("mutation_site_ordinals") {
-            let Some(ordinals) = ordinals.as_array() else {
-                bail!("API callsite {node_id} has non-array mutation site ordinals");
-            };
-            for ordinal in ordinals {
-                budget.checkpoint()?;
-                let Some(site_ordinal) = ordinal.as_u64() else {
-                    bail!("API callsite {node_id} has non-integer mutation site ordinal");
-                };
-                let Some((mutation_node, site)) =
-                    mutation_nodes.get(&(source_index_ordinal, site_ordinal))
-                else {
-                    bail!("API callsite {node_id} references missing mutation site {site_ordinal}");
-                };
-                graph.add_edge(
-                    mutation_node,
-                    &node_id,
-                    "api_mutation_evidence",
-                    json!({
-                        "operation": field(site, "operation"),
-                        "certainty": field(site, "certainty"),
-                        "affected_families": field(site, "affected_families"),
-                        "source_mutation_span": [field(site, "start"), field(site, "end")],
-                    }),
-                )?;
-            }
-        }
-        if bool_field(row, "absolute_network_url")
-            && !string_field(row, "kind").is_some_and(|kind| kind.ends_with("_candidate"))
-            && string_field(row, "binding_status") != Some("candidate")
-            && !matches!(
-                string_field(row, "method_status"),
-                Some("invalid" | "conditional")
-            )
-        {
-            if let Some(url) = string_field(row, "url") {
-                for target in graph.targets_for(url, budget)? {
-                    graph.add_edge(
-                        &node_id,
-                        &target,
-                        "api_target",
-                        json!({
-                            "sink_kind":field(row,"kind"),
-                            "method":field(row,"method"),
-                            "method_status":field(row,"method_status"),
-                            "standard_browser_api_semantics_required":bool_field(row,"standard_browser_api_semantics_required"),
-                        }),
-                    )?;
-                }
-            }
-        }
+        link_api_mutation_evidence(
+            graph,
+            row,
+            source_index_ordinal,
+            &node_id,
+            &mutation_nodes,
+            budget,
+        )?;
+        link_api_targets(graph, row, &node_id, budget)?;
     }
 
     for (key, node_id) in forwarded_sites {
@@ -462,7 +508,7 @@ mod tests {
     }
 
     #[test]
-    fn api_mutation_references_cannot_cross_source_units_or_dangle() -> Result<()> {
+    fn api_mutation_references_cannot_cross_source_units_or_dangle() {
         let mut graph = GraphBuilder::default();
         let document = json!({
             "mutation_sites": [
@@ -486,7 +532,6 @@ mod tests {
             &budget,
         )
         .is_err());
-        Ok(())
     }
 
     #[test]

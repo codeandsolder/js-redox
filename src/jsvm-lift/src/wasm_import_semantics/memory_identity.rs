@@ -30,6 +30,27 @@ pub struct WasmInstanceExportCall {
     pub static_uint32_array_argument_lengths: Vec<Option<usize>>,
 }
 
+/// Normal-exit initialization proof, including the permitted memory effects.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+pub struct InitializerEvidence {
+    #[serde(rename = "initializer_function")]
+    pub function: String,
+    #[serde(rename = "initializer_parameter")]
+    pub parameter: usize,
+    #[serde(rename = "initializer_call_starts")]
+    pub call_starts: Vec<u32>,
+    #[serde(rename = "initializer_exports_write_dominates_normal_exit")]
+    pub exports_write_dominates_normal_exit: bool,
+    /// Present only when proof-only normalization shows that the initializer's
+    /// sole call through the exact exports binding is this zero-argument export.
+    #[serde(rename = "initializer_only_wasm_export_call")]
+    pub only_wasm_export_call: Option<String>,
+    /// Proof-only normalized initializer has no non-start effects capable of
+    /// mutating or observing linear memory through user-defined accessors.
+    #[serde(rename = "initializer_non_start_effects_memory_disjoint")]
+    pub non_start_effects_memory_disjoint: bool,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct WasmModuleMemoryIdentityProof {
     pub import_module: String,
@@ -41,16 +62,8 @@ pub struct WasmModuleMemoryIdentityProof {
     pub instance_identity_kind: &'static str,
     pub exports_binding: String,
     pub memory_export_name: String,
-    pub initializer_function: String,
-    pub initializer_parameter: usize,
-    pub initializer_call_starts: Vec<u32>,
-    pub initializer_exports_write_dominates_normal_exit: bool,
-    /// Present only when proof-only normalization shows that the initializer's
-    /// sole call through the exact exports binding is this zero-argument export.
-    pub initializer_only_wasm_export_call: Option<String>,
-    /// Proof-only normalized initializer has no non-start effects capable of
-    /// mutating or observing linear memory through user-defined accessors.
-    pub initializer_non_start_effects_memory_disjoint: bool,
+    #[serde(flatten)]
+    pub initializer: InitializerEvidence,
     pub standard_js_numeric_builtin_semantics_required: bool,
     pub instantiation_site: WasmInstantiationSite,
     pub export_calls: Vec<WasmInstanceExportCall>,
@@ -1317,7 +1330,7 @@ fn unique_exact_instance_paths(
     let exact_sites = sites
         .iter()
         .filter(|site| {
-            site.exact_import_object_identity_proven && site.exact_module_identity_proven
+            site.exact_import_object_identity_proven && site.module.exact_module_identity_proven
         })
         .collect::<Vec<_>>();
     let mut candidates = HashMap::<InstanceKey, Vec<WasmInstantiationSite>>::new();
@@ -1564,7 +1577,8 @@ impl VerifiedGetter<'_> {
                 let Some(site) = self.exact_instances.get(&initializer.call.key) else {
                     continue;
                 };
-                if site.end > initializer.call.start {
+                let initializer_start = initializer.call.start;
+                if site.end > initializer_start {
                     continue;
                 }
                 let mut export_calls = region
@@ -1573,7 +1587,7 @@ impl VerifiedGetter<'_> {
                     .filter(|export| {
                         export.key == initializer.call.key
                             && export.statement_index > initializer.statement_index
-                            && export.call.call_start > initializer.call.start
+                            && export.call.call_start > initializer_start
                             && !region.helper_call_indices.iter().any(|index| {
                                 *index > initializer.statement_index
                                     && *index <= export.statement_index
@@ -1603,17 +1617,19 @@ impl VerifiedGetter<'_> {
                     instance_identity_kind: instance_kind(initializer.call.key),
                     exports_binding: self.getter.exports_binding.clone(),
                     memory_export_name: "memory".to_string(),
-                    initializer_function: self.function.name.clone(),
-                    initializer_parameter: self.write.parameter,
-                    initializer_call_starts: vec![initializer.call.start],
-                    initializer_exports_write_dominates_normal_exit: true,
-                    initializer_only_wasm_export_call: self
-                        .initializer_proof
-                        .only_start_export_call
-                        .then(|| "__wbindgen_start".to_string()),
-                    initializer_non_start_effects_memory_disjoint: self
-                        .initializer_proof
-                        .non_start_effects_memory_disjoint,
+                    initializer: InitializerEvidence {
+                        function: self.function.name.clone(),
+                        parameter: self.write.parameter,
+                        call_starts: vec![initializer.call.start],
+                        exports_write_dominates_normal_exit: true,
+                        only_wasm_export_call: self
+                            .initializer_proof
+                            .only_start_export_call
+                            .then(|| "__wbindgen_start".to_string()),
+                        non_start_effects_memory_disjoint: self
+                            .initializer_proof
+                            .non_start_effects_memory_disjoint,
+                    },
                     standard_js_numeric_builtin_semantics_required: true,
                     instantiation_site: site.clone(),
                     export_calls,

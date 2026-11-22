@@ -108,6 +108,184 @@ fn format_field(value: &Value, expr: Option<&str>, aliases: &BTreeSet<String>) -
     "{?}".to_owned()
 }
 
+fn print_decoder_header(
+    decoder: &Value,
+    builder: Option<&Value>,
+    width: u64,
+    linked: bool,
+) -> Result<()> {
+    let mut canonical_width = None;
+    let mut width_score = None;
+    let mut candidate_top_scoring = false;
+    if let Some(builder) = builder {
+        if let Some(hints) = builder.get("width_hints").and_then(Value::as_array) {
+            let top_score = hints
+                .iter()
+                .filter_map(|hint| hint.get("score").and_then(Value::as_i64))
+                .max();
+            if let Some(top_score) = top_score {
+                canonical_width = hints
+                    .iter()
+                    .filter(|hint| hint.get("score").and_then(Value::as_i64) == Some(top_score))
+                    .filter_map(|hint| hint.get("width").and_then(Value::as_u64))
+                    .min();
+                for hint in hints {
+                    if hint.get("width").and_then(Value::as_u64) == Some(width) {
+                        width_score = hint.get("score").and_then(Value::as_i64);
+                        candidate_top_scoring = width_score == Some(top_score);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut confidence = 0_u8;
+    let mut reasons = Vec::new();
+    if linked {
+        confidence += 3;
+        reasons.push("builder-linked");
+    }
+    if let Some(builder) = builder {
+        let arguments = u64_field(builder.get("arguments"), "builder arguments")?;
+        if width != 0 && arguments % width == 0 {
+            confidence += 1;
+            reasons.push("length-aligned");
+        }
+    }
+    if candidate_top_scoring {
+        confidence += 3;
+        reasons.push("decoder-width-is-top-scoring-period");
+    }
+    let mut offsets = decoder
+        .get("operand_offsets")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_u64)
+        .collect::<Vec<_>>();
+    offsets.sort_unstable();
+    if offsets.first() == Some(&0) && offsets.len() >= 2 {
+        confidence += 1;
+        reasons.push("multiple-fetch-offsets");
+    }
+
+    println!(
+        "decoder {} object={} builder={} width={width} ip={} base={} offsets={offsets:?} confidence={confidence}/8",
+        decoder.get("function_id").and_then(Value::as_str).unwrap_or("?"),
+        decoder.get("object").and_then(Value::as_str).unwrap_or("?"),
+        decoder.get("builder_var").and_then(Value::as_str).unwrap_or("?"),
+        decoder.get("ip").and_then(Value::as_str).unwrap_or("?"),
+        decoder.get("base").and_then(Value::as_str).unwrap_or("<inline>"),
+    );
+    println!(
+        "  builder_min_top_period={} linked_decoder_width={width} candidate_width_score={} reasons={}",
+        canonical_width.map_or_else(|| "?".to_owned(), |value| value.to_string()),
+        width_score.map_or_else(|| "?".to_owned(), |value| value.to_string()),
+        reasons.join(",")
+    );
+    let preview = decoder
+        .get("preview")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let preview = preview.get(..preview.len().min(220)).unwrap_or(preview);
+    println!("  evidence: {preview}");
+
+    Ok(())
+}
+
+fn print_selector_domain(decoder: &Value) -> Option<BTreeSet<u64>> {
+    let masks = decoder
+        .get("selector_masks")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_u64)
+        .collect::<Vec<_>>();
+    let domain = selector_domain(masks.iter().copied());
+    if decoder
+        .get("selector_var")
+        .is_some_and(|value| !value.is_null())
+        || !masks.is_empty()
+    {
+        println!(
+            "  selector: var={} masks={masks:?} domain={}",
+            decoder
+                .get("selector_var")
+                .and_then(Value::as_str)
+                .unwrap_or("?"),
+            domain
+                .as_ref()
+                .map_or_else(|| "?".to_owned(), |values| format!("{values:?}"))
+        );
+    }
+
+    domain
+}
+
+fn print_instruction_stream(
+    builder: &Value,
+    width: u64,
+    aliases: &BTreeSet<String>,
+    domain: Option<&BTreeSet<u64>>,
+    instructions: usize,
+) -> Result<BTreeSet<u64>> {
+    let values = values(builder)?;
+    let unknowns = unknown_map(builder)?;
+    let width_usize = usize::try_from(width).context("decoder width does not fit usize")?;
+    if width_usize == 0 {
+        bail!("decoder width must be non-zero");
+    }
+    let instruction_count = values.len() / width_usize;
+    let mut opcodes = BTreeSet::new();
+    let mut unknown_opcode_slots = 0_usize;
+    for instruction in 0..instruction_count {
+        let index = instruction * width_usize;
+        if let Some(value) = resolved_value(
+            &values[index],
+            unknowns.get(&index).map(String::as_str),
+            aliases,
+        ) {
+            opcodes.insert(value);
+        } else {
+            unknown_opcode_slots += 1;
+        }
+    }
+    let known = values.iter().filter(|value| !value.is_null()).count();
+    println!(
+        "  stream: args={} instructions={instruction_count} known={known}/{}",
+        values.len(),
+        values.len()
+    );
+    println!("  opcodes: observed={opcodes:?} unknown_slots={unknown_opcode_slots}");
+    if let Some(domain) = domain {
+        println!(
+            "  selector-vs-stream: unobserved={:?} out_of_domain={:?}",
+            domain
+                .difference(&opcodes)
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            opcodes.difference(domain).copied().collect::<BTreeSet<_>>()
+        );
+    }
+
+    for instruction in 0..instruction_count.min(instructions) {
+        let pc = instruction * width_usize;
+        let fields = (0..width_usize)
+            .map(|offset| {
+                let index = pc + offset;
+                format_field(
+                    &values[index],
+                    unknowns.get(&index).map(String::as_str),
+                    aliases,
+                )
+            })
+            .collect::<Vec<_>>();
+        println!("    {instruction:04} pc={pc:04}: {}", fields.join(" | "));
+    }
+    Ok(opcodes)
+}
+
 pub fn dump_linked_bytecode(
     jsonl: &Path,
     instructions: usize,
@@ -171,171 +349,19 @@ pub fn dump_linked_bytecode(
 
             let builder = decoder_builder_start.and_then(|start| builders.get(&start).copied());
             let width = u64_field(decoder.get("width"), "decoder width")?;
-            let mut canonical_width = None;
-            let mut width_score = None;
-            let mut candidate_top_scoring = false;
-            if let Some(builder) = builder {
-                if let Some(hints) = builder.get("width_hints").and_then(Value::as_array) {
-                    let top_score = hints
-                        .iter()
-                        .filter_map(|hint| hint.get("score").and_then(Value::as_i64))
-                        .max();
-                    if let Some(top_score) = top_score {
-                        canonical_width = hints
-                            .iter()
-                            .filter(|hint| {
-                                hint.get("score").and_then(Value::as_i64) == Some(top_score)
-                            })
-                            .filter_map(|hint| hint.get("width").and_then(Value::as_u64))
-                            .min();
-                        for hint in hints {
-                            if hint.get("width").and_then(Value::as_u64) == Some(width) {
-                                width_score = hint.get("score").and_then(Value::as_i64);
-                                candidate_top_scoring = width_score == Some(top_score);
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-
-            let mut confidence = 0_u8;
-            let mut reasons = Vec::new();
-            if linked {
-                confidence += 3;
-                reasons.push("builder-linked");
-            }
-            if let Some(builder) = builder {
-                let arguments = u64_field(builder.get("arguments"), "builder arguments")?;
-                if width != 0 && arguments % width == 0 {
-                    confidence += 1;
-                    reasons.push("length-aligned");
-                }
-            }
-            if candidate_top_scoring {
-                confidence += 3;
-                reasons.push("decoder-width-is-top-scoring-period");
-            }
-            let mut offsets = decoder
-                .get("operand_offsets")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_u64)
-                .collect::<Vec<_>>();
-            offsets.sort_unstable();
-            if offsets.first() == Some(&0) && offsets.len() >= 2 {
-                confidence += 1;
-                reasons.push("multiple-fetch-offsets");
-            }
-
-            println!(
-                "decoder {} object={} builder={} width={width} ip={} base={} offsets={offsets:?} confidence={confidence}/8",
-                decoder.get("function_id").and_then(Value::as_str).unwrap_or("?"),
-                decoder.get("object").and_then(Value::as_str).unwrap_or("?"),
-                decoder.get("builder_var").and_then(Value::as_str).unwrap_or("?"),
-                decoder.get("ip").and_then(Value::as_str).unwrap_or("?"),
-                decoder.get("base").and_then(Value::as_str).unwrap_or("<inline>"),
-            );
-            println!(
-                "  builder_min_top_period={} linked_decoder_width={width} candidate_width_score={} reasons={}",
-                canonical_width.map_or_else(|| "?".to_owned(), |value| value.to_string()),
-                width_score.map_or_else(|| "?".to_owned(), |value| value.to_string()),
-                reasons.join(",")
-            );
-            let preview = decoder
-                .get("preview")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let preview = preview.get(..preview.len().min(220)).unwrap_or(preview);
-            println!("  evidence: {preview}");
-
-            let masks = decoder
-                .get("selector_masks")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_u64)
-                .collect::<Vec<_>>();
-            let domain = selector_domain(masks.iter().copied());
-            if decoder
-                .get("selector_var")
-                .is_some_and(|value| !value.is_null())
-                || !masks.is_empty()
-            {
-                println!(
-                    "  selector: var={} masks={masks:?} domain={}",
-                    decoder
-                        .get("selector_var")
-                        .and_then(Value::as_str)
-                        .unwrap_or("?"),
-                    domain
-                        .as_ref()
-                        .map_or_else(|| "?".to_owned(), |values| format!("{values:?}"))
-                );
-                if let Some(domain) = &domain {
-                    report_selector_domain.extend(domain.iter().copied());
-                }
+            print_decoder_header(decoder, builder, width, linked)?;
+            let domain = print_selector_domain(decoder);
+            if let Some(domain) = &domain {
+                report_selector_domain.extend(domain.iter().copied());
             }
 
             let Some(builder) = builder else {
                 shown += 1;
                 continue;
             };
-            let values = values(builder)?;
-            let unknowns = unknown_map(builder)?;
-            let width_usize = usize::try_from(width).context("decoder width does not fit usize")?;
-            if width_usize == 0 {
-                bail!("decoder width must be non-zero");
-            }
-            let instruction_count = values.len() / width_usize;
-            let mut opcodes = BTreeSet::new();
-            let mut unknown_opcode_slots = 0_usize;
-            for instruction in 0..instruction_count {
-                let index = instruction * width_usize;
-                if let Some(value) = resolved_value(
-                    &values[index],
-                    unknowns.get(&index).map(String::as_str),
-                    &aliases,
-                ) {
-                    opcodes.insert(value);
-                } else {
-                    unknown_opcode_slots += 1;
-                }
-            }
-            report_observed.extend(opcodes.iter().copied());
-            let known = values.iter().filter(|value| !value.is_null()).count();
-            println!(
-                "  stream: args={} instructions={instruction_count} known={known}/{}",
-                values.len(),
-                values.len()
-            );
-            println!("  opcodes: observed={opcodes:?} unknown_slots={unknown_opcode_slots}");
-            if let Some(domain) = &domain {
-                println!(
-                    "  selector-vs-stream: unobserved={:?} out_of_domain={:?}",
-                    domain
-                        .difference(&opcodes)
-                        .copied()
-                        .collect::<BTreeSet<_>>(),
-                    opcodes.difference(domain).copied().collect::<BTreeSet<_>>()
-                );
-            }
-
-            for instruction in 0..instruction_count.min(instructions) {
-                let pc = instruction * width_usize;
-                let fields = (0..width_usize)
-                    .map(|offset| {
-                        let index = pc + offset;
-                        format_field(
-                            &values[index],
-                            unknowns.get(&index).map(String::as_str),
-                            &aliases,
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                println!("    {instruction:04} pc={pc:04}: {}", fields.join(" | "));
-            }
+            let opcodes =
+                print_instruction_stream(builder, width, &aliases, domain.as_ref(), instructions)?;
+            report_observed.extend(opcodes);
             shown += 1;
         }
 
@@ -427,159 +453,89 @@ fn symbolic_field(
     )
 }
 
-pub fn extract_linked_streams(
-    file: &Path,
-    scanner: Option<&Path>,
-    output: Option<&Path>,
-    preview: usize,
-) -> Result<()> {
-    let scanner = scanner_path(scanner)?;
-    let report = scan(file, &scanner)?;
-    let source = fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
-    let aliases = parse_int_aliases(&source);
+struct ResolvedStream {
+    width: u64,
+    total: usize,
+    literal_arguments: usize,
+    resolved: usize,
+    ratio: f64,
+    known_opcodes: BTreeSet<u64>,
+    instructions: Vec<Value>,
+}
 
-    let mut builders = BTreeMap::<(u64, u64), &Value>::new();
-    for builder in report
-        .get("push_builders")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        builders.insert(
-            (
-                u64_field(builder.get("start"), "builder start")?,
-                u64_field(builder.get("end"), "builder end")?,
-            ),
-            builder,
-        );
+fn resolve_stream(
+    builder: &Value,
+    decoders: &[&Value],
+    aliases: &BTreeSet<String>,
+) -> Result<ResolvedStream> {
+    let mut widths = BTreeMap::<u64, usize>::new();
+    for decoder in decoders {
+        let width = u64_field(decoder.get("width"), "decoder width")?;
+        *widths.entry(width).or_default() += 1;
     }
-    let mut groups = BTreeMap::<(u64, u64), Vec<&Value>>::new();
-    for decoder in report
-        .get("decoder_candidates")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let (Some(start), Some(end)) = (
-            decoder.get("builder_start").and_then(Value::as_u64),
-            decoder.get("builder_end").and_then(Value::as_u64),
-        ) else {
-            continue;
-        };
-        groups.entry((start, end)).or_default().push(decoder);
+    let width = widths
+        .iter()
+        .max_by_key(|(width, count)| (**count, std::cmp::Reverse(**width)))
+        .map(|(width, _)| *width)
+        .context("linked decoder group has no widths")?;
+    let width_usize = usize::try_from(width).context("decoder width does not fit usize")?;
+    if width_usize == 0 {
+        bail!("decoder width must be non-zero");
     }
-
-    let mut streams = Vec::new();
-    for (key, decoders) in groups {
-        let Some(builder) = builders.get(&key).copied() else {
-            continue;
-        };
-        let mut widths = BTreeMap::<u64, usize>::new();
-        for decoder in &decoders {
-            let width = u64_field(decoder.get("width"), "decoder width")?;
-            *widths.entry(width).or_default() += 1;
+    let values = values(builder)?;
+    let unknowns = unknown_map(builder)?;
+    let mut instructions = Vec::new();
+    let mut resolved = 0_usize;
+    let mut known_opcodes = BTreeSet::new();
+    for (index, chunk) in values.chunks(width_usize).enumerate() {
+        let pc = index * width_usize;
+        let fields = (0..chunk.len())
+            .map(|offset| symbolic_field(values, &unknowns, pc + offset, aliases))
+            .collect::<Vec<_>>();
+        resolved += fields
+            .iter()
+            .filter(|field| {
+                matches!(
+                    field.get("kind").and_then(Value::as_str),
+                    Some("literal" | "folded")
+                )
+            })
+            .count();
+        if let Some(opcode) = fields
+            .first()
+            .and_then(|field| field.get("value"))
+            .and_then(Value::as_u64)
+        {
+            known_opcodes.insert(opcode);
         }
-        let width = widths
-            .iter()
-            .max_by_key(|(width, count)| (**count, std::cmp::Reverse(**width)))
-            .map(|(width, _)| *width)
-            .context("linked decoder group has no widths")?;
-        let width_usize = usize::try_from(width).context("decoder width does not fit usize")?;
-        if width_usize == 0 {
-            bail!("decoder width must be non-zero");
-        }
-        let values = values(builder)?;
-        let unknowns = unknown_map(builder)?;
-        let mut instructions = Vec::new();
-        let mut resolved = 0_usize;
-        let mut known_opcodes = BTreeSet::new();
-        for (index, chunk) in values.chunks(width_usize).enumerate() {
-            let pc = index * width_usize;
-            let fields = (0..chunk.len())
-                .map(|offset| symbolic_field(values, &unknowns, pc + offset, &aliases))
-                .collect::<Vec<_>>();
-            resolved += fields
-                .iter()
-                .filter(|field| {
-                    matches!(
-                        field.get("kind").and_then(Value::as_str),
-                        Some("literal" | "folded")
-                    )
-                })
-                .count();
-            if let Some(opcode) = fields
-                .first()
-                .and_then(|field| field.get("value"))
-                .and_then(Value::as_u64)
-            {
-                known_opcodes.insert(opcode);
-            }
-            instructions.push(json!({
-                "pc": pc,
-                "index": index,
-                "opcode": fields.first().cloned().unwrap_or(Value::Null),
-                "operands": fields.into_iter().skip(1).collect::<Vec<_>>(),
-                "complete": chunk.len() == width_usize,
-            }));
-        }
-        let total_u32 = u32::try_from(values.len()).context("stream too large for ratio")?;
-        let resolved_u32 =
-            u32::try_from(resolved).context("resolved field count too large for ratio")?;
-        let ratio = if total_u32 == 0 {
-            0.0
-        } else {
-            f64::from(resolved_u32) / f64::from(total_u32)
-        };
-        let decoder_functions = decoders
-            .iter()
-            .filter_map(|decoder| decoder.get("function_id").and_then(Value::as_str))
-            .collect::<BTreeSet<_>>();
-        let decoder_objects = decoders
-            .iter()
-            .filter_map(|decoder| decoder.get("object").and_then(Value::as_str))
-            .collect::<BTreeSet<_>>();
-        let ips = decoders
-            .iter()
-            .filter_map(|decoder| decoder.get("ip").and_then(Value::as_str))
-            .collect::<BTreeSet<_>>();
-        streams.push(json!({
-            "builder_start": key.0,
-            "builder_end": key.1,
-            "receiver": builder.get("receiver").cloned().unwrap_or(Value::Null),
-            "arguments": builder.get("arguments").cloned().unwrap_or(Value::Null),
-            "decoder_width": width,
-            "decoder_count": decoders.len(),
-            "decoder_functions": decoder_functions,
-            "decoder_objects": decoder_objects,
-            "ips": ips,
-            "literal_arguments": values.iter().filter(|value| !value.is_null()).count(),
-            "resolved_arguments": resolved,
-            "resolved_ratio": ratio,
-            "unknown_arguments": values.len().saturating_sub(resolved),
-            "parseint_aliases": aliases,
-            "opcode_known": instructions.iter().filter(|instruction| instruction.get("opcode").and_then(|op| op.get("value")).is_some()).count(),
-            "opcode_unique": known_opcodes.len(),
-            "instructions": instructions,
+        instructions.push(json!({
+            "pc": pc,
+            "index": index,
+            "opcode": fields.first().cloned().unwrap_or(Value::Null),
+            "operands": fields.into_iter().skip(1).collect::<Vec<_>>(),
+            "complete": chunk.len() == width_usize,
         }));
     }
+    let total_u32 = u32::try_from(values.len()).context("stream too large for ratio")?;
+    let resolved_u32 =
+        u32::try_from(resolved).context("resolved field count too large for ratio")?;
+    let ratio = if total_u32 == 0 {
+        0.0
+    } else {
+        f64::from(resolved_u32) / f64::from(total_u32)
+    };
+    Ok(ResolvedStream {
+        width,
+        total: values.len(),
+        literal_arguments: values.iter().filter(|value| !value.is_null()).count(),
+        resolved,
+        ratio,
+        known_opcodes,
+        instructions,
+    })
+}
 
-    let document = json!({
-        "file": report.get("file").cloned().unwrap_or_else(|| json!(file.display().to_string())),
-        "streams": streams,
-    });
-    if let Some(path) = output {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-        }
-        let mut text = serde_json::to_string_pretty(&document)?;
-        text.push('\n');
-        fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
-    }
-
-    let streams = document
-        .get("streams")
-        .and_then(Value::as_array)
-        .context("generated streams must be an array")?;
+fn print_stream_preview(file: &Path, streams: &[Value], preview: usize) {
     println!("{}: {} linked streams", file.display(), streams.len());
     let mut ordered = streams.iter().collect::<Vec<_>>();
     ordered.sort_by_key(|stream| {
@@ -656,6 +612,107 @@ pub fn extract_linked_streams(
             );
         }
     }
+}
+
+pub fn extract_linked_streams(
+    file: &Path,
+    scanner: Option<&Path>,
+    output: Option<&Path>,
+    preview: usize,
+) -> Result<()> {
+    let scanner = scanner_path(scanner)?;
+    let report = scan(file, &scanner)?;
+    let source = fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+    let aliases = parse_int_aliases(&source);
+
+    let mut builders = BTreeMap::<(u64, u64), &Value>::new();
+    for builder in report
+        .get("push_builders")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        builders.insert(
+            (
+                u64_field(builder.get("start"), "builder start")?,
+                u64_field(builder.get("end"), "builder end")?,
+            ),
+            builder,
+        );
+    }
+    let mut groups = BTreeMap::<(u64, u64), Vec<&Value>>::new();
+    for decoder in report
+        .get("decoder_candidates")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let (Some(start), Some(end)) = (
+            decoder.get("builder_start").and_then(Value::as_u64),
+            decoder.get("builder_end").and_then(Value::as_u64),
+        ) else {
+            continue;
+        };
+        groups.entry((start, end)).or_default().push(decoder);
+    }
+
+    let mut streams = Vec::new();
+    for (key, decoders) in groups {
+        let Some(builder) = builders.get(&key).copied() else {
+            continue;
+        };
+        let stream = resolve_stream(builder, &decoders, &aliases)?;
+        let decoder_functions = decoders
+            .iter()
+            .filter_map(|decoder| decoder.get("function_id").and_then(Value::as_str))
+            .collect::<BTreeSet<_>>();
+        let decoder_objects = decoders
+            .iter()
+            .filter_map(|decoder| decoder.get("object").and_then(Value::as_str))
+            .collect::<BTreeSet<_>>();
+        let ips = decoders
+            .iter()
+            .filter_map(|decoder| decoder.get("ip").and_then(Value::as_str))
+            .collect::<BTreeSet<_>>();
+        streams.push(json!({
+            "builder_start": key.0,
+            "builder_end": key.1,
+            "receiver": builder.get("receiver").cloned().unwrap_or(Value::Null),
+            "arguments": builder.get("arguments").cloned().unwrap_or(Value::Null),
+            "decoder_width": stream.width,
+            "decoder_count": decoders.len(),
+            "decoder_functions": decoder_functions,
+            "decoder_objects": decoder_objects,
+            "ips": ips,
+            "literal_arguments": stream.literal_arguments,
+            "resolved_arguments": stream.resolved,
+            "resolved_ratio": stream.ratio,
+            "unknown_arguments": stream.total.saturating_sub(stream.resolved),
+            "parseint_aliases": aliases,
+            "opcode_known": stream.instructions.iter().filter(|instruction| instruction.get("opcode").and_then(|op| op.get("value")).is_some()).count(),
+            "opcode_unique": stream.known_opcodes.len(),
+            "instructions": stream.instructions,
+        }));
+    }
+
+    let document = json!({
+        "file": report.get("file").cloned().unwrap_or_else(|| json!(file.display().to_string())),
+        "streams": streams,
+    });
+    if let Some(path) = output {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let mut text = serde_json::to_string_pretty(&document)?;
+        text.push('\n');
+        fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
+    }
+
+    let streams = document
+        .get("streams")
+        .and_then(Value::as_array)
+        .context("generated streams must be an array")?;
+    print_stream_preview(file, streams, preview);
     if output.is_none() {
         let mut text = serde_json::to_string_pretty(&document)?;
         text.push('\n');
@@ -669,7 +726,7 @@ fn render_symbolic(field: &Value) -> String {
         Some("literal") => field
             .get("value")
             .map_or_else(|| "?".to_owned(), Value::to_string),
-        Some("folded") | Some("symbolic") => field
+        Some("folded" | "symbolic") => field
             .get("expr")
             .and_then(Value::as_str)
             .unwrap_or("?")

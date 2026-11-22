@@ -236,6 +236,98 @@ struct ResolverCollector<'c> {
 }
 
 impl ResolverCollector<'_> {
+    fn argument_boxes(
+        &self,
+        body: &oxc_ast::ast::FunctionBody<'_>,
+        return_start: u32,
+    ) -> Result<(HashSet<SymbolId>, bool), BudgetExceeded> {
+        let mut box_collector = ArgumentsBoxCollector {
+            boxes: HashMap::new(),
+            arguments_references: 0,
+            poller: BudgetPoller::new(&self.budget, 256),
+        };
+        box_collector.visit_function_body(body);
+        box_collector.poller.finish()?;
+        let declared_boxes = box_collector.boxes.len();
+        let mut argument_boxes = HashSet::new();
+        for (symbol, declaration_start) in box_collector.boxes {
+            self.budget.consume(1)?;
+            if declaration_start >= return_start {
+                continue;
+            }
+            let references = self.scoping.get_resolved_reference_ids(symbol);
+            if references.len() != 1 {
+                continue;
+            }
+            self.budget.consume(1)?;
+            let reference = self.scoping.get_reference(references[0]);
+            if reference.is_read()
+                && !reference.is_write()
+                && !reference.flags().is_member_write_target()
+            {
+                argument_boxes.insert(symbol);
+            }
+        }
+
+        Ok((
+            argument_boxes,
+            box_collector.arguments_references == declared_boxes,
+        ))
+    }
+
+    fn prove_resolver(
+        &self,
+        body: &oxc_ast::ast::FunctionBody<'_>,
+        parameter_symbol: SymbolId,
+    ) -> Result<Option<ResolverReturn>, BudgetExceeded> {
+        if !only_unconditional_statements_budgeted(&body.statements, &self.budget)? {
+            return Ok(None);
+        }
+        let mut return_locations = ReturnLocationCollector {
+            count: 0,
+            start: None,
+            poller: BudgetPoller::new(&self.budget, 256),
+        };
+        return_locations.visit_function_body(body);
+        return_locations.poller.finish()?;
+        if return_locations.count != 1 {
+            return Ok(None);
+        }
+        let Some(return_start) = return_locations.start else {
+            return Ok(None);
+        };
+
+        let (argument_boxes, all_arguments_boxed) = self.argument_boxes(body, return_start)?;
+        for reference_id in self.scoping.get_resolved_reference_ids(parameter_symbol) {
+            self.budget.consume(1)?;
+            let reference = self.scoping.get_reference(*reference_id);
+            if reference.is_write() || reference.flags().is_member_write_target() {
+                return Ok(None);
+            }
+        }
+        if !all_arguments_boxed {
+            return Ok(None);
+        }
+        let mut return_collector = ReturnShapeCollector {
+            scoping: self.scoping,
+            parameter: parameter_symbol,
+            argument_boxes: &argument_boxes,
+            returns: 0,
+            member: None,
+            invalid: false,
+            poller: BudgetPoller::new(&self.budget, 256),
+        };
+        return_collector.visit_function_body(body);
+        return_collector.poller.finish()?;
+        Ok(
+            if !return_collector.invalid && return_collector.returns == 1 {
+                return_collector.member
+            } else {
+                None
+            },
+        )
+    }
+
     fn analyze_function(&mut self, it: &Function<'_>) {
         if self.budget_error.is_some()
             || it.r#async
@@ -258,104 +350,8 @@ impl ResolverCollector<'_> {
             return;
         };
 
-        let unconditional =
-            match only_unconditional_statements_budgeted(&body.statements, &self.budget) {
-                Ok(unconditional) => unconditional,
-                Err(error) => {
-                    self.budget_error = Some(error);
-                    return;
-                }
-            };
-        if !unconditional {
-            return;
-        }
-
-        let mut return_locations = ReturnLocationCollector {
-            count: 0,
-            start: None,
-            poller: BudgetPoller::new(&self.budget, 256),
-        };
-        return_locations.visit_function_body(body);
-        if let Err(error) = return_locations.poller.finish() {
-            self.budget_error = Some(error);
-            return;
-        }
-        if return_locations.count != 1 {
-            return;
-        }
-        let Some(return_start) = return_locations.start else {
-            return;
-        };
-
-        let mut box_collector = ArgumentsBoxCollector {
-            boxes: HashMap::new(),
-            arguments_references: 0,
-            poller: BudgetPoller::new(&self.budget, 256),
-        };
-        box_collector.visit_function_body(body);
-        if let Err(error) = box_collector.poller.finish() {
-            self.budget_error = Some(error);
-            return;
-        }
-        let declared_boxes = box_collector.boxes.len();
-        let mut argument_boxes = HashSet::new();
-        for (symbol, declaration_start) in box_collector.boxes {
-            if let Err(error) = self.budget.consume(1) {
-                self.budget_error = Some(error);
-                return;
-            }
-            if declaration_start >= return_start {
-                continue;
-            }
-            let references = self.scoping.get_resolved_reference_ids(symbol);
-            if references.len() != 1 {
-                continue;
-            }
-            if let Err(error) = self.budget.consume(1) {
-                self.budget_error = Some(error);
-                return;
-            }
-            let reference = self.scoping.get_reference(references[0]);
-            if reference.is_read()
-                && !reference.is_write()
-                && !reference.flags().is_member_write_target()
-            {
-                argument_boxes.insert(symbol);
-            }
-        }
-
-        let mut parameter_is_read_only = true;
-        for reference_id in self.scoping.get_resolved_reference_ids(parameter_symbol) {
-            if let Err(error) = self.budget.consume(1) {
-                self.budget_error = Some(error);
-                return;
-            }
-            let reference = self.scoping.get_reference(*reference_id);
-            if reference.is_write() || reference.flags().is_member_write_target() {
-                parameter_is_read_only = false;
-                break;
-            }
-        }
-        if !parameter_is_read_only || box_collector.arguments_references != declared_boxes {
-            return;
-        }
-
-        let mut return_collector = ReturnShapeCollector {
-            scoping: self.scoping,
-            parameter: parameter_symbol,
-            argument_boxes: &argument_boxes,
-            returns: 0,
-            member: None,
-            invalid: false,
-            poller: BudgetPoller::new(&self.budget, 256),
-        };
-        return_collector.visit_function_body(body);
-        if let Err(error) = return_collector.poller.finish() {
-            self.budget_error = Some(error);
-            return;
-        }
-        if !return_collector.invalid && return_collector.returns == 1 {
-            if let Some(member) = return_collector.member {
+        match self.prove_resolver(body, parameter_symbol) {
+            Ok(Some(member)) => {
                 self.resolvers.insert(
                     function_symbol,
                     ResolverShape {
@@ -367,6 +363,8 @@ impl ResolverCollector<'_> {
                     },
                 );
             }
+            Ok(None) => {}
+            Err(error) => self.budget_error = Some(error),
         }
     }
 }

@@ -154,7 +154,7 @@ struct PrivateDispatchEnvironment<'a> {
     scoping: &'a Scoping,
     order: SymbolId,
     counter: SymbolId,
-    values: &'a [Value],
+    values: Vec<Value>,
     index: f64,
 }
 
@@ -235,7 +235,7 @@ impl Collector<'_, '_> {
 
         let mut serial = 0;
         let name = loop {
-            let candidate = format!("__jsvm_selector_{}_{}", switch.span.start, serial);
+            let candidate = format!("__jsvm_selector_{}_{serial}", switch.span.start);
             if !self.source.contains(&candidate)
                 && !self.scoping.symbol_names().any(|name| name == candidate)
                 && !self
@@ -255,7 +255,7 @@ impl Collector<'_, '_> {
         let mut default = None;
         let mut first = true;
         for case in &switch.cases {
-            let Some(test) = &case.test else {
+            let Some(case_label) = &case.test else {
                 default = Some(case);
                 continue;
             };
@@ -266,7 +266,7 @@ impl Collector<'_, '_> {
             write!(
                 text,
                 "if ({name} === ({}\n)) {{\n{}\n}}",
-                fragment(self.source, test.span()),
+                fragment(self.source, case_label.span()),
                 statement_text(self.source, &case.consequent)?
             )
             .ok()?;
@@ -306,11 +306,13 @@ impl Collector<'_, '_> {
             })
     }
 
-    /// Full straight-line recovery for a lexical loop-local dense literal
-    /// table, when its own entries guarantee an exit. Out-of-bounds reads
-    /// are deliberately not considered undefined: prototypes may supply one.
-    pub(super) fn bounded_dispatch_replacement(&self, it: &ForStatement<'_>) -> Option<String> {
-        let switch = dispatch_switch(&it.body, self, it.span)?;
+    /// Prove private binding identities and evaluate the dense literal only
+    /// after all references and initializer effects have been accounted for.
+    fn private_dispatch_environment(
+        &self,
+        it: &ForStatement<'_>,
+        switch: &SwitchStatement<'_>,
+    ) -> Option<PrivateDispatchEnvironment<'_>> {
         let Some(ForStatementInit::VariableDeclaration(init)) = &it.init else {
             return None;
         };
@@ -393,14 +395,53 @@ impl Collector<'_, '_> {
                 return None;
             }
         }
-        let values = values?;
-        let mut environment = PrivateDispatchEnvironment {
+        Some(PrivateDispatchEnvironment {
             scoping: self.scoping,
             order,
             counter,
-            values: &values,
+            values: values?,
             index: initial?,
-        };
+        })
+    }
+
+    /// Identify the exact statements retained by a selected arm and whether
+    /// it exits the original loop. Reject fallthrough and foreign continues.
+    fn retained_dispatch_arm<'a>(
+        &self,
+        switch: &'a SwitchStatement<'a>,
+        index: usize,
+        loop_span: Span,
+    ) -> Option<(&'a [Statement<'a>], bool)> {
+        let case = &switch.cases[index];
+        match case.consequent.split_last() {
+            Some((Statement::ContinueStatement(node), prefix))
+                if node.label.as_ref().is_none_or(|label| {
+                    self.active_labels
+                        .iter()
+                        .any(|(span, name)| *span == loop_span && name == label.name.as_str())
+                }) =>
+            {
+                Some((prefix, false))
+            }
+            Some((Statement::BreakStatement(node), prefix)) if node.label.is_none() => {
+                Some((prefix, true))
+            }
+            Some((last, _))
+                if cannot_complete_normally(last) || index + 1 == switch.cases.len() =>
+            {
+                Some((case.consequent.as_slice(), true))
+            }
+            None if index + 1 == switch.cases.len() => Some((case.consequent.as_slice(), true)),
+            _ => None,
+        }
+    }
+
+    /// Full straight-line recovery for a lexical loop-local dense literal
+    /// table, when its own entries guarantee an exit. Out-of-bounds reads
+    /// are deliberately not considered undefined: prototypes may supply one.
+    pub(super) fn bounded_dispatch_replacement(&self, it: &ForStatement<'_>) -> Option<String> {
+        let switch = dispatch_switch(&it.body, self, it.span)?;
+        let mut environment = self.private_dispatch_environment(it, switch)?;
         // Constant labels get an O(1) typed lookup. Otherwise evaluate only
         // the actually examined labels in source order with the postincrement
         // counter value. An unknown or effectful examined label rejects the
@@ -442,7 +483,7 @@ impl Collector<'_, '_> {
             }
             // Only the proven own data slot may be read. Negative, fractional
             // or exhausted indices would require a dynamic property lookup.
-            let value = values.get(exact_usize(environment.index)?)?;
+            let value = environment.values.get(exact_usize(environment.index)?)?;
             environment.index += 1.0; // dense array indices are exactly representable
             let matched = if let Some(cases) = &constant_cases {
                 StrictKey::from_value(value).and_then(|key| cases.get(&key).copied())
@@ -468,28 +509,7 @@ impl Collector<'_, '_> {
             if !selected.insert(index) {
                 return None;
             } // do not clone effects
-            let case = &switch.cases[index];
-            let (retained, exits) = match case.consequent.split_last() {
-                Some((Statement::ContinueStatement(node), prefix))
-                    if node.label.as_ref().is_none_or(|label| {
-                        self.active_labels
-                            .iter()
-                            .any(|(span, name)| *span == it.span && name == label.name.as_str())
-                    }) =>
-                {
-                    (prefix, false)
-                }
-                Some((Statement::BreakStatement(node), prefix)) if node.label.is_none() => {
-                    (prefix, true)
-                }
-                Some((last, _))
-                    if cannot_complete_normally(last) || index + 1 == switch.cases.len() =>
-                {
-                    (case.consequent.as_slice(), true)
-                }
-                None if index + 1 == switch.cases.len() => (case.consequent.as_slice(), true),
-                _ => return None,
-            };
+            let (retained, exits) = self.retained_dispatch_arm(switch, index, it.span)?;
             let control = LoopBodyControl::analyze(retained, it.span, &self.active_labels);
             if control.continues_loop {
                 return None;

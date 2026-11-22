@@ -33,7 +33,7 @@ fn direct_global_name(
 /// A statically identified invocation of a function declaration. Its
 /// captured environment is shared with the declaration's lexical owner.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(crate) struct InvocationSite {
+pub struct InvocationSite {
     pub(crate) callee: SymbolId,
     pub(crate) scope: ScopeId,
     pub(crate) span: Span,
@@ -43,7 +43,7 @@ pub(crate) struct InvocationSite {
 /// Keep the two together so no consumer can mistake a dynamically shadowed
 /// identifier for the global alias whose static symbol it shares.
 #[derive(Debug)]
-pub(crate) struct GlobalAliases {
+pub struct GlobalAliases {
     facts: BindingFacts,
     aliases: HashMap<SymbolId, String>,
 }

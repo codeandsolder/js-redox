@@ -103,18 +103,18 @@ impl<'a> Visit<'a> for ShapeVisitor {
             AstKind::BooleanLiteral(b) => self.tokens.push(format!("BOOL:{}", b.value)),
             AstKind::NullLiteral(_) => self.tokens.push("NULL".into()),
             AstKind::BinaryExpression(e) => {
-                self.tokens.push(format!("BIN:{}", e.operator.as_str()))
+                self.tokens.push(format!("BIN:{}", e.operator.as_str()));
             }
             AstKind::LogicalExpression(e) => {
-                self.tokens.push(format!("LOG:{}", e.operator.as_str()))
+                self.tokens.push(format!("LOG:{}", e.operator.as_str()));
             }
             AstKind::UnaryExpression(e) => self.tokens.push(format!("UN:{}", e.operator.as_str())),
             AstKind::UpdateExpression(e) => {
                 self.tokens
-                    .push(format!("UP:{}:{}", e.operator.as_str(), e.prefix))
+                    .push(format!("UP:{}:{}", e.operator.as_str(), e.prefix));
             }
             AstKind::AssignmentExpression(e) => {
-                self.tokens.push(format!("AS:{}", e.operator.as_str()))
+                self.tokens.push(format!("AS:{}", e.operator.as_str()));
             }
             AstKind::StaticMemberExpression(e) => {
                 let token = self.member_property_token(e.property.name.as_str());
@@ -123,7 +123,7 @@ impl<'a> Visit<'a> for ShapeVisitor {
             AstKind::ComputedMemberExpression(_) => self.tokens.push("MEM:[]".into()),
             AstKind::CallExpression(e) => {
                 self.tokens
-                    .push(format!("CALL:{}:{}", e.arguments.len(), e.optional))
+                    .push(format!("CALL:{}:{}", e.arguments.len(), e.optional));
             }
             AstKind::NewExpression(e) => self.tokens.push(format!("NEW:{}", e.arguments.len())),
             AstKind::Function(f) => self.tokens.push(format!(
@@ -134,7 +134,7 @@ impl<'a> Visit<'a> for ShapeVisitor {
             )),
             AstKind::ArrowFunctionExpression(f) => {
                 self.tokens
-                    .push(format!("ARROW:{}:{}", f.params.items.len(), f.r#async))
+                    .push(format!("ARROW:{}:{}", f.params.items.len(), f.r#async));
             }
             _ => {}
         }
@@ -145,12 +145,12 @@ impl<'a> Visit<'a> for ShapeVisitor {
     }
 }
 
-#[must_use]
+#[must_use = "Use the returned hash when comparing structural shapes"]
 pub fn hash_shape_text(text: &str) -> u64 {
     crate::fnv1a64(text.as_bytes())
 }
 
-#[must_use]
+#[must_use = "Use the returned structural effect summary"]
 pub fn analyze_program(program: &Program<'_>, property_mode: PropertyMode) -> EffectShape {
     let mut visitor = ShapeVisitor::new(property_mode);
     visitor.visit_program(program);
@@ -163,7 +163,7 @@ pub fn analyze_program(program: &Program<'_>, property_mode: PropertyMode) -> Ef
     }
 }
 
-#[must_use]
+#[must_use = "Use the returned structural effect summary"]
 pub fn analyze_effect(source: &str) -> EffectShape {
     for candidate in [source.to_string(), format!("({source})")] {
         let allocator = Allocator::default();
@@ -181,7 +181,7 @@ pub fn analyze_effect(source: &str) -> EffectShape {
     }
 }
 
-#[must_use]
+#[must_use = "Use the derived family name for grouping"]
 pub fn family_name(file: &str) -> String {
     Path::new(file)
         .file_name()

@@ -170,7 +170,7 @@ fn print_paths(rows: impl IntoIterator<Item = (String, Cluster)>, top: usize) {
             signature.split('|').count()
         };
         println!(
-            "\nuses {} decoders {} families {} effects {}",
+            "\nuses {} decoders {} families {} effects {effects}",
             cluster.count,
             cluster.decoders.len(),
             cluster
@@ -178,8 +178,7 @@ fn print_paths(rows: impl IntoIterator<Item = (String, Cluster)>, top: usize) {
                 .iter()
                 .cloned()
                 .collect::<Vec<_>>()
-                .join(","),
-            effects
+                .join(",")
         );
         for sample in cluster.samples.iter().take(2) {
             let clipped: String = sample.chars().take(420).collect();
