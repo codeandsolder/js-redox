@@ -12,6 +12,7 @@ use work_budget::WorkBudget;
 
 pub(super) struct CoverageIndex {
     by_script: ScriptIdentityIndex<Value>,
+    urls: ScriptIdentityIndex<Option<String>>,
     available_sessions: HashSet<String>,
     mode: String,
 }
@@ -52,6 +53,7 @@ impl CoverageIndex {
             .and_then(Value::as_array)
             .context("execution coverage requires sessions[]")?;
         let mut by_script = ScriptIdentityIndex::default();
+        let mut urls = ScriptIdentityIndex::default();
         let mut available_sessions = HashSet::new();
         let mut seen_sessions = HashSet::new();
         let mut script_rows = Vec::new();
@@ -115,7 +117,7 @@ impl CoverageIndex {
                         positive_functions += 1;
                     }
                 }
-                let row = json!({
+                let mut row = json!({
                     "cdp_session": name,
                     "script_id": script_id,
                     "coverage_mode": mode,
@@ -124,9 +126,14 @@ impl CoverageIndex {
                     "positive_ranges": positive_ranges,
                     "function_profiles": functions.len(),
                     "offset_units": "utf16",
-                    "source_url": script.get("url").cloned().unwrap_or(Value::Null),
                 });
                 by_script.register(name, &script_id, row.clone());
+                urls.register(
+                    name,
+                    &script_id,
+                    nonempty_text(script.get("url")).map(ToOwned::to_owned),
+                );
+                row["source_url"] = script.get("url").cloned().unwrap_or(Value::Null);
                 script_rows.push(row);
             }
         }
@@ -147,6 +154,7 @@ impl CoverageIndex {
         write_artifact(project, EXECUTION_COVERAGE, &document)?;
         Ok(Some(Self {
             by_script,
+            urls,
             available_sessions,
             mode: mode.to_owned(),
         }))
@@ -158,7 +166,12 @@ impl CoverageIndex {
 
     pub(super) fn for_script(&self, session: &str, script_id: &str) -> Value {
         match self.by_script.lookup(session, script_id) {
-            Some(IdentityState::Unique(row)) => row.clone(),
+            Some(IdentityState::Unique(row)) => {
+                let mut row = row.clone();
+                row["source_url"] =
+                    json!(self.urls.get(session, script_id).and_then(Option::as_deref));
+                row
+            }
             Some(IdentityState::Conflict) => {
                 json!({"status":"ambiguous_coverage_profiles","coverage_mode":self.mode})
             }
@@ -224,7 +237,11 @@ mod tests {
         fs::create_dir_all(&capture)?;
         fs::create_dir_all(&project)?;
         let profile = |id: Value, count: u64| json!({"scriptId":id,"functions":[{"ranges":[{"startOffset":0,"endOffset":3,"count":count}]}]});
-        let fixture = json!({"schema":"js-redox/execution-coverage/v2","mode":"best-effort","offsetUnits":"utf16","sessions":[{"cdpSession":"main","status":"captured","scripts":[profile(json!("1"),1),profile(json!(1),1),profile(json!(2),1),profile(json!(2),0),profile(json!(2),1)]}]});
+        let mut first = profile(json!("1"), 1);
+        first["url"] = json!("first.js");
+        let mut second = profile(json!(1), 1);
+        second["url"] = json!("second.js");
+        let fixture = json!({"schema":"js-redox/execution-coverage/v2","mode":"best-effort","offsetUnits":"utf16","sessions":[{"cdpSession":"main","status":"captured","scripts":[first,second,profile(json!(2),1),profile(json!(2),0),profile(json!(2),1)]}]});
         fs::write(
             capture.join("execution-coverage.json"),
             serde_json::to_vec(&fixture)?,
@@ -236,6 +253,7 @@ mod tests {
         )?
         .context("coverage missing")?;
         assert_eq!(index.for_script("main", "1")["status"], "positive");
+        assert!(index.for_script("main", "1")["source_url"].is_null());
         assert_eq!(
             index.for_script("main", "2")["status"],
             "ambiguous_coverage_profiles"

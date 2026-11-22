@@ -77,6 +77,12 @@ impl RuntimeCoverageIndex {
                     .get("script_url")
                     .and_then(Value::as_str)
                     .filter(|s| !s.is_empty())
+                    .or_else(|| {
+                        instance
+                            .pointer("/execution/source_url")
+                            .and_then(Value::as_str)
+                            .filter(|url| !url.is_empty())
+                    })
                     .map(ToOwned::to_owned),
             )
         })?;
@@ -123,10 +129,12 @@ mod tests {
         let instance = |session: &str, script: &str, url: &str, execution: &Value| json!({"cdp_session":session,"script_id":script,"script_url":url,"execution_context_id":1,"execution":execution});
         let one = instance("main", "1", "a", &profile);
         let two = instance("main", "2", "a", &profile);
+        let mut worker_profile = profile.clone();
+        worker_profile["source_url"] = json!("w");
         let runtime = json!({"sources":[{"sha256":"body","script_instances":[
             one.clone(),one,instance("main","1","b",&profile),
             two.clone(),instance("main","2","a",&json!({"status":"zero_only"})),
-            instance("main","3","a",&profile),instance("worker","3","w",&profile),
+            instance("main","3","a",&profile),instance("worker","3","",&worker_profile),
             instance("main","4","a",&json!({"status":"positive"})),
             instance("main","5","a",&profile)
         ]},{"sha256":"other","script_instances":[instance("main","5","a",&profile)]}],
