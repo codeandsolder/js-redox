@@ -94,7 +94,7 @@ fn runtime_identity_index(
         |sha, source, instance| {
             // Keep malformed claims in the index to invalidate conflicting rows;
             // verification at each consumer still requires a valid 64-digit SHA.
-            Some(RuntimeSourceIdentity {
+            RuntimeSourceIdentity {
                 sha256: sha.to_owned(),
                 start_line: instance.get("start_line").and_then(Value::as_u64),
                 start_column: instance.get("start_column").and_then(Value::as_u64),
@@ -103,7 +103,7 @@ fn runtime_identity_index(
                     .and_then(Value::as_str)
                     .map(|classification| classification == "capture_instrumentation"),
                 origin: ScriptOriginContext::from_instance(instance),
-            })
+            }
         },
         |previous, next| {
             if previous.sha256 != next.sha256 {

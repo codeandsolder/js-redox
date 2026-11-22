@@ -73,12 +73,12 @@ impl RuntimeCoverageIndex {
                         .filter(|url| !url.is_empty())
                         .map(ToOwned::to_owned);
                 }
-                Some((
+                (
                     sha.to_owned(),
                     PositiveCounters::from_instance(instance),
                     source["classification"] == "capture_instrumentation",
                     origin,
-                ))
+                )
             },
             |previous, next| {
                 if previous.0 != next.0 || previous.1 != next.1 || previous.2 != next.2 {

@@ -43,7 +43,7 @@ impl RuntimeInstances {
         Ok(Self(ScriptIdentityIndex::from_runtime_report(
             runtime,
             budget,
-            |sha, _, _| Some(sha.to_owned()),
+            |sha, _, _| sha.to_owned(),
         )?))
     }
 
