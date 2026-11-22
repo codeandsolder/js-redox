@@ -8,8 +8,8 @@
 //! binding identity, initialization and side-effect-free property access.
 
 use oxc_ast::ast::{
-    ArrayExpressionElement, Expression, LogicalExpression, PropertyKey, StringLiteral,
-    TemplateElement, UnaryExpression,
+    ArrayExpressionElement, BinaryExpression, Expression, LogicalExpression, PropertyKey,
+    StringLiteral, TemplateElement, UnaryExpression,
 };
 use oxc_ecmascript::{StringToNumber, ToInt32, ToUint32};
 use oxc_syntax::number::ToJsString;
@@ -292,7 +292,7 @@ where
 /// example for implementation-approximated powers.
 #[must_use = "Only discard a literal evaluation when its effects are proven inert"]
 pub fn inert_literal_value(expr: &Expression<'_>) -> bool {
-    inert_literal_kind(expr).is_some()
+    inert_literal_facts(expr).is_some()
 }
 
 /// Possible result types of an already proven nonthrowing literal expression.
@@ -314,6 +314,8 @@ impl LiteralTypes {
     const ORDINARY_PRIMITIVE: Self =
         Self(Self::NUMBER.0 | Self::STRING.0 | Self::BOOLEAN.0 | Self::NULL.0 | Self::UNDEFINED.0);
     const OBJECT_TYPEOF: Self = Self(Self::NULL.0 | Self::OBJECT.0);
+    const ALWAYS_TRUTHY: Self = Self(Self::OBJECT.0 | Self::FUNCTION.0);
+    const NULLISH: Self = Self(Self::NULL.0 | Self::UNDEFINED.0);
 
     const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
@@ -325,6 +327,10 @@ impl LiteralTypes {
 
     const fn includes(self, other: Self) -> bool {
         self.0 & other.0 != 0
+    }
+
+    const fn without(self, excluded: Self) -> Self {
+        Self(self.0 & !excluded.0)
     }
 
     const fn typeof_name(self) -> Option<&'static str> {
@@ -343,9 +349,9 @@ impl LiteralTypes {
     }
 
     const fn truthiness(self) -> Option<bool> {
-        if self.subset_of(Self::OBJECT.union(Self::FUNCTION)) {
+        if self.subset_of(Self::ALWAYS_TRUTHY) {
             Some(true)
-        } else if self.subset_of(Self::NULL.union(Self::UNDEFINED)) {
+        } else if self.subset_of(Self::NULLISH) {
             Some(false)
         } else {
             None
@@ -364,85 +370,179 @@ impl LiteralTypes {
     }
 }
 
-fn inert_literal_kind(expr: &Expression<'_>) -> Option<LiteralTypes> {
+/// Result facts of an independently proven normal, inert evaluation.
+/// Exact numeric or string values are not necessary for either lattice.
+#[derive(Clone, Copy)]
+struct LiteralFacts {
+    types: LiteralTypes,
+    truthiness: Option<bool>,
+}
+
+impl LiteralFacts {
+    const fn of_type(types: LiteralTypes) -> Self {
+        Self {
+            types,
+            truthiness: types.truthiness(),
+        }
+    }
+
+    const fn with_truthiness(types: LiteralTypes, truthiness: bool) -> Self {
+        Self {
+            types,
+            truthiness: Some(truthiness),
+        }
+    }
+
+    fn join(self, other: Self) -> Self {
+        Self {
+            types: self.types.union(other.types),
+            truthiness: if self.truthiness == other.truthiness {
+                self.truthiness
+            } else {
+                None
+            },
+        }
+    }
+
+    /// Restrict the LHS result to the branch where the RHS is skipped.
+    fn short_circuit_left(self, op: &str) -> Option<Self> {
+        let (excluded, truthiness) = match op {
+            "&&" => (LiteralTypes::ALWAYS_TRUTHY, Some(false)),
+            "||" => (LiteralTypes::NULLISH, Some(true)),
+            "??" => (LiteralTypes::NULLISH, self.truthiness),
+            _ => return None,
+        };
+        let types = self.types.without(excluded);
+        (types.0 != 0).then_some(Self {
+            types,
+            truthiness: truthiness.or_else(|| types.truthiness()),
+        })
+    }
+
+    const fn nullish(self) -> Option<bool> {
+        if self.types.subset_of(LiteralTypes::NULLISH) {
+            Some(true)
+        } else if !self.types.includes(LiteralTypes::NULLISH) {
+            Some(false)
+        } else {
+            None
+        }
+    }
+}
+
+fn inert_literal_facts(expr: &Expression<'_>) -> Option<LiteralFacts> {
+    let of_type = |types| Some(LiteralFacts::of_type(types));
+    let with_truthiness =
+        |types, truthiness| Some(LiteralFacts::with_truthiness(types, truthiness));
     match expr {
-        Expression::StringLiteral(_) => Some(LiteralTypes::STRING),
-        Expression::NumericLiteral(_) => Some(LiteralTypes::NUMBER),
-        Expression::NullLiteral(_) => Some(LiteralTypes::NULL),
-        Expression::BooleanLiteral(_) => Some(LiteralTypes::BOOLEAN),
-        Expression::BigIntLiteral(_) => Some(LiteralTypes::BIGINT),
-        Expression::RegExpLiteral(_) => Some(LiteralTypes::OBJECT),
+        Expression::StringLiteral(value) => {
+            with_truthiness(LiteralTypes::STRING, !value.value.is_empty())
+        }
+        Expression::NumericLiteral(value) => {
+            with_truthiness(LiteralTypes::NUMBER, Value::Number(value.value).truthy())
+        }
+        Expression::NullLiteral(_) => of_type(LiteralTypes::NULL),
+        Expression::BooleanLiteral(value) => with_truthiness(LiteralTypes::BOOLEAN, value.value),
+        Expression::BigIntLiteral(value) => {
+            // Oxc stores the unsigned literal magnitude in decimal.
+            with_truthiness(
+                LiteralTypes::BIGINT,
+                value.value.as_str().bytes().any(|byte| byte != b'0'),
+            )
+        }
+        Expression::RegExpLiteral(_) => of_type(LiteralTypes::OBJECT),
         // Creating a function does not execute its parameters or body.
         Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_) => {
-            Some(LiteralTypes::FUNCTION)
+            of_type(LiteralTypes::FUNCTION)
         }
         Expression::TemplateLiteral(template) => template
             .expressions
             .iter()
             .all(|expression| {
-                inert_literal_kind(expression).is_some_and(|kind| {
-                    kind.subset_of(LiteralTypes::ORDINARY_PRIMITIVE.union(LiteralTypes::BIGINT))
+                inert_literal_facts(expression).is_some_and(|facts| {
+                    facts
+                        .types
+                        .subset_of(LiteralTypes::ORDINARY_PRIMITIVE.union(LiteralTypes::BIGINT))
                 })
             })
-            .then_some(LiteralTypes::STRING),
+            .then_some(LiteralFacts::of_type(LiteralTypes::STRING)),
         Expression::ArrayExpression(array) => array
             .elements
             .iter()
             .all(inert_array_element)
-            .then_some(LiteralTypes::OBJECT),
-        Expression::ObjectExpression(object) => {
-            object.properties.is_empty().then_some(LiteralTypes::OBJECT)
-        }
-        Expression::ParenthesizedExpression(paren) => inert_literal_kind(&paren.expression),
+            .then_some(LiteralFacts::of_type(LiteralTypes::OBJECT)),
+        Expression::ObjectExpression(object) => object
+            .properties
+            .is_empty()
+            .then_some(LiteralFacts::of_type(LiteralTypes::OBJECT)),
+        Expression::ParenthesizedExpression(paren) => inert_literal_facts(&paren.expression),
         Expression::UnaryExpression(unary) => {
-            let kind = inert_literal_kind(&unary.argument)?;
+            let facts = inert_literal_facts(&unary.argument)?;
             match unary.operator.as_str() {
-                "!" => Some(LiteralTypes::BOOLEAN),
-                "void" => Some(LiteralTypes::UNDEFINED),
-                "typeof" => Some(LiteralTypes::STRING),
-                "+" | "-" | "~" if kind.subset_of(LiteralTypes::ORDINARY_PRIMITIVE) => {
-                    Some(LiteralTypes::NUMBER)
+                "!" => Some(LiteralFacts {
+                    types: LiteralTypes::BOOLEAN,
+                    truthiness: facts.truthiness.map(|value| !value),
+                }),
+                "void" => of_type(LiteralTypes::UNDEFINED),
+                "typeof" => with_truthiness(LiteralTypes::STRING, true),
+                "+" | "-" | "~" if facts.types.subset_of(LiteralTypes::ORDINARY_PRIMITIVE) => {
+                    of_type(LiteralTypes::NUMBER)
                 }
                 _ => None,
             }
         }
-        Expression::BinaryExpression(binary) => {
-            let left = inert_literal_kind(&binary.left)?;
-            let right = inert_literal_kind(&binary.right)?;
-            let ordinary = left
-                .union(right)
-                .subset_of(LiteralTypes::ORDINARY_PRIMITIVE);
-            match binary.operator.as_str() {
-                "===" | "!==" => Some(LiteralTypes::BOOLEAN),
-                // Ordinary primitive coercion cannot invoke user callbacks
-                // or cause language-level arithmetic errors.
-                "+" if ordinary => Some(left.addition(right)),
-                "-" | "*" | "/" | "%" | "**" | "<<" | ">>" | ">>>" | "&" | "|" | "^"
-                    if ordinary =>
-                {
-                    Some(LiteralTypes::NUMBER)
-                }
-                "==" | "!=" | "<" | "<=" | ">" | ">=" if ordinary => Some(LiteralTypes::BOOLEAN),
-                _ => None,
-            }
-        }
-        Expression::LogicalExpression(logical) => {
-            let left = inert_literal_kind(&logical.left)?;
-            let right = inert_literal_kind(&logical.right)?;
-            Some(left.union(right))
-        }
+        Expression::BinaryExpression(binary) => binary_literal_facts(binary),
+        Expression::LogicalExpression(logical) => logical_literal_facts(logical),
         Expression::ConditionalExpression(conditional) => {
-            inert_literal_kind(&conditional.test)?;
-            let yes = inert_literal_kind(&conditional.consequent)?;
-            let no = inert_literal_kind(&conditional.alternate)?;
-            Some(yes.union(no))
+            let test = inert_literal_facts(&conditional.test)?;
+            match test.truthiness {
+                Some(true) => inert_literal_facts(&conditional.consequent),
+                Some(false) => inert_literal_facts(&conditional.alternate),
+                None => Some(
+                    inert_literal_facts(&conditional.consequent)?
+                        .join(inert_literal_facts(&conditional.alternate)?),
+                ),
+            }
         }
         Expression::SequenceExpression(sequence) => {
             let mut expressions = sequence.expressions.iter();
-            let first = inert_literal_kind(expressions.next()?)?;
-            expressions.try_fold(first, |_, expression| inert_literal_kind(expression))
+            let first = inert_literal_facts(expressions.next()?)?;
+            expressions.try_fold(first, |_, expression| inert_literal_facts(expression))
         }
         _ => None,
+    }
+}
+
+fn binary_literal_facts(binary: &BinaryExpression<'_>) -> Option<LiteralFacts> {
+    let left = inert_literal_facts(&binary.left)?.types;
+    let right = inert_literal_facts(&binary.right)?.types;
+    let ordinary = left
+        .union(right)
+        .subset_of(LiteralTypes::ORDINARY_PRIMITIVE);
+    let types = match binary.operator.as_str() {
+        "===" | "!==" => LiteralTypes::BOOLEAN,
+        // Ordinary primitive coercion cannot invoke user callbacks
+        // or cause language-level arithmetic errors.
+        "+" if ordinary => left.addition(right),
+        "-" | "*" | "/" | "%" | "**" | "<<" | ">>" | ">>>" | "&" | "|" | "^" if ordinary => {
+            LiteralTypes::NUMBER
+        }
+        "==" | "!=" | "<" | "<=" | ">" | ">=" if ordinary => LiteralTypes::BOOLEAN,
+        _ => return None,
+    };
+    Some(LiteralFacts::of_type(types))
+}
+
+fn logical_literal_facts(logical: &LogicalExpression<'_>) -> Option<LiteralFacts> {
+    let op = logical.operator.as_str();
+    let left = inert_literal_facts(&logical.left)?;
+    match logical_evaluates_right(op, left.truthiness, left.nullish()) {
+        Some(false) => Some(left),
+        Some(true) => inert_literal_facts(&logical.right),
+        None => {
+            let right = inert_literal_facts(&logical.right)?;
+            Some(left.short_circuit_left(op)?.join(right))
+        }
     }
 }
 
@@ -461,7 +561,7 @@ where
     if let Some(v) = eval_with_resolver(expr, resolve) {
         return Some(v.truthy());
     }
-    inert_literal_kind(expr)?.truthiness()
+    inert_literal_facts(expr)?.truthiness
 }
 
 pub fn eval_unary(v: &UnaryExpression<'_>) -> Option<Value> {
@@ -498,11 +598,11 @@ where
         return known_bool_with_resolver(&v.argument, resolve).map(|x| Value::Bool(!x));
     }
     if matches!(op, "void" | "typeof") {
-        if let Some(kind) = inert_literal_kind(&v.argument) {
+        if let Some(facts) = inert_literal_facts(&v.argument) {
             if op == "void" {
                 return Some(Value::Undefined);
             }
-            if let Some(name) = kind.typeof_name() {
+            if let Some(name) = facts.types.typeof_name() {
                 return Some(Value::String(name.into()));
             }
         }
@@ -634,33 +734,50 @@ pub enum LogicalStep {
     EvaluateRight,
 }
 
-pub fn eval_logical_left(op: &str, left: Value) -> Option<LogicalStep> {
+// Exact values and partial literal facts share the same operator selection.
+fn logical_evaluates_right(
+    op: &str,
+    truthiness: Option<bool>,
+    nullish: Option<bool>,
+) -> Option<bool> {
     match op {
-        "&&" | "||" | "??" => {
-            let evaluate_right = match op {
-                "&&" => left.truthy(),
-                "||" => !left.truthy(),
-                "??" => matches!(left, Value::Null | Value::Undefined),
-                _ => unreachable!(),
-            };
-            Some(if evaluate_right {
-                LogicalStep::EvaluateRight
-            } else {
-                LogicalStep::Value(left)
-            })
-        }
+        "&&" => truthiness,
+        "||" => truthiness.map(|truthy| !truthy),
+        "??" => nullish,
         _ => None,
     }
+}
+
+pub fn eval_logical_left(op: &str, left: Value) -> Option<LogicalStep> {
+    let evaluate_right = logical_evaluates_right(
+        op,
+        Some(left.truthy()),
+        Some(matches!(left, Value::Null | Value::Undefined)),
+    )?;
+    Some(if evaluate_right {
+        LogicalStep::EvaluateRight
+    } else {
+        LogicalStep::Value(left)
+    })
 }
 
 fn eval_logical_with_resolver<'a, F>(v: &LogicalExpression<'a>, resolve: &F) -> Option<Value>
 where
     F: Fn(&Expression<'a>) -> Option<Value>,
 {
-    let left = eval_with_resolver(&v.left, resolve)?;
-    match eval_logical_left(v.operator.as_str(), left)? {
-        LogicalStep::Value(value) => Some(value),
-        LogicalStep::EvaluateRight => eval_with_resolver(&v.right, resolve),
+    if let Some(left) = eval_with_resolver(&v.left, resolve) {
+        return match eval_logical_left(v.operator.as_str(), left)? {
+            LogicalStep::Value(value) => Some(value),
+            LogicalStep::EvaluateRight => eval_with_resolver(&v.right, resolve),
+        };
+    }
+    // An inert, partially known left value can select the right operand
+    // without being representable in the exact primitive domain.
+    let left = inert_literal_facts(&v.left)?;
+    if logical_evaluates_right(v.operator.as_str(), left.truthiness, left.nullish())? {
+        eval_with_resolver(&v.right, resolve)
+    } else {
+        None
     }
 }
 
@@ -818,6 +935,63 @@ mod tests {
             ("typeof (class extends effect() {})", None),
             ("typeof (unknown)", None),
             ("void (1, effect())", None),
+        ] {
+            let allocator = Allocator::default();
+            let source = format!("({expression});");
+            let program = crate::parse_as(&allocator, &source, SourceType::cjs())
+                .unwrap_or_else(|| unreachable!("{source}"));
+            let [Statement::ExpressionStatement(statement)] = program.body.as_slice() else {
+                unreachable!("one expression");
+            };
+            let actual = super::eval(&statement.expression).and_then(|value| value.render());
+            assert_eq!(actual.as_deref(), expected, "{expression}");
+        }
+    }
+
+    #[test]
+    fn path_sensitive_literal_facts_respect_short_circuit_selection() {
+        use oxc_allocator::Allocator;
+        use oxc_ast::ast::Statement;
+        use oxc_span::SourceType;
+
+        for (expression, expected) in [
+            ("typeof ([] && 2 ** 1.5)", Some(r#""number""#)),
+            ("typeof (false && effect())", Some(r#""boolean""#)),
+            ("typeof ([] || effect())", Some(r#""object""#)),
+            ("typeof (0n && effect())", Some(r#""bigint""#)),
+            ("typeof (1n || effect())", Some(r#""bigint""#)),
+            ("typeof (2 ** 1.5 ?? effect())", Some(r#""number""#)),
+            ("typeof (void 0 ?? 2 ** 1.5)", Some(r#""number""#)),
+            ("typeof (true ? [] : effect())", Some(r#""object""#)),
+            ("typeof (false ? effect() : /x/)", Some(r#""object""#)),
+            (
+                "typeof ((true ? [] : effect()) ?? effect())",
+                Some(r#""object""#),
+            ),
+            ("void (false && effect())", Some("void 0")),
+            ("[] && 7", Some("7")),
+            ("0n || 7", Some("7")),
+            ("0x1n && 7", Some("7")),
+            ("!(2 ** 1.5 ? null : 0n)", Some("true")),
+            ("!('' || /x/)", Some("false")),
+            ("!((2 ** 1.5) && null)", Some("true")),
+            ("!((2 ** 1.5) || [])", Some("false")),
+            ("typeof ((2 ** 1.5 ? null : 1) ?? 2)", Some(r#""number""#)),
+            (
+                "typeof ((2 ** 1.5 ? void 0 : 's') || 't')",
+                Some(r#""string""#),
+            ),
+            ("typeof ((2 ** 1.5 ? [] : null) && 1)", None),
+            (r"!('\ud800' && null)", Some("true")),
+            ("typeof (2 ** 1.5 && effect())", None),
+            ("typeof (2 ** 1.5 ? effect() : 1)", None),
+            ("typeof (null ?? effect())", None),
+            ("typeof (1n && effect())", None),
+            ("typeof (true && (1n/0n))", None),
+            ("typeof (false || ({}+1))", None),
+            ("typeof (0n || missing)", None),
+            ("typeof ([effect()] || 1)", None),
+            ("typeof ((2 ** 1.5 ? null : 1) ?? effect())", None),
         ] {
             let allocator = Allocator::default();
             let source = format!("({expression});");
