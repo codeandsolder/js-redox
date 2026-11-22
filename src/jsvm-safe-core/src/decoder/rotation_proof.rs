@@ -92,7 +92,7 @@ impl ChecksumExpression {
                     rotation,
                     key.as_deref(),
                 )?;
-                js_parse_int(&value.js_string()?, *radix)
+                js_parse_int(&value.js_string(), *radix)
             }
         }
     }
