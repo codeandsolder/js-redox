@@ -223,7 +223,7 @@ impl ProvenConstantEnvironment {
     pub fn collect(program: &oxc_ast::ast::Program<'_>, scoping: &Scoping) -> Self {
         let mut constants = Self {
             bindings: HashMap::new(),
-            initialization: binding_facts::BindingFacts::analyze(program),
+            initialization: binding_facts::BindingFacts::analyze(program, scoping),
         };
         // An initializer can only consume facts proved available at that
         // source position. These dependencies are already in source order;
@@ -1127,7 +1127,10 @@ impl Collector<'_, '_> {
         if !Self::is_plain_call(call) {
             return None;
         }
-        let symbol = symbol_of(self.scoping, &call.callee)?;
+        let symbol = self
+            .constants
+            .initialization
+            .stable_callable_symbol(self.scoping, &call.callee)?;
         let dispatcher = self.selector_dispatchers.get(&symbol)?;
         let selector = call.arguments.first().and_then(argument_integer)?;
         let return_span = *dispatcher.returns.get(&selector)?;
@@ -1247,7 +1250,10 @@ impl Collector<'_, '_> {
         };
         let reference_id = callee.reference_id.get()?;
         let reference = self.scoping.get_reference(reference_id);
-        let symbol = reference.symbol_id()?;
+        let symbol = self
+            .constants
+            .initialization
+            .stable_callable_symbol(self.scoping, &call.callee)?;
         let initialized_after = self.from_char_code_aliases.get(&symbol)?;
         if call.span.start < *initialized_after
             || !Self::same_function_or_descendant_block_scope(
@@ -1281,7 +1287,10 @@ impl Collector<'_, '_> {
         if !Self::is_plain_call(call) {
             return None;
         }
-        let symbol = symbol_of(self.scoping, &call.callee)?;
+        let symbol = self
+            .constants
+            .initialization
+            .stable_callable_symbol(self.scoping, &call.callee)?;
         let function = self.pure_functions.get(&symbol)?;
         let values = call
             .arguments
@@ -7670,6 +7679,59 @@ mod tests {
                 result.source
             );
         }
+    }
+
+    #[test]
+    fn lexical_constant_resolution_respects_eval_created_variable_environments() {
+        for source in [
+            "const x=7;const f=()=>{eval('var x=9');return x};f();",
+            "const x=7;const f=()=>{(eval)('var x=9');return x};f();",
+            "const x=7;const f=()=>{if(flag){eval('var x=9');}return x};f();",
+            "const x=7;const f=()=>{eval('var x=9');const g=()=>x;return g()};f();",
+            "const x=7;const f=function(a=eval('var x=9')){return x};f();",
+            "const x=7;const f=()=>{eval('var x=9');return (()=>{'use strict';return x})()};f();",
+        ] {
+            let result = deobfuscate(source, 32).unwrap_or_else(|| unreachable!("{source}"));
+            assert!(
+                !result.transforms.contains_key("const_propagate"),
+                "{source} -> {}",
+                result.source
+            );
+        }
+        for source in [
+            "const x=7;const f=()=>{'use strict';eval('var x=9');return x};f();",
+            "const x=7;const f=()=>{const g=()=>eval('var x=9');g();return x};f();",
+            "const x=7;const f=()=>{(0,eval)('1');return x};f();",
+            "function f(){const x=7;eval('1');return x;}f();",
+            "const f=()=>{eval('var x=9');{const x=7;return x}};f();",
+        ] {
+            let result = deobfuscate(source, 32).unwrap_or_else(|| unreachable!("{source}"));
+            assert!(
+                result.transforms.contains_key("const_propagate"),
+                "{source} -> {}",
+                result.source
+            );
+        }
+    }
+
+    #[test]
+    fn pure_function_evaluation_respects_direct_eval_binding_changes() {
+        for source in [
+            "function f(x){return x+1}eval('f=function(x){return x+9}');f(2)",
+            "function f(x){return x+1}const g=()=>{eval('var f=function(x){return x+9}');return f(2)};g()",
+            "function f(x){return x+1}function g(){'use strict';eval('f=function(x){return x+9}')}g();f(2)",
+        ] {
+            let result = deobfuscate(source, 32).unwrap_or_else(|| unreachable!("{source}"));
+            assert!(!result.transforms.contains_key("pure_function_eval"), "{source} -> {}", result.source);
+        }
+        let source =
+            "function g(){function f(x){return x+1}return f(2)}function h(){eval('1')}h();g()";
+        let result = deobfuscate(source, 32).unwrap_or_else(|| unreachable!("{source}"));
+        assert!(
+            result.transforms.contains_key("pure_function_eval"),
+            "{}",
+            result.source
+        );
     }
 
     #[test]

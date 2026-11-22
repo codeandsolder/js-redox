@@ -28,6 +28,7 @@ pub(crate) struct BindingFacts {
     hoisted_functions: HashSet<ScopeId>,
     scopes: Vec<Option<ScopeId>>,
     dynamic_scopes: HashSet<ScopeId>,
+    sloppy_eval_var_scopes: HashSet<ScopeId>,
     exported_bindings: HashSet<SymbolId>,
     ambient_root: bool,
 }
@@ -89,13 +90,50 @@ impl BindingFacts {
         }
     }
 
-    pub(crate) fn analyze(program: &oxc_ast::ast::Program<'_>) -> Self {
+    pub(crate) fn analyze(program: &oxc_ast::ast::Program<'_>, scoping: &Scoping) -> Self {
         let mut facts = Self {
             ambient_root: !program.source_type.is_module(),
             ..Self::default()
         };
         facts.visit_program(program);
+        // Non-strict direct eval may create var bindings in its caller's
+        // variable environment. These bindings can shadow outer variables
+        // even when the static symbol itself is immutable. Do not confuse
+        // this with the ordinary DirectEval flag propagated to ancestors:
+        // a sibling function's eval cannot introduce bindings here.
+        facts.sloppy_eval_var_scopes = facts
+            .dynamic_scopes
+            .iter()
+            .filter(|&&scope| !scoping.scope_flags(scope).is_strict_mode())
+            .filter_map(|&scope| {
+                scoping
+                    .scope_ancestors(scope)
+                    .find(|&ancestor| scoping.scope_flags(ancestor).is_var())
+            })
+            .collect();
         facts
+    }
+
+    /// A static binding identity is stable only if lookup cannot encounter
+    /// a dynamically introduced binding before reaching its owner.
+    pub(crate) fn proves_reference_identity(
+        &self,
+        scoping: &Scoping,
+        symbol: SymbolId,
+        scope: ScopeId,
+    ) -> bool {
+        let owner = scoping.symbol_scope_id(symbol);
+        for ancestor in scoping.scope_ancestors(scope) {
+            if ancestor == owner {
+                return true;
+            }
+            if self.sloppy_eval_var_scopes.contains(&ancestor)
+                || scoping.scope_flags(ancestor).is_with()
+            {
+                return false;
+            }
+        }
+        false
     }
 
     /// Immutable bindings can be read by a later-created closure: once
@@ -109,6 +147,9 @@ impl BindingFacts {
         scope: ScopeId,
         at: Span,
     ) -> bool {
+        if !self.proves_reference_identity(scoping, symbol, scope) {
+            return false;
+        }
         let owner = scoping.symbol_scope_id(symbol);
         self.regions.get(&symbol).is_some_and(|regions| {
             regions.iter().any(|region| {
@@ -146,11 +187,32 @@ impl BindingFacts {
         {
             return false;
         }
+        !self.is_eval_exposed(scoping, symbol)
+    }
+
+    /// Even strict direct eval can change an existing mutable binding.
+    pub(crate) fn is_eval_exposed(&self, scoping: &Scoping, symbol: SymbolId) -> bool {
         let name = scoping.symbol_name(symbol);
-        !self
-            .dynamic_scopes
+        self.dynamic_scopes
             .iter()
             .any(|&scope| scoping.find_binding(scope, name.into()) == Some(symbol))
+    }
+
+    pub(crate) fn stable_callable_symbol(
+        &self,
+        scoping: &Scoping,
+        expression: &Expression<'_>,
+    ) -> Option<SymbolId> {
+        let Expression::Identifier(identifier) = expression else {
+            return None;
+        };
+        let reference_id = identifier.reference_id.get()?;
+        let symbol = crate::statically_resolved_symbol(scoping, reference_id)?;
+        let scope = scoping.get_reference(reference_id).scope_id();
+        (self.proves_reference_identity(scoping, symbol, scope)
+            && (scoping.symbol_flags(symbol).is_const_variable()
+                || !self.is_eval_exposed(scoping, symbol)))
+        .then_some(symbol)
     }
 
     pub(crate) fn initialized_read(
@@ -178,6 +240,9 @@ impl BindingFacts {
         scope: ScopeId,
         at: Span,
     ) -> bool {
+        if !self.proves_reference_identity(scoping, symbol, scope) {
+            return false;
+        }
         if self.hoisted_vars.contains(&symbol) && !self.parameters.contains(&symbol) {
             return true;
         }

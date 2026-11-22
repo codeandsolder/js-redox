@@ -340,6 +340,22 @@ fn assert_main_contract(file: &str, outcome: &SafeDeobOutcome) {
 fn depythonify_safe_deob_script_completion_runtime_equivalence() -> Result<()> {
     let scratch = TempDir::new()?;
     let sources = [
+        "function f(x){return x+1}eval('f=function(x){return x+9}');f(2)",
+        "function f(x){return x+1}const g=()=>{eval('var f=function(x){return x+9}');return f(2)};g()",
+        "function f(x){return x+1}function g(){'use strict';eval('f=function(x){return x+9}')}g();f(2)",
+        "function g(){function f(x){return x+1}return f(2)}function h(){eval('1')}h();g()",
+        "const x=7;const f=()=>{eval('var x=9');return x};f();",
+        "const x=7;const f=()=>{(eval)('var x=9');return x};f();",
+        "const x=7;const f=()=>{if(true){eval('var x=9');}return x};f();",
+        "const x=7;const f=()=>{eval('var x=9');const g=()=>x;return g()};f();",
+        "const x=7;const f=function(a=eval('var x=9')){return x};f();",
+        "const x=7;const f=()=>{eval('var x=9');return (()=>{'use strict';return x})()};f();",
+        "const x=7;const f=()=>{'use strict';eval('var x=9');return x};f();",
+        "const x=7;const f=()=>{const g=()=>eval('var x=9');g();return x};f();",
+        "const x=7;const f=()=>{(0,eval)('1');return x};f();",
+        "function f(){const x=7;eval('1');return x;}f();",
+        "const f=()=>{eval('var x=9');{const x=7;return x}};f();",
+        "function f(){const a=['outer'];return (()=>{eval('var a=[\"inner\"]');return a[0]})()}f();",
         "function f(){const o={m(){return this===o}};return (true?o.m:null)();}f();",
         "function f(){let x=7;return (true?eval:null)('typeof x');}f();",
         "function f(){const o={x:7};return [delete (true?o.x:null),o.x];}f();",
