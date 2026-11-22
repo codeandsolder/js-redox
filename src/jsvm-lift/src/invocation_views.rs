@@ -27,11 +27,9 @@ use std::{
 };
 
 fn display_json(value: &Value) -> Result<String> {
-    let raw = serde_json::to_string_pretty(value)?;
-    let limit = 16_000;
-    let (shortened, clipped) = clip_chars(&raw, limit);
+    let (shortened, clipped) = crate::report_markdown::json_preview(value, 16_000)?;
     if !clipped {
-        return Ok(fenced_code(shortened, "json"));
+        return Ok(fenced_code(&shortened, "json"));
     }
     Ok(fenced_code(&format!("{shortened}\n... truncated in this view; complete values remain in analysis/selective-trace.json"), "text"))
 }
