@@ -14,7 +14,7 @@ use oxc_parser::Parser;
 use oxc_span::SourceType;
 use std::fmt::Write as _;
 
-const ATOMS: [&str; 30] = [
+const ATOMS: [&str; 41] = [
     "0",
     "1",
     "-0",
@@ -45,6 +45,17 @@ const ATOMS: [&str; 30] = [
     "({...{get v(){return effect('spread')}}})",
     "[...[]]",
     "class {static {effect('static')}}",
+    "class {}",
+    "class {field=effect('instance')}",
+    "class extends null {}",
+    "class extends (class {}) {}",
+    "class extends (()=>{}) {}",
+    "class {static ['prototype']=effect('initializer')}",
+    "class {[effect('key')](){}}",
+    "class {static [2 ** 1.5]=1}",
+    "class {static [{}]=1}",
+    "class {static {throw 1}}",
+    "class {static value=({'x':1})}",
 ];
 
 const ENVIRONMENT: &str = r"
