@@ -23,6 +23,149 @@ fn nonempty_text(value: Option<&Value>) -> Option<&str> {
         .filter(|text| !text.is_empty())
 }
 
+struct CoverageCounters {
+    functions: usize,
+    ranges: usize,
+    profiles: usize,
+}
+
+impl CoverageCounters {
+    fn collect(script: &Value, budget: &WorkBudget) -> Result<Self> {
+        let mut positive_functions = 0usize;
+        let mut positive_ranges = 0usize;
+        let functions = script
+            .get("functions")
+            .and_then(Value::as_array)
+            .context("coverage script missing functions[]")?;
+        for function in functions {
+            budget.consume(1)?;
+            let ranges = function
+                .get("ranges")
+                .and_then(Value::as_array)
+                .context("coverage function missing ranges[]")?;
+            let mut positive = false;
+            for range in ranges {
+                budget.consume(1)?;
+                if range
+                    .get("count")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|count| count > 0)
+                {
+                    positive_ranges += 1;
+                    positive = true;
+                }
+            }
+            if positive {
+                positive_functions += 1;
+            }
+        }
+        Ok(Self {
+            functions: positive_functions,
+            ranges: positive_ranges,
+            profiles: functions.len(),
+        })
+    }
+}
+
+struct CoverageCollector {
+    index: CoverageIndex,
+    seen_sessions: HashSet<String>,
+    rows: Vec<Value>,
+}
+
+impl CoverageCollector {
+    fn new(mode: &str) -> Self {
+        Self {
+            index: CoverageIndex {
+                by_script: ScriptIdentityIndex::default(),
+                urls: ScriptIdentityIndex::default(),
+                available_sessions: HashSet::new(),
+                mode: mode.to_owned(),
+            },
+            seen_sessions: HashSet::new(),
+            rows: Vec::new(),
+        }
+    }
+
+    fn add_session(&mut self, session: &Value, budget: &WorkBudget) -> Result<()> {
+        budget.consume(1)?;
+        let name = session_name(session.get("cdpSession"))
+            .context("execution coverage session missing cdpSession")?;
+        if !self.seen_sessions.insert(name.to_owned()) {
+            bail!("duplicate execution coverage session: {name}");
+        }
+        let status = session.get("status").and_then(Value::as_str);
+        if self.index.mode == "none" {
+            if status != Some("disabled") {
+                bail!("coverage mode none must contain only disabled sessions");
+            }
+            return Ok(());
+        }
+        if status != Some("captured") {
+            if status != Some("unavailable") {
+                bail!("unsupported execution coverage session status: {status:?}");
+            }
+            return Ok(());
+        }
+        if !self.index.available_sessions.insert(name.to_owned()) {
+            bail!("duplicate captured execution coverage session: {name}");
+        }
+        let scripts = session
+            .get("scripts")
+            .and_then(Value::as_array)
+            .context("captured execution coverage missing scripts[]")?;
+        for script in scripts {
+            self.add_script(name, script, budget)?;
+        }
+        Ok(())
+    }
+
+    fn add_script(&mut self, name: &str, script: &Value, budget: &WorkBudget) -> Result<()> {
+        budget.consume(1)?;
+        let Some(script_id) = script.get("scriptId").and_then(script_id_text) else {
+            return Ok(());
+        };
+        let counters = CoverageCounters::collect(script, budget)?;
+        let mut row = json!({
+            "cdp_session": name,
+            "script_id": script_id,
+            "coverage_mode": self.index.mode,
+            "status": if counters.ranges > 0 { "positive" } else { "zero_only" },
+            "positive_functions": counters.functions,
+            "positive_ranges": counters.ranges,
+            "function_profiles": counters.profiles,
+            "offset_units": "utf16",
+        });
+        self.index.by_script.register(name, &script_id, row.clone());
+        self.index.urls.register(
+            name,
+            &script_id,
+            nonempty_text(script.get("url")).map(ToOwned::to_owned),
+        );
+        row["source_url"] = script.get("url").cloned().unwrap_or(Value::Null);
+        self.rows.push(row);
+        Ok(())
+    }
+
+    fn publish(&self, capture: &Path, project: &Path) -> Result<()> {
+        let document = json!({
+            "schema": EXECUTION_COVERAGE.schema,
+            "capture": capture.display().to_string(),
+            "mode": self.index.mode,
+            "summary": {
+                "mode": self.index.mode,
+                "captured_sessions": self.index.available_sessions.len(),
+                "script_profiles": self.rows.len(),
+                "positive_script_profiles": self.rows.iter().filter(|row| row["status"] == "positive").count(),
+                "zero_only_script_profiles": self.rows.iter().filter(|row| row["status"] == "zero_only").count(),
+                "notes": "Positive V8 function coverage is evidence of execution in the recorded mode; zero, missing, and unavailable coverage are inconclusive. Precise coverage disables optimization.",
+            },
+            "scripts": self.rows,
+        });
+        write_artifact(project, EXECUTION_COVERAGE, &document)
+    }
+}
+
 impl CoverageIndex {
     pub(super) fn load(
         capture: &Path,
@@ -52,112 +195,12 @@ impl CoverageIndex {
             .get("sessions")
             .and_then(Value::as_array)
             .context("execution coverage requires sessions[]")?;
-        let mut by_script = ScriptIdentityIndex::default();
-        let mut urls = ScriptIdentityIndex::default();
-        let mut available_sessions = HashSet::new();
-        let mut seen_sessions = HashSet::new();
-        let mut script_rows = Vec::new();
+        let mut collector = CoverageCollector::new(mode);
         for session in sessions {
-            budget.consume(1)?;
-            let name = session_name(session.get("cdpSession"))
-                .context("execution coverage session missing cdpSession")?;
-            if !seen_sessions.insert(name.to_owned()) {
-                bail!("duplicate execution coverage session: {name}");
-            }
-            let status = session.get("status").and_then(Value::as_str);
-            if mode == "none" {
-                if status != Some("disabled") {
-                    bail!("coverage mode none must contain only disabled sessions");
-                }
-                continue;
-            }
-            if status != Some("captured") {
-                if status != Some("unavailable") {
-                    bail!("unsupported execution coverage session status: {status:?}");
-                }
-                continue;
-            }
-            if !available_sessions.insert(name.to_owned()) {
-                bail!("duplicate captured execution coverage session: {name}");
-            }
-            let scripts = session
-                .get("scripts")
-                .and_then(Value::as_array)
-                .context("captured execution coverage missing scripts[]")?;
-            for script in scripts {
-                budget.consume(1)?;
-                let Some(script_id) = script.get("scriptId").and_then(script_id_text) else {
-                    continue;
-                };
-                let mut positive_functions = 0usize;
-                let mut positive_ranges = 0usize;
-                let functions = script
-                    .get("functions")
-                    .and_then(Value::as_array)
-                    .context("coverage script missing functions[]")?;
-                for function in functions {
-                    budget.consume(1)?;
-                    let ranges = function
-                        .get("ranges")
-                        .and_then(Value::as_array)
-                        .context("coverage function missing ranges[]")?;
-                    let mut positive = false;
-                    for range in ranges {
-                        budget.consume(1)?;
-                        if range
-                            .get("count")
-                            .and_then(Value::as_u64)
-                            .is_some_and(|count| count > 0)
-                        {
-                            positive_ranges += 1;
-                            positive = true;
-                        }
-                    }
-                    if positive {
-                        positive_functions += 1;
-                    }
-                }
-                let mut row = json!({
-                    "cdp_session": name,
-                    "script_id": script_id,
-                    "coverage_mode": mode,
-                    "status": if positive_ranges > 0 { "positive" } else { "zero_only" },
-                    "positive_functions": positive_functions,
-                    "positive_ranges": positive_ranges,
-                    "function_profiles": functions.len(),
-                    "offset_units": "utf16",
-                });
-                by_script.register(name, &script_id, row.clone());
-                urls.register(
-                    name,
-                    &script_id,
-                    nonempty_text(script.get("url")).map(ToOwned::to_owned),
-                );
-                row["source_url"] = script.get("url").cloned().unwrap_or(Value::Null);
-                script_rows.push(row);
-            }
+            collector.add_session(session, budget)?;
         }
-        let document = json!({
-            "schema": EXECUTION_COVERAGE.schema,
-            "capture": capture.display().to_string(),
-            "mode": mode,
-            "summary": {
-                "mode": mode,
-                "captured_sessions": available_sessions.len(),
-                "script_profiles": script_rows.len(),
-                "positive_script_profiles": script_rows.iter().filter(|row| row["status"] == "positive").count(),
-                "zero_only_script_profiles": script_rows.iter().filter(|row| row["status"] == "zero_only").count(),
-                "notes": "Positive V8 function coverage is evidence of execution in the recorded mode; zero, missing, and unavailable coverage are inconclusive. Precise coverage disables optimization.",
-            },
-            "scripts": script_rows,
-        });
-        write_artifact(project, EXECUTION_COVERAGE, &document)?;
-        Ok(Some(Self {
-            by_script,
-            urls,
-            available_sessions,
-            mode: mode.to_owned(),
-        }))
+        collector.publish(capture, project)?;
+        Ok(Some(collector.index))
     }
 
     pub(super) fn mode(&self) -> &str {
