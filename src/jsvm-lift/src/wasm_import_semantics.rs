@@ -612,6 +612,33 @@ fn analyze_handler(
         .or_else(|| analyze_wrapped_write_function(function, scoping, global_aliases, offset_value))
 }
 
+fn handler_shape(
+    scoping: &Scoping,
+    assignment: &oxc_ast::ast::AssignmentExpression<'_>,
+    import_module: Option<&str>,
+    import_name: &str,
+    semantic: WasmImportHandlerSemantic,
+    initialization_witnesses: Vec<AliasInitializationWitness>,
+) -> WasmImportHandlerShape {
+    let import_object = assignment_import_object(scoping, &assignment.left).and_then(
+        |(symbol, import_object, module, name)| {
+            (module == import_module.unwrap_or_default()
+                && name == import_name
+                && symbol_binding_is_stable(scoping, symbol))
+            .then_some(import_object)
+        },
+    );
+    WasmImportHandlerShape {
+        import_module: import_module.map(str::to_string),
+        import_name: import_name.to_string(),
+        import_object,
+        assignment_start: assignment.span.start,
+        assignment_end: assignment.span.end,
+        initialization_witnesses,
+        semantic,
+    }
+}
+
 struct HandlerCollector<'c, 'g, 'i, 'f> {
     scoping: &'c Scoping,
     global_aliases: &'g GlobalAliases,
@@ -670,24 +697,14 @@ impl<'a> Visit<'a> for HandlerCollector<'_, '_, '_, '_> {
                         self.global_aliases,
                         linked_sites,
                     ) {
-                        let import_object =
-                            assignment_import_object(self.scoping, &assignment.left).and_then(
-                                |(symbol, import_object, module, name)| {
-                                    (module == import_module.unwrap_or_default()
-                                        && name == import_name
-                                        && symbol_binding_is_stable(self.scoping, symbol))
-                                    .then_some(import_object)
-                                },
-                            );
-                        self.handler_semantics.push(WasmImportHandlerShape {
-                            import_module: import_module.map(str::to_string),
-                            import_name: import_name.to_string(),
-                            import_object,
-                            assignment_start: assignment.span.start,
-                            assignment_end: assignment.span.end,
-                            initialization_witnesses,
+                        self.handler_semantics.push(handler_shape(
+                            self.scoping,
+                            assignment,
+                            import_module,
+                            import_name,
                             semantic,
-                        });
+                            initialization_witnesses,
+                        ));
                     }
                     if let Some(global_object) = analyze_handler(
                         function,
@@ -816,24 +833,14 @@ impl<'a> Visit<'a> for NormalizedHandlerSemanticsCollector<'_, '_> {
                         semantic,
                         WasmImportHandlerSemantic::TableInitializerOnly { .. }
                     ) {
-                        let import_object =
-                            assignment_import_object(self.scoping, &assignment.left).and_then(
-                                |(symbol, import_object, module, name)| {
-                                    (module == import_module.unwrap_or_default()
-                                        && name == import_name
-                                        && symbol_binding_is_stable(self.scoping, symbol))
-                                    .then_some(import_object)
-                                },
-                            );
-                        self.shapes.push(WasmImportHandlerShape {
-                            import_module: import_module.map(str::to_string),
-                            import_name: import_name.to_string(),
-                            import_object,
-                            assignment_start: assignment.span.start,
-                            assignment_end: assignment.span.end,
-                            initialization_witnesses,
+                        self.shapes.push(handler_shape(
+                            self.scoping,
+                            assignment,
+                            import_module,
+                            import_name,
                             semantic,
-                        });
+                            initialization_witnesses,
+                        ));
                     }
                 }
             }
