@@ -17,14 +17,34 @@ struct DirectiveIdentity<'a> {
     cooked: &'a [u8],
 }
 
-fn identities<'a>(directives: &[Directive<'a>]) -> Vec<DirectiveIdentity<'a>> {
-    directives
-        .iter()
-        .map(|directive| DirectiveIdentity {
+impl<'a> From<&Directive<'a>> for DirectiveIdentity<'a> {
+    fn from(directive: &Directive<'a>) -> Self {
+        Self {
             raw: directive.directive.as_str(),
             cooked: directive.expression.value.as_bytes(),
-        })
-        .collect()
+        }
+    }
+}
+
+fn identities<'a>(directives: &[Directive<'a>]) -> Vec<DirectiveIdentity<'a>> {
+    directives.iter().map(DirectiveIdentity::from).collect()
+}
+
+fn same_directives(expected: &[DirectiveIdentity<'_>], actual: &[Directive<'_>]) -> bool {
+    expected.len() == actual.len()
+        && expected
+            .iter()
+            .zip(actual)
+            .all(|(expected, actual)| *expected == DirectiveIdentity::from(actual))
+}
+
+fn brace_anchors(body: &FunctionBody<'_>, source: &str) -> Option<(usize, usize)> {
+    let start = body.span.start as usize;
+    let end = (body.span.end as usize).checked_sub(1)?;
+    (source.as_bytes().get(start) == Some(&b'{')
+        && source.as_bytes().get(end) == Some(&b'}')
+        && start < end)
+        .then_some((start, end))
 }
 
 /// Root directives and function bodies with actual source brace anchors.
@@ -42,16 +62,8 @@ impl<'a> DirectiveInventory<'a> {
     }
 
     pub(super) fn record_body(&mut self, body: &FunctionBody<'a>, source: &str) {
-        let start = body.span.start as usize;
-        let Some(end) = (body.span.end as usize).checked_sub(1) else {
-            return;
-        };
-        if source.as_bytes().get(start) == Some(&b'{')
-            && source.as_bytes().get(end) == Some(&b'}')
-            && start < end
-        {
-            self.bodies
-                .insert((start, end), identities(&body.directives));
+        if let Some(anchors) = brace_anchors(body, source) {
+            self.bodies.insert(anchors, identities(&body.directives));
         }
     }
 
@@ -73,33 +85,66 @@ impl<'a> DirectiveInventory<'a> {
         let Some(program) = crate::parse_as(&allocator, candidate, original.source_type) else {
             return false;
         };
-        let mut visitor = InventoryVisitor {
+        if !same_directives(&self.root, &program.directives) {
+            return false;
+        }
+
+        // Preserved byte coordinates are strictly order-preserving, so the
+        // original BTreeMap order also sorts the mapped anchor pairs. Store
+        // references to expectations rather than building a second inventory
+        // of all candidate functions and their directive strings.
+        let mapped = self
+            .bodies
+            .iter()
+            .filter_map(|(&(start, end), expected)| {
+                let anchors = coordinates
+                    .preserved_byte(start)
+                    .zip(coordinates.preserved_byte(end))?;
+                Some((anchors, expected.as_slice()))
+            })
+            .collect::<Vec<_>>();
+        let mut visitor = DirectiveValidator {
             source: candidate,
-            inventory: DirectiveInventory::default(),
+            mapped: &mapped,
+            valid: true,
         };
         visitor.visit_program(&program);
-        let actual = visitor.inventory;
-        self.root == actual.root
-            && self.bodies.iter().all(|(&(start, end), expected)| {
-                let Some(mapped) = coordinates
-                    .preserved_byte(start)
-                    .zip(coordinates.preserved_byte(end))
-                else {
-                    return true;
-                };
-                actual
-                    .bodies
-                    .get(&mapped)
-                    .is_none_or(|found| found == expected)
-            })
+        visitor.valid
     }
 }
 
+type MappedDirectiveBody<'inventory, 'source> =
+    ((usize, usize), &'inventory [DirectiveIdentity<'source>]);
+
+struct DirectiveValidator<'inventory, 'original, 'candidate> {
+    source: &'candidate str,
+    mapped: &'inventory [MappedDirectiveBody<'inventory, 'original>],
+    valid: bool,
+}
+
+impl<'candidate> Visit<'candidate> for DirectiveValidator<'_, '_, 'candidate> {
+    fn visit_function_body(&mut self, body: &FunctionBody<'candidate>) {
+        if !self.valid {
+            return;
+        }
+        if let Some(anchors) = brace_anchors(body, self.source) {
+            if let Ok(index) = self.mapped.binary_search_by_key(&anchors, |(key, _)| *key) {
+                self.valid = same_directives(self.mapped[index].1, &body.directives);
+            }
+        }
+        if self.valid {
+            walk::walk_function_body(self, body);
+        }
+    }
+}
+
+#[cfg(test)]
 struct InventoryVisitor<'a> {
     source: &'a str,
     inventory: DirectiveInventory<'a>,
 }
 
+#[cfg(test)]
 impl<'a> Visit<'a> for InventoryVisitor<'a> {
     fn visit_program(&mut self, program: &Program<'a>) {
         self.inventory.record_program(program);
@@ -231,6 +276,43 @@ mod tests {
 
         let candidate = format!("/*new*/{original}");
         assert!(accepts(original, &candidate, &[edit(0, 0, "/*new*/")]));
+    }
+
+    #[test]
+    fn compares_only_mapped_function_bodies_among_inserted_and_removed_functions() {
+        let original = "function discarded(){'gone';}function first(){'a';function nested(){'b';}}function last(){;'use strict';}";
+        let Some(remove_end) = original.find("function first") else {
+            unreachable!();
+        };
+        let Some(last) = original.find("function last") else {
+            unreachable!();
+        };
+        let Some(barrier) = original.rfind(";'use strict'") else {
+            unreachable!();
+        };
+        let insertion = "function inserted(){'new';}";
+        let edits = [edit(0, remove_end, ""), edit(last, last, insertion)];
+        let candidate = format!(
+            "{}{insertion}{}",
+            &original[remove_end..last],
+            &original[last..]
+        );
+        assert!(accepts(original, &candidate, &edits));
+
+        // The final original function retains its braces but acquires a new
+        // directive. Unmatched inserted/removed bodies must not hide that.
+        let bad_edits = [
+            edit(0, remove_end, ""),
+            edit(last, last, insertion),
+            edit(barrier, barrier + 1, ""),
+        ];
+        let candidate = format!(
+            "{}{insertion}{}{}",
+            &original[remove_end..last],
+            &original[last..barrier],
+            &original[barrier + 1..]
+        );
+        assert!(!accepts(original, &candidate, &bad_edits));
     }
 
     #[test]
