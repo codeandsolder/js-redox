@@ -54,40 +54,71 @@ pub(crate) fn validate_project_relative_path(value: &str, label: &str) -> Result
     Ok(())
 }
 
-fn validate_output_path(value: Option<&Value>, label: &str) -> Result<()> {
-    let Some(value) = value else {
-        return Ok(());
-    };
-    if value.is_null() {
-        return Ok(());
-    }
-    let Some(path) = value.as_str() else {
-        bail!("{label}: output_path must be a string or null");
-    };
-    validate_project_relative_path(path, label)?;
-    if !path.starts_with("resources/") {
-        bail!("{label}: output_path must be under resources/");
-    }
-    Ok(())
+#[derive(Default)]
+struct BodyClaims<'a> {
+    digest: Option<&'a str>,
+    bytes: Option<u64>,
 }
 
-fn check_shared_source_sha(
-    object: &Map<String, Value>,
-    known: &mut BTreeMap<String, String>,
-    label: &str,
-) -> Result<()> {
-    let (Some(path), Some(sha)) = (
-        object.get("output_path").and_then(Value::as_str),
-        object.get("sha256").and_then(Value::as_str),
-    ) else {
-        return Ok(());
-    };
-    if let Some(existing) = known.get(path) {
-        if existing != sha {
-            bail!("{label}: conflicting SHA-256 claims for shared capture path {path}");
+#[derive(Default)]
+struct CapturePaths<'a> {
+    claims: BTreeMap<&'a str, BodyClaims<'a>>,
+}
+
+impl<'a> CapturePaths<'a> {
+    fn record(&mut self, object: &'a Map<String, Value>, label: &str) -> Result<()> {
+        let Some(value) = object.get("output_path").filter(|value| !value.is_null()) else {
+            return Ok(());
+        };
+        let Some(path) = value.as_str() else {
+            bail!("{label}: output_path must be a string or null");
+        };
+        validate_project_relative_path(path, label)?;
+        if !path.starts_with("resources/") {
+            bail!("{label}: output_path must be under resources/");
         }
-    } else {
-        known.insert(path.to_owned(), sha.to_owned());
+        let claim = self.claims.entry(path).or_default();
+        if let Some(value) = object.get("sha256").filter(|value| !value.is_null()) {
+            let digest = value
+                .as_str()
+                .context("capture SHA-256 claim must be a string")?;
+            if claim.digest.is_some_and(|previous| previous != digest) {
+                bail!("{label}: conflicting SHA-256 claims for shared capture path {path}");
+            }
+            claim.digest = Some(digest);
+        }
+        if let Some(value) = object.get("body_bytes").filter(|value| !value.is_null()) {
+            let bytes = value
+                .as_u64()
+                .context("capture body size must be a non-negative integer")?;
+            if claim.bytes.is_some_and(|previous| previous != bytes) {
+                bail!("{label}: conflicting byte counts for shared capture path {path}");
+            }
+            claim.bytes = Some(bytes);
+        }
+        Ok(())
+    }
+
+    /// File paths cannot be ancestors of other file paths, regardless of
+    /// whether either row supplies a digest or length claim.
+    fn validate_namespace(&self, label: &str) -> Result<()> {
+        for &path in self.claims.keys() {
+            for (boundary, _) in path.match_indices('/') {
+                let parent = &path[..boundary];
+                if self.claims.contains_key(parent) {
+                    bail!(
+                        "{label}: capture paths {parent} and {path} conflict as file and directory"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_extra_fields(extra: &Map<String, Value>, reserved: &[&str], label: &str) -> Result<()> {
+    if let Some(field) = reserved.iter().find(|&&field| extra.contains_key(field)) {
+        bail!("{label}: extra metadata shadows reserved field {field}");
     }
     Ok(())
 }
@@ -96,7 +127,8 @@ fn check_shared_source_sha(
 ///
 /// # Errors
 ///
-/// Fails on an incorrect schema, empty source metadata, duplicate or malformed resource IDs, unsafe output paths or inline scripts referencing unknown resources.
+/// Fails on an incorrect schema, shadowed canonical fields, malformed record
+/// identities, unsafe output paths or contradictory shared-file claims.
 pub fn validate_manifest(manifest: &CaptureManifest, label: &str) -> Result<()> {
     if manifest.schema != SCHEMA {
         bail!("{label}: expected schema {SCHEMA:?}");
@@ -108,8 +140,31 @@ pub fn validate_manifest(manifest: &CaptureManifest, label: &str) -> Result<()> 
         bail!("{label}: source.input must be a non-empty string");
     }
 
+    validate_extra_fields(
+        &manifest.extra,
+        &[
+            "schema",
+            "source",
+            "pages",
+            "resources",
+            "inline_scripts",
+            "counts",
+        ],
+        label,
+    )?;
+    validate_extra_fields(
+        &manifest.source.extra,
+        &["kind", "input", "salvaged"],
+        &format!("{label}: source"),
+    )?;
+    for (index, page) in manifest.pages.iter().enumerate() {
+        if !page.is_object() {
+            bail!("{label}: pages[{index}] must be an object");
+        }
+    }
+
     let mut resource_ids = BTreeSet::new();
-    let mut shared_path_hashes = BTreeMap::<String, String>::new();
+    let mut paths = CapturePaths::default();
     for (index, resource) in manifest.resources.iter().enumerate() {
         let Some(object) = resource.as_object() else {
             bail!("{label}: resources[{index}] must be an object");
@@ -120,28 +175,34 @@ pub fn validate_manifest(manifest: &CaptureManifest, label: &str) -> Result<()> 
         if !resource_ids.insert(resource_id) {
             bail!("{label}: duplicate resource id {resource_id}");
         }
-        validate_output_path(
-            object.get("output_path"),
-            &format!("{label}: resources[{index}].output_path"),
-        )?;
-        check_shared_source_sha(object, &mut shared_path_hashes, label)?;
+        paths.record(object, &format!("{label}: resources[{index}]"))?;
     }
 
+    let mut script_ids = BTreeSet::new();
     for (index, script) in manifest.inline_scripts.iter().enumerate() {
         let Some(object) = script.as_object() else {
             bail!("{label}: inline_scripts[{index}] must be an object");
         };
-        let parent = object.get("parent_resource_id").and_then(Value::as_u64);
-        if parent.is_none_or(|parent| !resource_ids.contains(&parent)) {
+        let Some(parent) = object
+            .get("parent_resource_id")
+            .and_then(Value::as_u64)
+            .filter(|parent| resource_ids.contains(parent))
+        else {
             bail!("{label}: inline_scripts[{index}].parent_resource_id does not name a resource");
+        };
+        let Some(ordinal) = object
+            .get("ordinal")
+            .and_then(Value::as_u64)
+            .filter(|&ordinal| ordinal != 0)
+        else {
+            bail!("{label}: inline_scripts[{index}].ordinal must be a positive integer");
+        };
+        if !script_ids.insert((parent, ordinal)) {
+            bail!("{label}: duplicate inline script identity ({parent}, {ordinal})");
         }
-        validate_output_path(
-            object.get("output_path"),
-            &format!("{label}: inline_scripts[{index}].output_path"),
-        )?;
-        check_shared_source_sha(object, &mut shared_path_hashes, label)?;
+        paths.record(object, &format!("{label}: inline_scripts[{index}]"))?;
     }
-    Ok(())
+    paths.validate_namespace(label)
 }
 
 /// Deserialize and validate a capture manifest from a JSON value.
@@ -295,11 +356,88 @@ mod tests {
     }
 
     #[test]
+    fn canonical_manifest_fields_cannot_be_shadowed_by_metadata() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let path = manifest_path(root.path());
+        let original = valid_manifest();
+        write_manifest(&path, &original)?;
+        let bytes = fs::read(&path)?;
+        for field in [
+            "schema",
+            "source",
+            "pages",
+            "resources",
+            "inline_scripts",
+            "counts",
+        ] {
+            let mut invalid = original.clone();
+            invalid.extra.insert(field.into(), Value::Null);
+            assert!(write_manifest(&path, &invalid).is_err(), "{field}");
+            assert_eq!(fs::read(&path)?, bytes);
+        }
+        for field in ["kind", "input", "salvaged"] {
+            let mut invalid = original.clone();
+            invalid.source.extra.insert(field.into(), Value::Null);
+            assert!(write_manifest(&path, &invalid).is_err(), "{field}");
+            assert_eq!(fs::read(&path)?, bytes);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn capture_namespace_and_partial_size_claims_are_consistent() -> Result<()> {
+        let mut manifest = valid_manifest();
+        manifest.resources = vec![
+            json!({"id":1,"output_path":"resources/a","body_bytes":4}),
+            json!({"id":2,"output_path":"resources/a","sha256":"digest-a"}),
+            json!({"id":3,"output_path":"resources/a-other","body_bytes":0}),
+        ];
+        manifest.inline_scripts = vec![
+            json!({"parent_resource_id":1,"ordinal":1,"output_path":"resources/a","body_bytes":4,"sha256":"digest-a"}),
+        ];
+        validate_manifest(&manifest, "consistent claims")?;
+        manifest.inline_scripts[0]["body_bytes"] = json!(5);
+        assert!(validate_manifest(&manifest, "conflicting size").is_err());
+        manifest.inline_scripts[0]["body_bytes"] = Value::Null;
+        validate_manifest(&manifest, "unknown size")?;
+        manifest.resources[2]["output_path"] = json!("resources/a/b");
+        assert!(validate_manifest(&manifest, "file-directory conflict").is_err());
+        manifest.resources.reverse();
+        assert!(validate_manifest(&manifest, "reversed conflict").is_err());
+        manifest.resources[0]["output_path"] = json!("resources/a-other");
+        manifest.resources[1]["sha256"] = json!(42);
+        assert!(validate_manifest(&manifest, "nonstring hash").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn pages_and_inline_occurrences_have_record_and_identity_contracts() -> Result<()> {
+        let mut manifest = valid_manifest();
+        manifest.pages.push(Value::Null);
+        assert!(validate_manifest(&manifest, "invalid page record").is_err());
+        manifest.pages[0] = json!({"id":"page"});
+        manifest.resources = vec![json!({"id":7}), json!({"id":9})];
+        manifest.inline_scripts = vec![
+            json!({"parent_resource_id":7,"ordinal":1}),
+            json!({"parent_resource_id":9,"ordinal":1}),
+        ];
+        validate_manifest(&manifest, "separate occurrences")?;
+        manifest.inline_scripts[1]["parent_resource_id"] = json!(7);
+        assert!(validate_manifest(&manifest, "duplicate ordinal").is_err());
+        for ordinal in [json!(0), json!(-1), json!("1"), Value::Null] {
+            manifest.inline_scripts[1]["ordinal"] = ordinal;
+            assert!(validate_manifest(&manifest, "invalid ordinal").is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn rejects_inline_parent_outside_resource_range() {
         let mut manifest = valid_manifest();
         manifest.resources = vec![json!({"id": 7, "output_path": "resources/a.js"})];
-        manifest.inline_scripts =
-            vec![json!({"parent_resource_id": 7, "output_path": "resources/inline.js"})];
+        manifest.inline_scripts = vec![
+            json!({"parent_resource_id": 7, "ordinal": 1, "output_path": "resources/inline.js"}),
+        ];
         assert!(validate_manifest(&manifest, "test").is_ok());
         manifest.inline_scripts[0]["parent_resource_id"] = json!(9);
         assert!(validate_manifest(&manifest, "test").is_err());
