@@ -976,6 +976,222 @@ pub fn proven_fast_lazy_cell_factory_call(
     })
 }
 
+struct SlowCellConstruction {
+    symbol: SymbolId,
+    state_parameter_index: usize,
+    prototype_field: String,
+    method_key_field: String,
+    assignment: Span,
+}
+
+#[derive(Default)]
+struct SlowCellEvidence {
+    handler: Option<(usize, usize, Span)>,
+    index_state: Option<(SymbolId, Span)>,
+    phase: Option<(SymbolId, SymbolId, Span)>,
+    cell: Option<SlowCellConstruction>,
+    update: Option<Span>,
+    resolver: Option<(String, Span)>,
+    returned_alias: bool,
+}
+
+struct SlowCellScope<'a> {
+    scoping: &'a Scoping,
+    parameters: &'a [SymbolId],
+    function_span: Span,
+    returned_symbol: SymbolId,
+}
+
+impl SlowCellEvidence {
+    fn record_binding(
+        &mut self,
+        scope: &SlowCellScope<'_>,
+        target_symbol: SymbolId,
+        assignment: &oxc_ast::ast::AssignmentExpression<'_>,
+    ) -> Option<()> {
+        let scoping = scope.scoping;
+        if let Expression::ArrayExpression(array) = last_sequence_expression(&assignment.right) {
+            if let Some(parameter_index) = scope
+                .parameters
+                .iter()
+                .position(|parameter| *parameter == target_symbol)
+            {
+                if let Some(slot) = direct_identifier_array_slot(scoping, array, target_symbol) {
+                    return self
+                        .handler
+                        .replace((parameter_index, slot, assignment.span))
+                        .is_none()
+                        .then_some(());
+                }
+            }
+        }
+        if let Some(rhs_symbol) = reference_symbol(scoping, &assignment.right) {
+            let rhs_declaration = scoping.symbol_span(rhs_symbol);
+            if !(scope.function_span.start <= rhs_declaration.start
+                && rhs_declaration.end <= scope.function_span.end)
+            {
+                return self
+                    .phase
+                    .replace((target_symbol, rhs_symbol, assignment.span))
+                    .is_none()
+                    .then_some(());
+            }
+        }
+        if !matches!(
+            last_sequence_expression(&assignment.right),
+            Expression::Identifier(_)
+        ) && pure_integer_expression(&assignment.right)
+        {
+            return self
+                .index_state
+                .replace((target_symbol, assignment.span))
+                .is_none()
+                .then_some(());
+        }
+        if let Expression::CallExpression(call) = last_sequence_expression(&assignment.right) {
+            if !call.optional && call.arguments.len() == 1 {
+                let argument = call.arguments[0].as_expression()?;
+                let (state_parameter_index, prototype_field) =
+                    parameter_member(scoping, argument, scope.parameters)?;
+                let Expression::ComputedMemberExpression(callee) =
+                    last_sequence_expression(&call.callee)
+                else {
+                    return Some(());
+                };
+                if callee.optional {
+                    return Some(());
+                }
+                let (method_state_index, method_key_field) =
+                    parameter_member(scoping, &callee.expression, scope.parameters)?;
+                if state_parameter_index != method_state_index {
+                    return None;
+                }
+                return self
+                    .cell
+                    .replace(SlowCellConstruction {
+                        symbol: target_symbol,
+                        state_parameter_index,
+                        prototype_field,
+                        method_key_field,
+                        assignment: assignment.span,
+                    })
+                    .is_none()
+                    .then_some(());
+            }
+        }
+        if scope.returned_symbol == target_symbol {
+            if let Some(cell) = self.cell.as_ref() {
+                if reference_symbol(scoping, &assignment.right) == Some(cell.symbol) {
+                    self.returned_alias = true;
+                }
+            }
+        }
+        Some(())
+    }
+
+    fn record_member(
+        &mut self,
+        scope: &SlowCellScope<'_>,
+        assignment: &oxc_ast::ast::AssignmentExpression<'_>,
+    ) -> Option<()> {
+        let Some(cell) = self.cell.as_ref() else {
+            return Some(());
+        };
+        let scoping = scope.scoping;
+        match &assignment.left {
+            AssignmentTarget::ComputedMemberExpression(member) if !member.optional => {
+                if reference_symbol(scoping, &member.object) != Some(cell.symbol) {
+                    return Some(());
+                }
+                let Some((key_state_index, key_field)) =
+                    parameter_member(scoping, &member.expression, scope.parameters)
+                else {
+                    return Some(());
+                };
+                if key_state_index != cell.state_parameter_index
+                    || key_field != cell.method_key_field
+                {
+                    return Some(());
+                }
+                let Expression::FunctionExpression(function) =
+                    last_sequence_expression(&assignment.right)
+                else {
+                    return Some(());
+                };
+                self.update.replace(function.span).is_none().then_some(())
+            }
+            AssignmentTarget::StaticMemberExpression(member) if !member.optional => {
+                if reference_symbol(scoping, &member.object) != Some(cell.symbol) {
+                    return Some(());
+                }
+                let Expression::FunctionExpression(function) =
+                    last_sequence_expression(&assignment.right)
+                else {
+                    return Some(());
+                };
+                self.resolver
+                    .replace((member.property.name.to_string(), function.span))
+                    .is_none()
+                    .then_some(())
+            }
+            _ => Some(()),
+        }
+    }
+
+    fn finish(
+        self,
+        function_span: Span,
+        returned_symbol: SymbolId,
+        logical: &oxc_ast::ast::LogicalExpression<'_>,
+    ) -> Option<SlowLazyCellFactoryShape> {
+        let (handler_parameter_index, handler_slot, handler_capture) = self.handler?;
+        let (index_state_symbol, index_state_initialization) = self.index_state?;
+        let (phase_local_symbol, phase_binding_symbol, phase_capture) = self.phase?;
+        let SlowCellConstruction {
+            symbol: cell_symbol,
+            state_parameter_index,
+            prototype_field,
+            method_key_field,
+            assignment: cell_construction,
+        } = self.cell?;
+        let update_function = self.update?;
+        let (resolver_property, resolver_function) = self.resolver?;
+        if returned_symbol != cell_symbol && !self.returned_alias {
+            return None;
+        }
+
+        Some(SlowLazyCellFactoryShape {
+            function_start: function_span.start,
+            function_end: function_span.end,
+            guard_start: logical.left.span().start,
+            guard_end: logical.left.span().end,
+            slow_sequence_start: logical.right.span().start,
+            slow_sequence_end: logical.right.span().end,
+            state_parameter_index,
+            handler_parameter_index,
+            handler_slot,
+            handler_capture_start: handler_capture.start,
+            handler_capture_end: handler_capture.end,
+            index_state_symbol,
+            index_state_initialization_start: index_state_initialization.start,
+            index_state_initialization_end: index_state_initialization.end,
+            prototype_field,
+            method_key_field,
+            phase_local_symbol,
+            phase_binding_symbol,
+            phase_capture_start: phase_capture.start,
+            phase_capture_end: phase_capture.end,
+            cell_construction_start: cell_construction.start,
+            cell_construction_end: cell_construction.end,
+            update_function_start: update_function.start,
+            update_function_end: update_function.end,
+            resolver_property,
+            resolver_function_start: resolver_function.start,
+            resolver_function_end: resolver_function.end,
+        })
+    }
+}
+
 fn shape_for_function(
     function: &Function<'_>,
     scoping: &Scoping,
@@ -1013,204 +1229,24 @@ fn shape_for_function(
         return None;
     };
 
-    let mut handler = None;
-    let mut index_state = None;
-    let mut phase = None;
-    let mut cell = None;
-    let mut update = None;
-    let mut resolver = None;
-    let mut returned_alias = false;
-
+    let scope = SlowCellScope {
+        scoping,
+        parameters: &parameters,
+        function_span: function.span,
+        returned_symbol,
+    };
+    let mut evidence = SlowCellEvidence::default();
     for expression in &slow_sequence.expressions {
         let Some(assignment) = assignment_expression(expression) else {
             continue;
         };
         if let Some(target_symbol) = assignment_symbol(scoping, &assignment.left) {
-            if let Expression::ArrayExpression(array) = last_sequence_expression(&assignment.right)
-            {
-                if let Some(parameter_index) = parameters
-                    .iter()
-                    .position(|parameter| *parameter == target_symbol)
-                {
-                    if let Some(slot) = direct_identifier_array_slot(scoping, array, target_symbol)
-                    {
-                        if handler
-                            .replace((target_symbol, parameter_index, slot, assignment.span))
-                            .is_some()
-                        {
-                            return None;
-                        }
-                        continue;
-                    }
-                }
-            }
-
-            if let Some(rhs_symbol) = reference_symbol(scoping, &assignment.right) {
-                let rhs_declaration = scoping.symbol_span(rhs_symbol);
-                if !(function.span.start <= rhs_declaration.start
-                    && rhs_declaration.end <= function.span.end)
-                {
-                    if phase
-                        .replace((target_symbol, rhs_symbol, assignment.span))
-                        .is_some()
-                    {
-                        return None;
-                    }
-                    continue;
-                }
-            }
-
-            if !matches!(
-                last_sequence_expression(&assignment.right),
-                Expression::Identifier(_)
-            ) && pure_integer_expression(&assignment.right)
-            {
-                if index_state
-                    .replace((target_symbol, assignment.span))
-                    .is_some()
-                {
-                    return None;
-                }
-                continue;
-            }
-
-            if let Expression::CallExpression(call) = last_sequence_expression(&assignment.right) {
-                if !call.optional && call.arguments.len() == 1 {
-                    let argument = call.arguments[0].as_expression()?;
-                    let (state_parameter_index, prototype_field) =
-                        parameter_member(scoping, argument, &parameters)?;
-                    let Expression::ComputedMemberExpression(callee) =
-                        last_sequence_expression(&call.callee)
-                    else {
-                        continue;
-                    };
-                    if callee.optional {
-                        continue;
-                    }
-                    let (method_state_index, method_key_field) =
-                        parameter_member(scoping, &callee.expression, &parameters)?;
-                    if state_parameter_index != method_state_index {
-                        return None;
-                    }
-                    if cell
-                        .replace((
-                            target_symbol,
-                            state_parameter_index,
-                            prototype_field,
-                            method_key_field,
-                            assignment.span,
-                        ))
-                        .is_some()
-                    {
-                        return None;
-                    }
-                    continue;
-                }
-            }
-
-            if returned_symbol == target_symbol {
-                if let Some((cell_symbol, ..)) = cell.as_ref() {
-                    if reference_symbol(scoping, &assignment.right) == Some(*cell_symbol) {
-                        returned_alias = true;
-                    }
-                }
-            }
-            continue;
-        }
-
-        match &assignment.left {
-            AssignmentTarget::ComputedMemberExpression(member) if !member.optional => {
-                let Some((cell_symbol, state_parameter_index, _, method_key_field, _)) =
-                    cell.as_ref()
-                else {
-                    continue;
-                };
-                if reference_symbol(scoping, &member.object) != Some(*cell_symbol) {
-                    continue;
-                }
-                let Some((key_state_index, key_field)) =
-                    parameter_member(scoping, &member.expression, &parameters)
-                else {
-                    continue;
-                };
-                if key_state_index != *state_parameter_index || key_field != *method_key_field {
-                    continue;
-                }
-                let Expression::FunctionExpression(function) =
-                    last_sequence_expression(&assignment.right)
-                else {
-                    continue;
-                };
-                if update.replace(function.span).is_some() {
-                    return None;
-                }
-            }
-            AssignmentTarget::StaticMemberExpression(member) if !member.optional => {
-                let Some((cell_symbol, ..)) = cell.as_ref() else {
-                    continue;
-                };
-                if reference_symbol(scoping, &member.object) != Some(*cell_symbol) {
-                    continue;
-                }
-                let Expression::FunctionExpression(function) =
-                    last_sequence_expression(&assignment.right)
-                else {
-                    continue;
-                };
-                if resolver
-                    .replace((member.property.name.to_string(), function.span))
-                    .is_some()
-                {
-                    return None;
-                }
-            }
-            _ => {}
+            evidence.record_binding(&scope, target_symbol, assignment)?;
+        } else {
+            evidence.record_member(&scope, assignment)?;
         }
     }
-
-    let (_, handler_parameter_index, handler_slot, handler_capture) = handler?;
-    let (index_state_symbol, index_state_initialization) = index_state?;
-    let (phase_local_symbol, phase_binding_symbol, phase_capture) = phase?;
-    let (cell_symbol, state_parameter_index, prototype_field, method_key_field, cell_construction) =
-        cell?;
-    let update_function = update?;
-    let (resolver_property, resolver_function) = resolver?;
-    if returned_symbol == cell_symbol {
-        returned_alias = true;
-    }
-    if !returned_alias {
-        return None;
-    }
-
-    Some(SlowLazyCellFactoryShape {
-        function_start: function.span.start,
-        function_end: function.span.end,
-        guard_start: logical.left.span().start,
-        guard_end: logical.left.span().end,
-        slow_sequence_start: logical.right.span().start,
-        slow_sequence_end: logical.right.span().end,
-        state_parameter_index,
-        handler_parameter_index,
-        handler_slot,
-        handler_capture_start: handler_capture.start,
-        handler_capture_end: handler_capture.end,
-        index_state_symbol,
-        index_state_initialization_start: index_state_initialization.start,
-        index_state_initialization_end: index_state_initialization.end,
-        prototype_field,
-        method_key_field,
-        phase_local_symbol,
-        phase_binding_symbol,
-        phase_capture_start: phase_capture.start,
-        phase_capture_end: phase_capture.end,
-        cell_construction_start: cell_construction.start,
-        cell_construction_end: cell_construction.end,
-        update_function_start: update_function.start,
-        update_function_end: update_function.end,
-        resolver_property,
-        resolver_function_start: resolver_function.start,
-        resolver_function_end: resolver_function.end,
-    })
+    evidence.finish(function.span, returned_symbol, logical)
 }
 
 fn pure_integer_expression(expression: &Expression<'_>) -> bool {
@@ -1713,6 +1749,34 @@ fn exact_update_writes(
     (actual_writes == expected_writes).then_some(())
 }
 
+fn unique_assigned_closure<'a>(
+    sequence: &'a oxc_ast::ast::SequenceExpression<'a>,
+    span: Span,
+) -> Option<&'a Function<'a>> {
+    let mut functions = sequence.expressions.iter().filter_map(|expression| {
+        let assignment = assignment_expression(expression)?;
+        let Expression::FunctionExpression(resolver) = last_sequence_expression(&assignment.right)
+        else {
+            return None;
+        };
+        (resolver.span.start == span.start && resolver.span.end == span.end).then_some(resolver)
+    });
+    let resolver = functions.next()?;
+    if functions.next().is_some()
+        || resolver.r#async
+        || resolver.generator
+        || function_subtree_has_dynamic_scope(resolver)
+        || resolver
+            .body
+            .as_deref()
+            .is_none_or(function_body_uses_arguments)
+    {
+        return None;
+    }
+
+    Some(resolver)
+}
+
 fn analyze_slow_lazy_cell_update_state(
     function: &Function<'_>,
     semantic: &Semantic<'_>,
@@ -1740,28 +1804,10 @@ fn analyze_slow_lazy_cell_update_state(
         IntegerPolynomial::constant(i128::from(initial_state_value)),
     );
 
-    let mut updates = sequence.expressions.iter().filter_map(|expression| {
-        let assignment = assignment_expression(expression)?;
-        let Expression::FunctionExpression(update) = last_sequence_expression(&assignment.right)
-        else {
-            return None;
-        };
-        (update.span.start == shape.update_function_start
-            && update.span.end == shape.update_function_end)
-            .then_some(update)
-    });
-    let update = updates.next()?;
-    if updates.next().is_some()
-        || update.r#async
-        || update.generator
-        || function_subtree_has_dynamic_scope(update)
-        || update
-            .body
-            .as_deref()
-            .is_none_or(function_body_uses_arguments)
-    {
-        return None;
-    }
+    let update = unique_assigned_closure(
+        sequence,
+        Span::new(shape.update_function_start, shape.update_function_end),
+    )?;
     let update_parameters = parameter_symbols(update)?;
     let [update_parameter] = update_parameters.as_slice() else {
         return None;
@@ -2472,6 +2518,129 @@ struct RegistryInstallFacts<'a> {
     exact_key: i64,
 }
 
+#[derive(Clone, Copy)]
+struct CapturedPathCursor<'a> {
+    incoming: &'a ProvenOriginDirectCall,
+    value_symbol: SymbolId,
+    key_parameter_index: usize,
+    key_symbol: SymbolId,
+}
+
+struct CapturedPathProof<'a, 'ast> {
+    source: &'a str,
+    program: &'a Program<'ast>,
+    semantic: &'a Semantic<'ast>,
+    exact_key: i64,
+}
+
+impl CapturedPathProof<'_, '_> {
+    fn unique_argument_for_symbol(
+        &self,
+        call: &ProvenOriginDirectCall,
+        symbol: SymbolId,
+    ) -> Option<usize> {
+        let mut matches = (0..call.argument_spans.len()).filter(|index| {
+            call_argument_symbol_at(
+                self.program,
+                self.semantic.scoping(),
+                call.call_start,
+                call.call_end,
+                *index,
+            ) == Some(symbol)
+        });
+        let first = matches.next()?;
+        matches.next().is_none().then_some(first)
+    }
+
+    fn binding_preserved(
+        &self,
+        cursor: CapturedPathCursor<'_>,
+        call: &ProvenOriginDirectCall,
+    ) -> bool {
+        let context = &cursor.incoming.callee;
+        parameter_binding_preserved_before_event(
+            self.source,
+            self.program,
+            self.semantic,
+            cursor.incoming,
+            Span::new(context.function_start, context.function_end),
+            cursor.value_symbol,
+            Span::new(call.call_start, call.call_end),
+        )
+    }
+
+    fn only_forwarded(
+        &self,
+        cursor: CapturedPathCursor<'_>,
+        call: &ProvenOriginDirectCall,
+        argument_index: usize,
+    ) -> bool {
+        let context = &cursor.incoming.callee;
+        symbol_only_forwarded_at_direct_call(
+            self.source,
+            self.program,
+            self.semantic,
+            ForwardedSymbolQuery {
+                symbol: cursor.value_symbol,
+                function_span: Span::new(context.function_start, context.function_end),
+                incoming: cursor.incoming,
+                exact_integer_parameter: (cursor.key_parameter_index, self.exact_key),
+                call,
+                argument_index,
+            },
+        )
+    }
+
+    fn advance<'a>(
+        &self,
+        cursor: CapturedPathCursor<'a>,
+        next: &'a ProvenOriginDirectCall,
+    ) -> Option<CapturedPathCursor<'a>> {
+        if next.caller != cursor.incoming.callee || !self.binding_preserved(cursor, next) {
+            return None;
+        }
+        let value_index = self.unique_argument_for_symbol(next, cursor.value_symbol)?;
+        if !self.only_forwarded(cursor, next, value_index) {
+            return None;
+        }
+        let key_index = self.unique_argument_for_symbol(next, cursor.key_symbol)?;
+        let parameters = function_parameter_symbols_at(
+            self.program,
+            next.callee.function_start,
+            next.callee.function_end,
+        )?;
+        Some(CapturedPathCursor {
+            incoming: next,
+            value_symbol: *parameters.get(value_index)?,
+            key_parameter_index: key_index,
+            key_symbol: *parameters.get(key_index)?,
+        })
+    }
+
+    fn verify_factory(
+        &self,
+        cursor: CapturedPathCursor<'_>,
+        factory: &ProvenSlowLazyCellFactoryCall,
+    ) -> Option<()> {
+        let call = &factory.call;
+        let value_index = factory.shape.handler_parameter_index;
+        if cursor.incoming.callee != call.caller
+            || call_argument_symbol_at(
+                self.program,
+                self.semantic.scoping(),
+                call.call_start,
+                call.call_end,
+                value_index,
+            ) != Some(cursor.value_symbol)
+            || !self.only_forwarded(cursor, call, value_index)
+            || !self.binding_preserved(cursor, call)
+        {
+            return None;
+        }
+        Some(())
+    }
+}
+
 fn proven_slow_lazy_cell_captured_value_path(
     source: &str,
     program: &Program<'_>,
@@ -2509,150 +2678,23 @@ fn proven_slow_lazy_cell_captured_value_path(
         root.callee.function_start,
         root.callee.function_end,
     )?;
-    let mut current_symbol = *root_parameters.get(root_value_parameter_index)?;
-    let mut current_key_parameter_index = root_key_parameter_index;
-    let mut current_key_symbol = *root_parameters.get(root_key_parameter_index)?;
-    let mut current_context = root.callee.clone();
-    let mut incoming = root.clone();
-
-    for next in chain.iter().skip(1) {
-        if next.caller != current_context {
-            return None;
-        }
-        let event = Span::new(next.call_start, next.call_end);
-        if !parameter_binding_preserved_before_event(
-            source,
-            program,
-            semantic,
-            &incoming,
-            Span::new(current_context.function_start, current_context.function_end),
-            current_symbol,
-            event,
-        ) {
-            return None;
-        }
-        let matching_arguments = (0..next.argument_spans.len())
-            .filter(|index| {
-                call_argument_symbol_at(
-                    program,
-                    semantic.scoping(),
-                    next.call_start,
-                    next.call_end,
-                    *index,
-                ) == Some(current_symbol)
-            })
-            .collect::<Vec<_>>();
-        let [next_parameter_index] = matching_arguments.as_slice() else {
-            return None;
-        };
-        if !symbol_only_forwarded_at_direct_call(
-            source,
-            program,
-            semantic,
-            ForwardedSymbolQuery {
-                symbol: current_symbol,
-                function_span: Span::new(
-                    current_context.function_start,
-                    current_context.function_end,
-                ),
-                incoming: &incoming,
-                exact_integer_parameter: (
-                    current_key_parameter_index,
-                    exact_assignment.exact_key_value,
-                ),
-                call: next,
-                argument_index: *next_parameter_index,
-            },
-        ) {
-            return None;
-        }
-        let matching_key_arguments = (0..next.argument_spans.len())
-            .filter(|index| {
-                call_argument_symbol_at(
-                    program,
-                    semantic.scoping(),
-                    next.call_start,
-                    next.call_end,
-                    *index,
-                ) == Some(current_key_symbol)
-            })
-            .collect::<Vec<_>>();
-        let [next_key_parameter_index] = matching_key_arguments.as_slice() else {
-            return None;
-        };
-        let next_parameters = function_parameter_symbols_at(
-            program,
-            next.callee.function_start,
-            next.callee.function_end,
-        )?;
-        current_symbol = *next_parameters.get(*next_parameter_index)?;
-        current_key_symbol = *next_parameters.get(*next_key_parameter_index)?;
-        current_key_parameter_index = *next_key_parameter_index;
-        current_context = next.callee.clone();
-        incoming = next.clone();
-    }
-
-    let factory_caller = &exact_assignment.assignment.factory_call.call.caller;
-    if current_context != *factory_caller {
-        return None;
-    }
-
-    let nested_value_symbol = call_argument_symbol_at(
-        program,
-        semantic.scoping(),
-        exact_assignment.assignment.factory_call.call.call_start,
-        exact_assignment.assignment.factory_call.call.call_end,
-        exact_assignment
-            .assignment
-            .factory_call
-            .shape
-            .handler_parameter_index,
-    );
-    if nested_value_symbol != Some(current_symbol)
-        || !symbol_only_forwarded_at_direct_call(
-            source,
-            program,
-            semantic,
-            ForwardedSymbolQuery {
-                symbol: current_symbol,
-                function_span: Span::new(
-                    factory_caller.function_start,
-                    factory_caller.function_end,
-                ),
-                incoming: &incoming,
-                exact_integer_parameter: (
-                    current_key_parameter_index,
-                    exact_assignment.exact_key_value,
-                ),
-                call: &exact_assignment.assignment.factory_call.call,
-                argument_index: exact_assignment
-                    .assignment
-                    .factory_call
-                    .shape
-                    .handler_parameter_index,
-            },
-        )
-    {
-        return None;
-    }
-
-    let event = Span::new(
-        exact_assignment.assignment.factory_call.call.call_start,
-        exact_assignment.assignment.factory_call.call.call_end,
-    );
-    if !parameter_binding_preserved_before_event(
+    let mut cursor = CapturedPathCursor {
+        incoming: root,
+        value_symbol: *root_parameters.get(root_value_parameter_index)?,
+        key_parameter_index: root_key_parameter_index,
+        key_symbol: *root_parameters.get(root_key_parameter_index)?,
+    };
+    let proof = CapturedPathProof {
         source,
         program,
         semantic,
-        &incoming,
-        Span::new(factory_caller.function_start, factory_caller.function_end),
-        current_symbol,
-        event,
-    ) {
-        return None;
+        exact_key: exact_assignment.exact_key_value,
+    };
+    for next in chain.iter().skip(1) {
+        cursor = proof.advance(cursor, next)?;
     }
-
-    Some((root_value_parameter_index, current_symbol))
+    proof.verify_factory(cursor, &exact_assignment.assignment.factory_call)?;
+    Some((root_value_parameter_index, cursor.value_symbol))
 }
 
 /// Join one exact slow-cell registry assignment to any logical forwarding install
@@ -3177,6 +3219,49 @@ fn resolver_index_value(
     Some((*span, *value))
 }
 
+#[derive(Clone, Copy)]
+struct ResolverCaptureBindings {
+    handler: (SymbolId, Span),
+    phase: (SymbolId, Span),
+    factory_key_symbol: SymbolId,
+}
+
+fn resolver_bindings_stable(
+    source: &str,
+    program: &Program<'_>,
+    semantic: &Semantic<'_>,
+    factory_call: &ProvenSlowLazyCellFactoryCall,
+    function_span: Span,
+    bindings: ResolverCaptureBindings,
+) -> bool {
+    let ResolverCaptureBindings {
+        handler,
+        phase,
+        factory_key_symbol,
+    } = bindings;
+    if !binding_stable_after_capture(
+        source,
+        program,
+        semantic,
+        factory_call,
+        handler.0,
+        handler.1,
+    ) || !binding_stable_after_capture(source, program, semantic, factory_call, phase.0, phase.1)
+    {
+        return false;
+    }
+
+    let key_declaration = semantic.scoping().symbol_span(factory_key_symbol);
+    function_span.contains_inclusive(key_declaration)
+        && binding_stable_from_factory_entry(
+            source,
+            program,
+            semantic,
+            factory_call,
+            factory_key_symbol,
+        )
+}
+
 fn analyze_slow_lazy_cell_resolver_index(
     source: &str,
     program: &Program<'_>,
@@ -3215,34 +3300,21 @@ fn analyze_slow_lazy_cell_resolver_index(
     else {
         return None;
     };
-    if !binding_stable_after_capture(
+    if !resolver_bindings_stable(
         source,
         program,
         semantic,
         factory_call,
-        handler_symbol,
-        handler_capture.span,
-    ) || !binding_stable_after_capture(
-        source,
-        program,
-        semantic,
-        factory_call,
-        shape.phase_local_symbol,
-        Span::new(shape.phase_capture_start, shape.phase_capture_end),
-    ) {
-        return None;
-    }
-
-    let key_declaration = semantic.scoping().symbol_span(factory_key_symbol);
-    if !function.span.contains_inclusive(key_declaration)
-        || !binding_stable_from_factory_entry(
-            source,
-            program,
-            semantic,
-            factory_call,
+        function.span,
+        ResolverCaptureBindings {
+            handler: (handler_symbol, handler_capture.span),
+            phase: (
+                shape.phase_local_symbol,
+                Span::new(shape.phase_capture_start, shape.phase_capture_end),
+            ),
             factory_key_symbol,
-        )
-    {
+        },
+    ) {
         return None;
     }
 
@@ -3255,28 +3327,10 @@ fn analyze_slow_lazy_cell_resolver_index(
         exact_key_value,
     )?;
 
-    let mut resolvers = sequence.expressions.iter().filter_map(|expression| {
-        let assignment = assignment_expression(expression)?;
-        let Expression::FunctionExpression(resolver) = last_sequence_expression(&assignment.right)
-        else {
-            return None;
-        };
-        (resolver.span.start == shape.resolver_function_start
-            && resolver.span.end == shape.resolver_function_end)
-            .then_some(resolver)
-    });
-    let resolver = resolvers.next()?;
-    if resolvers.next().is_some()
-        || resolver.r#async
-        || resolver.generator
-        || function_subtree_has_dynamic_scope(resolver)
-        || resolver
-            .body
-            .as_deref()
-            .is_none_or(function_body_uses_arguments)
-    {
-        return None;
-    }
+    let resolver = unique_assigned_closure(
+        sequence,
+        Span::new(shape.resolver_function_start, shape.resolver_function_end),
+    )?;
 
     let mut bindings = exact_integer_scalar_bindings(&parameters, &factory_call.call);
     bindings.insert(

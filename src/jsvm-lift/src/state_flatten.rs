@@ -1358,37 +1358,25 @@ struct ProtectedLoopReachabilityRunner<'s> {
     env: HashMap<String, Scalar>,
     result: Option<bool>,
 }
-impl<'a> Visit<'a> for ProtectedLoopReachabilityRunner<'_> {
-    fn visit_while_statement(&mut self, while_statement: &WhileStatement<'a>) {
-        if self.result.is_some() {
-            return;
-        }
-        if while_statement.span != self.target {
-            walk::walk_while_statement(self, while_statement);
-            return;
-        }
+impl ProtectedLoopReachabilityRunner<'_> {
+    fn prove_target(&mut self, while_statement: &WhileStatement<'_>) -> bool {
         if !control_test_is_effect_free(&while_statement.test) {
-            self.result = Some(false);
-            return;
+            return false;
         }
         let Statement::TryStatement(try_statement) = &while_statement.body else {
-            self.result = Some(false);
-            return;
+            return false;
         };
         let (Some(handler), None) = (&try_statement.handler, &try_statement.finalizer) else {
-            self.result = Some(false);
-            return;
+            return false;
         };
         let Some((state_var, event_state)) =
             branch_state_variable_for_span(&try_statement.block, self.event)
         else {
-            self.result = Some(false);
-            return;
+            return false;
         };
 
         if protected_loop_captures_state(while_statement, &state_var) {
-            self.result = Some(false);
-            return;
+            return false;
         }
 
         let mut evidence = IfLadderEvidenceVisitor {
@@ -1397,53 +1385,62 @@ impl<'a> Visit<'a> for ProtectedLoopReachabilityRunner<'_> {
         };
         evidence.visit_block_statement(&try_statement.block);
         if evidence.evidence.compared_states.len() < 4 || evidence.evidence.state_assignments < 4 {
-            self.result = Some(false);
-            return;
+            return false;
         }
 
+        self.run_loop(
+            &try_statement.block.body,
+            &handler.body.body,
+            &state_var,
+            event_state,
+        )
+    }
+
+    fn run_loop(
+        &mut self,
+        body: &[Statement<'_>],
+        handler: &[Statement<'_>],
+        state_var: &str,
+        event_state: u64,
+    ) -> bool {
         for _ in 0..256 {
-            let Some(Scalar::Int(state)) = self.env.get(&state_var).copied() else {
-                self.result = Some(false);
-                return;
+            let Some(Scalar::Int(state)) = self.env.get(state_var).copied() else {
+                return false;
             };
             if u64::try_from(state).ok() == Some(event_state) {
-                self.result = Some(false);
-                return;
+                return false;
             }
 
             let mut semantic = Vec::new();
             let mut ambiguous_envs = Vec::new();
             match exec_statements(
-                &try_statement.block.body,
+                body,
                 self.source,
-                &state_var,
+                state_var,
                 &mut self.env,
                 &mut semantic,
                 &mut ambiguous_envs,
             ) {
                 ExecStatus::Return | ExecStatus::Break => {
-                    self.result = Some(true);
-                    return;
+                    return true;
                 }
                 ExecStatus::Throw => {
                     let mut catch_semantic = Vec::new();
                     let mut catch_ambiguous_envs = Vec::new();
                     match exec_statements(
-                        &handler.body.body,
+                        handler,
                         self.source,
-                        &state_var,
+                        state_var,
                         &mut self.env,
                         &mut catch_semantic,
                         &mut catch_ambiguous_envs,
                     ) {
                         ExecStatus::Return | ExecStatus::Throw | ExecStatus::Break => {
-                            self.result = Some(true);
-                            return;
+                            return true;
                         }
                         ExecStatus::Normal => {
                             if !catch_semantic.is_empty() {
-                                self.result = Some(false);
-                                return;
+                                return false;
                             }
                         }
                     }
@@ -1454,9 +1451,9 @@ impl<'a> Visit<'a> for ProtectedLoopReachabilityRunner<'_> {
                         let mut catch_semantic = Vec::new();
                         let mut catch_ambiguous_envs = Vec::new();
                         let catch_status = exec_statements(
-                            &handler.body.body,
+                            handler,
                             self.source,
-                            &state_var,
+                            state_var,
                             &mut catch_env,
                             &mut catch_semantic,
                             &mut catch_ambiguous_envs,
@@ -1465,14 +1462,26 @@ impl<'a> Visit<'a> for ProtectedLoopReachabilityRunner<'_> {
                             catch_status,
                             ExecStatus::Return | ExecStatus::Throw | ExecStatus::Break
                         ) {
-                            self.result = Some(false);
-                            return;
+                            return false;
                         }
                     }
                 }
             }
         }
-        self.result = Some(false);
+        false
+    }
+}
+
+impl<'a> Visit<'a> for ProtectedLoopReachabilityRunner<'_> {
+    fn visit_while_statement(&mut self, while_statement: &WhileStatement<'a>) {
+        if self.result.is_some() {
+            return;
+        }
+        if while_statement.span != self.target {
+            walk::walk_while_statement(self, while_statement);
+            return;
+        }
+        self.result = Some(self.prove_target(while_statement));
     }
     fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
     fn visit_arrow_function_expression(
@@ -2634,6 +2643,33 @@ fn protected_assignment_symbol(
     resolved_reference_symbol(semantic.scoping(), identifier.reference_id.get())
 }
 
+fn eval_protected_binary(
+    binary: &oxc_ast::ast::BinaryExpression<'_>,
+    semantic: &Semantic<'_>,
+    env: &mut HashMap<SymbolId, Scalar>,
+) -> Option<ProtectedScalarValue> {
+    let left = eval_protected_scalar_expression(&binary.left, semantic, env)?;
+    let right = eval_protected_scalar_expression(&binary.right, semantic, env)?;
+    let (ProtectedScalarValue::Known(left), ProtectedScalarValue::Known(right)) = (left, right)
+    else {
+        return Some(ProtectedScalarValue::Unknown);
+    };
+    let value = match binary.operator.as_str() {
+        "==" | "===" => i64::from(match (left, right) {
+            (Scalar::Undefined, Scalar::Undefined) => true,
+            (Scalar::Int(left), Scalar::Int(right)) => left == right,
+            _ => false,
+        }),
+        "!=" | "!==" => i64::from(match (left, right) {
+            (Scalar::Undefined, Scalar::Undefined) => false,
+            (Scalar::Int(left), Scalar::Int(right)) => left != right,
+            _ => true,
+        }),
+        _ => return None,
+    };
+    Some(ProtectedScalarValue::Known(Scalar::Int(value)))
+}
+
 fn eval_protected_scalar_expression(
     expression: &Expression<'_>,
     semantic: &Semantic<'_>,
@@ -2699,29 +2735,7 @@ fn eval_protected_scalar_expression(
                 _ => None,
             }
         }
-        Expression::BinaryExpression(binary) => {
-            let left = eval_protected_scalar_expression(&binary.left, semantic, env)?;
-            let right = eval_protected_scalar_expression(&binary.right, semantic, env)?;
-            let (ProtectedScalarValue::Known(left), ProtectedScalarValue::Known(right)) =
-                (left, right)
-            else {
-                return Some(ProtectedScalarValue::Unknown);
-            };
-            let value = match binary.operator.as_str() {
-                "==" | "===" => i64::from(match (left, right) {
-                    (Scalar::Undefined, Scalar::Undefined) => true,
-                    (Scalar::Int(left), Scalar::Int(right)) => left == right,
-                    _ => false,
-                }),
-                "!=" | "!==" => i64::from(match (left, right) {
-                    (Scalar::Undefined, Scalar::Undefined) => false,
-                    (Scalar::Int(left), Scalar::Int(right)) => left != right,
-                    _ => true,
-                }),
-                _ => return None,
-            };
-            Some(ProtectedScalarValue::Known(Scalar::Int(value)))
-        }
+        Expression::BinaryExpression(binary) => eval_protected_binary(binary, semantic, env),
         Expression::ConditionalExpression(conditional) => {
             let ProtectedScalarValue::Known(test) =
                 eval_protected_scalar_expression(&conditional.test, semantic, env)?
@@ -3384,6 +3398,112 @@ pub fn prove_detected_if_ladder_event_before_barriers(
     })
 }
 
+struct IfLadderMachineCollector<'s, 'p, F> {
+    source: &'s str,
+    detection_scope: &'static str,
+    event: Span,
+    prove: &'p mut F,
+    matches: usize,
+    result: bool,
+}
+
+impl<F> IfLadderMachineCollector<'_, '_, F> {
+    fn consider<'a>(&mut self, machine: &IfLadderStateMachineCandidate, body: &Statement<'a>)
+    where
+        F: FnMut(&IfLadderStateMachineCandidate, &Statement<'a>) -> bool,
+    {
+        if machine.start <= self.event.start && self.event.end <= machine.end {
+            self.matches += 1;
+            self.result = (self.prove)(machine, body);
+        }
+    }
+
+    fn scan_statement_list<'a>(&mut self, statements: &[Statement<'a>])
+    where
+        F: FnMut(&IfLadderStateMachineCandidate, &Statement<'a>) -> bool,
+    {
+        for pair in statements.windows(2) {
+            let [init, Statement::WhileStatement(while_statement)] = pair else {
+                continue;
+            };
+            let Some(machine) = detect_while_state_machine(
+                self.source,
+                self.detection_scope,
+                init,
+                while_statement,
+            ) else {
+                continue;
+            };
+            self.consider(&machine, &while_statement.body);
+        }
+    }
+}
+
+impl<'a, F: FnMut(&IfLadderStateMachineCandidate, &Statement<'a>) -> bool> Visit<'a>
+    for IfLadderMachineCollector<'_, '_, F>
+{
+    fn visit_function_body(&mut self, body: &FunctionBody<'a>) {
+        self.scan_statement_list(&body.statements);
+        walk::walk_function_body(self, body);
+    }
+
+    fn visit_block_statement(&mut self, block: &oxc_ast::ast::BlockStatement<'a>) {
+        self.scan_statement_list(&block.body);
+        walk::walk_block_statement(self, block);
+    }
+
+    fn visit_for_statement(&mut self, statement: &ForStatement<'a>) {
+        let detected = detect_for_state_machines(self.source, self.detection_scope, statement);
+        for machine in detected.if_ladder_machines {
+            self.consider(&machine, &statement.body);
+        }
+        walk::walk_for_statement(self, statement);
+    }
+
+    fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+    fn visit_arrow_function_expression(
+        &mut self,
+        _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+    ) {
+    }
+}
+
+struct IfLadderFunctionHarness<'s, 'p, F> {
+    source: &'s str,
+    function_start: u32,
+    function_end: u32,
+    detection_scope: &'static str,
+    event: Span,
+    prove: &'p mut F,
+    result: Option<bool>,
+}
+
+impl<'a, F: FnMut(&IfLadderStateMachineCandidate, &Statement<'a>) -> bool> Visit<'a>
+    for IfLadderFunctionHarness<'_, '_, F>
+{
+    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        if self.result.is_some() {
+            return;
+        }
+        if function.span.start == self.function_start && function.span.end == self.function_end {
+            self.result = Some(function.body.as_ref().is_some_and(|body| {
+                let mut collector = IfLadderMachineCollector {
+                    source: self.source,
+                    detection_scope: self.detection_scope,
+                    event: self.event,
+                    prove: &mut *self.prove,
+                    matches: 0,
+                    result: false,
+                };
+                collector.visit_function_body(body);
+                collector.matches == 1 && collector.result
+            }));
+            return;
+        }
+        walk::walk_function(self, function, flags);
+    }
+}
+
 // Find a unique flattened loop in exactly one function, without entering
 // nested functions. Each proof supplies its own detection scope and obligations;
 // both use identical for/while traversal and fail closed on ambiguous matches.
@@ -3396,114 +3516,7 @@ fn prove_function_if_ladder_machine<'a>(
     detection_scope: &'static str,
     mut prove: impl FnMut(&IfLadderStateMachineCandidate, &Statement<'a>) -> bool,
 ) -> bool {
-    struct MachineCollector<'s, 'p, F> {
-        source: &'s str,
-        detection_scope: &'static str,
-        event: Span,
-        prove: &'p mut F,
-        matches: usize,
-        result: bool,
-    }
-
-    impl<F> MachineCollector<'_, '_, F> {
-        fn consider<'a>(&mut self, machine: &IfLadderStateMachineCandidate, body: &Statement<'a>)
-        where
-            F: FnMut(&IfLadderStateMachineCandidate, &Statement<'a>) -> bool,
-        {
-            if machine.start <= self.event.start && self.event.end <= machine.end {
-                self.matches += 1;
-                self.result = (self.prove)(machine, body);
-            }
-        }
-
-        fn scan_statement_list<'a>(&mut self, statements: &[Statement<'a>])
-        where
-            F: FnMut(&IfLadderStateMachineCandidate, &Statement<'a>) -> bool,
-        {
-            for pair in statements.windows(2) {
-                let [init, Statement::WhileStatement(while_statement)] = pair else {
-                    continue;
-                };
-                let Some(machine) = detect_while_state_machine(
-                    self.source,
-                    self.detection_scope,
-                    init,
-                    while_statement,
-                ) else {
-                    continue;
-                };
-                self.consider(&machine, &while_statement.body);
-            }
-        }
-    }
-
-    impl<'a, F: FnMut(&IfLadderStateMachineCandidate, &Statement<'a>) -> bool> Visit<'a>
-        for MachineCollector<'_, '_, F>
-    {
-        fn visit_function_body(&mut self, body: &FunctionBody<'a>) {
-            self.scan_statement_list(&body.statements);
-            walk::walk_function_body(self, body);
-        }
-
-        fn visit_block_statement(&mut self, block: &oxc_ast::ast::BlockStatement<'a>) {
-            self.scan_statement_list(&block.body);
-            walk::walk_block_statement(self, block);
-        }
-
-        fn visit_for_statement(&mut self, statement: &ForStatement<'a>) {
-            let detected = detect_for_state_machines(self.source, self.detection_scope, statement);
-            for machine in detected.if_ladder_machines {
-                self.consider(&machine, &statement.body);
-            }
-            walk::walk_for_statement(self, statement);
-        }
-
-        fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
-        fn visit_arrow_function_expression(
-            &mut self,
-            _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
-        ) {
-        }
-    }
-
-    struct FunctionHarness<'s, 'p, F> {
-        source: &'s str,
-        function_start: u32,
-        function_end: u32,
-        detection_scope: &'static str,
-        event: Span,
-        prove: &'p mut F,
-        result: Option<bool>,
-    }
-
-    impl<'a, F: FnMut(&IfLadderStateMachineCandidate, &Statement<'a>) -> bool> Visit<'a>
-        for FunctionHarness<'_, '_, F>
-    {
-        fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
-            if self.result.is_some() {
-                return;
-            }
-            if function.span.start == self.function_start && function.span.end == self.function_end
-            {
-                self.result = Some(function.body.as_ref().is_some_and(|body| {
-                    let mut collector = MachineCollector {
-                        source: self.source,
-                        detection_scope: self.detection_scope,
-                        event: self.event,
-                        prove: &mut *self.prove,
-                        matches: 0,
-                        result: false,
-                    };
-                    collector.visit_function_body(body);
-                    collector.matches == 1 && collector.result
-                }));
-                return;
-            }
-            walk::walk_function(self, function, flags);
-        }
-    }
-
-    let mut harness = FunctionHarness {
+    let mut harness = IfLadderFunctionHarness {
         source,
         function_start,
         function_end,
@@ -3833,6 +3846,50 @@ impl Scalar {
     }
 }
 
+fn eval_scalar_binary(operator: &str, left: Scalar, right: Scalar) -> Option<Scalar> {
+    match operator {
+        "==" | "===" => Some(Scalar::Int(i64::from(match (left, right) {
+            (Scalar::Undefined, Scalar::Undefined) => true,
+            (Scalar::Int(left), Scalar::Int(right)) => left == right,
+            _ => false,
+        }))),
+        "!=" | "!==" => Some(Scalar::Int(i64::from(match (left, right) {
+            (Scalar::Undefined, Scalar::Undefined) => false,
+            (Scalar::Int(left), Scalar::Int(right)) => left != right,
+            _ => true,
+        }))),
+        "<" => match (left.int(), right.int()) {
+            (Some(left), Some(right)) => Some(Scalar::Int(i64::from(left < right))),
+            _ => None,
+        },
+        "<=" => match (left.int(), right.int()) {
+            (Some(left), Some(right)) => Some(Scalar::Int(i64::from(left <= right))),
+            _ => None,
+        },
+        ">" => match (left.int(), right.int()) {
+            (Some(left), Some(right)) => Some(Scalar::Int(i64::from(left > right))),
+            _ => None,
+        },
+        ">=" => match (left.int(), right.int()) {
+            (Some(left), Some(right)) => Some(Scalar::Int(i64::from(left >= right))),
+            _ => None,
+        },
+        op @ ("&" | "|" | "^" | "<<" | ">>" | ">>>") => match (left.int(), right.int()) {
+            (Some(left), Some(right)) => eval_js_bitwise_i64(op, left, right).map(Scalar::Int),
+            _ => None,
+        },
+        "+" => match (left.int(), right.int()) {
+            (Some(left), Some(right)) => Some(Scalar::Int(left.wrapping_add(right))),
+            _ => None,
+        },
+        "-" => match (left.int(), right.int()) {
+            (Some(left), Some(right)) => Some(Scalar::Int(left.wrapping_sub(right))),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn eval_expr_impl(
     expr: &Expression<'_>,
     env: &HashMap<String, Scalar>,
@@ -3876,49 +3933,7 @@ fn eval_expr_impl(
             let Some(right) = eval_expr_impl(&binary.right, env, budget)? else {
                 return Ok(None);
             };
-            match binary.operator.as_str() {
-                "==" | "===" => Some(Scalar::Int(i64::from(match (left, right) {
-                    (Scalar::Undefined, Scalar::Undefined) => true,
-                    (Scalar::Int(left), Scalar::Int(right)) => left == right,
-                    _ => false,
-                }))),
-                "!=" | "!==" => Some(Scalar::Int(i64::from(match (left, right) {
-                    (Scalar::Undefined, Scalar::Undefined) => false,
-                    (Scalar::Int(left), Scalar::Int(right)) => left != right,
-                    _ => true,
-                }))),
-                "<" => match (left.int(), right.int()) {
-                    (Some(left), Some(right)) => Some(Scalar::Int(i64::from(left < right))),
-                    _ => None,
-                },
-                "<=" => match (left.int(), right.int()) {
-                    (Some(left), Some(right)) => Some(Scalar::Int(i64::from(left <= right))),
-                    _ => None,
-                },
-                ">" => match (left.int(), right.int()) {
-                    (Some(left), Some(right)) => Some(Scalar::Int(i64::from(left > right))),
-                    _ => None,
-                },
-                ">=" => match (left.int(), right.int()) {
-                    (Some(left), Some(right)) => Some(Scalar::Int(i64::from(left >= right))),
-                    _ => None,
-                },
-                op @ ("&" | "|" | "^" | "<<" | ">>" | ">>>") => match (left.int(), right.int()) {
-                    (Some(left), Some(right)) => {
-                        eval_js_bitwise_i64(op, left, right).map(Scalar::Int)
-                    }
-                    _ => None,
-                },
-                "+" => match (left.int(), right.int()) {
-                    (Some(left), Some(right)) => Some(Scalar::Int(left.wrapping_add(right))),
-                    _ => None,
-                },
-                "-" => match (left.int(), right.int()) {
-                    (Some(left), Some(right)) => Some(Scalar::Int(left.wrapping_sub(right))),
-                    _ => None,
-                },
-                _ => None,
-            }
+            eval_scalar_binary(binary.operator.as_str(), left, right)
         }
         Expression::LogicalExpression(logical) => {
             let Some(left) = eval_expr_impl(&logical.left, env, budget)? else {
@@ -4216,6 +4231,81 @@ fn record_ambiguous_effect(
     semantic.push(slice(source, span));
 }
 
+fn exec_control_assignment(
+    assignment: &oxc_ast::ast::AssignmentExpression<'_>,
+    source: &str,
+    env: &mut HashMap<String, Scalar>,
+    semantic: &mut Vec<String>,
+    ambiguous_envs: &mut Vec<HashMap<String, Scalar>>,
+    budget: Option<&WorkBudget>,
+) -> Result<ExecStatus, BudgetExceeded> {
+    Ok(
+        if let Some(target) = assignment.left.get_identifier_name() {
+            if let Some(value) = eval_expr_impl(&assignment.right, env, budget)? {
+                env.insert(target.to_string(), value);
+            } else if expression_definitely_throws_impl(&assignment.right, env, budget)? {
+                return Ok(ExecStatus::Throw);
+            } else {
+                record_ambiguous_effect(source, assignment.span, env, semantic, ambiguous_envs);
+                env.remove(target);
+            }
+            ExecStatus::Normal
+        } else if expression_definitely_throws_impl(&assignment.right, env, budget)? {
+            ExecStatus::Throw
+        } else {
+            record_ambiguous_effect(source, assignment.span, env, semantic, ambiguous_envs);
+            ExecStatus::Normal
+        },
+    )
+}
+
+fn exec_control_logical(
+    logical: &oxc_ast::ast::LogicalExpression<'_>,
+    source: &str,
+    env: &mut HashMap<String, Scalar>,
+    semantic: &mut Vec<String>,
+    ambiguous_envs: &mut Vec<HashMap<String, Scalar>>,
+    budget: Option<&WorkBudget>,
+) -> Result<ExecStatus, BudgetExceeded> {
+    if expression_definitely_throws_impl(&logical.left, env, budget)? {
+        return Ok(ExecStatus::Throw);
+    }
+    Ok(
+        if let Some(left) = eval_expr_impl(&logical.left, env, budget)? {
+            match logical.operator.as_str() {
+                "&&" if left.truthy() => {
+                    return exec_control_expr_impl(
+                        &logical.right,
+                        source,
+                        env,
+                        semantic,
+                        ambiguous_envs,
+                        budget,
+                    );
+                }
+                "||" if !left.truthy() => {
+                    return exec_control_expr_impl(
+                        &logical.right,
+                        source,
+                        env,
+                        semantic,
+                        ambiguous_envs,
+                        budget,
+                    );
+                }
+                "&&" | "||" => ExecStatus::Normal,
+                _ => {
+                    record_ambiguous_effect(source, logical.span, env, semantic, ambiguous_envs);
+                    ExecStatus::Normal
+                }
+            }
+        } else {
+            record_ambiguous_effect(source, logical.span, env, semantic, ambiguous_envs);
+            ExecStatus::Normal
+        },
+    )
+}
+
 fn exec_control_expr_impl(
     expr: &Expression<'_>,
     source: &str,
@@ -4255,22 +4345,7 @@ fn exec_control_expr_impl(
             ExecStatus::Normal
         }
         Expression::AssignmentExpression(assignment) if assignment.operator.is_assign() => {
-            if let Some(target) = assignment.left.get_identifier_name() {
-                if let Some(value) = eval_expr_impl(&assignment.right, env, budget)? {
-                    env.insert(target.to_string(), value);
-                } else if expression_definitely_throws_impl(&assignment.right, env, budget)? {
-                    return Ok(ExecStatus::Throw);
-                } else {
-                    record_ambiguous_effect(source, assignment.span, env, semantic, ambiguous_envs);
-                    env.remove(target);
-                }
-                ExecStatus::Normal
-            } else if expression_definitely_throws_impl(&assignment.right, env, budget)? {
-                ExecStatus::Throw
-            } else {
-                record_ambiguous_effect(source, assignment.span, env, semantic, ambiguous_envs);
-                ExecStatus::Normal
-            }
+            exec_control_assignment(assignment, source, env, semantic, ambiguous_envs, budget)?
         }
         Expression::ConditionalExpression(conditional) => {
             if expression_definitely_throws_impl(&conditional.test, env, budget)? {
@@ -4295,47 +4370,7 @@ fn exec_control_expr_impl(
             ExecStatus::Normal
         }
         Expression::LogicalExpression(logical) => {
-            if expression_definitely_throws_impl(&logical.left, env, budget)? {
-                return Ok(ExecStatus::Throw);
-            }
-            if let Some(left) = eval_expr_impl(&logical.left, env, budget)? {
-                match logical.operator.as_str() {
-                    "&&" if left.truthy() => {
-                        return exec_control_expr_impl(
-                            &logical.right,
-                            source,
-                            env,
-                            semantic,
-                            ambiguous_envs,
-                            budget,
-                        );
-                    }
-                    "||" if !left.truthy() => {
-                        return exec_control_expr_impl(
-                            &logical.right,
-                            source,
-                            env,
-                            semantic,
-                            ambiguous_envs,
-                            budget,
-                        );
-                    }
-                    "&&" | "||" => ExecStatus::Normal,
-                    _ => {
-                        record_ambiguous_effect(
-                            source,
-                            logical.span,
-                            env,
-                            semantic,
-                            ambiguous_envs,
-                        );
-                        ExecStatus::Normal
-                    }
-                }
-            } else {
-                record_ambiguous_effect(source, logical.span, env, semantic, ambiguous_envs);
-                ExecStatus::Normal
-            }
+            exec_control_logical(logical, source, env, semantic, ambiguous_envs, budget)?
         }
         _ if expression_definitely_throws_impl(expr, env, budget)? => ExecStatus::Throw,
         _ => {
