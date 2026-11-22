@@ -101,9 +101,103 @@ pub(crate) fn fenced_code(value: &str, language: &str) -> String {
     format!("{fence}{language}\n{value}\n{fence}\n")
 }
 
+/// Keep only a bounded UTF-8 scalar prefix of a JSON serialization. The
+/// serializer supplies valid UTF-8, but may split writes at any byte.
+struct JsonPrefix {
+    bytes: Vec<u8>,
+    remaining: usize,
+    clipped: bool,
+}
+
+impl std::io::Write for JsonPrefix {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut end = buf.len();
+        for (index, &byte) in buf.iter().enumerate() {
+            // UTF-8 continuation bytes belong to an already counted scalar.
+            if byte & 0xc0 != 0x80 {
+                if self.remaining == 0 {
+                    end = index;
+                    break;
+                }
+                self.remaining -= 1;
+            }
+        }
+        if end == 0 && !buf.is_empty() {
+            self.clipped = true;
+            return Err(std::io::Error::other("JSON preview limit reached"));
+        }
+        self.bytes.extend_from_slice(&buf[..end]);
+        Ok(end)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Pretty-print a value without materializing the discarded serialization.
+/// Returns the same prefix as clipping the full pretty-printed string.
+pub(crate) fn json_preview(
+    value: &serde_json::Value,
+    cap: usize,
+) -> anyhow::Result<(String, bool)> {
+    let mut prefix = JsonPrefix {
+        bytes: Vec::new(),
+        remaining: cap,
+        clipped: false,
+    };
+    match serde_json::to_writer_pretty(&mut prefix, value) {
+        Ok(()) => {}
+        Err(error) if prefix.clipped && error.is_io() => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok((String::from_utf8(prefix.bytes)?, prefix.clipped))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_preview_matches_full_serialization_at_every_boundary() -> anyhow::Result<()> {
+        let values = [
+            serde_json::json!(null),
+            serde_json::json!(true),
+            serde_json::json!("a💡é中\n\t\"\\"),
+            serde_json::json!({"nested": [1, null, "🦀", {"é": "中"}]}),
+        ];
+        for value in values {
+            let full = serde_json::to_string_pretty(&value)?;
+            for cap in 0..=full.len() + 1 {
+                let (expected, clipped) = crate::source_text::clip_chars(&full, cap);
+                assert_eq!(json_preview(&value, cap)?, (expected.to_owned(), clipped));
+            }
+        }
+        let long = serde_json::json!(["💡".repeat(100_000), "unused tail"]);
+        let (prefix, clipped) = json_preview(&long, 16_000)?;
+        assert_eq!(prefix.chars().count(), 16_000);
+        assert!(clipped);
+        assert!(prefix.len() <= 64_000);
+        Ok(())
+    }
+
+    #[test]
+    fn json_prefix_preserves_split_utf8_scalars() -> anyhow::Result<()> {
+        use std::io::Write as _;
+        let mut prefix = JsonPrefix {
+            bytes: Vec::new(),
+            remaining: 1,
+            clipped: false,
+        };
+        for byte in "💡".bytes() {
+            prefix.write_all(&[byte])?;
+        }
+        assert!(!prefix.clipped);
+        assert!(prefix.write_all(b"x").is_err());
+        assert!(prefix.clipped);
+        assert_eq!(String::from_utf8(prefix.bytes)?, "💡");
+        Ok(())
+    }
 
     #[test]
     fn code_spans_handle_delimiters_empty_text_and_padding() {
