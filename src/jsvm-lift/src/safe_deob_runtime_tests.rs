@@ -741,6 +741,23 @@ fn depythonify_safe_deob_direct_decoder_runtime_equivalence() -> Result<()> {
     script_runtime_equivalence(&sources, "direct-decoder", true)
 }
 
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_provider_runtime_equivalence() -> Result<()> {
+    let sources = [
+        "function p(){var t=['a','b'];p=function(){return t;};return p();}function d(i,t,v){return i=i-16,t=p(),v=t[i],v;}[d(16),d(17)];",
+        "function p(){var t=['a','b'];events.push('init');p=function(){return t;};return p();}function d(i,t,v){return i=i-16,t=p(),v=t[i],v;}[d(16),d(17)];",
+        "function p(){var t=['a','b'];p=function(){events.push('read');return t;};return p();}function d(i,t,v){return i=i-16,t=p(),v=t[i],v;}[d(16),d(17)];",
+        "function p(){var t=['a','b'];p=function(){return t;};return p();}function d(i,t,v){return i=i-16,t=p(),v=t[i],v;}p()[0]='z';d(16);",
+        "function p(){var t=['a','b'];p=function(){return t;};return p();}function d(i,t,v){return i=i-16,t=p(),v=t[i],v;}const escaped=p;escaped()[0]='z';d(16);",
+        "function p(){var t=['a','b'];p=function(){return t;};return p();}function d(i,t,v){return i=i-16,t=p(),v=t[i],v;}{let p=[];(function(a,n){return n})(p,4);}d(16);",
+        "function p(){var t=['a','b'];p=function(){return t;};return p();}function d(i,t,v){return i=i-16,t=p(),v=t[i],v;}p=()=>['z'];d(16);",
+        "function p(){var t=['a','b'];p=function(){return t;};return p();}function d(i,t,v){return i=i-16,t=p(),v=t[i],v;}eval(\"p=()=>['z']\");d(16);",
+        "function p(){var t=['11','22','33'];p=function(){return t;};return p();}function d(i,t,v){return i=i-0,t=p(),v=t[i],v;}function e(i,t,v){return i=i-0,t=p(),v=t[i],v;}(function(provider,target){var alias=d,table=provider();while(true){try{var checksum=parseInt(alias(0));if(checksum===target)break;else table.push(table.shift());}catch(err){table.push(table.shift());}}})(p,22);[d(0),e(0),e(1)];",
+    ];
+    script_runtime_equivalence(&sources, "provider", false)
+}
+
 fn script_runtime_equivalence(sources: &[&str], suite: &str, browser_globals: bool) -> Result<()> {
     let scratch = TempDir::new()?;
     // Browser decoders assume standard atob. Node's isolated VM does not
