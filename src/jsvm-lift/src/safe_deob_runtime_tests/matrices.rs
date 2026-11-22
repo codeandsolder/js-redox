@@ -377,3 +377,20 @@ fn unicode_boundary_sources() -> Result<Vec<String>> {
 fn depythonify_safe_deob_unicode_boundary_matrix() -> Result<()> {
     compare_sources("unicode-boundary-matrix", unicode_boundary_sources()?)
 }
+
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_literal_type_facts_runtime_equivalence() -> Result<()> {
+    compare_sources(
+        "literal-type-facts",
+        [
+            "events.push(typeof (2 ** 1.5), typeof (2 ** 1.5 + 'x'), typeof (2 ** 1.5 < 3)); void (2 ** 1.5);",
+            "events.push(typeof /x/, typeof [2 ** 1.5], typeof (1n), typeof (2 ** 1.5 ? null : {})); void (1n);",
+            "function effect(){events.push('called'); return 7;} events.push(typeof function(x=effect()){effect()}, typeof (()=>effect())); !(/x/);",
+            "events.push(!(2 ** 1.5 ? [] : function(){}), !(2 ** 1.5 ? null : void 0)); typeof ((2 ** 1.5 ? 0 : 'x') + 'y');",
+            "function effect(){events.push('called'); return 7;} events.push(typeof [effect()]); void effect();",
+            "try{void (1n/0n)}catch(e){events.push(e.name)} try{typeof (1n+1)}catch(e){events.push(e.name)} typeof (2 ** 1.5);",
+            "function effect(){events.push('base'); return class {}} events.push(typeof (class extends effect() {})); void ({}+1);",
+        ].into_iter().map(str::to_owned).collect(),
+    )
+}

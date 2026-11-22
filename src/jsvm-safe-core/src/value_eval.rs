@@ -285,80 +285,147 @@ pub fn inert_literal_value(expr: &Expression<'_>) -> bool {
     inert_literal_kind(expr).is_some()
 }
 
+/// Possible result types of an already proven nonthrowing literal expression.
+///
+/// A union retains type uncertainty without requiring a constant value.
+/// No member of the set implies an effectful coercion is safe.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum InertKind {
-    /// A primitive accepted by ordinary primitive numeric/string coercion, including
-    /// strings with lone surrogates and unknown approximated numeric results.
-    NonBigIntPrimitive,
-    /// An inert value that may be `BigInt` or an object. Its coercion might
-    /// throw or call user code even though obtaining the value is inert.
-    Other,
-}
+struct LiteralTypes(u8);
 
-impl InertKind {
-    const fn join(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::NonBigIntPrimitive, Self::NonBigIntPrimitive) => Self::NonBigIntPrimitive,
-            _ => Self::Other,
+impl LiteralTypes {
+    const NUMBER: Self = Self(1 << 0);
+    const STRING: Self = Self(1 << 1);
+    const BOOLEAN: Self = Self(1 << 2);
+    const NULL: Self = Self(1 << 3);
+    const UNDEFINED: Self = Self(1 << 4);
+    const BIGINT: Self = Self(1 << 5);
+    const OBJECT: Self = Self(1 << 6);
+    const FUNCTION: Self = Self(1 << 7);
+    const ORDINARY_PRIMITIVE: Self =
+        Self(Self::NUMBER.0 | Self::STRING.0 | Self::BOOLEAN.0 | Self::NULL.0 | Self::UNDEFINED.0);
+    const OBJECT_TYPEOF: Self = Self(Self::NULL.0 | Self::OBJECT.0);
+
+    const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    const fn subset_of(self, other: Self) -> bool {
+        self.0 & !other.0 == 0
+    }
+
+    const fn includes(self, other: Self) -> bool {
+        self.0 & other.0 != 0
+    }
+
+    const fn typeof_name(self) -> Option<&'static str> {
+        if self.subset_of(Self::OBJECT_TYPEOF) {
+            return Some("object");
+        }
+        match self {
+            Self::NUMBER => Some("number"),
+            Self::STRING => Some("string"),
+            Self::BOOLEAN => Some("boolean"),
+            Self::UNDEFINED => Some("undefined"),
+            Self::BIGINT => Some("bigint"),
+            Self::FUNCTION => Some("function"),
+            _ => None,
+        }
+    }
+
+    const fn truthiness(self) -> Option<bool> {
+        if self.subset_of(Self::OBJECT.union(Self::FUNCTION)) {
+            Some(true)
+        } else if self.subset_of(Self::NULL.union(Self::UNDEFINED)) {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    /// Addition of ordinary primitives may concatenate or add numbers.
+    fn addition(self, other: Self) -> Self {
+        if self == Self::STRING || other == Self::STRING {
+            Self::STRING
+        } else if self.includes(Self::STRING) || other.includes(Self::STRING) {
+            Self::STRING.union(Self::NUMBER)
+        } else {
+            Self::NUMBER
         }
     }
 }
 
-fn inert_literal_kind(expr: &Expression<'_>) -> Option<InertKind> {
-    use InertKind::{NonBigIntPrimitive, Other};
+fn inert_literal_kind(expr: &Expression<'_>) -> Option<LiteralTypes> {
     match expr {
-        Expression::StringLiteral(_)
-        | Expression::NumericLiteral(_)
-        | Expression::NullLiteral(_)
-        | Expression::BooleanLiteral(_) => Some(NonBigIntPrimitive),
-        Expression::BigIntLiteral(_) | Expression::RegExpLiteral(_) => Some(Other),
+        Expression::StringLiteral(_) => Some(LiteralTypes::STRING),
+        Expression::NumericLiteral(_) => Some(LiteralTypes::NUMBER),
+        Expression::NullLiteral(_) => Some(LiteralTypes::NULL),
+        Expression::BooleanLiteral(_) => Some(LiteralTypes::BOOLEAN),
+        Expression::BigIntLiteral(_) => Some(LiteralTypes::BIGINT),
+        Expression::RegExpLiteral(_) => Some(LiteralTypes::OBJECT),
+        // Creating a function does not execute its parameters or body.
+        Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_) => {
+            Some(LiteralTypes::FUNCTION)
+        }
         Expression::TemplateLiteral(template) => template
             .expressions
             .iter()
-            .all(|expression| inert_literal_kind(expression) == Some(NonBigIntPrimitive))
-            .then_some(NonBigIntPrimitive),
+            .all(|expression| {
+                inert_literal_kind(expression).is_some_and(|kind| {
+                    kind.subset_of(LiteralTypes::ORDINARY_PRIMITIVE.union(LiteralTypes::BIGINT))
+                })
+            })
+            .then_some(LiteralTypes::STRING),
         Expression::ArrayExpression(array) => array
             .elements
             .iter()
             .all(inert_array_element)
-            .then_some(Other),
-        Expression::ObjectExpression(object) => object.properties.is_empty().then_some(Other),
+            .then_some(LiteralTypes::OBJECT),
+        Expression::ObjectExpression(object) => {
+            object.properties.is_empty().then_some(LiteralTypes::OBJECT)
+        }
         Expression::ParenthesizedExpression(paren) => inert_literal_kind(&paren.expression),
         Expression::UnaryExpression(unary) => {
             let kind = inert_literal_kind(&unary.argument)?;
             match unary.operator.as_str() {
-                "!" | "void" | "typeof" => Some(NonBigIntPrimitive),
-                "+" | "-" | "~" if kind == NonBigIntPrimitive => Some(NonBigIntPrimitive),
+                "!" => Some(LiteralTypes::BOOLEAN),
+                "void" => Some(LiteralTypes::UNDEFINED),
+                "typeof" => Some(LiteralTypes::STRING),
+                "+" | "-" | "~" if kind.subset_of(LiteralTypes::ORDINARY_PRIMITIVE) => {
+                    Some(LiteralTypes::NUMBER)
+                }
                 _ => None,
             }
         }
         Expression::BinaryExpression(binary) => {
             let left = inert_literal_kind(&binary.left)?;
             let right = inert_literal_kind(&binary.right)?;
+            let ordinary = left
+                .union(right)
+                .subset_of(LiteralTypes::ORDINARY_PRIMITIVE);
             match binary.operator.as_str() {
-                "===" | "!==" => Some(NonBigIntPrimitive),
-                // Coercion of ordinary primitive values has no callbacks or
-                // language-level arithmetic errors. This must not be extended
-                // to arbitrary BigInts or object operands.
-                "+" | "-" | "*" | "/" | "%" | "**" | "<<" | ">>" | ">>>" | "&" | "|" | "^"
-                | "==" | "!=" | "<" | "<=" | ">" | ">="
-                    if left == NonBigIntPrimitive && right == NonBigIntPrimitive =>
+                "===" | "!==" => Some(LiteralTypes::BOOLEAN),
+                // Ordinary primitive coercion cannot invoke user callbacks
+                // or cause language-level arithmetic errors.
+                "+" if ordinary => Some(left.addition(right)),
+                "-" | "*" | "/" | "%" | "**" | "<<" | ">>" | ">>>" | "&" | "|" | "^"
+                    if ordinary =>
                 {
-                    Some(NonBigIntPrimitive)
+                    Some(LiteralTypes::NUMBER)
                 }
+                "==" | "!=" | "<" | "<=" | ">" | ">=" if ordinary => Some(LiteralTypes::BOOLEAN),
                 _ => None,
             }
         }
         Expression::LogicalExpression(logical) => {
             let left = inert_literal_kind(&logical.left)?;
             let right = inert_literal_kind(&logical.right)?;
-            Some(left.join(right))
+            Some(left.union(right))
         }
         Expression::ConditionalExpression(conditional) => {
             inert_literal_kind(&conditional.test)?;
             let yes = inert_literal_kind(&conditional.consequent)?;
             let no = inert_literal_kind(&conditional.alternate)?;
-            Some(yes.join(no))
+            Some(yes.union(no))
         }
         Expression::SequenceExpression(sequence) => {
             let mut expressions = sequence.expressions.iter();
@@ -384,12 +451,7 @@ where
     if let Some(v) = eval_with_resolver(expr, resolve) {
         return Some(v.truthy());
     }
-    match expr {
-        Expression::ArrayExpression(v) if v.elements.iter().all(inert_array_element) => Some(true),
-        Expression::ObjectExpression(v) if v.properties.is_empty() => Some(true),
-        Expression::ParenthesizedExpression(v) => known_bool_with_resolver(&v.expression, resolve),
-        _ => None,
-    }
+    inert_literal_kind(expr)?.truthiness()
 }
 
 pub fn eval_unary(v: &UnaryExpression<'_>) -> Option<Value> {
@@ -424,6 +486,16 @@ where
     let op = v.operator.as_str();
     if op == "!" {
         return known_bool_with_resolver(&v.argument, resolve).map(|x| Value::Bool(!x));
+    }
+    if matches!(op, "void" | "typeof") {
+        if let Some(kind) = inert_literal_kind(&v.argument) {
+            if op == "void" {
+                return Some(Value::Undefined);
+            }
+            if let Some(name) = kind.typeof_name() {
+                return Some(Value::String(name.into()));
+            }
+        }
     }
     let value = eval_with_resolver(&v.argument, resolve)?;
     eval_unary_value(op, &value)
@@ -693,6 +765,59 @@ mod tests {
             if expression == "2 ** 1.5" {
                 assert!(super::eval(&statement.expression).is_none());
             }
+        }
+    }
+
+    #[test]
+    fn literal_type_and_discard_proofs_do_not_need_exact_values() {
+        use oxc_allocator::Allocator;
+        use oxc_ast::ast::Statement;
+        use oxc_span::SourceType;
+
+        for (expression, expected) in [
+            ("typeof (2 ** 1.5)", Some(r#""number""#)),
+            ("typeof (2 ** 1.5 + 3)", Some(r#""number""#)),
+            ("typeof (2 ** 1.5 + 'x')", Some(r#""string""#)),
+            ("typeof (2 ** 1.5 < 3)", Some(r#""boolean""#)),
+            ("typeof (2 ** 1.5 ? null : {})", Some(r#""object""#)),
+            ("typeof (2 ** 1.5 ? 0 : 'x')", None),
+            ("typeof ((2 ** 1.5 ? 0 : 'x') + 'y')", Some(r#""string""#)),
+            ("typeof (void (2 ** 1.5))", Some(r#""undefined""#)),
+            ("typeof (1n)", Some(r#""bigint""#)),
+            (r"typeof '\ud800'", Some(r#""string""#)),
+            ("typeof /x/", Some(r#""object""#)),
+            (
+                "typeof (function f(x=effect()){effect()})",
+                Some(r#""function""#),
+            ),
+            ("typeof (()=>effect())", Some(r#""function""#)),
+            ("typeof [2 ** 1.5]", Some(r#""object""#)),
+            ("typeof ([], 2 ** 1.5)", Some(r#""number""#)),
+            ("void (2 ** 1.5)", Some("void 0")),
+            ("void (1n)", Some("void 0")),
+            ("void `value=${1n}`", Some("void 0")),
+            ("void [2 ** 1.5]", Some("void 0")),
+            ("!(/x/)", Some("false")),
+            ("!(2 ** 1.5 ? [] : function(){})", Some("false")),
+            ("!(2 ** 1.5 ? null : void 0)", Some("true")),
+            ("void (1n / 0n)", None),
+            ("typeof (1n + 1)", None),
+            ("void ({} + 1)", None),
+            ("typeof [effect()]", None),
+            ("void effect()", None),
+            ("typeof (class extends effect() {})", None),
+            ("typeof (unknown)", None),
+            ("void (1, effect())", None),
+        ] {
+            let allocator = Allocator::default();
+            let source = format!("({expression});");
+            let program = crate::parse_as(&allocator, &source, SourceType::cjs())
+                .unwrap_or_else(|| unreachable!("{source}"));
+            let [Statement::ExpressionStatement(statement)] = program.body.as_slice() else {
+                unreachable!("one expression");
+            };
+            let actual = super::eval(&statement.expression).and_then(|value| value.render());
+            assert_eq!(actual.as_deref(), expected, "{expression}");
         }
     }
 
