@@ -1,6 +1,7 @@
 //! Ordered lexical frame plans, initializer purity, and reference confinement.
 use super::super::{callables::ForwardedValue, *};
 use super::values::{known_array, ArgumentList, ValueBuilder, ValueFrame};
+use super::FrameContext;
 use oxc_ast::{
     ast::{
         Argument, ArrayExpressionElement, FormalParameters, Function, FunctionBody, Statement,
@@ -136,7 +137,7 @@ impl<'a> Wrapper<'a> {
     pub(super) fn returned_origin(
         &self,
         builder: &mut ValueBuilder<'_, 'a>,
-        collector: &Collector<'_, '_>,
+        collector: &FrameContext<'_, '_>,
     ) -> Result<Option<&'a Expression<'a>>> {
         let locals = self.symbols().collect::<BTreeSet<_>>();
         if !pure_initializer(self.body, builder, &locals, collector)? {
@@ -315,7 +316,7 @@ fn reference_requirements(
                     if !dispatch_member
                         && !member.optional
                         && member.object.span() == current
-                        && matches!(member.property.name.as_str(), "call" | "apply") =>
+                        && matches!(member.property.name.as_str(), "call" | "apply" | "bind") =>
                 {
                     dispatch_member = true;
                 }
@@ -325,7 +326,7 @@ fn reference_requirements(
                         && member.object.span() == current
                         && static_string(&member.expression, scoping, constants)
                             .as_deref()
-                            .is_some_and(|name| matches!(name, "call" | "apply")) =>
+                            .is_some_and(|name| matches!(name, "call" | "apply" | "bind")) =>
                 {
                     dispatch_member = true;
                 }
@@ -377,7 +378,7 @@ fn pure_initializer<'a>(
     expression: &'a Expression<'a>,
     builder: &mut ValueBuilder<'_, 'a>,
     all_locals: &BTreeSet<SymbolId>,
-    collector: &Collector<'_, '_>,
+    collector: &FrameContext<'_, '_>,
 ) -> Result<bool> {
     builder.budget.consume(1)?;
     let expr = unparenthesized(expression);
@@ -459,7 +460,7 @@ pub(super) fn instantiate<'a, 's>(
     wrapper: &Wrapper<'a>,
     args: &ArgumentList<'a>,
     proof: &FrameProof,
-    collector: &Collector<'_, 's>,
+    collector: &FrameContext<'_, 's>,
     limit: usize,
     budget: &'s WorkBudget,
 ) -> Result<Option<ValueBuilder<'s, 'a>>> {
