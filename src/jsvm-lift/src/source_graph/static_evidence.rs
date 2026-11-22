@@ -5,8 +5,8 @@
 //! derivative takes precedence over its original captured source.
 
 use super::{
-    array_field, bool_field, field, required_u64, runtime_evidence::runtime_node_id, string_field,
-    u64_field, GraphBuilder, InlineSourceIndex, RuntimeSourceGraphIndex,
+    array_field, bool_field, field, required_u64, runtime_evidence::captured_runtime_source,
+    string_field, u64_field, GraphBuilder, InlineSourceIndex,
 };
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
@@ -21,7 +21,6 @@ pub(super) fn seed_safe_deobfuscation_sources(
     graph: &mut GraphBuilder,
     deobfuscation: &Value,
     inline_nodes: &InlineSourceIndex,
-    runtime_index: &RuntimeSourceGraphIndex,
     budget: &WorkBudget,
 ) -> Result<BTreeMap<u64, String>> {
     // Safe static deobfuscation is a provenance-preserving source transform.
@@ -58,27 +57,21 @@ pub(super) fn seed_safe_deobfuscation_sources(
                 "runtime_semantics_preserved_by_design":unit.get("runtime_semantics_preserved_by_design").and_then(Value::as_bool).unwrap_or(true),
             }),
         )?;
-        let parent = string_field(unit, "raw_path")
-            .and_then(|raw| {
-                inline_nodes.for_record(unit).or_else(|| {
-                    // CDP runtime source bodies are not synthetic HTTP
-                    // resources. Connect their deobfuscation result to the
-                    // independently captured runtime-script node by exact
-                    // content-addressed identity, not a guessed URL.
-                    let digest = raw
-                        .strip_prefix("resources/runtime-scripts/")?
-                        .strip_suffix(".js")?;
-                    if string_field(unit, "input_sha256") != Some(digest)
-                        || !runtime_index.general_paths.contains_key(digest)
-                    {
-                        return None;
-                    }
-                    Some(runtime_node_id(digest))
-                })
-            })
-            .or_else(|| {
-                u64_field(unit, "resource_id").map(|resource_id| format!("resource:{resource_id}"))
-            });
+        let raw = string_field(unit, "raw_path");
+        let parent = if let Some(inline) = inline_nodes.for_record(unit) {
+            Some(inline)
+        } else if let Some(runtime_path) =
+            raw.and_then(|path| path.strip_prefix("resources/runtime-scripts/"))
+        {
+            // A declared runtime source is never a captured HTTP resource.
+            // Its source path and full input SHA must match an actual graph node.
+            runtime_path
+                .strip_suffix(".js")
+                .filter(|digest| string_field(unit, "input_sha256") == Some(*digest))
+                .and_then(|digest| captured_runtime_source(graph, digest))
+        } else {
+            u64_field(unit, "resource_id").map(|resource_id| format!("resource:{resource_id}"))
+        };
         if let Some(parent) = parent {
             graph.add_edge(
                 &parent,
@@ -299,10 +292,11 @@ mod tests {
         inline.insert("resources/inline.js", 7, 4, "inline:7:4".into())?;
         let runtime_sha = "a".repeat(64);
         let runtime_path = format!("resources/runtime-scripts/{runtime_sha}.js");
-        let runtime_index = RuntimeSourceGraphIndex {
-            instances: Default::default(),
-            general_paths: BTreeMap::from([(runtime_sha.clone(), runtime_path.clone())]),
-        };
+        graph.insert_node(
+            "runtime:aaaaaaaaaaaaaaaaaaaa",
+            json!({"type":"runtime_script","sha256":runtime_sha}),
+        )?;
+        let missing_sha = format!("{}{}", "a".repeat(20), "b".repeat(44));
         let units = json!({
             "units": [
                 {
@@ -319,6 +313,12 @@ mod tests {
                     "input_sha256": "different"
                 },
                 {
+                    "ordinal": 10, "exit": 0, "resource_id": 15,
+                    "raw_path": format!("resources/runtime-scripts/{missing_sha}.js"), "input_sha256":missing_sha
+                }, {
+                    "ordinal": 11, "exit": 0, "resource_id": 16,
+                    "raw_path": "resources/ordinary.js"
+                }, {
                     "ordinal": 9, "exit": 1, "resource_id": 14,
                     "raw_path": "resources/failure.js"
                 }
@@ -326,9 +326,8 @@ mod tests {
         });
         let budget = AnalysisBudgets::standard("static-evidence-test")
             .operation(AnalysisOperation::SourceGraph, "parents");
-        let nodes =
-            seed_safe_deobfuscation_sources(&mut graph, &units, &inline, &runtime_index, &budget)?;
-        assert_eq!(nodes.len(), 3);
+        let nodes = seed_safe_deobfuscation_sources(&mut graph, &units, &inline, &budget)?;
+        assert_eq!(nodes.len(), 5);
         assert!(!nodes.contains_key(&9));
         let edges = graph
             .edges()
@@ -344,7 +343,10 @@ mod tests {
         }));
         assert!(edges
             .iter()
-            .any(|edge| { edge["from"] == "resource:13" && edge["to"] == "deobfuscated:8" }));
+            .any(|edge| { edge["from"] == "resource:16" && edge["to"] == "deobfuscated:11" }));
+        assert!(!edges
+            .iter()
+            .any(|edge| edge["to"] == "deobfuscated:8" || edge["to"] == "deobfuscated:10"));
         assert_eq!(
             graph.node("deobfuscated:4").context("missing deob node")?["safe_static_only"],
             Value::Bool(true)
