@@ -6,6 +6,9 @@
 //! lexical separators required when an otherwise-safe rewrite would join
 //! JavaScript tokens into a different token.
 
+mod directives;
+
+use self::directives::DirectiveInventory;
 use crate::ArithmeticStateProof;
 use oxc_ast::ast::{Expression, FunctionBody, Program, Statement};
 use oxc_ast_visit::{walk, Visit};
@@ -338,10 +341,12 @@ impl StatementBoundaries {
 struct BoundaryCollector<'s> {
     source: &'s str,
     boundaries: StatementBoundaries,
+    directives: DirectiveInventory,
 }
 
 impl<'a> Visit<'a> for BoundaryCollector<'_> {
     fn visit_program(&mut self, program: &Program<'a>) {
+        self.directives.record_program(program);
         self.boundaries.record_prologue_end(
             &program.directives,
             &program.body,
@@ -352,6 +357,7 @@ impl<'a> Visit<'a> for BoundaryCollector<'_> {
     }
 
     fn visit_function_body(&mut self, body: &FunctionBody<'a>) {
+        self.directives.record_body(body, self.source);
         self.boundaries.record_prologue_end(
             &body.directives,
             &body.statements,
@@ -391,6 +397,7 @@ pub fn apply(
     let mut collector = BoundaryCollector {
         source: program.source_text,
         boundaries: StatementBoundaries::default(),
+        directives: DirectiveInventory::default(),
     };
     collector.visit_program(program);
     collector
@@ -399,61 +406,88 @@ pub fn apply(
     if replacements.is_empty() {
         return Some(program.source_text.to_owned());
     }
-    apply_raw(
-        program.source_text,
-        replacements,
-        counts,
-        arithmetic_state_proofs,
-        iteration,
-    )
+    let transaction = RewriteTransaction::prepare(program.source_text, replacements)?;
+    if transaction.source != program.source_text
+        && !collector
+            .directives
+            .preserves(program, &transaction.source, &transaction.edits)
+    {
+        return None;
+    }
+    Some(transaction.commit(counts, arithmetic_state_proofs, iteration))
 }
 
+struct RewriteTransaction {
+    source: String,
+    edits: Vec<Replacement>,
+}
+
+impl RewriteTransaction {
+    fn prepare(source: &str, replacements: Vec<Replacement>) -> Option<Self> {
+        // Validate every candidate before span-width subtraction or overlap
+        // arbitration. A malformed candidate must not panic or silently vanish
+        // behind a larger, valid overlapping replacement.
+        if replacements
+            .iter()
+            .any(|edit| source.get(edit.start..edit.end).is_none())
+        {
+            return None;
+        }
+        let mut selected = select_replacements(replacements);
+        let adjusted = lexically_safe_texts(source, &selected)?;
+        for (edit, text) in selected.iter_mut().zip(adjusted) {
+            edit.text = text;
+        }
+        let mut magic = MagicString::try_new(source).ok()?;
+        magic
+            .apply_edits(
+                selected
+                    .iter()
+                    .map(|edit| TextEdit::new(edit.start, edit.end, edit.text.as_str())),
+            )
+            .ok()?;
+
+        let rewritten = magic.to_string();
+        // Individually restored edits leave their original bytes in place.
+        // Treat them as retained source for both coordinates and accounting.
+        selected.retain(|edit| source.get(edit.start..edit.end) != Some(edit.text.as_str()));
+        if rewritten == source {
+            selected.clear();
+        }
+        Some(Self {
+            source: rewritten,
+            edits: selected,
+        })
+    }
+
+    fn commit(
+        self,
+        counts: &mut Counts,
+        arithmetic_state_proofs: &mut Vec<ArithmeticStateProof>,
+        iteration: usize,
+    ) -> String {
+        // Accounting is published only after all edits and directive
+        // invariants have been accepted as one transaction.
+        for edit in self.edits {
+            counts.bump(edit.kind);
+            if let Some(mut proof) = edit.arithmetic_state_proof {
+                proof.iteration = iteration;
+                arithmetic_state_proofs.push(proof);
+            }
+        }
+        self.source
+    }
+}
+
+#[cfg(test)]
 fn apply_raw(
     source: &str,
     replacements: Vec<Replacement>,
     counts: &mut Counts,
-    arithmetic_state_proofs: &mut Vec<ArithmeticStateProof>,
+    proofs: &mut Vec<ArithmeticStateProof>,
     iteration: usize,
 ) -> Option<String> {
-    // Validate every candidate before span-width subtraction or overlap
-    // arbitration. A malformed candidate must not panic or silently vanish
-    // behind a larger, valid overlapping replacement.
-    if replacements
-        .iter()
-        .any(|edit| source.get(edit.start..edit.end).is_none())
-    {
-        return None;
-    }
-    let mut selected = select_replacements(replacements);
-    let adjusted = lexically_safe_texts(source, &selected)?;
-    let mut magic = MagicString::try_new(source).ok()?;
-    magic
-        .apply_edits(selected.iter().zip(&adjusted).map(|(replacement, text)| {
-            TextEdit::new(replacement.start, replacement.end, text.as_str())
-        }))
-        .ok()?;
-
-    // Do not publish accounting/proof side effects until every edit was
-    // accepted. A malformed range therefore fails closed as one transaction.
-    // Lexical repair can also restore the original text of an edit, or
-    // multiple edits can cancel. Neither changes the source nor proves a
-    // transformation occurred.
-    let rewritten = magic.to_string();
-    if rewritten == source {
-        return Some(rewritten);
-    }
-    for (replacement, text) in selected.iter_mut().zip(&adjusted) {
-        if source.get(replacement.start..replacement.end) == Some(text.as_str()) {
-            continue;
-        }
-        counts.bump(replacement.kind);
-        if let Some(mut proof) = replacement.arithmetic_state_proof.take() {
-            proof.iteration = iteration;
-            arithmetic_state_proofs.push(proof);
-        }
-    }
-
-    Some(rewritten)
+    Some(RewriteTransaction::prepare(source, replacements)?.commit(counts, proofs, iteration))
 }
 
 #[cfg(test)]
@@ -731,6 +765,33 @@ mod tests {
             Some("()")
         );
         assert!(counts.into_inner().is_empty());
+    }
+
+    #[test]
+    fn directive_contract_rejects_before_publishing_counts_or_proofs() {
+        let source = "function f(){ /* trivia */ work(); }";
+        let allocator = oxc_allocator::Allocator::default();
+        let program = crate::parse_as(&allocator, source, oxc_span::SourceType::cjs())
+            .unwrap_or_else(|| unreachable!());
+        let Some(opening_brace) = source.find('{') else {
+            unreachable!();
+        };
+        let offset = opening_brace + 1;
+        let mut counts = Counts::default();
+        let mut proofs = Vec::new();
+        // Insertion into trivia immediately after the opening brace does
+        // not begin at a statement span. The directive contract, rather than
+        // only the separator heuristic, must catch this invalid transaction.
+        assert!(apply(
+            &program,
+            vec![replacement_with_proof(offset, offset, "'use strict';")],
+            &mut counts,
+            &mut proofs,
+            1,
+        )
+        .is_none());
+        assert!(counts.into_inner().is_empty());
+        assert!(proofs.is_empty());
     }
 
     #[test]
