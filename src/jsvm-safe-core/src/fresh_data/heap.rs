@@ -37,7 +37,7 @@ impl Fact {
         Ok(self.clone())
     }
 
-    fn clone_weight(&self) -> usize {
+    const fn clone_weight(&self) -> usize {
         match self {
             Self::Primitive(value) => value_weight(value),
             Self::Objects(_) => 1,
@@ -152,7 +152,7 @@ fn same_primitive_fact(left: &Value, right: &Value) -> bool {
     }
 }
 
-pub(super) fn value_weight(value: &Value) -> usize {
+pub(super) const fn value_weight(value: &Value) -> usize {
     match value {
         Value::String(value) => value.len().saturating_add(1),
         _ => 1,
@@ -182,7 +182,7 @@ impl Property {
         }
     }
 
-    fn clone_weight(&self) -> usize {
+    const fn clone_weight(&self) -> usize {
         self.fact().map_or(1, Fact::clone_weight)
     }
 
@@ -755,10 +755,10 @@ impl Environment {
 
     pub(super) fn read_binding(
         &self,
-        symbol: &SymbolId,
+        symbol: SymbolId,
         budget: &WorkBudget,
     ) -> Result<Option<Fact>, BudgetExceeded> {
-        self.get(*symbol).map(|fact| fact.copy(budget)).transpose()
+        self.get(symbol).map(|fact| fact.copy(budget)).transpose()
     }
 
     fn charge_binding_copy(&self, budget: &WorkBudget) -> Result<(), BudgetExceeded> {
@@ -1245,11 +1245,11 @@ mod tests {
             &unlimited,
         )?;
         let bounded = WorkBudget::new("binding-read", work_budget::BudgetLimits::work(32));
-        assert!(heap.read_binding(&symbol, &bounded).is_err());
+        assert!(heap.read_binding(symbol, &bounded).is_err());
         let locations = Rc::from((0..1024).collect::<Vec<_>>());
         heap.insert(symbol, Fact::Objects(Rc::clone(&locations)), &unlimited)?;
         let bounded = WorkBudget::new("binding-read", work_budget::BudgetLimits::work(32));
-        let Some(Fact::Objects(read)) = heap.read_binding(&symbol, &bounded)? else {
+        let Some(Fact::Objects(read)) = heap.read_binding(symbol, &bounded)? else {
             unreachable!()
         };
         assert!(Rc::ptr_eq(&read, &locations));
@@ -1319,10 +1319,7 @@ mod tests {
             Some(&Fact::Primitive(Value::Number(9.0))),
             &bounded
         )?);
-        assert!(matches!(
-            heap.read(&locations, "x", &unlimited)?,
-            Ok(None)
-        ));
+        assert!(matches!(heap.read(&locations, "x", &unlimited)?, Ok(None)));
         // An opaque path must still reject a write, even when earlier
         // paths have already established unknown ordinary data.
         let mut opaque = OwnData::new(AllocationKind::Ordinary);

@@ -22,7 +22,9 @@ use std::collections::{HashMap, HashSet};
 use work_budget::{BudgetExceeded, WorkBudget};
 
 mod heap;
-use heap::{value_weight, AllocationId, AllocationKind, Environment, Fact, Locations, Lookup, OwnData};
+use heap::{
+    value_weight, AllocationId, AllocationKind, Environment, Fact, Locations, Lookup, OwnData,
+};
 
 enum Reference {
     Binding(SymbolId),
@@ -36,7 +38,7 @@ impl Reference {
         budget: &WorkBudget,
     ) -> Result<Lookup, BudgetExceeded> {
         match self {
-            Self::Binding(symbol) => Ok(Ok(environment.read_binding(symbol, budget)?)),
+            Self::Binding(symbol) => Ok(Ok(environment.read_binding(*symbol, budget)?)),
             Self::Member { locations, key } => environment.read(locations, key, budget),
         }
     }
@@ -47,11 +49,10 @@ impl Reference {
         value: Option<&Fact>,
         budget: &WorkBudget,
     ) -> Result<bool, BudgetExceeded> {
-        let value = value.map(|fact| fact.copy(budget)).transpose()?;
         match self {
             Self::Binding(symbol) => {
                 if let Some(value) = value {
-                    environment.insert(*symbol, value.clone(), budget)?;
+                    environment.insert(*symbol, value.copy(budget)?, budget)?;
                 } else {
                     environment.remove(*symbol, budget)?;
                 }
@@ -218,7 +219,7 @@ impl Analyzer<'_> {
         if !reference_flags.is_read() || reference_flags.is_write() {
             return Self::barrier(environment);
         }
-        let Some(fact) = self.heap_result(environment.read_binding(&symbol, self.budget)) else {
+        let Some(fact) = self.heap_result(environment.read_binding(symbol, self.budget)) else {
             return Self::barrier(environment);
         };
         if let Some(fact) = fact {

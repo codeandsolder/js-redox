@@ -703,8 +703,7 @@ mod tests {
     use super::distinct_lazy_accessor_families;
     use jsvm_lift::forwarding_semantics::structurally_proven_lazy_registry_read_calls;
     use oxc_allocator::Allocator;
-    use oxc_ast::ast::Program;
-    use oxc_semantic::{Scoping, Semantic, SemanticBuilder};
+    use oxc_semantic::SemanticBuilder;
     use oxc_span::SourceType;
     use rolldown_redox::ecmascript::parse_program;
     use work_budget::{BudgetLimits, WorkBudget};
