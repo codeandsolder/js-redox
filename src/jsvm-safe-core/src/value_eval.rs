@@ -7,6 +7,8 @@
 //! may resolve identifier and member reads only with independent proofs of
 //! binding identity, initialization and side-effect-free property access.
 
+mod literal_class;
+
 use oxc_ast::ast::{
     ArrayExpressionElement, BinaryExpression, Expression, LogicalExpression, ObjectPropertyKind,
     PropertyKey, StringLiteral, TemplateElement, UnaryExpression,
@@ -295,12 +297,12 @@ pub fn inert_literal_value(expr: &Expression<'_>) -> bool {
     inert_literal_facts(expr).is_some()
 }
 
-/// Possible result types of an already proven nonthrowing literal expression.
+/// Possible result types and constructor refinements of a proven inert expression.
 ///
 /// A union retains type uncertainty without requiring a constant value.
 /// No member of the set implies an effectful coercion is safe.
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct LiteralTypes(u8);
+struct LiteralTypes(u16);
 
 impl LiteralTypes {
     const NUMBER: Self = Self(1 << 0);
@@ -310,7 +312,12 @@ impl LiteralTypes {
     const UNDEFINED: Self = Self(1 << 4);
     const BIGINT: Self = Self(1 << 5);
     const OBJECT: Self = Self(1 << 6);
-    const FUNCTION: Self = Self(1 << 7);
+    // These facts originate only in fresh literal evaluation. In particular,
+    // a fresh ordinary constructor has an own data prototype, so heritage's
+    // prototype read cannot invoke an inherited getter or proxy trap.
+    const FRESH_CONSTRUCTOR: Self = Self(1 << 7);
+    const OTHER_FUNCTION: Self = Self(1 << 8);
+    const FUNCTION: Self = Self(Self::FRESH_CONSTRUCTOR.0 | Self::OTHER_FUNCTION.0);
     const ORDINARY_PRIMITIVE: Self =
         Self(Self::NUMBER.0 | Self::STRING.0 | Self::BOOLEAN.0 | Self::NULL.0 | Self::UNDEFINED.0);
     const OBJECT_TYPEOF: Self = Self(Self::NULL.0 | Self::OBJECT.0);
@@ -337,13 +344,15 @@ impl LiteralTypes {
         if self.subset_of(Self::OBJECT_TYPEOF) {
             return Some("object");
         }
+        if self.subset_of(Self::FUNCTION) {
+            return Some("function");
+        }
         match self {
             Self::NUMBER => Some("number"),
             Self::STRING => Some("string"),
             Self::BOOLEAN => Some("boolean"),
             Self::UNDEFINED => Some("undefined"),
             Self::BIGINT => Some("bigint"),
-            Self::FUNCTION => Some("function"),
             _ => None,
         }
     }
@@ -451,10 +460,17 @@ fn inert_literal_facts(expr: &Expression<'_>) -> Option<LiteralFacts> {
             )
         }
         Expression::RegExpLiteral(_) => of_type(LiteralTypes::OBJECT),
+        Expression::ClassExpression(class) => literal_class::inert_class_definition(class)
+            .then_some(LiteralFacts::of_type(LiteralTypes::FRESH_CONSTRUCTOR)),
         // Creating a function does not execute its parameters or body.
-        Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_) => {
-            of_type(LiteralTypes::FUNCTION)
-        }
+        Expression::FunctionExpression(function) => of_type(
+            if function.generator || function.r#async || function.declare {
+                LiteralTypes::OTHER_FUNCTION
+            } else {
+                LiteralTypes::FRESH_CONSTRUCTOR
+            },
+        ),
+        Expression::ArrowFunctionExpression(_) => of_type(LiteralTypes::OTHER_FUNCTION),
         Expression::TemplateLiteral(template) => template
             .expressions
             .iter()
@@ -955,6 +971,10 @@ mod tests {
                 Some(r#""function""#),
             ),
             ("typeof (()=>effect())", Some(r#""function""#)),
+            (
+                "typeof (2 ** 1.5 ? function(){} : (()=>{}))",
+                Some(r#""function""#),
+            ),
             ("typeof [2 ** 1.5]", Some(r#""object""#)),
             ("typeof ({x:2 ** 1.5})", Some(r#""object""#)),
             ("!({get x(){effect()}})", Some("false")),
