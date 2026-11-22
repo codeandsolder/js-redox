@@ -8,8 +8,8 @@
 //! binding identity, initialization and side-effect-free property access.
 
 use oxc_ast::ast::{
-    ArrayExpressionElement, BinaryExpression, Expression, LogicalExpression, PropertyKey,
-    StringLiteral, TemplateElement, UnaryExpression,
+    ArrayExpressionElement, BinaryExpression, Expression, LogicalExpression, ObjectPropertyKind,
+    PropertyKey, StringLiteral, TemplateElement, UnaryExpression,
 };
 use oxc_ecmascript::{StringToNumber, ToInt32, ToUint32};
 use oxc_syntax::number::ToJsString;
@@ -473,7 +473,8 @@ fn inert_literal_facts(expr: &Expression<'_>) -> Option<LiteralFacts> {
             .then_some(LiteralFacts::of_type(LiteralTypes::OBJECT)),
         Expression::ObjectExpression(object) => object
             .properties
-            .is_empty()
+            .iter()
+            .all(inert_object_property)
             .then_some(LiteralFacts::of_type(LiteralTypes::OBJECT)),
         Expression::ParenthesizedExpression(paren) => inert_literal_facts(&paren.expression),
         Expression::UnaryExpression(unary) => {
@@ -544,6 +545,27 @@ fn logical_literal_facts(logical: &LogicalExpression<'_>) -> Option<LiteralFacts
             Some(left.short_circuit_left(op)?.join(right))
         }
     }
+}
+
+/// Constructing a property of a fresh ordinary object does not invoke
+/// inherited setters. Computed keys must be primitive to avoid user-defined
+/// `ToPrimitive`; spread can invoke arbitrary getters and is not covered.
+fn inert_object_property(property: &ObjectPropertyKind<'_>) -> bool {
+    let ObjectPropertyKind::ObjectProperty(property) = property else {
+        return false;
+    };
+    if property.computed {
+        let primitive = LiteralTypes::ORDINARY_PRIMITIVE.union(LiteralTypes::BIGINT);
+        if !property.key.as_expression().is_some_and(|key| {
+            inert_literal_facts(key).is_some_and(|facts| facts.types.subset_of(primitive))
+        }) {
+            return false;
+        }
+    }
+    // A method/accessor's function body is not executed during definition.
+    // The special __proto__ initializer also only sets the fresh object's
+    // prototype (or ignores a primitive); its value still must be inert.
+    inert_literal_value(&property.value)
 }
 
 fn inert_array_element(element: &ArrayExpressionElement<'_>) -> bool {
@@ -858,6 +880,21 @@ mod tests {
             ("(false || 2 ** 1.5) * 2", true),
             ("([], 2 ** 1.5) | 1", true),
             ("[2 ** 1.5]", true),
+            ("({x:2 ** 1.5, y:[1,2]})", true),
+            (
+                "({get x(){effect()}, set x(v){effect()}, m(){effect()}})",
+                true,
+            ),
+            ("({[2 ** 1.5]:1,[1n]:2})", true),
+            ("({__proto__: {m(){effect()}}})", true),
+            ("({__proto__: 1})", true),
+            ("({x:effect()})", false),
+            ("({[effect()]:0})", false),
+            ("({[{}]:0})", false),
+            ("({[1n/0n]:0})", false),
+            ("({x})", false),
+            ("({...{get x(){effect()}}})", false),
+            ("({__proto__:effect()})", false),
             ("void (2 ** 1.5)", true),
             (r"+'\ud800'", true),
             ("[] === {}", true),
@@ -919,6 +956,12 @@ mod tests {
             ),
             ("typeof (()=>effect())", Some(r#""function""#)),
             ("typeof [2 ** 1.5]", Some(r#""object""#)),
+            ("typeof ({x:2 ** 1.5})", Some(r#""object""#)),
+            ("!({get x(){effect()}})", Some("false")),
+            ("void ({[2 ** 1.5]:1})", Some("void 0")),
+            (r#"({"x":3}, 7)"#, Some("7")),
+            ("typeof ({[{}]:1})", None),
+            ("void ({x:effect()})", None),
             ("typeof ([], 2 ** 1.5)", Some(r#""number""#)),
             ("void (2 ** 1.5)", Some("void 0")),
             ("void (1n)", Some("void 0")),

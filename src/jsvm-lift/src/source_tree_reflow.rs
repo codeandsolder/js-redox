@@ -474,12 +474,23 @@ mod tests {
     }
 
     #[test]
+    fn accessor_definition_does_not_read_accessor() {
+        let source =
+            "function f(){while('X')if((effect(),{get prop(){throw Error('getter ran');}}))break;}";
+        let out = reflow_single_trip_loops(source);
+        assert_eq!(out.rewritten_loops, 1, "{}", out.source);
+        assert!(out.source.contains("(effect());"), "{}", out.source);
+        assert!(!out.source.contains("get prop"), "{}", out.source);
+    }
+
+    #[test]
     fn does_not_assume_effectful_or_false_guards_are_truthy() {
         for source in [
             "function f(x){while('X')if(x)break;}",
             "function f(){while('X')if((effect(),false))break;}",
             "function f(){while('X')if((effect(),unknown))break;}",
-            "function f(){while('X')if((effect(),{get prop(){return 3;}}))break;}",
+            "function f(){while('X')if((effect(),{get prop(){return effect();}}.prop))break;}",
+            "function f(){while('X')if((effect(),{[effect()]:3}))break;}",
             "function f(){while('X'){if(x)break;}}",
             "function f(){while('X'){if((effect(),{}))continue;}}",
             "function f(){while('X'){if((effect(),{}))break outer;}}",
