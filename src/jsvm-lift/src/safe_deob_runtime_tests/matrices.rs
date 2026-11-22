@@ -1,64 +1,17 @@
 //! Generated, deterministic differential tests for ordinary JavaScript semantics.
 //! Every input is synthetic and executed in a fresh VM context.
 
-use super::{assert_invariants, budget, node};
+use super::{
+    assert_invariants, budget,
+    script_observations::{compare_pairs, Comparison},
+};
 use crate::safe_deob::{deobfuscate_source, SourceMode};
-use anyhow::{bail, Result};
-use std::{fmt::Write as _, fs};
-use tempfile::TempDir;
-
-#[derive(serde::Serialize)]
-struct Comparison {
-    label: String,
-    original: String,
-    rewritten: String,
-}
-
-const RUNNER: &str = r"
-const vm = require('node:vm');
-function encode(value) {
-    const type = typeof value;
-    switch (type) {
-        case 'number':
-            return [type, Object.is(value, -0) ? '-0' : String(value)];
-        case 'bigint':
-        case 'undefined':
-            return [type, String(value)];
-        default:
-            return [type, value];
-    }
-}
-function observe(text, label) {
-    // A syntax failure must not become a successful differential comparison.
-    const script = new vm.Script(text, {filename: label});
-    const events = [];
-    let value;
-    try {
-        value = encode(script.runInNewContext({events}, {timeout: 10000}));
-    } catch (error) {
-        if (error.code === 'ERR_SCRIPT_EXECUTION_TIMEOUT') throw error;
-        value = ['throw', error.name];
-    }
-    return JSON.stringify([value, events]);
-}
-for (const row of comparisons) {
-    const before = observe(row.original, row.label + ':original');
-    const after = observe(row.rewritten, row.label + ':rewritten');
-    if (before !== after) {
-        let offset = 0;
-        while (offset < before.length && before[offset] === after[offset]) offset++;
-        throw Error(row.label + ': mismatch at encoded offset ' + offset +
-            '\noriginal: ' + before.slice(Math.max(0, offset - 80), offset + 160) +
-            '\nrewritten: ' + after.slice(Math.max(0, offset - 80), offset + 160));
-    }
-}
-console.log(comparisons.length);
-";
+use anyhow::Result;
+use std::fmt::Write as _;
 
 /// Execute a batch of independently parsed scripts in one Node process rather
 /// than launching two processes for every tiny fixture.
 fn compare_sources(suite: &str, sources: Vec<String>) -> Result<()> {
-    let scratch = TempDir::new()?;
     let mut comparisons = Vec::with_capacity(sources.len());
     let mut changed = 0;
     for (index, original) in sources.into_iter().enumerate() {
@@ -81,17 +34,7 @@ fn compare_sources(suite: &str, sources: Vec<String>) -> Result<()> {
         });
     }
     assert!(changed > 0, "{suite} did not exercise any transformation");
-    let path = scratch.path().join("matrix.cjs");
-    let runner = format!(
-        "const comparisons = {};\n{RUNNER}",
-        serde_json::to_string(&comparisons)?
-    );
-    fs::write(&path, runner)?;
-    let count = node(&path, false)?;
-    if count != format!("{}\n", comparisons.len()).as_bytes() {
-        bail!("{suite}: unexpected comparison runner output");
-    }
-    Ok(())
+    compare_pairs(suite, &comparisons, false)
 }
 
 const VALUES: [&str; 27] = [

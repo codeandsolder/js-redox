@@ -1,5 +1,7 @@
 #[path = "safe_deob_runtime_tests/matrices.rs"]
 mod matrices;
+#[path = "safe_deob_runtime_tests/script_observations.rs"]
+mod script_observations;
 
 use super::*;
 use anyhow::{anyhow, Context, Result};
@@ -1039,32 +1041,21 @@ fn depythonify_safe_deob_local_alias_regions_runtime_equivalence() -> Result<()>
 }
 
 fn script_runtime_equivalence(sources: &[&str], suite: &str, browser_globals: bool) -> Result<()> {
-    let scratch = TempDir::new()?;
-    // Browser decoders assume standard atob. Node's isolated VM does not
-    // populate it by default; expose it explicitly only for that suite.
-    let globals = if browser_globals {
-        "events,atob"
-    } else {
-        "events"
-    };
-    for (index, source) in sources.iter().enumerate() {
-        let label = format!("{suite}-{index}");
-        let result =
-            deobfuscate_source(source, &label, SourceMode::Auto, 48, false, &budget(&label))?;
-        let runner = |text: &str| -> Result<String> {
-            let encoded = serde_json::to_string(text)?;
-            Ok(format!(
-                r"const vm=require('node:vm');const events=[];try{{const value=vm.runInNewContext({encoded},{{{globals}}},{{timeout:1000}});console.log(JSON.stringify([typeof value,String(value),events]));}}catch(e){{console.log(JSON.stringify(['throw',String(e),events]));}}"
-            ))
-        };
-        runtime_equivalent(
-            scratch.path(),
-            &label,
-            &runner(source)?,
-            &runner(&result.source)?,
-        )?;
-    }
-    Ok(())
+    let comparisons = sources
+        .iter()
+        .enumerate()
+        .map(|(index, source)| {
+            let label = format!("{suite}-{index}");
+            let result =
+                deobfuscate_source(source, &label, SourceMode::Auto, 48, false, &budget(&label))?;
+            Ok(script_observations::Comparison {
+                label,
+                original: (*source).to_owned(),
+                rewritten: result.source,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    script_observations::compare_pairs(suite, &comparisons, browser_globals)
 }
 
 #[test]
