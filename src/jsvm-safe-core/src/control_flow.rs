@@ -1455,7 +1455,7 @@ impl Collector<'_, '_> {
                             .number()
                             .and_then(exact_u32)?
                     } else {
-                        10
+                        0
                     };
                     js_parse_int(&value.js_string()?, radix).map(Value::Number)
                 }

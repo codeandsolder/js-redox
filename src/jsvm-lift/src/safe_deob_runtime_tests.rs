@@ -809,6 +809,37 @@ fn depythonify_safe_deob_rotation_order_runtime_equivalence() -> Result<()> {
     script_runtime_equivalence(&sources, "rotation-order", false)
 }
 
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_rotation_effects_runtime_equivalence() -> Result<()> {
+    let prefix = "function p(){var t=['11','22','33'];p=function(){return t;};return p();}function d(i,t,v){return i=i-0,t=p(),v=t[i],v;}";
+    let setup = "var alias=d,table=provider();";
+    let body = "while(true){try{var checksum=parseInt(alias(0));if(checksum===target)break;else table.push(table.shift());}catch(err){table.push(table.shift());}}";
+    let mut sources = [
+        (setup.to_string(), body.to_string()),
+        (setup.to_string(), body.replace("while(true)", "for(;;)")),
+        (setup.to_string(), body.replace("table.push(table.shift())", "table['push'](table['shift']())")),
+        ("var alias=d,table=provider(),sum=0;".to_string(), body.replace("var checksum=parseInt(alias(0));if(checksum===target)", "if(sum=parseInt(alias(0)),sum===target)")),
+        (setup.to_string(), body.replace("var checksum=parseInt(alias(0));if(checksum===target)", "if(target===parseInt(alias(0)))")),
+        (setup.to_string(), body.replace("var checksum=parseInt(alias(0));", "var checksum=parseInt(alias(0));events.push(checksum);")),
+        (format!("{setup}events.push('before');"), body.to_string()),
+        (setup.to_string(), format!("{body}events.push('after');")),
+        (setup.to_string(), body.replace("while(true)", "while(false)")),
+        (setup.to_string(), body.replace("while(true)", "for(;true;events.push('update'))")),
+        (setup.to_string(), body.replace("else table.push(table.shift());", "else {table.push(table.shift());table.push(table.shift());}")),
+        (setup.to_string(), format!("{}finally{{events.push('finally')}}}}", body.strip_suffix('}').unwrap_or_default())),
+        (setup.to_string(), body.replace("break;", "return 1;")),
+    ].into_iter().map(|(initialization, loop_body)| format!("{prefix}const result=(function(provider,target){{{initialization}{loop_body}}})(p,22);[result,d(0)];")).collect::<Vec<_>>();
+    for (first, target) in [("bad", 22), ("0x10", 16), ("18446744073709551616", 22)] {
+        let prefix = prefix.replace("'11'", &format!("'{first}'"));
+        sources.push(format!(
+            "{prefix}(function(provider,target){{{setup}{body}}})(p,{target});d(0);"
+        ));
+    }
+    let refs = sources.iter().map(String::as_str).collect::<Vec<_>>();
+    script_runtime_equivalence(&refs, "rotation-effects", false)
+}
+
 fn script_runtime_equivalence(sources: &[&str], suite: &str, browser_globals: bool) -> Result<()> {
     let scratch = TempDir::new()?;
     // Browser decoders assume standard atob. Node's isolated VM does not

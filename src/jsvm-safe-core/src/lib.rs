@@ -8312,6 +8312,141 @@ sink(decode(0x10), decode(0x11));
     }
 
     #[test]
+    fn decoder_rotation_requires_complete_structural_effect_proof() {
+        let prefix = "function p(){var t=['11','22','33'];p=function(){return t;};return p();}function d(i,t,v){return i=i-0,t=p(),v=t[i],v;}";
+        let setup = "var alias=d,table=provider();";
+        let body = "while(true){try{var checksum=parseInt(alias(0));if(checksum===target)break;else table.push(table.shift());}catch(err){table.push(table.shift());}}";
+        for (initialization, loop_body, expected) in [
+            (setup.to_string(), body.to_string(), 1),
+            (setup.to_string(), body.replace("while(true)", "for(;;)"), 1),
+            (
+                setup.to_string(),
+                body.replace("break;else", "{break;}else"),
+                1,
+            ),
+            (
+                setup.to_string(),
+                body.replace(
+                    "table.push(table.shift())",
+                    "table['push'](table['shift']())",
+                ),
+                1,
+            ),
+            (
+                "var alias=d,table=provider(),sum=0;".to_string(),
+                body.replace(
+                    "var checksum=parseInt(alias(0));if(checksum===target)",
+                    "if(sum=parseInt(alias(0)),sum===target)",
+                ),
+                1,
+            ),
+            (
+                setup.to_string(),
+                body.replace(
+                    "var checksum=parseInt(alias(0));if(checksum===target)",
+                    "if(target===parseInt(alias(0)))",
+                ),
+                1,
+            ),
+            (
+                setup.to_string(),
+                body.replace(
+                    "var checksum=parseInt(alias(0));",
+                    "var checksum=parseInt(alias(0));events.push(checksum);",
+                ),
+                0,
+            ),
+            (
+                format!("{setup}events.push('before');"),
+                body.to_string(),
+                0,
+            ),
+            (setup.to_string(), format!("{body}events.push('after');"), 0),
+            (
+                setup.to_string(),
+                body.replace("while(true)", "while(false)"),
+                0,
+            ),
+            (
+                setup.to_string(),
+                body.replace("while(true)", "for(;true;events.push('update'))"),
+                0,
+            ),
+            (
+                setup.to_string(),
+                body.replace(
+                    "else table.push(table.shift());",
+                    "else {table.push(table.shift());table.push(table.shift());}",
+                ),
+                0,
+            ),
+            (
+                setup.to_string(),
+                format!(
+                    "{}finally{{events.push('finally')}}}}",
+                    body.strip_suffix('}').unwrap_or_default()
+                ),
+                0,
+            ),
+            (setup.to_string(), body.replace("break;", "return 1;"), 0),
+            (
+                setup.to_string(),
+                body.replace("var checksum", "using checksum"),
+                0,
+            ),
+            (format!("{setup}using resource=null;"), body.to_string(), 0),
+        ] {
+            let source = format!("{prefix}(function(provider,target){{{initialization}{loop_body}}})(p,22);sink(d(0));");
+            let result =
+                recover_static_decoders(&source, 8).unwrap_or_else(|| unreachable!("{source}"));
+            assert_eq!(
+                result
+                    .transforms
+                    .get("remove_decoder_rotation_iife")
+                    .copied()
+                    .unwrap_or_default(),
+                expected,
+                "{source}: {}",
+                result.source
+            );
+        }
+        for (first, target, expected) in [
+            ("bad", 22, 1),
+            ("0x10", 16, 1),
+            ("18446744073709551616", 22, 0),
+        ] {
+            let prefix = prefix.replace("'11'", &format!("'{first}'"));
+            let source = format!(
+                "{prefix}(function(provider,target){{{setup}{body}}})(p,{target});sink(d(0));"
+            );
+            let result =
+                recover_static_decoders(&source, 8).unwrap_or_else(|| unreachable!("{source}"));
+            assert_eq!(
+                result
+                    .transforms
+                    .get("remove_decoder_rotation_iife")
+                    .copied()
+                    .unwrap_or_default(),
+                expected,
+                "{source}: {}",
+                result.source
+            );
+        }
+        let source = format!("{prefix}function e(i,t,v){{return i=i-0,t=p(),v=t[i],v;}}(function(provider,target){{var alias=d,other=e,table=provider();{}}})(p,55);sink(d(0),e(1));",body.replace("parseInt(alias(0))", "parseInt(alias(0))+parseInt(other(1))"));
+        let result =
+            recover_static_decoders(&source, 8).unwrap_or_else(|| unreachable!("{source}"));
+        assert_eq!(
+            result.transforms.get("remove_decoder_rotation_iife"),
+            Some(&1)
+        );
+        assert!(
+            result.source.contains("sink(\"22\",\"33\")"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
     fn decoder_provider_identity_and_confinement_are_shared_across_all_views() {
         let source = SPLIT_PROVIDER_ROTATION_SOURCE.replace(
             "let setup, after;",
