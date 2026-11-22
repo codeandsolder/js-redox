@@ -33,14 +33,33 @@ enum Fact {
 }
 
 impl Fact {
-    fn same_fact(&self, other: &Self) -> bool {
+    fn join(&self, other: &Self) -> Option<Self> {
         match (self, other) {
-            (Self::Primitive(Value::Number(a)), Self::Primitive(Value::Number(b))) => {
-                a.to_bits() == b.to_bits()
+            (Self::Primitive(a), Self::Primitive(b)) => same_primitive(a, b).then(|| self.clone()),
+            (Self::Data(a), Self::Data(b)) if Rc::ptr_eq(a, b) => Some(self.clone()),
+            (Self::Data(a), Self::Data(b)) => {
+                // Neither identity nor non-shared properties are proven at
+                // the join. Retain only own data guaranteed on both paths.
+                // A differing value is still a non-effectful own-data read.
+                let (smaller, larger) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+                let common = smaller
+                    .iter()
+                    .filter_map(|(key, left)| {
+                        let right = larger.get(key)?;
+                        let value = left
+                            .as_ref()
+                            .filter(|value| {
+                                right
+                                    .as_ref()
+                                    .is_some_and(|other| same_primitive(value, other))
+                            })
+                            .cloned();
+                        Some((key.clone(), value))
+                    })
+                    .collect();
+                Some(Self::Data(Rc::new(common)))
             }
-            (Self::Primitive(a), Self::Primitive(b)) => same_value(a, b),
-            (Self::Data(a), Self::Data(b)) => Rc::ptr_eq(a, b),
-            _ => false,
+            _ => None,
         }
     }
 
@@ -49,6 +68,13 @@ impl Fact {
             Self::Primitive(value) => value.truthy(),
             Self::Data(_) => true,
         }
+    }
+}
+
+fn same_primitive(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Number(a), Value::Number(b)) => a.to_bits() == b.to_bits(),
+        _ => same_value(left, right),
     }
 }
 
@@ -89,7 +115,13 @@ impl Evaluation {
 }
 
 fn intersect(left: &mut Environment, right: &Environment) {
-    left.retain(|symbol, fact| right.get(symbol).is_some_and(|other| fact.same_fact(other)));
+    left.retain(|symbol, fact| {
+        let Some(joined) = right.get(symbol).and_then(|other| fact.join(other)) else {
+            return false;
+        };
+        *fact = joined;
+        true
+    });
 }
 
 #[derive(Default)]
@@ -361,12 +393,11 @@ impl Analyzer<'_> {
                 let right = self.expression(&conditional.alternate, &mut other);
                 intersect(environment, &other);
                 Evaluation {
-                    fact: left.fact.filter(|fact| {
-                        right
-                            .fact
-                            .as_ref()
-                            .is_some_and(|other| fact.same_fact(other))
-                    }),
+                    fact: left
+                        .fact
+                        .as_ref()
+                        .zip(right.fact.as_ref())
+                        .and_then(|(left, right)| left.join(right)),
                     inert: test.inert && left.inert && right.inert,
                 }
             }
@@ -714,6 +745,22 @@ mod tests {
             ),
             ("let a={x:7,...side(),x:9};a.x;", vec![("a.x", "9")]),
             ("let a={x:7,...side()};a.x;", vec![]),
+            (
+                "function f(flag){let a={x:7,y:8};if(flag)a={x:7,z:9};return a.x;}",
+                vec![("a.x", "7")],
+            ),
+            (
+                "function f(flag){let a=flag?{x:7,y:8}:{x:7,y:9};a.y;return a.x;}",
+                vec![("a.x", "7")],
+            ),
+            (
+                "function f(flag){let a=flag?[-0]:[0];a[0];a.length;}",
+                vec![("a.length", "1")],
+            ),
+            (
+                "function f(flag){let a=flag?{x:7}:{get x(){return 7}};return a.x;}",
+                vec![],
+            ),
             ("let a={'1e+21':7,1e21:9};a[1e21];", vec![("a[1e21]", "9")]),
             (
                 "let a={'0.0000001':7,1e-7:9};a['0.0000001'];a[1e-7];",
