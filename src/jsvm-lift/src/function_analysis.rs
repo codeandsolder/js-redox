@@ -89,7 +89,7 @@ pub fn expression_evidence(source: &str, expr: &Expression<'_>) -> ExprEvidence 
 
 fn evidence_reaches_computed_inner(
     evidence: &ExprEvidence,
-    vars: &HashMap<String, ExprEvidence>,
+    vars: &HashMap<String, ExprEvidence, impl std::hash::BuildHasher>,
     seen: &mut HashSet<String>,
 ) -> bool {
     if evidence.computed_members > 0 {
@@ -111,14 +111,14 @@ fn evidence_reaches_computed_inner(
 #[must_use]
 pub fn evidence_reaches_computed(
     evidence: &ExprEvidence,
-    vars: &HashMap<String, ExprEvidence>,
+    vars: &HashMap<String, ExprEvidence, impl std::hash::BuildHasher>,
 ) -> bool {
     evidence_reaches_computed_inner(evidence, vars, &mut HashSet::new())
 }
 
 fn collect_indexed_reads(
     evidence: &ExprEvidence,
-    vars: &HashMap<String, ExprEvidence>,
+    vars: &HashMap<String, ExprEvidence, impl std::hash::BuildHasher>,
     seen: &mut HashSet<String>,
     out: &mut BTreeSet<String>,
 ) {

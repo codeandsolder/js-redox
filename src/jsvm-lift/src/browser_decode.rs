@@ -123,8 +123,7 @@ fn parse_ascii_attrs(tag: &[u8]) -> Vec<(String, String)> {
         while i < tag.len() && is_html_space(tag[i]) {
             i += 1;
         }
-        let mut value = String::new();
-        if i < tag.len() && tag[i] == b'=' {
+        let value = if i < tag.len() && tag[i] == b'=' {
             i += 1;
             while i < tag.len() && is_html_space(tag[i]) {
                 i += 1;
@@ -148,8 +147,10 @@ fn parse_ascii_attrs(tag: &[u8]) -> Vec<(String, String)> {
                 }
                 (start, i)
             };
-            value = String::from_utf8_lossy(&tag[start..end]).into_owned();
-        }
+            String::from_utf8_lossy(&tag[start..end]).into_owned()
+        } else {
+            String::new()
+        };
         if !attrs.iter().any(|(existing, _)| existing == &name) {
             attrs.push((name, value));
         }

@@ -137,15 +137,14 @@ fn assignment_symbol(scoping: &Scoping, target: &AssignmentTarget<'_>) -> Option
         .symbol_id()
 }
 
-struct Normalizer<'s, 'b, 'c, 'a> {
+struct Normalizer<'s, 'c, 'a, C, A> {
     scoping: &'s Scoping,
     bindings: HashMap<SymbolId, IntegerPolynomial>,
-    opaque_constants: &'c HashMap<(u32, u32), i128>,
-    arbitrary_assignments: &'a HashSet<SymbolId>,
-    _marker: std::marker::PhantomData<&'b ()>,
+    opaque_constants: &'c HashMap<(u32, u32), i128, C>,
+    arbitrary_assignments: &'a HashSet<SymbolId, A>,
 }
 
-impl Normalizer<'_, '_, '_, '_> {
+impl<C: std::hash::BuildHasher, A: std::hash::BuildHasher> Normalizer<'_, '_, '_, C, A> {
     fn normalize(&mut self, expression: &Expression<'_>) -> Option<IntegerPolynomial> {
         let span = expression.span();
         if let Some(value) = self.opaque_constants.get(&(span.start, span.end)) {
@@ -238,16 +237,18 @@ impl Normalizer<'_, '_, '_, '_> {
 pub fn normalize_integer_polynomial(
     expression: &Expression<'_>,
     scoping: &Scoping,
-    bindings: &HashMap<SymbolId, IntegerPolynomial>,
-    opaque_constants: &HashMap<(u32, u32), i128>,
-    arbitrary_assignments: &HashSet<SymbolId>,
+    bindings: &HashMap<SymbolId, IntegerPolynomial, impl std::hash::BuildHasher>,
+    opaque_constants: &HashMap<(u32, u32), i128, impl std::hash::BuildHasher>,
+    arbitrary_assignments: &HashSet<SymbolId, impl std::hash::BuildHasher>,
 ) -> Option<IntegerPolynomial> {
     Normalizer {
         scoping,
-        bindings: bindings.clone(),
+        bindings: bindings
+            .iter()
+            .map(|(&symbol, value)| (symbol, value.clone()))
+            .collect(),
         opaque_constants,
         arbitrary_assignments,
-        _marker: std::marker::PhantomData,
     }
     .normalize(expression)
 }

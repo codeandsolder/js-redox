@@ -279,7 +279,7 @@ fn polish_lexical_helper_view(
     max_iterations: usize,
     format_output: bool,
     budgets: &AnalysisBudgets,
-) -> Result<PolishedHelperView> {
+) -> PolishedHelperView {
     let reflowed = reflow_single_trip_loops(&source);
     let (source, mut subsequent_transforms, post_reflow_error) = if reflowed.rewritten_loops == 0 {
         (source, BTreeMap::new(), None)
@@ -330,7 +330,7 @@ fn polish_lexical_helper_view(
                 Err(error) => (returns.source, Some(error.to_string())),
             }
         };
-    Ok(PolishedHelperView {
+    PolishedHelperView {
         source,
         single_trip_loops_reflowed: reflowed.rewritten_loops,
         subsequent_transforms,
@@ -339,7 +339,7 @@ fn polish_lexical_helper_view(
         labeled_return_joins,
         guarded_return_joins,
         post_return_error,
-    })
+    }
 }
 
 /// Derive a full-lexical-context view, retaining original symbol identities
@@ -440,7 +440,7 @@ fn materialize_full_lexical_context(
         fs::write(&raw_target, &helper.source)?;
         let label = format!("full lexical helper {}", helper.name);
         let polished =
-            polish_lexical_helper_view(helper.source.clone(), &label, iterations, true, budgets)?;
+            polish_lexical_helper_view(helper.source.clone(), &label, iterations, true, budgets);
         let changed = polished.source != helper.source;
         polished_count += usize::from(changed);
         loop_reflows += polished.single_trip_loops_reflowed;
@@ -907,7 +907,7 @@ fn build_source_tree(args: &SourceTreeArgs) -> Result<serde_json::Value> {
                 args.max_iterations,
                 args.format_output,
                 &budgets,
-            )?;
+            );
             accumulate_polished_transform_counts(&mut transforms, &polished);
             let code = polished.source;
             let rewritten_loops = polished.single_trip_loops_reflowed;
@@ -1359,7 +1359,7 @@ fn build_source_tree(args: &SourceTreeArgs) -> Result<serde_json::Value> {
                 args.max_iterations,
                 args.format_output,
                 &budgets,
-            )?;
+            );
             accumulate_polished_transform_counts(&mut transforms, &polished);
             let code = polished.source;
             let rewritten_loops = polished.single_trip_loops_reflowed;

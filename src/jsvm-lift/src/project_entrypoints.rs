@@ -33,11 +33,10 @@ fn path_link(unit: &Value, readable: &BTreeMap<&str, &str>) -> String {
             continue;
         }
         // This page is under src/. Non-src paths must be rooted one level up.
-        let (label, destination) = if let Some(relative) = path.strip_prefix("src/") {
-            (relative, link_destination(relative))
-        } else {
-            (path, format!("../{}", link_destination(path)))
-        };
+        let (label, destination) = path.strip_prefix("src/").map_or_else(
+            || (path, format!("../{}", link_destination(path))),
+            |relative| (relative, link_destination(relative)),
+        );
         return format!("[{}]({destination})", code_span(label));
     }
     format!(

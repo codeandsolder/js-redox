@@ -4522,7 +4522,7 @@ mod tests {
     }
 
     #[test]
-    fn proves_structural_slow_cell_factory_shape() -> TestResult {
+    fn proves_structural_slow_cell_factory_shape() {
         let source = r"
             let phase;
             function make(mode, state, handler, s, q, cell, out) {
@@ -4546,12 +4546,10 @@ mod tests {
         assert_eq!(shape.prototype_field, "base");
         assert_eq!(shape.method_key_field, "method");
         assert_eq!(shape.resolver_property, "resolve");
-
-        Ok(())
     }
 
     #[test]
-    fn rejects_factory_when_handler_is_not_captured_directly() -> TestResult {
+    fn rejects_factory_when_handler_is_not_captured_directly() {
         assert_eq!(
             shapes(
                 r"
@@ -4571,8 +4569,6 @@ mod tests {
             .len(),
             0
         );
-
-        Ok(())
     }
 
     fn specialized_call(source: &str, needle: &str) -> Result<bool, TestFailure> {
@@ -4888,7 +4884,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_fast_lazy_cell_updater_that_transforms_capture() -> TestResult {
+    fn rejects_fast_lazy_cell_updater_that_transforms_capture() {
         let source = r"
             const Maker = Object;
             function make(value, mode, state) {
@@ -4914,8 +4910,6 @@ mod tests {
             .len(),
             0
         );
-
-        Ok(())
     }
 
     #[test]
@@ -5810,7 +5804,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_factory_when_phase_value_is_local() -> TestResult {
+    fn rejects_factory_when_phase_value_is_local() {
         assert_eq!(
             shapes(
                 r"
@@ -5829,7 +5823,5 @@ mod tests {
             .len(),
             0
         );
-
-        Ok(())
     }
 }

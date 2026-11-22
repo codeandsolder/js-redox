@@ -938,17 +938,17 @@ impl Collector<'_, '_> {
         callable
             .prefix
             .append(arguments, self.source, self.scoping, self.constants);
-        self.emit_invocation(callee, callable, span);
+        self.emit_invocation(callee, &callable, span);
     }
 
-    fn emit_invocation(&mut self, callee: &Expression<'_>, callable: Callable, span: Span) {
+    fn emit_invocation(&mut self, callee: &Expression<'_>, callable: &Callable, span: Span) {
         self.emit_forwarded(callee, callable, span, &BTreeSet::new());
     }
 
     fn emit_forwarded(
         &mut self,
         callee: &Expression<'_>,
-        callable: Callable,
+        callable: &Callable,
         span: Span,
         forwarding_dependencies: &BTreeSet<String>,
     ) {
@@ -1076,7 +1076,7 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
                 self.callables
                     .resolve_dispatch(call, self.source, self.scoping, self.constants)
             {
-                self.emit_invocation(&call.callee, dispatch.callable, call.span);
+                self.emit_invocation(&call.callee, &dispatch.callable, call.span);
             } else {
                 self.visit_invocation(&call.callee, &call.arguments, call.span, false);
             }

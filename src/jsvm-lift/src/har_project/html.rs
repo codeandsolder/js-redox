@@ -140,8 +140,7 @@ pub fn parse_attrs(tag: &str) -> HashMap<String, String> {
         while i < bytes.len() && bytes[i].is_ascii_whitespace() {
             i += 1;
         }
-        let mut value = String::new();
-        if i < bytes.len() && bytes[i] == b'=' {
+        let value = if i < bytes.len() && bytes[i] == b'=' {
             i += 1;
             while i < bytes.len() && bytes[i].is_ascii_whitespace() {
                 i += 1;
@@ -166,8 +165,10 @@ pub fn parse_attrs(tag: &str) -> HashMap<String, String> {
                 }
                 (value_start, i)
             };
-            value = decode_html_entities(&tag[value_start..value_end]).into_owned();
-        }
+            decode_html_entities(&tag[value_start..value_end]).into_owned()
+        } else {
+            String::new()
+        };
         out.insert(key, value);
     }
     out

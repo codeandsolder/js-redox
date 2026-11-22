@@ -159,8 +159,8 @@ impl<T: Eq> ScriptIdentityIndex<T> {
 
 /// Retain only fields on which all inventory occurrences agree. Unknown or
 /// contradictory values remain unknown when more occurrences are merged.
-pub fn retain_agreed<T: Eq>(current: &mut Option<T>, next: Option<T>) {
-    if *current != next {
+pub fn retain_agreed<T: Eq>(current: &mut Option<T>, next: Option<&T>) {
+    if current.as_ref() != next {
         *current = None;
     }
 }
@@ -179,8 +179,11 @@ impl ScriptOriginContext {
         }
     }
     pub(crate) fn retain_agreed(&mut self, other: Self) {
-        retain_agreed(&mut self.url, other.url);
-        retain_agreed(&mut self.execution_context_id, other.execution_context_id);
+        retain_agreed(&mut self.url, other.url.as_ref());
+        retain_agreed(
+            &mut self.execution_context_id,
+            other.execution_context_id.as_ref(),
+        );
     }
 }
 

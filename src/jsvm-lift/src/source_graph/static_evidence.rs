@@ -58,20 +58,20 @@ pub(super) fn seed_safe_deobfuscation_sources(
             }),
         )?;
         let raw = string_field(unit, "raw_path");
-        let parent = if let Some(inline) = inline_nodes.for_record(unit) {
-            Some(inline)
-        } else if let Some(runtime_path) =
-            raw.and_then(|path| path.strip_prefix("resources/runtime-scripts/"))
-        {
-            // A declared runtime source is never a captured HTTP resource.
-            // Its source path and full input SHA must match an actual graph node.
-            runtime_path
-                .strip_suffix(".js")
-                .filter(|digest| string_field(unit, "input_sha256") == Some(*digest))
-                .and_then(|digest| captured_runtime_source(graph, digest))
-        } else {
-            u64_field(unit, "resource_id").map(|resource_id| format!("resource:{resource_id}"))
-        };
+        let parent = inline_nodes.for_record(unit).or_else(|| {
+            if let Some(runtime_path) =
+                raw.and_then(|path| path.strip_prefix("resources/runtime-scripts/"))
+            {
+                // A declared runtime source is never a captured HTTP resource.
+                // Its source path and full input SHA must match an actual graph node.
+                runtime_path
+                    .strip_suffix(".js")
+                    .filter(|digest| string_field(unit, "input_sha256") == Some(*digest))
+                    .and_then(|digest| captured_runtime_source(graph, digest))
+            } else {
+                u64_field(unit, "resource_id").map(|resource_id| format!("resource:{resource_id}"))
+            }
+        });
         if let Some(parent) = parent {
             graph.add_edge(
                 &parent,
@@ -113,6 +113,7 @@ pub(super) fn seed_browser_api_callsites(
     inline_nodes: &InlineSourceIndex,
     budget: &WorkBudget,
 ) -> Result<()> {
+    type SinkKey = (u64, u64, u64, String);
     let mut mutation_nodes = BTreeMap::<(u64, u64), (String, &Value)>::new();
     for row in array_field(api_surface, "mutation_sites") {
         budget.checkpoint()?;
@@ -152,7 +153,6 @@ pub(super) fn seed_browser_api_callsites(
     // An original sink expression can have many specializing wrapper
     // invocations. Join by source identity, span and native API origin, never
     // by URL or text. Higher-order wrappers may have no direct sink row.
-    type SinkKey = (u64, u64, u64, String);
     let mut direct_sites = BTreeMap::<SinkKey, Vec<String>>::new();
     let mut forwarded_sites = Vec::<(SinkKey, String)>::new();
     // Static browser API callsites hang off the exact selected source derivative.
@@ -462,7 +462,7 @@ mod tests {
     }
 
     #[test]
-    fn api_mutation_references_cannot_cross_source_units_or_dangle() -> Result<()> {
+    fn api_mutation_references_cannot_cross_source_units_or_dangle() {
         let mut graph = GraphBuilder::default();
         let document = json!({
             "mutation_sites": [
@@ -486,7 +486,6 @@ mod tests {
             &budget,
         )
         .is_err());
-        Ok(())
     }
 
     #[test]

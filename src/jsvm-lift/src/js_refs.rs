@@ -230,11 +230,11 @@ fn parse<'a>(
 pub fn extract_js_references(source: &str, budget: &WorkBudget) -> Result<Vec<JsReference>> {
     budget.checkpoint()?;
     let allocator = Allocator::default();
-    let program = if let Some(program) = parse(&allocator, source, SourceType::mjs()) {
-        budget.checkpoint()?;
-        program
+    let module = parse(&allocator, source, SourceType::mjs());
+    budget.checkpoint()?;
+    let program = if let Some(module) = module {
+        module
     } else {
-        budget.checkpoint()?;
         let program = parse(&allocator, source, SourceType::cjs())
             .ok_or_else(|| anyhow::anyhow!("Oxc could not parse source as module or script"))?;
         budget.checkpoint()?;

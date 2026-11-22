@@ -366,8 +366,8 @@ fn known_bool_for_offset(
             let right =
                 numeric_value_for_offset(scoping, &binary.right, offset_symbol, offset_value)?;
             match binary.operator.as_str() {
-                "==" | "===" => Some(left == right),
-                "!=" | "!==" => Some(left != right),
+                "==" | "===" => Some(jsvm_safe_core::js_number_equal(left, right)),
+                "!=" | "!==" => Some(!jsvm_safe_core::js_number_equal(left, right)),
                 "<" => Some(left < right),
                 "<=" => Some(left <= right),
                 ">" => Some(left > right),

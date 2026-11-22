@@ -44,7 +44,7 @@ pub fn recover_static_strings(
                 original.to_string(),
                 result.iterations,
                 result.decoder_candidates,
-                Default::default(),
+                std::collections::BTreeMap::new(),
                 "iteration_cycle",
                 Some(json!({
                     "first_seen_iteration": cycle.first_seen_iteration,
@@ -66,7 +66,7 @@ pub fn recover_static_strings(
             original.to_string(),
             0,
             0,
-            Default::default(),
+            std::collections::BTreeMap::new(),
             "parse_or_semantic_rejected",
             None,
         ),
@@ -153,7 +153,7 @@ pub fn recover_static_strings(
                 "literal_concat_folds": 0,
             })],
             0,
-            Default::default(),
+            std::collections::BTreeMap::new(),
         ),
     };
     let decoder_call_replacements = classic_transforms

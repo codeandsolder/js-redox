@@ -110,11 +110,11 @@ fn runtime_identity_index(
             if previous.sha256 != next.sha256 {
                 return false;
             }
-            retain_agreed(&mut previous.start_line, next.start_line);
-            retain_agreed(&mut previous.start_column, next.start_column);
+            retain_agreed(&mut previous.start_line, next.start_line.as_ref());
+            retain_agreed(&mut previous.start_column, next.start_column.as_ref());
             retain_agreed(
                 &mut previous.capture_instrumentation,
-                next.capture_instrumentation,
+                next.capture_instrumentation.as_ref(),
             );
             previous.origin.retain_agreed(next.origin);
             true

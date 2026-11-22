@@ -159,7 +159,10 @@ pub fn index_shape(expr: &Expression<'_>) -> Option<IndexShape> {
 }
 
 #[must_use]
-pub fn resolve_alias(name: &str, aliases: &HashMap<String, String>) -> String {
+pub fn resolve_alias(
+    name: &str,
+    aliases: &HashMap<String, String, impl std::hash::BuildHasher>,
+) -> String {
     let mut current = name.to_string();
     let mut seen = HashSet::new();
     while seen.insert(current.clone()) {
@@ -268,9 +271,9 @@ pub fn derive_candidates(function_id: &str, accesses: &[IndexedAccess]) -> Vec<D
 
 pub fn annotate_bitfield_selectors(
     candidates: &mut [DecoderCandidate],
-    indexed_value_vars: &HashMap<String, IndexedAccess>,
-    bit_masks: &HashMap<String, BTreeSet<u64>>,
-    aliases: &HashMap<String, String>,
+    indexed_value_vars: &HashMap<String, IndexedAccess, impl std::hash::BuildHasher>,
+    bit_masks: &HashMap<String, BTreeSet<u64>, impl std::hash::BuildHasher>,
+    aliases: &HashMap<String, String, impl std::hash::BuildHasher>,
 ) {
     let mut reads: Vec<_> = indexed_value_vars.iter().collect();
     reads.sort_by_key(|(_, access)| access.start);
@@ -328,9 +331,9 @@ pub fn annotate_bitfield_selectors(
 
 pub fn link_candidates(
     candidates: &mut [DecoderCandidate],
-    aliases: &HashMap<String, String>,
+    aliases: &HashMap<String, String, impl std::hash::BuildHasher>,
     push_builder_vars: &BTreeSet<String>,
-    push_builder_sites: &HashMap<String, BuilderSite>,
+    push_builder_sites: &HashMap<String, BuilderSite, impl std::hash::BuildHasher>,
 ) {
     for candidate in candidates {
         if candidate.builder_var.is_some() {

@@ -617,12 +617,12 @@ fn global_root_dependency(path: &str) -> Option<&'static str> {
 }
 
 impl Namespace {
-    fn from_path(path: String, witness: Option<Rc<WitnessLink>>) -> Option<Self> {
+    fn from_path(path: &str, witness: Option<Rc<WitnessLink>>) -> Option<Self> {
         let relative = path
             .strip_prefix("window.")
             .or_else(|| path.strip_prefix("globalThis."))
             .or_else(|| path.strip_prefix("self."))
-            .unwrap_or(&path);
+            .unwrap_or(path);
         let canonical = match relative {
             "window" | "globalThis" | "self" => "globalThis",
             "navigator" | "Object" | "Reflect" | "Function" | "Object.prototype"
@@ -632,7 +632,7 @@ impl Namespace {
         Some(Self {
             path: canonical.to_owned(),
             witness,
-            dependencies: global_root_dependency(&path).into_iter().collect(),
+            dependencies: global_root_dependency(path).into_iter().collect(),
         })
     }
 
@@ -641,8 +641,8 @@ impl Namespace {
     }
 
     fn child(&self, key: &str) -> Option<Self> {
-        let mut child = Self::from_path(self.property(key)?, self.witness.clone())?;
-        child.dependencies = self.dependencies.clone();
+        let mut child = Self::from_path(&self.property(key)?, self.witness.clone())?;
+        child.dependencies.clone_from(&self.dependencies);
         Some(child)
     }
 
@@ -650,7 +650,7 @@ impl Namespace {
         let kind = ApiKind::from_global(&self.property(key)?)?;
         let mut callable = Callable::native(kind);
         callable.captured = self.witness.is_some();
-        callable.witness = self.witness.clone();
+        callable.witness.clone_from(&self.witness);
         callable
             .namespace_dependencies
             .clone_from(&self.dependencies);
@@ -697,6 +697,7 @@ pub(super) struct BindingSite {
     pub(super) allocation: Span,
 }
 
+#[derive(Clone, Copy)]
 pub(super) struct DispatchOperands<'s, 'e, 'a> {
     pub(super) original_object: &'e Expression<'a>,
     pub(super) object: &'e Expression<'a>,
@@ -812,7 +813,7 @@ impl CallableIndex {
         constants: &ProvenConstantEnvironment,
     ) -> Option<Namespace> {
         if let Some(path) = global_path(scoping, constants, expr) {
-            return Namespace::from_path(path, None);
+            return Namespace::from_path(&path, None);
         }
         if let Some(symbol) = expression_symbol(scoping, expr) {
             return self.namespaces.get(&symbol)?.at(expr.span().start).cloned();
@@ -880,7 +881,7 @@ impl CallableIndex {
                 let mut callable = Callable::native(ApiKind::XhrOpen);
                 callable.receiver = Some(symbol);
                 callable.constructor_captured = constructor.captured;
-                callable.witness = constructor.witness.clone();
+                callable.witness.clone_from(&constructor.witness);
                 callable
                     .namespace_dependencies
                     .clone_from(&constructor.namespace_dependencies);

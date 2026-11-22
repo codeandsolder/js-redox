@@ -163,10 +163,7 @@ fn assert_main_contract(file: &str, outcome: &SafeDeobOutcome) {
             assert!(count(report, "proxy_computed_member") >= 2);
         }
         "proxy-calls.js" => assert!(count(report, "proxy_call") >= 3),
-        "multi-exit-reducible-state.js" => {
-            assert!(count(report, "if_ladder_structured") >= 2);
-        }
-        "early-abrupt-state-dispatch.js" => {
+        "multi-exit-reducible-state.js" | "early-abrupt-state-dispatch.js" => {
             assert!(count(report, "if_ladder_structured") >= 2);
         }
         "exception-resume-state.js" => {

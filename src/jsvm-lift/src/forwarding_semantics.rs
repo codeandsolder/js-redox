@@ -4392,7 +4392,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_forwarding_propagates_work_budget_exhaustion() -> TestResult {
+    fn registry_forwarding_propagates_work_budget_exhaustion() {
         let allocator = Allocator::default();
         let source = "function install(receiver,key,value){receiver.handlers[key]=value;} install(state,7,function(){});";
         let parsed = parse_program(&allocator, source, SourceType::cjs());
@@ -4410,7 +4410,5 @@ mod tests {
                 if error.kind() == BudgetExceededKind::Work
                     && error.scope() == "forwarding-fuel"
         ));
-
-        Ok(())
     }
 }

@@ -4163,7 +4163,6 @@ fn expression_definitely_throws_impl(
                 "||" if !left.truthy() => {
                     expression_definitely_throws_impl(&logical.right, env, budget)
                 }
-                "&&" | "||" => Ok(false),
                 _ => Ok(false),
             }
         }
@@ -6396,7 +6395,7 @@ mod tests {
             &machine,
             &while_statement.body,
             event,
-            &[(("selector").to_string(), 14i64)].into_iter().collect(),
+            &std::iter::once((("selector").to_string(), 14i64)).collect(),
         ));
         assert!(
             super::prove_function_if_ladder_event_unreachable_with_integer_parameters(
@@ -6406,7 +6405,7 @@ mod tests {
                 IntegerParameterEvent {
                     function: Span::new(function.span.start, function.span.end),
                     event,
-                    parameter_bindings: &[(0usize, 14i64)].into_iter().collect(),
+                    parameter_bindings: &std::iter::once((0usize, 14i64)).collect(),
                 },
             )
         );

@@ -41,7 +41,7 @@ use control_flow::{
 use decoder::{analyze_decoders, decoder_call_rewrite, js_parse_int, static_decoder_pass, Decoder};
 pub use iteration_history::IterationCycle;
 use iteration_history::IterationHistory;
-pub use numeric::{exact_i64, exact_u32, exact_u64, exact_usize};
+pub use numeric::{exact_i64, exact_u32, exact_u64, exact_usize, js_number_equal};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, ArrayExpressionElement, BindingPattern, CallExpression, ComputedMemberExpression,

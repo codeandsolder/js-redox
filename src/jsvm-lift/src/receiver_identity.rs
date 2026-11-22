@@ -4056,7 +4056,7 @@ impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
                         .as_deref()
                         .is_none_or(|property| property == "prototype")
                     {
-                        return [owner].into_iter().collect();
+                        return std::iter::once(owner).collect();
                     }
                 }
                 self.prototype_value(expression).into_iter().collect()
@@ -4530,7 +4530,6 @@ impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
                     self.process_expression(&unary.argument);
                 }
             }
-            Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_) => {}
             _ => {}
         }
     }
@@ -7726,7 +7725,7 @@ mod tests {
     }
 
     #[test]
-    fn phase_binding_audit_distinguishes_lexical_eval_and_explicit_writes() -> TestResult {
+    fn phase_binding_audit_distinguishes_lexical_eval_and_explicit_writes() {
         use super::structurally_proven_prototype_method_phase_closures;
         use crate::lexical_mutation::audit_lexical_binding_mutation;
 
@@ -7808,7 +7807,6 @@ mod tests {
             );
             assert!(!audit.root_scope_binding);
         }
-        Ok(())
     }
 
     #[test]

@@ -428,10 +428,8 @@ impl Evaluator<'_, '_, '_, '_> {
                 }
                 let first = call.arguments.first()?.as_expression()?;
                 match (helper, self.expression(first)?) {
-                    (HelperKind::Base64ArrayBufferPair, StaticWasmValue::Base64Module(sha256)) => {
-                        Some(StaticWasmValue::BufferPair(sha256))
-                    }
-                    (HelperKind::ArrayIdentity { .. }, StaticWasmValue::BufferPair(sha256)) => {
+                    (HelperKind::Base64ArrayBufferPair, StaticWasmValue::Base64Module(sha256))
+                    | (HelperKind::ArrayIdentity { .. }, StaticWasmValue::BufferPair(sha256)) => {
                         Some(StaticWasmValue::BufferPair(sha256))
                     }
                     _ => None,

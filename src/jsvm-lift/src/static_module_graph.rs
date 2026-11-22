@@ -830,13 +830,13 @@ mod tests {
                 kind: "test".into(),
                 input: "synthetic".into(),
                 salvaged: false,
-                extra: Default::default(),
+                extra: serde_json::Map::new(),
             },
             pages: vec![],
             resources,
             inline_scripts,
-            counts: Default::default(),
-            extra: Default::default(),
+            counts: std::collections::BTreeMap::new(),
+            extra: serde_json::Map::new(),
         };
         let source = CapturedScriptSource {
             resource_id: Some(0),

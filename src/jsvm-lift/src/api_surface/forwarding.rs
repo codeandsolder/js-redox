@@ -416,6 +416,7 @@ fn forwarded_dispatch<'a>(
 /// Follow a chain with concrete source argument origins. Each step has a
 /// unique function span and charges the analysis budget; cycles cannot grow
 /// the trace. Original syntactic API sites are emitted by the normal walker.
+#[derive(Clone, Copy)]
 pub(super) struct InvocationSite<'a> {
     pub(super) callee: &'a Expression<'a>,
     pub(super) arguments: &'a [Argument<'a>],
@@ -500,7 +501,7 @@ pub(super) fn specialize<'a>(
                     collector.constants,
                 );
                 callable.mark_forwarding(&witnesses, sink);
-                collector.emit_forwarded(site.callee, callable, site.span, &dependencies);
+                collector.emit_forwarded(site.callee, &callable, site.span, &dependencies);
             }
             return Ok(());
         }
@@ -562,7 +563,7 @@ pub(super) fn specialize<'a>(
                     dependencies.insert("rest_iterator".into());
                 }
                 callable.mark_forwarding(&witnesses, sink);
-                collector.emit_forwarded(site.callee, callable, site.span, &dependencies);
+                collector.emit_forwarded(site.callee, &callable, site.span, &dependencies);
                 return Ok(());
             }
         }

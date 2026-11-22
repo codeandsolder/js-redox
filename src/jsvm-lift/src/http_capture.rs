@@ -475,7 +475,7 @@ mod tests {
     }
 
     #[test]
-    fn html_base_links_and_import_maps() -> Result<()> {
+    fn html_base_links_and_import_maps() {
         let html = r#"<base href="/app/"><link rel="modulepreload" href="chunk.js">
           <script type="importmap">{"imports":{"lib":"./lib.js"}}</script>
           <script type="module">import "lib"; import("./later.js");</script>
@@ -501,6 +501,5 @@ mod tests {
         assert!(urls.contains("https://example.test/app/later.js"));
         assert!(urls.contains("https://example.test/app/main.js"));
         assert!(warnings.is_empty(), "{warnings:?}");
-        Ok(())
     }
 }

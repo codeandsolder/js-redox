@@ -833,7 +833,7 @@ mod tests {
     }
 
     #[test]
-    fn budget_is_enforced() -> TestResult {
+    fn budget_is_enforced() {
         let alloc = Allocator::default();
         let p = parse_program(&alloc, ACCESSOR, SourceType::cjs());
         let s = SemanticBuilder::new()
@@ -842,6 +842,5 @@ mod tests {
             .build(&p.program);
         let b = WorkBudget::new("zero", BudgetLimits::work(0));
         assert!(analyze(&s.semantic, &[], &b).is_err());
-        Ok(())
     }
 }

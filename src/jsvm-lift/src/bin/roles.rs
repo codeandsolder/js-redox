@@ -121,28 +121,28 @@ fn hungarian_max(
 
     let mut cols = names.to_vec();
     cols.extend((0..roles.len()).map(|i| format!("__dummy_{i}")));
-    let n = roles.len();
-    let m = cols.len();
+    let role_count = roles.len();
+    let column_count = cols.len();
 
-    let mut u = vec![0i64; n + 1];
-    let mut v = vec![0i64; m + 1];
-    let mut p = vec![0usize; m + 1];
-    let mut way = vec![0usize; m + 1];
+    let mut role_potential = vec![0i64; role_count + 1];
+    let mut column_potential = vec![0i64; column_count + 1];
+    let mut matched_role = vec![0usize; column_count + 1];
+    let mut predecessor = vec![0usize; column_count + 1];
 
-    for i in 1..=n {
-        p[0] = i;
+    for i in 1..=role_count {
+        matched_role[0] = i;
         let mut j0 = 0usize;
-        let mut minv = vec![INF; m + 1];
-        let mut used = vec![false; m + 1];
+        let mut minv = vec![INF; column_count + 1];
+        let mut used = vec![false; column_count + 1];
 
         loop {
             used[j0] = true;
-            let i0 = p[j0];
+            let i0 = matched_role[j0];
             let role = &roles[i0 - 1];
             let mut delta = INF;
             let mut j1 = 0usize;
 
-            for j in 1..=m {
+            for j in 1..=column_count {
                 if used[j] {
                     continue;
                 }
@@ -156,10 +156,10 @@ fn hungarian_max(
                         .copied()
                         .unwrap_or(0)
                 };
-                let cur = -weight - u[i0] - v[j];
+                let cur = -weight - role_potential[i0] - column_potential[j];
                 if cur < minv[j] {
                     minv[j] = cur;
-                    way[j] = j0;
+                    predecessor[j] = j0;
                 }
                 if minv[j] < delta {
                     delta = minv[j];
@@ -167,24 +167,24 @@ fn hungarian_max(
                 }
             }
 
-            for j in 0..=m {
+            for j in 0..=column_count {
                 if used[j] {
-                    u[p[j]] += delta;
-                    v[j] -= delta;
+                    role_potential[matched_role[j]] += delta;
+                    column_potential[j] -= delta;
                 } else {
                     minv[j] -= delta;
                 }
             }
 
             j0 = j1;
-            if p[j0] == 0 {
+            if matched_role[j0] == 0 {
                 break;
             }
         }
 
         loop {
-            let j1 = way[j0];
-            p[j0] = p[j1];
+            let j1 = predecessor[j0];
+            matched_role[j0] = matched_role[j1];
             j0 = j1;
             if j0 == 0 {
                 break;
@@ -193,11 +193,11 @@ fn hungarian_max(
     }
 
     let mut out = HashMap::new();
-    for j in 1..=m {
-        if p[j] == 0 {
+    for j in 1..=column_count {
+        if matched_role[j] == 0 {
             continue;
         }
-        let role = roles[p[j] - 1].clone();
+        let role = roles[matched_role[j] - 1].clone();
         let name = cols[j - 1].clone();
         if !name.starts_with("__dummy_") {
             out.insert(role, name);
