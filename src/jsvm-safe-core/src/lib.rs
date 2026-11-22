@@ -8975,6 +8975,67 @@ use();
     }
 
     #[test]
+    fn nonleading_mutable_decoder_aliases_use_exact_local_initialization_regions() {
+        let functions = "function p(){var t=['a','b'];p=function(){return t;};return p();}function d(i,t,v){return i=i-16,t=p(),v=t[i],v;}";
+        for (body, expected) in [
+            ("side();let a=d;sink(a(16));", 1),
+            ("side();var a=d;sink(a(16));", 1),
+            ("var before=side(),a=d;sink(a(16));", 1),
+            ("side();let a=d;side();let b=a;sink(b(16));", 1),
+            ("side();{let a=d;sink(a(16));}", 1),
+            ("if(flag){var a=d;sink(a(16));}sink(a(16));", 1),
+            ("if(flag){var a=d;}sink(a(16));", 0),
+            ("try{a(16)}catch(e){}var a=d;sink(a(16));", 1),
+            ("try{a(16)}catch(e){}let a=d;sink(a(16));", 1),
+            ("side();let a=d;a=replacement;sink(a(16));", 0),
+            (
+                "function inner(){return a(16)}side();var a=d;sink(inner());",
+                1,
+            ),
+            (
+                "function inner(){return a(16)}try{inner()}catch(e){}var a=d;sink(inner(),a(16));",
+                1,
+            ),
+            ("try{side();var a=d;}catch(error){}sink(a(16));", 0),
+            ("side();let a=d;eval('a=replacement');sink(a(16));", 0),
+            ("side();var a=d;let f=()=>a(16);sink(f());", 1),
+            (
+                "side();let a=d;function mutate(){a=replacement}sink(a(16));",
+                0,
+            ),
+        ] {
+            let source = format!("(function(){{{functions}{body}}})();");
+            let result =
+                recover_static_decoders(&source, 4).unwrap_or_else(|| unreachable!("{source}"));
+            assert_eq!(
+                result
+                    .transforms
+                    .get("string_array_decode")
+                    .copied()
+                    .unwrap_or_default(),
+                expected,
+                "{source}: {}",
+                result.source
+            );
+        }
+        let source = format!("{functions}const a=d;side();let b=a;sink(b(16));");
+        let result = recover_static_decoders(&source, 4).unwrap_or_else(|| unreachable!());
+        assert_eq!(
+            result.transforms.get("string_array_decode"),
+            Some(&1),
+            "{}",
+            result.source
+        );
+        let source = format!("{functions}var a=d;side();let b=a;sink(b(16));");
+        let result = recover_static_decoders(&source, 4).unwrap_or_else(|| unreachable!());
+        assert!(
+            !result.transforms.contains_key("string_array_decode"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
     fn decoder_alias_first_statement_dominates_closure_reads() {
         let source = r"
 function provider(table) {

@@ -3669,6 +3669,18 @@ impl AliasCandidateCollector<'_, '_> {
         if alias == target_symbol || !facts.binding_unmodified_by_eval(scoping, target_symbol) {
             return;
         }
+        // Nonleading declarations need actual execution-region evidence,
+        // not just a declaration offset. Permit mutable local storage when
+        // neither end depends on an ambient object-backed binding whose
+        // value could change during an earlier unknown operation.
+        if matches!(origin, AliasOrigin::Declaration(None))
+            && !scoping.symbol_flags(alias).is_const_variable()
+            && (!facts.source_local_data_binding(scoping, alias)
+                || !(facts.is_private(scoping, target_symbol)
+                    || facts.source_local_data_binding(scoping, target_symbol)))
+        {
+            return;
+        }
         self.by_target
             .entry(target_symbol)
             .or_default()
@@ -3786,7 +3798,7 @@ impl AliasCandidateCollector<'_, '_> {
 
 impl<'a> Visit<'a> for AliasCandidateCollector<'_, '_> {
     fn visit_variable_declaration(&mut self, declaration: &oxc_ast::ast::VariableDeclaration<'a>) {
-        if declaration.kind == VariableDeclarationKind::Const {
+        if rotation_proof::ordinary_declaration(declaration) {
             for declarator in &declaration.declarations {
                 self.declaration(declarator, None);
             }

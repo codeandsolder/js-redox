@@ -995,6 +995,31 @@ fn depythonify_safe_deob_callable_installation_runtime_equivalence() -> Result<(
     script_runtime_equivalence(&refs, "callable-installation", false)
 }
 
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_local_alias_regions_runtime_equivalence() -> Result<()> {
+    let functions = "function p(){var t=['a','b'];p=function(){return t;};return p();}function d(i,t,v){return i=i-16,t=p(),v=t[i],v;}";
+    let sources = [
+        "events.push('before');let a=d;return a(16);",
+        "events.push('before');var a=d;return a(16);",
+        "var before=events.push('before'),a=d;return a(16);",
+        "events.push('before');let a=d;events.push('middle');let b=a;return b(16);",
+        "events.push('before');{let a=d;return a(16);}",
+        "if(flag){var a=d;events.push(a(16));}try{return a(16)}catch(e){return e.name}",
+        "try{a(16)}catch(e){events.push(e.name)}var a=d;return a(16);",
+        "try{a(16)}catch(e){events.push(e.name)}let a=d;return a(16);",
+        "events.push('before');let a=d;a=()=>7;return a(16);",
+        "function inner(){return a(16)}events.push('before');var a=d;return inner();",
+        "function inner(){return a(16)}try{inner()}catch(e){events.push(e.name)}var a=d;return [inner(),a(16)];",
+        "try{if(flag)throw Error('early');var a=d;}catch(error){}try{return a(16)}catch(e){return e.name}",
+        "events.push('before');let a=d;eval('a=()=>7');return a(16);",
+        "events.push('before');var a=d;let f=()=>a(16);return f();",
+        "events.push('before');let a=d;function mutate(){a=()=>7}mutate();return a(16);",
+    ].into_iter().map(|body|format!("function run(flag){{{functions}{body}}}[run(false),run(true)];")).collect::<Vec<_>>();
+    let refs = sources.iter().map(String::as_str).collect::<Vec<_>>();
+    script_runtime_equivalence(&refs, "local-alias-regions", false)
+}
+
 fn script_runtime_equivalence(sources: &[&str], suite: &str, browser_globals: bool) -> Result<()> {
     let scratch = TempDir::new()?;
     // Browser decoders assume standard atob. Node's isolated VM does not
