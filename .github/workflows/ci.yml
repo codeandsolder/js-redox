@@ -13,6 +13,10 @@ permissions:
   contents: read
 
 jobs:
+  strict-rust:
+    name: Shared strict Rust policy
+    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@c9dbc011bec3c43a65b62a16cbf2a3f2e31a13cb # main
+
   rust:
     name: Rust 1.100 quality gate
     uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@411fd9e8b72b47b2d086b6c18671434cc019699a # main
