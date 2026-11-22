@@ -5,8 +5,9 @@ mod source_cache;
 use source_cache::{VerifiedSource, VerifiedSources, SOURCE_CACHE_BYTES};
 
 use crate::{
-    analysis_artifacts::{load_artifact, write_artifact, RUNTIME_SCRIPTS, SELECTIVE_TRACE},
+    analysis_artifacts::{load_artifact, stage_artifact, RUNTIME_SCRIPTS, SELECTIVE_TRACE},
     analysis_budget::{AnalysisBudgets, AnalysisOperation},
+    report_file::stage_text,
     report_markdown::{code_span, fenced_code, literal_text},
     runtime_identity::{
         retain_agreed, script_id_text, session_name, ScriptIdentityIndex, ScriptOriginContext,
@@ -469,6 +470,7 @@ pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -
          formatted or deobfuscated source positions may differ.\n\n"
     );
 
+    let mut staged = Vec::new();
     for (ordinal, hit) in hits.iter_mut().enumerate() {
         budget.checkpoint()?;
         let fields = hit
@@ -606,7 +608,7 @@ pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -
                 hit,
                 ordinal,
             )?;
-            fs::write(output.join(&path_name), path_view)?;
+            staged.push(stage_text(&output.join(&path_name), &path_view)?);
             hit["path_view_path"] = json!(path_destination);
             let _ = write!(view,
                 "## Ordered execution witness\n\n[Browse {} observed debugger steps](./{path_name}). This is a bounded sequence, not universal path specialization.\n\n",
@@ -620,7 +622,7 @@ pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -
             "expressions": hit.get("expressions"),
         }))?);
         view.push_str("\n[Full machine-readable trace](../../../analysis/selective-trace.json)\n");
-        fs::write(output.join(&name), view)?;
+        staged.push(stage_text(&output.join(&name), &view)?);
         hit["readable_view_path"] = json!(destination);
         let point = hit
             .get("pointId")
@@ -633,17 +635,25 @@ pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -
         );
     }
 
-    let keep = hits.len();
+    // Finish rendering and serialization before replacing any output. A
+    // failure in a later input therefore leaves all earlier reports intact.
+    staged.push(stage_text(&output.join("README.md"), &index)?);
+    staged.push(stage_artifact(project, SELECTIVE_TRACE, &trace)?);
+    budget.checkpoint()?;
+    for report in staged {
+        report.publish()?;
+    }
+    let hits = trace["hits"]
+        .as_array()
+        .context("selective trace missing hits[]")?;
     remove_obsolete_pages(&output, Some(hits))?;
-    fs::write(output.join("README.md"), index)?;
-    write_artifact(project, SELECTIVE_TRACE, &trace)?;
-    Ok(keep)
+    Ok(hits.len())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{sha256_hex, source_text::js_line_ranges};
+    use crate::{analysis_artifacts::write_artifact, sha256_hex, source_text::js_line_ranges};
     use tempfile::TempDir;
 
     #[test]
@@ -797,6 +807,31 @@ mod tests {
             trace["hits"][0]["path_view_path"],
             "src/_observed/invocations/0000-path.md"
         );
+        // A later unreadable exact source must not expose partially regenerated
+        // earlier pages, and all temporary report files must be reclaimed.
+        let output = project.join("src/_observed/invocations");
+        let old_index = fs::read(output.join("README.md"))?;
+        let mut invalid = trace.clone();
+        invalid["hits"][0]["pointId"] = json!("changed before later failure");
+        invalid["hits"].as_array_mut().context("fixture hits")?.push(json!({
+            "cdpSession":"main","pointId":"later",
+            "frames":[{"source_identity":"exact","sourceSha256":"f".repeat(64),"location":{"scriptId":"7","lineNumber":0,"columnNumber":0}}]
+        }));
+        write_artifact(project, SELECTIVE_TRACE, &invalid)?;
+        assert!(materialize_invocation_views(
+            project,
+            &AnalysisBudgets::standard("failed generation")
+        )
+        .is_err());
+        assert_eq!(fs::read_to_string(output.join("0000.md"))?, page);
+        assert_eq!(fs::read_to_string(output.join("0000-path.md"))?, path);
+        assert_eq!(fs::read(output.join("README.md"))?, old_index);
+        assert_eq!(fs::read_dir(&output)?.count(), 3);
+        assert_eq!(
+            load_artifact(project, SELECTIVE_TRACE, false)?,
+            Some(invalid)
+        );
+
         let mut unscoped = trace;
         unscoped["hits"][0]["cdpSession"] = Value::Null;
         write_artifact(project, SELECTIVE_TRACE, &unscoped)?;
