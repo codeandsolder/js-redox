@@ -7,6 +7,7 @@ use crate::{
     analysis_budget::{AnalysisBudgets, AnalysisOperation},
     capture_project::load_manifest,
     project_entrypoints::write_entrypoint_index,
+    report_markdown::{code_span, literal_text},
 };
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -296,8 +297,14 @@ pub fn refresh_project_readme(project: &Path, budgets: &AnalysisBudgets) -> Resu
         .map(|unit| array(unit, "arithmetic_state_proofs").len())
         .sum::<usize>();
 
-    let declared_scripts =
-        write_entrypoint_index(&project, &manifest_value, &source_index, &deob, &jsrefs)?;
+    let declared_scripts = write_entrypoint_index(
+        &project,
+        &manifest_value,
+        &source_index,
+        &deob,
+        &jsrefs,
+        &budget,
+    )?;
     let source = manifest_value
         .get("source")
         .context("capture manifest source missing")?;
@@ -326,9 +333,13 @@ pub fn refresh_project_readme(project: &Path, budgets: &AnalysisBudgets) -> Resu
     let mut lines = vec![
         "# Recovered source project".to_owned(),
         String::new(),
-        format!("Generated from {source_capture}. Input kind: **{source_kind}**. Capture state: **{capture_state}**."),
+        format!(
+            "Generated from {}. Input kind: **{}**. Capture state: **{capture_state}**.",
+            code_span(source_capture),
+            literal_text(source_kind)
+        ),
     ];
-    if let Some(url) = original_url {
+    if let Some(url) = original_url.map(code_span) {
         if source_kind.starts_with("saved_page_") {
             lines.push(format!(
                 "Original page URL recorded by the saved page: {url}."
@@ -339,7 +350,7 @@ pub fn refresh_project_readme(project: &Path, budgets: &AnalysisBudgets) -> Resu
             lines.push(format!("Observed browser entrypoint URL: {url}."));
         }
     }
-    if let Some(url) = final_url {
+    if let Some(url) = final_url.map(code_span) {
         lines.push(format!(
             "{}: {url}.",
             if source_kind == "http_static" {
@@ -405,10 +416,7 @@ pub fn refresh_project_readme(project: &Path, budgets: &AnalysisBudgets) -> Resu
         ]);
         for warning in array(capture, "warnings") {
             if let Some(message) = warning.as_str() {
-                lines.push(format!(
-                    "- Acquisition note: {}",
-                    message.replace('\n', " ")
-                ));
+                lines.push(format!("- Acquisition note: {}", literal_text(message)));
             }
         }
     }
@@ -444,7 +452,7 @@ pub fn refresh_project_readme(project: &Path, budgets: &AnalysisBudgets) -> Resu
         } else {
             lines.push(format!(
                 "- Runtime WASM provenance unavailable: **{}**",
-                str_field(summary, "unavailable_reason").unwrap_or("unknown")
+                literal_text(str_field(summary, "unavailable_reason").unwrap_or("unknown"))
             ));
         }
     }
@@ -463,14 +471,14 @@ pub fn refresh_project_readme(project: &Path, budgets: &AnalysisBudgets) -> Resu
         format!("- Readable source units: **{}** ({} JavaScript)", source_units.len(), js_units.len()),
         format!("- Exact-content JS reuse: **{unique_js}** unique bodies / **{}** occurrences (**{}** formatter reuses)", js_units.len(), usize_field(source_summary, "deduplicated_javascript_units")),
         format!("- JS-reference extraction: **{extractor_invocations}** parser invocations / **{}** exact-hash reuses", usize_field(jsref_summary, "deduplicated_units")),
-        format!("- Source kinds: {}", serde_json::to_string(&source_kinds)?),
+        format!("- Source kinds: {}", code_span(&serde_json::to_string(&source_kinds)?)),
         format!("- JS/module/worker references: **{}**", usize_field(jsref_summary, "references")),
     ]);
     if api_surface_doc.is_some() {
         lines.push(format!("- Static browser API callsites: **{}**; callsites with exact absolute network URLs: **{}**; proven invalid methods: **{}**; failed source units: **{}**", usize_field(api_summary, "callsites"), usize_field(api_summary, "absolute_network_urls"), usize_field(api_summary, "invalid_methods"), usize_field(api_summary, "failures")));
         lines.push(format!(
             "- Static browser API sink kinds: {}",
-            compact(api_summary.get("kinds"))
+            code_span(&compact(api_summary.get("kinds")))
         ));
     }
     lines.extend([
@@ -534,7 +542,8 @@ pub fn refresh_project_readme(project: &Path, budgets: &AnalysisBudgets) -> Resu
                     ToOwned::to_owned,
                 );
             lines.push(format!(
-                "- {label} — {} devirtualized interpreter module(s)",
+                "- {} — {} devirtualized interpreter module(s)",
+                code_span(&label),
                 array(unit, "devirtualized_units").len()
             ));
         }
@@ -557,7 +566,8 @@ pub fn refresh_project_readme(project: &Path, budgets: &AnalysisBudgets) -> Resu
                 usize_field(unit, "largest_handler_table")
             };
             lines.push(format!(
-                "- {label} — largest static function table {handlers} handlers"
+                "- {} — largest static function table {handlers} handlers",
+                code_span(&label)
             ));
         }
     }
@@ -580,7 +590,10 @@ pub fn refresh_project_readme(project: &Path, budgets: &AnalysisBudgets) -> Resu
                 "- External uncaptured URLs: **{}**",
                 usize_field(summary, "external_urls")
             ),
-            format!("- Edge kinds: {}", compact(summary.get("edge_kinds"))),
+            format!(
+                "- Edge kinds: {}",
+                code_span(&compact(summary.get("edge_kinds")))
+            ),
         ]);
     }
 
@@ -592,7 +605,7 @@ pub fn refresh_project_readme(project: &Path, budgets: &AnalysisBudgets) -> Resu
             "The input HAR ended before valid JSON completion. Structurally complete entries before the truncation point were salvaged; absence of later resources is not evidence they were never requested.".into(),
         ]);
         if let Some(parse_error) = str_field(source, "parse_error") {
-            lines.push(format!("- HAR parse error: {parse_error}"));
+            lines.push(format!("- HAR parse error: {}", literal_text(parse_error)));
         }
     }
 
@@ -643,9 +656,9 @@ mod tests {
         write_manifest(&project.join("capture-manifest.json"), &manifest)?;
         refresh_project_readme(project, &AnalysisBudgets::standard("HTTP README test"))?;
         let readme = fs::read_to_string(project.join("README.md"))?;
-        assert!(readme.contains("Input kind: **http_static**"));
-        assert!(readme.contains("HTTP requested URL: https://fixture.invalid/app/index.html."));
-        assert!(readme.contains("Final HTTP URL: https://fixture.invalid/app/index.html."));
+        assert!(readme.contains("Input kind: **http\\_static**"));
+        assert!(readme.contains("HTTP requested URL: `https://fixture.invalid/app/index.html`."));
+        assert!(readme.contains("Final HTTP URL: `https://fixture.invalid/app/index.html`."));
         assert!(readme.contains("## HTTP-only acquisition"));
         assert!(readme.contains("HTTP responses: **2**"));
         assert!(readme.contains("[src/ENTRYPOINTS.md](src/ENTRYPOINTS.md)"));

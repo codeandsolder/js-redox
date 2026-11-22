@@ -1,7 +1,11 @@
 //! Navigable document-to-module source index for a recovered capture project.
 //! Kept independent of runtime evidence: HTML declarations and import edges
 //! describe statically reachable code, not necessarily executed functions.
-use crate::browser_script_types::is_executable_script;
+use crate::{
+    browser_script_types::is_executable_script,
+    capture_project::validate_project_relative_path,
+    report_markdown::{code_span, link_destination},
+};
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::{
@@ -9,6 +13,7 @@ use std::{
     fs,
     path::Path,
 };
+use work_budget::WorkBudget;
 
 fn fields<'a>(value: &'a Value, key: &str) -> &'a [Value] {
     value
@@ -21,77 +26,96 @@ fn string<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value.get(key).and_then(Value::as_str)
 }
 
-fn display(text: &str) -> String {
-    text.replace('\\', "\\\\")
-        .replace('`', "\\`")
-        .replace(['\n', '\r'], " ")
-}
-
 fn path_link(unit: &Value, readable: &BTreeMap<&str, &str>) -> String {
-    let raw = string(unit, "raw_path").unwrap_or_default();
-    let source = string(unit, "source_path").unwrap_or_default();
-    let preferred = readable.get(raw).copied().unwrap_or(source);
-    // Links originate inside src/; all source paths are validated project paths.
-    let relative = preferred.strip_prefix("src/").unwrap_or(preferred);
-    let escaped = relative
-        .replace('%', "%25")
-        .replace('#', "%23")
-        .replace(' ', "%20")
-        .replace('(', "%28")
-        .replace(')', "%29");
-    format!("[`{}`]({escaped})", display(relative))
-}
-
-fn append_reachable<'a>(
-    lines: &mut Vec<String>,
-    roots: Vec<(&'a Value, String)>,
-    by_url: &BTreeMap<&str, Vec<&'a Value>>,
-    references: &BTreeMap<&str, &[Value]>,
-    readable: &BTreeMap<&str, &str>,
-    global_seen: &mut BTreeSet<&'a str>,
-) {
-    let mut queue = VecDeque::from(roots);
-    let mut visited = BTreeSet::<&str>::new();
-    while let Some((unit, why)) = queue.pop_front() {
-        let Some(raw) = string(unit, "raw_path") else {
-            continue;
-        };
-        if !visited.insert(raw) {
+    let raw = string(unit, "raw_path");
+    let preferred = raw.and_then(|raw| readable.get(raw).copied());
+    for path in [preferred, string(unit, "source_path"), raw]
+        .into_iter()
+        .flatten()
+    {
+        if validate_project_relative_path(path, "entrypoint source path").is_err() {
             continue;
         }
-        global_seen.insert(raw);
-        lines.push(format!("- {} — {why}", path_link(unit, readable)));
-        for reference in references.get(raw).copied().unwrap_or_default() {
-            let specifier = string(reference, "specifier").unwrap_or("unknown");
-            let kind = string(reference, "kind").unwrap_or("reference");
-            let Some(destination) = string(reference, "resolved_url") else {
-                if !specifier.is_empty() {
-                    lines.push(format!(
-                        "  - `{kind}` `{}` — unresolved",
-                        display(specifier)
-                    ));
+        // This page is under src/. Non-src paths must be rooted one level up.
+        let (label, destination) = if let Some(relative) = path.strip_prefix("src/") {
+            (relative, link_destination(relative))
+        } else {
+            (path, format!("../{}", link_destination(path)))
+        };
+        return format!("[{}]({destination})", code_span(label));
+    }
+    format!(
+        "{} (no valid project-local source path)",
+        code_span(raw.unwrap_or("unknown source"))
+    )
+}
+
+struct NavigationIndex<'a> {
+    by_url: BTreeMap<&'a str, Vec<&'a Value>>,
+    references: BTreeMap<&'a str, &'a [Value]>,
+    readable: BTreeMap<&'a str, &'a str>,
+}
+
+impl<'a> NavigationIndex<'a> {
+    fn append_reachable(
+        &self,
+        lines: &mut Vec<String>,
+        roots: &[&'a Value],
+        root_reason: &str,
+        global_seen: &mut BTreeSet<&'a str>,
+        budget: &WorkBudget,
+    ) -> Result<()> {
+        // Mark at enqueue time: a dense graph must not enqueue one copy of
+        // every node for every incoming edge. First BFS reason wins as before.
+        let mut queue = VecDeque::new();
+        let mut discovered = BTreeSet::<&str>::new();
+        budget.consume(u64::try_from(roots.len())?)?;
+        for &root in roots {
+            if let Some(raw) = string(root, "raw_path") {
+                if discovered.insert(raw) {
+                    queue.push_back((root, raw, root_reason.to_owned()));
                 }
-                continue;
-            };
-            let Some(targets) = by_url.get(destination) else {
-                lines.push(format!(
-                    "  - `{kind}` `{}` — not captured (`{}`)",
-                    display(specifier),
-                    display(destination)
-                ));
-                continue;
-            };
-            for target in targets {
-                queue.push_back((
-                    target,
-                    format!(
-                        "`{kind}` `{}` from {}",
-                        display(specifier),
-                        path_link(unit, readable)
-                    ),
-                ));
             }
         }
+        while let Some((unit, raw, why)) = queue.pop_front() {
+            budget.consume(1)?;
+            global_seen.insert(raw);
+            let source_link = path_link(unit, &self.readable);
+            lines.push(format!("- {source_link} — {why}"));
+            for reference in self.references.get(raw).copied().unwrap_or_default() {
+                budget.consume(1)?;
+                let specifier = string(reference, "specifier").unwrap_or("unknown");
+                let kind = code_span(string(reference, "kind").unwrap_or("reference"));
+                let Some(destination) = string(reference, "resolved_url") else {
+                    if !specifier.is_empty() {
+                        lines.push(format!("  - {kind} {} — unresolved", code_span(specifier)));
+                    }
+                    continue;
+                };
+                let Some(targets) = self.by_url.get(destination) else {
+                    lines.push(format!(
+                        "  - {kind} {} — not captured ({})",
+                        code_span(specifier),
+                        code_span(destination)
+                    ));
+                    continue;
+                };
+                budget.consume(u64::try_from(targets.len())?)?;
+                let mut reason = None;
+                for &target in targets {
+                    let Some(raw) = string(target, "raw_path") else {
+                        continue;
+                    };
+                    if discovered.insert(raw) {
+                        let why = reason.get_or_insert_with(|| {
+                            format!("{kind} {} from {source_link}", code_span(specifier))
+                        });
+                        queue.push_back((target, raw, why.clone()));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -99,13 +123,18 @@ fn append_reachable<'a>(
 /// statically resolved transitive JavaScript imports. Returns the number of
 /// distinct declared script entries; an empty index is still useful for
 /// explaining why there is no HTML-root code path in a capture.
-pub fn write_entrypoint_index(
+pub(crate) fn write_entrypoint_index(
     project: &Path,
     manifest: &Value,
     source_index: &Value,
     deob: &Value,
     references: &Value,
+    budget: &WorkBudget,
 ) -> Result<usize> {
+    budget.consume(u64::try_from(fields(source_index, "units").len())?)?;
+    budget.consume(u64::try_from(fields(deob, "units").len())?)?;
+    budget.consume(u64::try_from(fields(references, "code_units").len())?)?;
+    budget.consume(u64::try_from(fields(manifest, "resources").len())?)?;
     let js_units = fields(source_index, "units")
         .iter()
         .filter(|unit| string(unit, "kind") == Some("javascript"))
@@ -137,6 +166,11 @@ pub fn write_entrypoint_index(
         .iter()
         .filter_map(|unit| Some((string(unit, "raw_path")?, fields(unit, "references"))))
         .collect::<BTreeMap<_, _>>();
+    let navigation = NavigationIndex {
+        by_url,
+        references,
+        readable,
+    };
     let documents = fields(manifest, "resources")
         .iter()
         .filter_map(|row| Some((row.get("id")?.as_u64()?, string(row, "url")?)))
@@ -150,6 +184,7 @@ pub fn write_entrypoint_index(
     let mut global_seen = BTreeSet::<&str>::new();
     let mut roots = 0;
     for script in fields(manifest, "inline_scripts") {
+        budget.consume(1)?;
         if !is_executable_script(string(script, "script_type")) {
             continue;
         }
@@ -160,56 +195,48 @@ pub fn write_entrypoint_index(
             .and_then(|id| documents.get(&id).copied())
             .unwrap_or("unknown document");
         let ordinal = script.get("ordinal").and_then(Value::as_u64).unwrap_or(0);
-        lines.push(format!("## {} — script {ordinal}", display(document)));
+        lines.push(format!("## {} — script {ordinal}", code_span(document)));
         lines.push(String::new());
-        let roots_for_script = string(script, "resolved_src").map_or_else(
-            || {
-                string(script, "output_path")
-                    .and_then(|raw| by_raw.get(raw).copied())
-                    .into_iter()
-                    .collect()
-            },
-            |src| {
-                lines.push(format!("HTML `src`: `{}`", display(src)));
-                by_url.get(src).cloned().unwrap_or_default()
-            },
-        );
+        let inline_root = string(script, "output_path").and_then(|raw| by_raw.get(raw).copied());
+        let roots_for_script = if let Some(src) = string(script, "resolved_src") {
+            lines.push(format!("HTML `src`: {}", code_span(src)));
+            navigation.by_url.get(src).map_or_default(Vec::as_slice)
+        } else {
+            inline_root.as_slice()
+        };
         if roots_for_script.is_empty() {
             lines.push("Source body not present in this capture.".into());
             lines.push(String::new());
             continue;
         }
-        append_reachable(
+        navigation.append_reachable(
             &mut lines,
-            roots_for_script
-                .into_iter()
-                .map(|unit| (unit, "declared entrypoint".to_owned()))
-                .collect(),
-            &by_url,
-            &references,
-            &readable,
+            roots_for_script,
+            "declared entrypoint",
             &mut global_seen,
-        );
+            budget,
+        )?;
         lines.push(String::new());
     }
     if roots == 0 {
         lines.push("No executable HTML script declarations were found in this capture.".into());
         lines.push(String::new());
     }
-    let preloads = fields(manifest, "resources")
-        .iter()
-        .flat_map(|document| {
-            fields(document, "references")
-                .iter()
+    let mut preloads = Vec::new();
+    for document in fields(manifest, "resources") {
+        let refs = fields(document, "references");
+        budget.consume(u64::try_from(refs.len())?)?;
+        preloads.extend(
+            refs.iter()
                 .filter(|reference| {
                     matches!(
                         string(reference, "kind"),
                         Some("modulepreload" | "script_preload")
                     )
                 })
-                .map(move |reference| (document, reference))
-        })
-        .collect::<Vec<_>>();
+                .map(|reference| (document, reference)),
+        );
+    }
     if !preloads.is_empty() {
         lines.extend([
             "## HTML script preload hints".into(),
@@ -222,25 +249,20 @@ pub fn write_entrypoint_index(
             let kind = string(reference, "kind").unwrap_or("preload");
             let url = string(reference, "resolved_url").unwrap_or_default();
             lines.push(format!(
-                "### {} — `{}` `{}`",
-                display(document_url),
-                kind,
-                display(url)
+                "### {} — {} {}",
+                code_span(document_url),
+                code_span(kind),
+                code_span(url)
             ));
             lines.push(String::new());
-            if let Some(units) = by_url.get(url) {
-                append_reachable(
+            if let Some(units) = navigation.by_url.get(url) {
+                navigation.append_reachable(
                     &mut lines,
-                    units
-                        .iter()
-                        .copied()
-                        .map(|unit| (unit, format!("HTML `{kind}` hint")))
-                        .collect(),
-                    &by_url,
-                    &references,
-                    &readable,
+                    units,
+                    &format!("HTML {} hint", code_span(kind)),
                     &mut global_seen,
-                );
+                    budget,
+                )?;
             } else {
                 lines.push("Preloaded script body not present in this capture.".into());
             }
@@ -259,13 +281,98 @@ pub fn write_entrypoint_index(
             String::new(),
         ]);
         for unit in unlinked {
-            lines.push(format!("- {}", path_link(unit, &readable)));
+            lines.push(format!("- {}", path_link(unit, &navigation.readable)));
         }
         lines.push(String::new());
     }
+    budget.checkpoint()?;
     let output = project.join("src/ENTRYPOINTS.md");
     fs::create_dir_all(output.parent().context("entrypoint index has no parent")?)?;
     fs::write(&output, lines.join("\n"))
         .with_context(|| format!("writing {}", output.display()))?;
     Ok(roots)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use work_budget::BudgetLimits;
+
+    #[test]
+    fn source_links_encode_literal_names_and_stay_project_relative() {
+        let unit = json!({"raw_path":"resources/raw.js","source_path":"src/dir/a [b]#?%.js"});
+        assert_eq!(
+            path_link(&unit, &BTreeMap::new()),
+            "[`dir/a [b]#?%.js`](dir/a%20%5Bb%5D%23%3F%25.js)"
+        );
+        let readable = BTreeMap::from([("resources/raw.js", "//external.example/invalid.js")]);
+        assert_eq!(
+            path_link(&unit, &readable),
+            path_link(&unit, &BTreeMap::new())
+        );
+        let fallback = json!({"raw_path":"resources/raw.js","source_path":"../invalid.js"});
+        assert_eq!(
+            path_link(&fallback, &BTreeMap::new()),
+            "[`resources/raw.js`](../resources/raw.js)"
+        );
+        let invalid =
+            json!({"raw_path":"C:/outside.js","source_path":"//external.example/script.js"});
+        let label = path_link(&invalid, &BTreeMap::new());
+        assert!(label.contains("no valid project-local source path"));
+        assert!(!label.contains("](//"));
+    }
+
+    #[test]
+    fn entrypoint_index_escapes_all_labels_and_deduplicates_dense_traversal() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let project = directory.path();
+        let manifest = json!({
+            "resources":[{"id":0,"url":"https://fixture.invalid/[doc]`\n# not a heading"}],
+            "inline_scripts":[{"parent_resource_id":0,"ordinal":1,"script_type":"module","resolved_src":"entry"}]
+        });
+        let units = json!({"units":[
+            {"kind":"javascript","raw_path":"resources/a.js","source_path":"src/a.js","url":"entry"},
+            {"kind":"javascript","raw_path":"resources/b.js","source_path":"src/b.js","url":"dependency"},
+            {"kind":"javascript","raw_path":"resources/c.js","source_path":"src/c.js","url":"dependency"}
+        ]});
+        let references = json!({"code_units":[
+            {"raw_path":"resources/a.js","references":[{"kind":"import_static","specifier":"pkg`\n# fake","resolved_url":"dependency"},{"kind":"import_static","specifier":"second","resolved_url":"dependency"}]},
+            {"raw_path":"resources/b.js","references":[{"kind":"import_static","specifier":"cycle","resolved_url":"entry"}]},
+            {"raw_path":"resources/c.js","references":[{"kind":"import_static","specifier":"cycle","resolved_url":"entry"}]}
+        ]});
+        let deob = json!({"units":[]});
+        assert_eq!(
+            write_entrypoint_index(
+                project,
+                &manifest,
+                &units,
+                &deob,
+                &references,
+                &WorkBudget::unlimited("fixture")
+            )?,
+            1
+        );
+        let output = project.join("src/ENTRYPOINTS.md");
+        let original = fs::read_to_string(&output)?;
+        assert!(original.contains("`` pkg`\\n# fake ``"), "{original}");
+        for body in ["a.js", "b.js", "c.js"] {
+            assert_eq!(
+                original
+                    .lines()
+                    .filter(|line| line.starts_with(&format!("- [`{body}`]")))
+                    .count(),
+                1,
+                "{original}"
+            );
+        }
+        assert!(!original.contains("\n# not a heading\n"));
+        let budget = WorkBudget::new("exhausted fixture", BudgetLimits::work(12));
+        assert!(
+            write_entrypoint_index(project, &manifest, &units, &deob, &references, &budget)
+                .is_err()
+        );
+        assert_eq!(fs::read_to_string(output)?, original);
+        Ok(())
+    }
 }

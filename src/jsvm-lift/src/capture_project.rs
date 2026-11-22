@@ -31,7 +31,7 @@ pub struct CaptureManifest {
     pub extra: Map<String, Value>,
 }
 
-fn validate_project_relative_path(value: &str, label: &str) -> Result<()> {
+pub(crate) fn validate_project_relative_path(value: &str, label: &str) -> Result<()> {
     if value.is_empty() {
         bail!("{label}: path must be a non-empty string");
     }
