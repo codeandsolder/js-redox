@@ -8282,6 +8282,36 @@ sink(decode(0x10), decode(0x11));
     }
 
     #[test]
+    fn decoder_rotation_order_requires_guaranteed_execution_before_observation() {
+        let prefix = "function p(){var t=['11','22','33'];p=function(){return t;};return p();}function d(i,t,v){return i=i-0,t=p(),v=t[i],v;}";
+        let rotation = "(function(provider,target){var alias=d,table=provider();while(true){try{var checksum=parseInt(alias(0));if(checksum===target)break;else table.push(table.shift());}catch(err){table.push(table.shift());}}})(p,22)";
+        let second = rotation.replace("(p,22)", "(p,33)");
+        for (source, calls, rotations) in [
+            (format!("{prefix}{rotation};sink(d(0));"), 1, 1),
+            (format!("{prefix}sink(d(0));{rotation};sink(d(0));"), 0, 0),
+            (format!("{prefix}if(flag){rotation};sink(d(0));"), 0, 0),
+            (format!("{prefix}flag&&{rotation};sink(d(0));"), 0, 0),
+            (format!("{prefix}flag?{rotation}:0;sink(d(0));"), 0, 0),
+            (format!("{prefix}for(let i=0;i<2;i++){{{rotation};}}sink(d(0));"), 0, 0),
+            (format!("{prefix}function before(){{return d(0)}}sink(before());{rotation};sink(d(0));"), 0, 0),
+            (format!("function run(){{{prefix}function after(){{return d(0)}}{rotation};return after()}}sink(run());"), 1, 1),
+            (format!("function run(){{{prefix}function before(){{return d(0)}}sink(before());{rotation};return d(0)}}sink(run());"), 0, 0),
+            (format!("{prefix}{rotation};{second};sink(d(0));"), 1, 2),
+            (format!("{prefix}{rotation};sink(d(0));{second};sink(d(0));"), 0, 0),
+            (format!("{prefix}({rotation},sink(d(0)));"), 1, 1),
+            (format!("{prefix}for({rotation};false;){{}}sink(d(0));"), 1, 1),
+            (format!("{prefix}const x={rotation};sink(d(0),x);"), 1, 1),
+            (format!("{prefix}if({rotation}){{sink(d(0))}}sink(d(0));"), 2, 1),
+            (format!("{prefix}42;{rotation};"), 0, 1),
+            (format!("{prefix}42;!{rotation};"), 0, 1),
+        ] {
+            let result = recover_static_decoders(&source, 8).unwrap_or_else(|| unreachable!("{source}"));
+            assert_eq!(result.transforms.get("string_array_decode").copied().unwrap_or_default(), calls, "{source}: {}", result.source);
+            assert_eq!(result.transforms.get("remove_decoder_rotation_iife").copied().unwrap_or_default(), rotations, "{source}: {}", result.source);
+        }
+    }
+
+    #[test]
     fn decoder_provider_identity_and_confinement_are_shared_across_all_views() {
         let source = SPLIT_PROVIDER_ROTATION_SOURCE.replace(
             "let setup, after;",

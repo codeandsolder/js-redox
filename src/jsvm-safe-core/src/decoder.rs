@@ -19,8 +19,7 @@ use crate::{
 use fixed_base64_proof::fixed_base64_algorithm_proven;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    Argument, BindingPattern, CallExpression, Expression, ExpressionStatement, Statement,
-    VariableDeclarationKind,
+    Argument, BindingPattern, CallExpression, Expression, Statement, VariableDeclarationKind,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_parser::Parser;
@@ -2239,7 +2238,8 @@ struct RotationIife {
     proof_eligible: bool,
     body_span: Span,
     statement_span: Span,
-    standalone_statement: bool,
+    call_span: Span,
+    execution: Option<RotationExecution>,
 }
 
 fn rotation_iife_function<'a>(expr: &'a Expression<'a>) -> Option<&'a oxc_ast::ast::Function<'a>> {
@@ -2265,18 +2265,121 @@ fn rotation_iife_call<'a>(expr: &'a Expression<'a>) -> Option<&'a CallExpression
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RotationExecution {
+    owner: ScopeId,
+    after: Span,
+}
+
+/// Collect calls that execute once on the normal-completion path of a
+/// statement. In particular, do not descend into short-circuited arms,
+/// deferred function bodies, or repeating loop tests and updates.
+fn guaranteed_expression_calls(expression: &Expression<'_>, visit: &mut impl FnMut(Span)) {
+    match unparenthesized(expression) {
+        Expression::CallExpression(call) if !call.optional => {
+            guaranteed_expression_calls(&call.callee, visit);
+            for argument in &call.arguments {
+                if let Some(value) = argument.as_expression() {
+                    guaranteed_expression_calls(value, visit);
+                }
+            }
+            if rotation_iife_function(&call.callee).is_some() {
+                visit(call.span);
+            }
+        }
+        Expression::SequenceExpression(sequence) => {
+            for expression in &sequence.expressions {
+                guaranteed_expression_calls(expression, visit);
+            }
+        }
+        Expression::UnaryExpression(unary) => guaranteed_expression_calls(&unary.argument, visit),
+        Expression::BinaryExpression(binary) => {
+            guaranteed_expression_calls(&binary.left, visit);
+            guaranteed_expression_calls(&binary.right, visit);
+        }
+        Expression::LogicalExpression(logical) => guaranteed_expression_calls(&logical.left, visit),
+        Expression::ConditionalExpression(conditional) => {
+            guaranteed_expression_calls(&conditional.test, visit)
+        }
+        Expression::AssignmentExpression(assignment) if !assignment.operator.is_logical() => {
+            guaranteed_expression_calls(&assignment.right, visit);
+        }
+        _ => {}
+    }
+}
+
 #[derive(Default)]
 struct RotationStatementSpanCollector {
+    scopes: Vec<Option<ScopeId>>,
     spans: HashMap<(u32, u32), Span>,
+    executions: HashMap<(u32, u32), RotationExecution>,
 }
 
 impl<'a> Visit<'a> for RotationStatementSpanCollector {
-    fn visit_expression_statement(&mut self, statement: &ExpressionStatement<'a>) {
-        if let Some(call) = rotation_iife_call(&statement.expression) {
-            self.spans
-                .insert((call.span.start, call.span.end), statement.span);
+    fn enter_scope(&mut self, _: ScopeFlags, scope: &std::cell::Cell<Option<ScopeId>>) {
+        self.scopes.push(scope.get());
+    }
+
+    fn leave_scope(&mut self) {
+        self.scopes.pop();
+    }
+
+    fn visit_statements(&mut self, statements: &oxc_allocator::Vec<'a, Statement<'a>>) {
+        if let (Some(Some(owner)), Some(last)) = (self.scopes.last(), statements.last()) {
+            let owner = *owner;
+            let end = last.span().end;
+            for statement in statements {
+                let span = statement.span();
+                let mut record = |call: Span| {
+                    self.executions.insert(
+                        (call.start, call.end),
+                        RotationExecution {
+                            owner,
+                            after: Span::new(call.end, end),
+                        },
+                    );
+                };
+                match statement {
+                    Statement::ExpressionStatement(expression) => {
+                        guaranteed_expression_calls(&expression.expression, &mut record);
+                        if let Some(call) = rotation_iife_call(&expression.expression) {
+                            self.spans.insert((call.span.start, call.span.end), span);
+                        }
+                    }
+                    Statement::VariableDeclaration(declaration) => {
+                        for declarator in &declaration.declarations {
+                            if let Some(init) = &declarator.init {
+                                guaranteed_expression_calls(init, &mut record);
+                            }
+                        }
+                    }
+                    Statement::ForStatement(statement) => {
+                        if let Some(init) = &statement.init {
+                            if let Some(expression) = init.as_expression() {
+                                guaranteed_expression_calls(expression, &mut record);
+                            } else if let oxc_ast::ast::ForStatementInit::VariableDeclaration(
+                                declaration,
+                            ) = init
+                            {
+                                for declarator in &declaration.declarations {
+                                    if let Some(value) = &declarator.init {
+                                        guaranteed_expression_calls(value, &mut record);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Statement::IfStatement(statement) => {
+                        guaranteed_expression_calls(&statement.test, &mut record)
+                    }
+                    Statement::SwitchStatement(statement) => {
+                        guaranteed_expression_calls(&statement.discriminant, &mut record)
+                    }
+                    _ => {}
+                }
+            }
         }
-        walk::walk_expression_statement(self, statement);
+        walk::walk_statements(self, statements);
     }
 }
 
@@ -2781,7 +2884,6 @@ fn closed_over_rotation_iife(
 
     let mut stable_aliases = HashMap::new();
     stable_aliases.insert(decoder_symbol, decoder_alias.name.to_string());
-    let standalone = statement_span.is_some();
     Some(RotationIife {
         provider,
         provider_reference,
@@ -2794,7 +2896,8 @@ fn closed_over_rotation_iife(
         proof_eligible: true,
         body_span: body.span,
         statement_span: statement_span.unwrap_or(call.span),
-        standalone_statement: standalone,
+        call_span: call.span,
+        execution: None,
     })
 }
 
@@ -2802,7 +2905,7 @@ struct RotationIifeCollector<'c, 's> {
     source: &'s str,
     scoping: &'c Scoping,
     facts: &'c BindingFacts,
-    statement_spans: &'s HashMap<(u32, u32), Span>,
+    statement_spans: &'s RotationStatementSpanCollector,
     reference_spans: &'s HashMap<ReferenceId, Span>,
     out: Vec<RotationIife>,
 }
@@ -2813,9 +2916,10 @@ impl<'a> Visit<'a> for RotationIifeCollector<'_, '_> {
             if let Some(function) = rotation_iife_function(&call.callee) {
                 let statement_span = self
                     .statement_spans
+                    .spans
                     .get(&(call.span.start, call.span.end))
                     .copied();
-                if let Some(rotation) = closed_over_rotation_iife(
+                if let Some(mut rotation) = closed_over_rotation_iife(
                     self.source,
                     call,
                     function,
@@ -2823,6 +2927,11 @@ impl<'a> Visit<'a> for RotationIifeCollector<'_, '_> {
                     self.facts,
                     statement_span,
                 ) {
+                    rotation.execution = self
+                        .statement_spans
+                        .executions
+                        .get(&(call.span.start, call.span.end))
+                        .copied();
                     self.out.push(rotation);
                 }
             }
@@ -2888,6 +2997,7 @@ impl<'a> Visit<'a> for RotationIifeCollector<'_, '_> {
                     };
                     let standalone_statement = self
                         .statement_spans
+                        .spans
                         .get(&(call.span.start, call.span.end))
                         .copied();
                     self.out.push(RotationIife {
@@ -2902,7 +3012,12 @@ impl<'a> Visit<'a> for RotationIifeCollector<'_, '_> {
                         proof_eligible,
                         body_span: body.span,
                         statement_span: standalone_statement.unwrap_or(call.span),
-                        standalone_statement: standalone_statement.is_some(),
+                        call_span: call.span,
+                        execution: self
+                            .statement_spans
+                            .executions
+                            .get(&(call.span.start, call.span.end))
+                            .copied(),
                     });
                 }
             }
@@ -2924,7 +3039,7 @@ fn collect_rotation_iifes(
         source,
         scoping,
         facts,
-        statement_spans: &statement_spans.spans,
+        statement_spans: &statement_spans,
         reference_spans,
         out: Vec::new(),
     };
@@ -3047,11 +3162,15 @@ fn fixed_rotated_candidate_names(source: &str, function: &VariableFunctionInfo) 
 fn detect_fixed_rotated_direct_decoders(
     source: &str,
     program: &oxc_ast::ast::Program<'_>,
-    scoping: &Scoping,
-    facts: &BindingFacts,
-    reference_spans: &HashMap<ReferenceId, Span>,
+    context: &DecoderBindingContext<'_>,
     rotations: &[RotationIife],
-) -> DecoderDetection {
+) -> Result<DecoderDetection, BudgetExceeded> {
+    let DecoderBindingContext {
+        scoping,
+        facts,
+        reference_spans,
+        budget,
+    } = *context;
     let arrays = all_static_arrays(program);
     let functions = variable_functions(program);
     let mut arrays_by_name: HashMap<&str, Vec<&StaticArrayInfo>> = HashMap::new();
@@ -3110,6 +3229,33 @@ fn detect_fixed_rotated_direct_decoders(
                 continue;
             }
             let rotation = matching_rotations[0];
+            let Some(execution) = rotation.execution else {
+                continue;
+            };
+            if execution.owner != scoping.symbol_scope_id(array.symbol) {
+                continue;
+            }
+            let mut ordered = true;
+            for &reference in scoping.get_resolved_reference_ids(function.symbol) {
+                let Some(&span) = reference_spans.get(&reference) else {
+                    ordered = false;
+                    break;
+                };
+                let scope = scoping.get_reference(reference).scope_id();
+                if !facts.proves_execution_region_through_calls(
+                    scoping,
+                    execution.owner,
+                    execution.after,
+                    (scope, span),
+                    budget,
+                )? {
+                    ordered = false;
+                    break;
+                }
+            }
+            if !ordered {
+                continue;
+            }
             let Some(amount) = fixed_count_rotation(source, rotation, array.values.len()) else {
                 continue;
             };
@@ -3146,13 +3292,9 @@ fn detect_fixed_rotated_direct_decoders(
                 arithmetic_state_proof: None,
             });
             replacements.push(Replacement {
-                start: rotation.statement_span.start as usize,
-                end: rotation.statement_span.end as usize,
-                text: if rotation.standalone_statement {
-                    String::new()
-                } else {
-                    "void 0".to_string()
-                },
+                start: rotation.call_span.start as usize,
+                end: rotation.call_span.end as usize,
+                text: "(void 0)".to_string(),
                 kind: "remove_fixed_decoder_rotation_iife",
                 arithmetic_state_proof: None,
             });
@@ -3175,7 +3317,7 @@ fn detect_fixed_rotated_direct_decoders(
         }
     }
 
-    (decoders, protected_spans, replacements)
+    Ok((decoders, protected_spans, replacements))
 }
 
 #[derive(Debug, Clone)]
@@ -3183,7 +3325,6 @@ struct ProvenRotationIife {
     provider: SymbolId,
     start: usize,
     end: usize,
-    standalone_statement: bool,
 }
 
 fn rotation_checksum_expression(source: &str, iife: &RotationIife) -> Option<String> {
@@ -3309,15 +3450,16 @@ fn prove_rotation_iifes(
     decoders: &mut HashMap<SymbolId, Decoder>,
 ) -> Vec<ProvenRotationIife> {
     let mut proven_iifes = Vec::new();
-    for iife in rotation_iifes {
+    let mut ordered = rotation_iifes.iter().collect::<Vec<_>>();
+    ordered.sort_unstable_by_key(|rotation| rotation.call_span.start);
+    for iife in ordered {
         if !prove_rotation_iife(source, iife, decoders) {
             continue;
         }
         proven_iifes.push(ProvenRotationIife {
             provider: iife.provider,
-            start: iife.statement_span.start as usize,
-            end: iife.statement_span.end as usize,
-            standalone_statement: iife.standalone_statement,
+            start: iife.call_span.start as usize,
+            end: iife.call_span.end as usize,
         });
     }
     proven_iifes
@@ -3383,11 +3525,9 @@ fn rotation_replacements(
                 .map(|iife| Replacement {
                     start: iife.start,
                     end: iife.end,
-                    text: if iife.standalone_statement {
-                        String::new()
-                    } else {
-                        "void 0".to_string()
-                    },
+                    // Replace the call, not an enclosing expression statement:
+                    // retain its undefined completion and any outer operator.
+                    text: "(void 0)".to_string(),
                     kind: "remove_decoder_rotation_iife",
                     arithmetic_state_proof: None,
                 }),
@@ -3750,6 +3890,92 @@ fn propagate_decoder_aliases(
     Ok(())
 }
 
+/// Rotations may be materialized only if each executes once in the
+/// provider's own allocation context, and no decoder can observe a table
+/// before the last rotation. Capturing an alias also counts as an observation
+/// until the capture/use chain can provide a more precise temporal proof.
+fn prove_rotation_order(
+    functions: &[FnInfo],
+    rotations: &[RotationIife],
+    decoders: &mut HashMap<SymbolId, Decoder>,
+    context: &DecoderBindingContext<'_>,
+) -> Result<(), BudgetExceeded> {
+    let DecoderBindingContext {
+        scoping,
+        facts,
+        reference_spans,
+        budget,
+    } = *context;
+    let mut groups: HashMap<SymbolId, Vec<&RotationIife>> = HashMap::new();
+    for rotation in rotations {
+        groups.entry(rotation.provider).or_default().push(rotation);
+    }
+    let mut by_provider: HashMap<SymbolId, Vec<&FnInfo>> = HashMap::new();
+    for function in functions {
+        if let Some(decoder) = decoders.get(&function.symbol) {
+            by_provider
+                .entry(decoder.provider)
+                .or_default()
+                .push(function);
+        }
+    }
+    let mut invalid = HashSet::new();
+    for (provider, mut group) in groups {
+        let Some(views) = by_provider.get(&provider) else {
+            continue;
+        };
+        budget.checkpoint()?;
+        group.sort_unstable_by_key(|rotation| rotation.call_span.start);
+        let Some(last) = group.last().and_then(|rotation| rotation.execution) else {
+            invalid.insert(provider);
+            continue;
+        };
+        if last.owner != scoping.symbol_scope_id(provider)
+            || group.iter().any(|rotation| {
+                rotation.execution.is_none_or(|execution| {
+                    execution.owner != last.owner || execution.after.end != last.after.end
+                })
+            })
+            || group
+                .windows(2)
+                .any(|pair| pair[0].call_span.end > pair[1].call_span.start)
+        {
+            invalid.insert(provider);
+            continue;
+        }
+        'observations: for function in views {
+            let references = scoping.get_resolved_reference_ids(function.symbol);
+            budget.consume(u64::try_from(references.len()).unwrap_or(u64::MAX))?;
+            for &reference in references {
+                let Some(&span) = reference_spans.get(&reference) else {
+                    invalid.insert(provider);
+                    break 'observations;
+                };
+                if span_contains(function.span, span)
+                    || group
+                        .iter()
+                        .any(|rotation| span_contains(rotation.call_span, span))
+                {
+                    continue;
+                }
+                let scope = scoping.get_reference(reference).scope_id();
+                if !facts.proves_execution_region_through_calls(
+                    scoping,
+                    last.owner,
+                    last.after,
+                    (scope, span),
+                    budget,
+                )? {
+                    invalid.insert(provider);
+                    break 'observations;
+                }
+            }
+        }
+    }
+    decoders.retain(|_, decoder| !invalid.contains(&decoder.provider));
+    Ok(())
+}
+
 fn detect_decoders(
     source: &str,
     functions: &[FnInfo],
@@ -3849,6 +4075,7 @@ fn detect_decoders(
         })
         .collect();
     decoders.retain(|_, decoder| !invalid.contains(&decoder.provider));
+    prove_rotation_order(functions, rotations, &mut decoders, context)?;
     let (protected_spans, rotation_replacements) =
         apply_proven_decoder_rotations(source, &mut decoders, rotations);
     propagate_decoder_aliases(&mut decoders, program, context)?;
@@ -3891,14 +4118,7 @@ pub fn analyze_decoders(
     let (mut decoders, mut protected_spans, mut replacements) =
         detect_decoders(source, &functions, program, &context, &rotations)?;
     let (fixed_decoders, fixed_protected, fixed_replacements) =
-        detect_fixed_rotated_direct_decoders(
-            source,
-            program,
-            scoping,
-            facts,
-            reference_spans,
-            &rotations,
-        );
+        detect_fixed_rotated_direct_decoders(source, program, &context, &rotations)?;
     for (symbol, decoder) in fixed_decoders {
         decoders.entry(symbol).or_insert(decoder);
     }
@@ -4272,7 +4492,8 @@ mod tests {
             proof_eligible: true,
             body_span: Span::new(0, 0),
             statement_span: Span::new(0, 0),
-            standalone_statement: true,
+            call_span: Span::new(0, 0),
+            execution: None,
         };
         assert_eq!(
             rotation_decoder_alias(&base, SymbolId::new(1)),
@@ -4326,7 +4547,8 @@ mod tests {
             proof_eligible: true,
             body_span: Span::new(0, 10),
             statement_span: Span::new(0, 10),
-            standalone_statement: true,
+            call_span: Span::new(0, 10),
+            execution: None,
         };
         assert!(prove_rotation_iife(source, &iife, &mut decoders));
         for symbol in [first, second] {

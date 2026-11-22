@@ -311,29 +311,43 @@ impl BindingFacts {
         }
         let owner = scoping.symbol_scope_id(symbol);
         self.regions.get(&symbol).is_some_and(|regions| {
-            regions.iter().any(|region| {
-                if region.start > at.start || at.end > region.end {
+            regions
+                .iter()
+                .any(|&region| self.execution_region_contains(scoping, owner, region, scope, at))
+        })
+    }
+
+    /// An execution region is entered only after an earlier operation has
+    /// completed normally. Nested ordinary expressions inherit that ordering;
+    /// hoisted closures, however, may be invoked before their textual position.
+    pub(crate) fn execution_region_contains(
+        &self,
+        scoping: &Scoping,
+        owner: ScopeId,
+        region: Span,
+        scope: ScopeId,
+        at: Span,
+    ) -> bool {
+        if region.start > at.start || at.end > region.end {
+            return false;
+        }
+        for ancestor in scoping.scope_ancestors(scope) {
+            if ancestor == owner {
+                return true;
+            }
+            if self.hoisted_functions.contains(&ancestor) {
+                let Some(entry) = scoping
+                    .scope_parent_id(ancestor)
+                    .and_then(|parent| self.scope_entries.get(&parent))
+                else {
+                    return false;
+                };
+                if *entry < region.start || *entry > region.end {
                     return false;
                 }
-                for ancestor in scoping.scope_ancestors(scope) {
-                    if ancestor == owner {
-                        return true;
-                    }
-                    if self.hoisted_functions.contains(&ancestor) {
-                        let Some(entry) = scoping
-                            .scope_parent_id(ancestor)
-                            .and_then(|parent| self.scope_entries.get(&parent))
-                        else {
-                            return false;
-                        };
-                        if *entry < region.start || *entry > region.end {
-                            return false;
-                        }
-                    }
-                }
-                false
-            })
-        })
+            }
+        }
+        false
     }
 
     /// Discharge initialization at a specific use through a closed set of
@@ -349,16 +363,44 @@ impl BindingFacts {
         at: Span,
         budget: &work_budget::WorkBudget,
     ) -> Result<bool, work_budget::BudgetExceeded> {
-        if self.proves_value_initialized(scoping, symbol, scope, at) {
-            return Ok(true);
-        }
-        let owner = scoping.symbol_scope_id(symbol);
+        self.proves_through_closed_calls(
+            scoping,
+            scoping.symbol_scope_id(symbol),
+            scope,
+            at,
+            budget,
+            |scope, at| self.proves_value_initialized(scoping, symbol, scope, at),
+        )
+    }
+
+    pub(crate) fn proves_execution_region_through_calls(
+        &self,
+        scoping: &Scoping,
+        owner: ScopeId,
+        region: Span,
+        site: (ScopeId, Span),
+        budget: &work_budget::WorkBudget,
+    ) -> Result<bool, work_budget::BudgetExceeded> {
+        self.proves_through_closed_calls(scoping, owner, site.0, site.1, budget, |scope, at| {
+            self.execution_region_contains(scoping, owner, region, scope, at)
+        })
+    }
+
+    fn proves_through_closed_calls(
+        &self,
+        scoping: &Scoping,
+        owner: ScopeId,
+        scope: ScopeId,
+        at: Span,
+        budget: &work_budget::WorkBudget,
+        established: impl Fn(ScopeId, Span) -> bool,
+    ) -> Result<bool, work_budget::BudgetExceeded> {
         let mut pending = vec![(scope, at)];
         let mut visited = HashSet::new();
         let mut grounded = false;
         while let Some((scope, at)) = pending.pop() {
             budget.checkpoint()?;
-            if self.proves_value_initialized(scoping, symbol, scope, at) {
+            if established(scope, at) {
                 grounded = true;
                 continue;
             }
