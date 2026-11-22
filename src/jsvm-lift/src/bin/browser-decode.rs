@@ -103,10 +103,7 @@ fn main() -> Result<()> {
             )
         };
     if let Some(output) = &args.output {
-        if let Some(parent) = output.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(output, source.as_bytes())?;
+        jsvm_lift::report_file::write_text(output, &source)?;
     }
     let report = Report {
         schema: "js-browser-decode/v2",

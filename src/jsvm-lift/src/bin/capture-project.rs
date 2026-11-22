@@ -15,7 +15,7 @@ use jsvm_lift::{
 };
 use serde_json::Value;
 use std::{
-    env, fs,
+    env,
     path::{Path, PathBuf},
 };
 
@@ -304,14 +304,13 @@ fn main() -> Result<()> {
 
     if let Some(summary) = http_summary {
         let analysis = output.join("analysis");
-        fs::create_dir_all(&analysis)?;
         let archived = analysis.join("http-capture.har");
-        fs::copy(&capture, &archived)
-            .with_context(|| format!("preserving HTTP capture in {}", archived.display()))?;
-        fs::write(
-            analysis.join("http-static.json"),
-            serde_json::to_vec_pretty(&summary)?,
+        jsvm_lift::report_file::copy_snapshot(
+            &capture,
+            &archived,
+            &AnalysisBudgets::standard("http-capture-archive").scope("snapshot"),
         )?;
+        jsvm_lift::report_file::write_json(&analysis.join("http-static.json"), &summary)?;
         let manifest_path = output.join(MANIFEST_NAME);
         let mut manifest = read_manifest(&manifest_path)?;
         manifest.source.kind = "http_static".into();

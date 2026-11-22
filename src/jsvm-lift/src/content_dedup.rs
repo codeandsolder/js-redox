@@ -37,9 +37,11 @@ pub(crate) fn is_canonical_sha256(value: &str) -> bool {
 }
 
 /// Identity and length of precisely the bytes consumed by a stream operation.
-pub(crate) struct FileDigest {
-    pub(crate) sha256: String,
-    pub(crate) bytes: u64,
+pub struct FileDigest {
+    /// Lowercase hexadecimal SHA-256 of the consumed bytes.
+    pub sha256: String,
+    /// Number of bytes consumed.
+    pub bytes: u64,
 }
 
 pub(crate) fn digest_stream(
