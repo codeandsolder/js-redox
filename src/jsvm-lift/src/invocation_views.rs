@@ -37,6 +37,26 @@ fn verified_sha(value: &Value) -> Option<&str> {
         .filter(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
+/// ECMAScript lines include CR, LF, CRLF and Unicode line/paragraph separators.
+/// Retain an empty final line so a coordinate at EOF is representable.
+fn js_source_lines(source: &str) -> impl Iterator<Item = &str> {
+    let mut remaining = Some(source);
+    std::iter::from_fn(move || {
+        let text = remaining.take()?;
+        let Some(end) = text.find(['\r', '\n', '\u{2028}', '\u{2029}']) else {
+            return Some(text);
+        };
+        let (line, terminator) = text.split_at(end);
+        let width = if terminator.starts_with("\r\n") {
+            2
+        } else {
+            terminator.chars().next()?.len_utf8()
+        };
+        remaining = terminator.get(width..);
+        Some(line)
+    })
+}
+
 fn source_excerpt(raw: &str, line: u64, first_line: Option<u64>) -> String {
     let Some(start) = first_line else {
         return "CDP script start offset was not recorded; raw source link is authoritative.\n"
@@ -48,27 +68,25 @@ fn source_excerpt(raw: &str, line: u64, first_line: Option<u64>) -> String {
     else {
         return "Paused location precedes the script start offset; no excerpt claimed.\n".into();
     };
-    let lines = raw.lines().collect::<Vec<_>>();
-    if local_line >= lines.len() {
-        return "Paused location is outside the captured raw source lines; no excerpt claimed.\n"
-            .into();
-    }
     let begin = local_line.saturating_sub(2);
-    let end = (local_line + 3).min(lines.len());
+    let end = local_line.saturating_add(3);
     let mut excerpt = String::new();
-    for (index, text) in lines.iter().enumerate().take(end).skip(begin) {
-        let shown = text.chars().take(260).collect::<String>();
-        let cropped = if text.chars().count() > 260 {
-            " …"
-        } else {
-            ""
-        };
+    let mut found = false;
+    for (index, text) in js_source_lines(raw).enumerate().take(end).skip(begin) {
+        found |= index == local_line;
+        let mut chars = text.chars();
+        let shown = chars.by_ref().take(260).collect::<String>();
+        let cropped = if chars.next().is_some() { " …" } else { "" };
         let _ = writeln!(
             excerpt,
             "{} {:>6} | {shown}{cropped}",
             if index == local_line { ">" } else { " " },
-            index + 1 + usize::try_from(start).unwrap_or(0),
+            u128::from(start) + index as u128 + 1,
         );
+    }
+    if !found {
+        return "Paused location is outside the captured raw source lines; no excerpt claimed.\n"
+            .into();
     }
     fence(excerpt.trim_end(), "js")
 }
@@ -619,6 +637,20 @@ mod tests {
         assert!(excerpt.contains(">     12 | const b = a + 2;"));
         assert!(source_excerpt(source, 11, None).contains("start offset was not recorded"));
         assert!(source_excerpt(source, 9, Some(10)).contains("precedes"));
+    }
+
+    #[test]
+    fn source_excerpt_uses_ecmascript_line_terminators_and_eof() {
+        let source = "zero\rone\r\ntwo\n\u{2028}four\u{2029}";
+        assert_eq!(
+            js_source_lines(source).collect::<Vec<_>>(),
+            ["zero", "one", "two", "", "four", ""]
+        );
+        assert!(source_excerpt(source, 14, Some(10)).contains(">     15 | four"));
+        assert!(source_excerpt(source, 15, Some(10)).contains(">     16 |"));
+        assert!(source_excerpt(source, 16, Some(10)).contains("outside"));
+        assert!(source_excerpt(source, u64::MAX, Some(u64::MAX))
+            .contains("18446744073709551616 | zero"));
     }
 
     #[test]
