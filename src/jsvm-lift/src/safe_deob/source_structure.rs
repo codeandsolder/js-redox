@@ -248,7 +248,9 @@ mod tests {
         assert_eq!(comparison.original, comparison.analysis);
         assert_eq!(exact.remaining_work(), Some(0));
         let insufficient = WorkBudget::new("structure", work_budget::BudgetLimits::work(count - 1));
-        let error = measure(source, SourceType::cjs(), &insufficient).unwrap_err();
+        let Err(error) = measure(source, SourceType::cjs(), &insufficient) else {
+            bail!("structural measurement exceeded its allowance without reporting an error");
+        };
         assert!(work_budget::find_budget_exceeded(error.as_ref()).is_some());
         Ok(())
     }
