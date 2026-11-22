@@ -5,13 +5,14 @@ use tempfile::TempDir;
 use work_budget::{run_command, BudgetLimits, WorkBudget};
 
 const FIXTURE_DIR: &str = "corpus/generated/reversible-obfuscation";
-const MAIN_FIXTURES: [&str; 41] = [
+const MAIN_FIXTURES: [&str; 42] = [
     "obscura-split-strings.js",
     "obscura-number-expressions.js",
     "obscura-unicode-escape.js",
     "obscura-string-array.js",
     "rotated-base64-string-array.js",
     "direct-rotated-string-array.js",
+    "duplicate-scope-decoder.js",
     "formatted-base64-string-array.js",
     "token-boundaries.js",
     "proxy-literals-unary.js",
@@ -144,6 +145,9 @@ fn assert_main_contract(file: &str, outcome: &SafeDeobOutcome) {
             assert!(count(report, "string_array_decode") >= 2, "{file}");
             assert!(count(report, "materialize_decoder_rotation") >= 1, "{file}");
             assert!(count(report, "remove_decoder_rotation_iife") >= 1, "{file}");
+        }
+        "duplicate-scope-decoder.js" => {
+            assert_eq!(count(report, "string_array_decode"), 2, "{file}");
         }
         "token-boundaries.js" => {
             for merged in ["returnfalse", "returntrue", "throwtrue"] {
@@ -938,6 +942,31 @@ fn depythonify_safe_deob_heap_liveness_runtime_equivalence() -> Result<()> {
     script_runtime_equivalence(&refs, "heap-liveness", false)
 }
 
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_plain_decoder_runtime_equivalence() -> Result<()> {
+    let prefix = "function p(){var t=['a','b'];p=function(){return t;};return p();}";
+    let sources = [
+        "function d(i){i=i-16;const t=p();let v=t[i];return v;}",
+        "function d(i){i-=16;const t=p();return t[i]}",
+        "function d(i){i=(i)-(16);const /*table*/ t=(p)();return (t)[(i)];}",
+        "function d(i){const t=p();return (d=function(x){return t[x-=16]})(i)}",
+        "function d(i){const t=p();return d=function(x){x-=16;return t[x]},d(i)}",
+        "function d(i){const t=p();return d=function(x){x=x-16;const v=t[x];return v},d(i)}",
+        "function d(i){const t=p();return (d=function named(x){return t[x-=16]})(i)}",
+        "function d(i){i=i-16;const t=p();let v=t[i];events.push(v);return v;}",
+        "function d(i){const t=p();return d=function(x){x=x-16;const v=t[x];events.push(v);return v},d(i)}",
+        "function d(i){const t=p();return (d=function(t){return t[t-=16]})(i)}",
+        "function d(i){const t=p();return (d=function(x){return t[x-=16]})(i+1)}",
+        "function d(i){const t=p();return (d=function(x=events.push(i)){return t[x-=16]})(i)}",
+        "function d(i){const t=p();return (d=function(x){return t[x-=16]})?.(i)}",
+        "function d(i){i=i-16;const t=p();let v=t[i];return 'wrong'}",
+        "function d(i){i=i-16;const t=p();return t?.[i]}",
+    ].into_iter().map(|decoder|format!("{prefix}{decoder}[d(16),d(17)];")).collect::<Vec<_>>();
+    let refs = sources.iter().map(String::as_str).collect::<Vec<_>>();
+    script_runtime_equivalence(&refs, "plain-decoder", false)
+}
+
 fn script_runtime_equivalence(sources: &[&str], suite: &str, browser_globals: bool) -> Result<()> {
     let scratch = TempDir::new()?;
     // Browser decoders assume standard atob. Node's isolated VM does not
@@ -1462,10 +1491,6 @@ fn depythonify_safe_deob_safety_runtime_equivalence() -> Result<()> {
     }
 
     for (file, kinds) in [
-        (
-            "duplicate-scope-decoder-negative.js",
-            &["string_array_decode"][..],
-        ),
         (
             "mutable-decoder-alias-safety.js",
             &["string_array_decode"][..],

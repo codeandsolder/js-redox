@@ -8118,6 +8118,48 @@ mod tests {
     }
 
     #[test]
+    fn plain_decoder_requires_complete_exact_binding_and_effect_roles() {
+        let prefix = "function p(){var t=['a','b'];p=function(){return t;};return p();}";
+        for (decoder, expected) in [
+            ("function d(i){i=i-16;const t=p();let v=t[i];return v;}",1),
+            ("function d(i){i-=16;const t=p();return t[i]}",1),
+            ("function d(i){i=(i)-(16);const /*table*/ t=(p)();return (t)[(i)];}",1),
+            ("function d(i){const t=p();return (d=function(x){return t[x-=16]})(i)}",1),
+            ("function d(i){const t=p();return d=function(x){x-=16;return t[x]},d(i)}",1),
+            ("function d(i){const t=p();return d=function(x){x=x-16;const v=t[x];return v},d(i)}",1),
+            ("function d(i){const t=p();return (d=function named(x){return t[x-=16]})(i)}",1),
+            ("function d(i){i=i-16;const t=p();let v=t[i];events.push(v);return v;}",0),
+            ("function d(i){const t=p();return d=function(x){x=x-16;const v=t[x];events.push(v);return v},d(i)}",0),
+            ("function d(i){const t=p();return (d=function(t){return t[t-=16]})(i)}",0),
+            ("function d(i){const t=p();return (d=function(x){return t[x-=16]})(i+1)}",0),
+            ("function d(i){const t=p();return (d=function(x=events.push(i)){return t[x-=16]})(i)}",0),
+            ("function d(i){const t=p();return (d=async function(x){return t[x-=16]})(i)}",0),
+            ("function d(i){const t=p();return (d=function*(x){return t[x-=16]})(i)}",0),
+            ("function d(i){const t=p();return (d=function(x){return t[x-=16]})?.(i)}",0),
+            ("function d(i){i=i-16;const t=p();let v=t[i];return 'wrong'}",0),
+            ("function d(i){i=i-16;const t=p();using v=t[i];return v;}",0),
+            ("function d(i){i=i-16;const t=p();return t?.[i]}",0),
+        ] {
+            let source = format!("{prefix}{decoder}sink(d(16));");
+            let result = recover_static_decoders(&source, 4).unwrap_or_else(|| unreachable!("{source}"));
+            assert_eq!(result.transforms.get("string_array_decode").copied().unwrap_or_default(), expected, "{source}: {}",result.source);
+        }
+        let source = format!("{prefix}function d(i){{i-=16;const t=p();return t[i]}}sink(d(16));(function(){{function p(){{var t=['other'];p=function(){{return t}};return p()}}function d(i){{i-=17;const t=p();return t[i]}}sink(d(17));}})();");
+        let result = recover_static_decoders(&source, 4).unwrap_or_else(|| unreachable!());
+        assert_eq!(
+            result.transforms.get("string_array_decode"),
+            Some(&2),
+            "{}",
+            result.source
+        );
+        assert!(
+            result.source.contains("sink(\"a\")") && result.source.contains("sink(\"other\")"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
     fn decoder_only_recovery_proves_inline_self_rewriting_plain_decoder() {
         let source = r#"
 function provider() {
