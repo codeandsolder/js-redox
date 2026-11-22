@@ -57,7 +57,7 @@ impl<'a> Visit<'a> for ParseIntAliasVisitor {
 
 /// Return identifiers whose source assignment is a direct alias of `parseInt`.
 /// This syntax-only helper is for diagnostics, not semantic rewrite proofs.
-#[must_use]
+#[must_use = "Use the returned recognized aliases when evaluating parseInt calls"]
 pub fn parse_int_aliases(source: &str) -> BTreeSet<String> {
     let allocator = Allocator::default();
     let parsed = parse_program(&allocator, source, SourceType::cjs());
@@ -81,7 +81,7 @@ fn expression_from_program<'a>(
 
 /// Resolve a standalone `parseInt("literal", radix)` expression, including a
 /// source-discovered direct alias. Unsupported edge cases remain symbolic.
-#[must_use]
+#[must_use = "Use the resolved integer only when the literal call is recognized"]
 pub fn resolve_literal_parse_int(preview: &str, aliases: &BTreeSet<String>) -> Option<u64> {
     let allocator = Allocator::default();
     let parsed = parse_program(&allocator, preview, SourceType::cjs());

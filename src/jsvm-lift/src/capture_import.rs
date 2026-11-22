@@ -24,7 +24,7 @@ pub enum CaptureInputKind {
 }
 
 impl CaptureInputKind {
-    #[must_use]
+    #[must_use = "Use the returned stable spelling when serializing or displaying this value"]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Har => "har",

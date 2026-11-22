@@ -69,10 +69,12 @@ fn value_counts(rows: &[Value], field: &str) -> BTreeMap<String, usize> {
     counts
 }
 
-#[test]
-fn recorder_runtime_provenance_flows_into_source_graph() -> Result<()> {
-    let workspace = tempfile::tempdir()?;
-    let capture = workspace.path().join("capture");
+const FIXTURE_NETWORK: &str = "globalThis.networkFixture = 1;";
+const FIXTURE_INLINE: &str = "globalThis.inlineFixture = 1;";
+const FIXTURE_OBSERVED_NETWORK: &str = "globalThis.crlfFixture = 1;\r\n";
+const FIXTURE_GENERATED_LEAF: &str = "globalThis.dynamicLeaf = 2;";
+
+fn write_runtime_capture(capture: &Path) -> Result<()> {
     let runtime = capture.join("runtime-scripts");
     let bodies = capture.join("bodies");
     let frames = capture.join("frames");
@@ -80,10 +82,8 @@ fn recorder_runtime_provenance_flows_into_source_graph() -> Result<()> {
         fs::create_dir_all(directory)?;
     }
 
-    let network = "globalThis.networkFixture = 1;";
     let network_other = "globalThis.otherCapturedResponse = 2;";
     let missed_other = "globalThis.missedResponse = 3;";
-    let inline = "globalThis.inlineFixture = 1;";
     let exact = alpine("app.foo");
     let model = alpine("form.name = __placeholder");
     let xfor = alpine("items");
@@ -91,28 +91,28 @@ fn recorder_runtime_provenance_flows_into_source_graph() -> Result<()> {
         "() => Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight || 0)";
     let gtm = "(function(){return google_tag_manager[\"rm\"][\"123\"](7).href})();";
     let generated = "globalThis.dynamicFixture = 1;";
-    let generated_leaf = "globalThis.dynamicLeaf = 2;";
-    let observed_network = "globalThis.crlfFixture = 1;\r\n";
     let sources = [
-        network,
-        inline,
+        FIXTURE_NETWORK,
+        FIXTURE_INLINE,
         exact.as_str(),
         model.as_str(),
         xfor.as_str(),
         instrumentation,
         gtm,
         generated,
-        generated_leaf,
-        observed_network,
+        FIXTURE_GENERATED_LEAF,
+        FIXTURE_OBSERVED_NETWORK,
     ];
     for source in sources {
         fs::write(runtime.join(format!("{}.js", digest(source))), source)?;
     }
-    fs::write(bodies.join(digest(network)), network)?;
+    fs::write(bodies.join(digest(FIXTURE_NETWORK)), FIXTURE_NETWORK)?;
 
     // Identical inline script bytes in two distinct ordinal positions are
     // separate capture candidates, not two observed executions.
-    let initial_html = format!("<!doctype html><script>{inline}</script><script>{inline}</script>");
+    let initial_html = format!(
+        "<!doctype html><script>{FIXTURE_INLINE}</script><script>{FIXTURE_INLINE}</script>"
+    );
     let har = json!({
         "log": {
             "version": "1.2",
@@ -120,12 +120,12 @@ fn recorder_runtime_provenance_flows_into_source_graph() -> Result<()> {
             "pages": [],
             "entries": [
                 har_entry("https://fixture.invalid/", "text/html", &initial_html),
-                har_entry("https://fixture.invalid/app.js", "application/javascript", network),
+                har_entry("https://fixture.invalid/app.js", "application/javascript", FIXTURE_NETWORK),
                 // Same URL, different source bytes: only the exact body can
                 // substantiate a source match with the captured runtime script.
                 har_entry("https://fixture.invalid/app.js", "application/javascript", network_other),
                 // Same bytes at a different URL must not borrow app.js identity.
-                har_entry("https://fixture.invalid/copy.js", "application/javascript", network),
+                har_entry("https://fixture.invalid/copy.js", "application/javascript", FIXTURE_NETWORK),
                 har_entry("https://fixture.invalid/body-missed.js", "application/javascript", ""),
                 har_entry("https://fixture.invalid/body-missed.js", "application/javascript", missed_other),
             ],
@@ -145,6 +145,11 @@ fn recorder_runtime_provenance_flows_into_source_graph() -> Result<()> {
         ),
     )?;
 
+    write_runtime_events(capture, &sources)?;
+    Ok(())
+}
+
+fn write_runtime_events(capture: &Path, sources: &[&str]) -> Result<()> {
     let mut events = sources
         .iter()
         .enumerate()
@@ -155,9 +160,9 @@ fn recorder_runtime_provenance_flows_into_source_graph() -> Result<()> {
                 "cdpSession":"main",
                 "scriptId": (index + 1).to_string(),
                 "executionContextId": 1,
-                "url": if source == network {
+                "url": if source == FIXTURE_NETWORK {
                     "https://fixture.invalid/app.js"
-                } else if source == observed_network {
+                } else if source == FIXTURE_OBSERVED_NETWORK {
                     "https://fixture.invalid/body-missed.js"
                 } else {
                     ""
@@ -194,18 +199,10 @@ fn recorder_runtime_provenance_flows_into_source_graph() -> Result<()> {
         serde_json::to_vec(&events)?,
     )?;
 
-    let project = workspace.path().join("project");
-    let summary = import_capture_project(
-        &CaptureImportOptions {
-            input: capture,
-            output: project.clone(),
-            assets_dir: None,
-            overwrite: false,
-        },
-        &AnalysisBudgets::standard("runtime-script-project-test"),
-    )?;
-    assert_eq!(summary.kind.as_str(), "recorder");
+    Ok(())
+}
 
+fn assert_runtime_report(project: &Path) -> Result<()> {
     let report = read_json(&project.join("analysis/runtime-scripts.json"))?;
     let summary = &report["summary"];
     assert_eq!(summary["script_parsed_events"], 10);
@@ -254,33 +251,14 @@ fn recorder_runtime_provenance_flows_into_source_graph() -> Result<()> {
             source.get("classification").and_then(Value::as_str) == Some("network_observed")
         })
         .context("network-observed runtime source missing")?;
-    assert_eq!(observed["sha256"], digest(observed_network));
+    assert_eq!(observed["sha256"], digest(FIXTURE_OBSERVED_NETWORK));
     assert_eq!(observed["event_count"], 1);
 
-    build_source_graph(
-        &project,
-        &AnalysisBudgets::standard("runtime-script-graph-test"),
-    )?;
-    let graph = read_json(&project.join("analysis/source-graph.json"))?;
-    let nodes = graph
-        .get("nodes")
-        .and_then(Value::as_array)
-        .context("source-graph nodes missing")?;
-    let edges = graph
-        .get("edges")
-        .and_then(Value::as_array)
-        .context("source-graph edges missing")?;
-    let node_types = value_counts(nodes, "type");
-    let edge_kinds = value_counts(edges, "kind");
-    assert_eq!(node_types.get("runtime_script"), Some(&10));
-    assert_eq!(node_types.get("runtime_expression_family"), Some(&4));
-    assert_eq!(node_types.get("dom_snapshot"), Some(&1));
-    assert_eq!(node_types.get("dom_directive"), Some(&3));
-    assert_eq!(edge_kinds.get("runtime_execution"), None);
-    assert_eq!(edge_kinds.get("runtime_source_match"), Some(&1));
-    assert_eq!(edge_kinds.get("runtime_source_candidate"), Some(&4));
-    assert_eq!(edge_kinds.get("runtime_generated_code"), Some(&2));
-    let inline_sha = digest(inline);
+    Ok(())
+}
+
+fn assert_runtime_response_identities(project: &Path, edges: &[Value]) -> Result<()> {
+    let inline_sha = digest(FIXTURE_INLINE);
     let inline_runtime = format!("runtime:{}", &inline_sha[..20]);
     let inline_candidates = edges
         .iter()
@@ -298,7 +276,7 @@ fn recorder_runtime_provenance_flows_into_source_graph() -> Result<()> {
     let resources = manifest["resources"]
         .as_array()
         .context("capture resources missing")?;
-    let network_sha = digest(network);
+    let network_sha = digest(FIXTURE_NETWORK);
     let network_runtime = format!("runtime:{}", &network_sha[..20]);
     let network_edges = edges
         .iter()
@@ -322,7 +300,7 @@ fn recorder_runtime_provenance_flows_into_source_graph() -> Result<()> {
     assert_eq!(network_edges[0]["candidate_count"], 1);
     assert_eq!(network_edges[0]["exact_response_identity"], true);
     assert_eq!(network_edges[0]["runtime_execution_observed"], false);
-    let observed_sha = digest(observed_network);
+    let observed_sha = digest(FIXTURE_OBSERVED_NETWORK);
     let observed_runtime = format!("runtime:{}", &observed_sha[..20]);
     let url_only = edges
         .iter()
@@ -347,6 +325,51 @@ fn recorder_runtime_provenance_flows_into_source_graph() -> Result<()> {
         .iter()
         .any(|edge| edge["to"] == network_runtime && edge["kind"] == "runtime_execution"));
 
+    Ok(())
+}
+
+#[test]
+fn recorder_runtime_provenance_flows_into_source_graph() -> Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let capture = workspace.path().join("capture");
+    write_runtime_capture(&capture)?;
+    let project = workspace.path().join("project");
+    let summary = import_capture_project(
+        &CaptureImportOptions {
+            input: capture,
+            output: project.clone(),
+            assets_dir: None,
+            overwrite: false,
+        },
+        &AnalysisBudgets::standard("runtime-script-project-test"),
+    )?;
+    assert_eq!(summary.kind.as_str(), "recorder");
+
+    assert_runtime_report(&project)?;
+    build_source_graph(
+        &project,
+        &AnalysisBudgets::standard("runtime-script-graph-test"),
+    )?;
+    let graph = read_json(&project.join("analysis/source-graph.json"))?;
+    let nodes = graph
+        .get("nodes")
+        .and_then(Value::as_array)
+        .context("source-graph nodes missing")?;
+    let edges = graph
+        .get("edges")
+        .and_then(Value::as_array)
+        .context("source-graph edges missing")?;
+    let node_types = value_counts(nodes, "type");
+    let edge_kinds = value_counts(edges, "kind");
+    assert_eq!(node_types.get("runtime_script"), Some(&10));
+    assert_eq!(node_types.get("runtime_expression_family"), Some(&4));
+    assert_eq!(node_types.get("dom_snapshot"), Some(&1));
+    assert_eq!(node_types.get("dom_directive"), Some(&3));
+    assert_eq!(edge_kinds.get("runtime_execution"), None);
+    assert_eq!(edge_kinds.get("runtime_source_match"), Some(&1));
+    assert_eq!(edge_kinds.get("runtime_source_candidate"), Some(&4));
+    assert_eq!(edge_kinds.get("runtime_generated_code"), Some(&2));
+    assert_runtime_response_identities(&project, edges)?;
     assert_eq!(edge_kinds.get("runtime_expression_family"), Some(&4));
     assert_eq!(edge_kinds.get("dom_directive"), Some(&3));
     assert_eq!(edge_kinds.get("runtime_alpine_compile"), Some(&3));
@@ -365,13 +388,13 @@ fn recorder_runtime_provenance_flows_into_source_graph() -> Result<()> {
         .find(|node| {
             node.get("type").and_then(Value::as_str) == Some("runtime_script")
                 && node.get("sha256").and_then(Value::as_str)
-                    == Some(digest(generated_leaf).as_str())
+                    == Some(digest(FIXTURE_GENERATED_LEAF).as_str())
         })
         .context("generated leaf runtime node missing")?;
     assert_eq!(generated_leaf_node["generation_max_depth"], 2);
     assert_eq!(
         generated_leaf_node["generated_root_sha256s"],
-        json!([digest(network)])
+        json!([digest(FIXTURE_NETWORK)])
     );
 
     let helper = nodes
@@ -386,27 +409,25 @@ fn recorder_runtime_provenance_flows_into_source_graph() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn missing_conflicting_parent_body_does_not_turn_claim_into_exact_graph_link() -> Result<()> {
-    let workspace = tempfile::tempdir()?;
-    let capture = workspace.path().join("capture");
+const COLLISION_PARENT: &str = "let parent = 1;";
+const COLLISION_MISSING: &str = "let otherParent = 2;";
+const COLLISION_CHILD: &str = "let child = 3;";
+
+fn write_conflicting_runtime_capture(capture: &Path) -> Result<()> {
     let runtime = capture.join("runtime-scripts");
     fs::create_dir_all(&runtime)?;
-    let parent = "let parent = 1;";
-    let missing = "let otherParent = 2;";
-    let child = "let child = 3;";
-    for body in [parent, child] {
+    for body in [COLLISION_PARENT, COLLISION_CHILD] {
         fs::write(runtime.join(format!("{}.js", digest(body))), body)?;
     }
     fs::write(capture.join("recorder-manifest.json"), b"{}")?;
     let har = json!({"log":{"version":"1.2","creator":{"name":"fixture","version":"1"},"pages":[],"entries":[har_entry("https://fixture.invalid/", "text/html", "<!doctype html>")]}});
     fs::write(capture.join("capture.har"), serde_json::to_vec(&har)?)?;
     let row = |id: &str, source: &str| json!({"cdpSession":"main","scriptId":id,"captured":{"kind":"javascript","sha256":digest(source),"size":source.len(),"path":format!("runtime-scripts/{}.js",digest(source))}});
-    let mut child_event = row("2", child);
+    let mut child_event = row("2", COLLISION_CHILD);
     child_event["stackTrace"] = json!({"callFrames":[{"scriptId":"1","url":"https://fixture.invalid/parent.js","lineNumber":0,"columnNumber":0}]});
     let events = [
-        row("1", parent),
-        row("1", missing),
+        row("1", COLLISION_PARENT),
+        row("1", COLLISION_MISSING),
         child_event.clone(),
         child_event,
     ];
@@ -420,6 +441,27 @@ fn missing_conflicting_parent_body_does_not_turn_claim_into_exact_graph_link() -
         capture.join("execution-coverage.json"),
         serde_json::to_vec(&coverage)?,
     )?;
+    Ok(())
+}
+
+fn assert_observed_collision_sources(project: &Path, budget: &AnalysisBudgets) -> Result<()> {
+    let observed =
+        jsvm_lift::observed_runtime::materialize_observed_runtime_sources(project, budget)?;
+    assert_eq!(observed.witnessed, 1);
+    assert!(project
+        .join(format!("src/_observed/{}.js", digest(COLLISION_CHILD)))
+        .is_file());
+    assert!(!project
+        .join(format!("src/_observed/{}.js", digest(COLLISION_PARENT)))
+        .is_file());
+    Ok(())
+}
+
+#[test]
+fn missing_conflicting_parent_body_does_not_turn_claim_into_exact_graph_link() -> Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let capture = workspace.path().join("capture");
+    write_conflicting_runtime_capture(&capture)?;
     let project = workspace.path().join("project");
     let budget = AnalysisBudgets::standard("missing-conflicting-parent-body");
     import_capture_project(
@@ -438,11 +480,11 @@ fn missing_conflicting_parent_body_does_not_turn_claim_into_exact_graph_link() -
     assert_eq!(sources.len(), 2);
     let child_row = sources
         .iter()
-        .find(|row| row["sha256"] == digest(child))
+        .find(|row| row["sha256"] == digest(COLLISION_CHILD))
         .context("child source missing")?;
     let parent_row = sources
         .iter()
-        .find(|row| row["sha256"] == digest(parent))
+        .find(|row| row["sha256"] == digest(COLLISION_PARENT))
         .context("parent source missing")?;
     assert_eq!(parent_row["observed_executed"], false);
     assert_eq!(
@@ -463,7 +505,7 @@ fn missing_conflicting_parent_body_does_not_turn_claim_into_exact_graph_link() -
     let claim = &child_row["generated"]["origins"][0]["chain"][0];
     assert_eq!(claim["parent_event_status"], "conflicting_source_claims");
     assert!(claim["sha256"].is_null());
-    let expected = BTreeSet::from([digest(parent), digest(missing)]);
+    let expected = BTreeSet::from([digest(COLLISION_PARENT), digest(COLLISION_MISSING)]);
     let actual = claim["parent_event_digest_claims"]
         .as_array()
         .context("parent claims missing")?
@@ -497,11 +539,11 @@ fn missing_conflicting_parent_body_does_not_turn_claim_into_exact_graph_link() -
     let nodes = graph["nodes"].as_array().context("graph nodes missing")?;
     let parent_node = nodes
         .iter()
-        .find(|row| row["type"] == "runtime_script" && row["sha256"] == digest(parent))
+        .find(|row| row["type"] == "runtime_script" && row["sha256"] == digest(COLLISION_PARENT))
         .context("parent node missing")?;
     let child_node = nodes
         .iter()
-        .find(|row| row["type"] == "runtime_script" && row["sha256"] == digest(child))
+        .find(|row| row["type"] == "runtime_script" && row["sha256"] == digest(COLLISION_CHILD))
         .context("child node missing")?;
     assert_eq!(parent_node["observed_executed"], false);
     assert_eq!(parent_node["positive_coverage_witnesses"], json!([]));
@@ -510,15 +552,7 @@ fn missing_conflicting_parent_body_does_not_turn_claim_into_exact_graph_link() -
         .context("child coverage missing")?;
     assert_eq!(child_witnesses.len(), 1);
     assert_eq!(child_witnesses[0]["positive_ranges"], 1);
-    let observed =
-        jsvm_lift::observed_runtime::materialize_observed_runtime_sources(&project, &budget)?;
-    assert_eq!(observed.witnessed, 1);
-    assert!(project
-        .join(format!("src/_observed/{}.js", digest(child)))
-        .is_file());
-    assert!(!project
-        .join(format!("src/_observed/{}.js", digest(parent)))
-        .is_file());
+    assert_observed_collision_sources(&project, &budget)?;
     assert_eq!(graph["unresolved_edges"], json!([]));
     Ok(())
 }

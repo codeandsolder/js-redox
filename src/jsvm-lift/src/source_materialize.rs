@@ -784,47 +784,52 @@ mod tests {
         result
     }
 
+    fn write_sparse_source_fixture(project: &Path) -> Result<()> {
+        fs::write(project.join("resources/a.js"), "const x = 1;\n")?;
+        fs::write(project.join("resources/b.js"), "const x = 1;\n")?;
+        fs::write(
+            project.join("resources/legacy.js"),
+            b"// Copyright \xa9 2012\nconst y = 2;\n",
+        )?;
+        fs::write(project.join("resources/bad.js"), "const = ;\n")?;
+        fs::write(
+            project.join("resources/latin1.js"),
+            b"const marker = '\x81';\n",
+        )?;
+        fs::write(
+            project.join("resources/data.json"),
+            ")]}'\n{\"payload\":{\"value\":42}}",
+        )?;
+        fs::write(
+            project.join("resources/inline.json"),
+            "{\"hello\":\"world\"}",
+        )?;
+        let raw = json!({
+            "schema": "capture-project/v1",
+            "source": {"kind": "synthetic", "input": "test", "salvaged": false},
+            "pages": [],
+            "resources": [
+                {"id": 42, "kind": "javascript", "url": "https://x/a.js", "output_path": "resources/a.js"},
+                {"id": 7, "kind": "javascript", "url": "https://x/b.js", "output_path": "resources/b.js"},
+                {"id": 90, "kind": "javascript", "url": "https://x/legacy.js", "output_path": "resources/legacy.js", "mime_type": "text/javascript; charset=iso-8859-1"},
+                {"id": 91, "kind": "javascript", "url": "https://x/bad.js", "output_path": "resources/bad.js"},
+                {"id": 92, "kind": "javascript", "url": "https://x/latin1.js", "output_path": "resources/latin1.js"},
+                {"id": 5, "kind": "json", "url": "https://x/data", "output_path": "resources/data.json"},
+                {"id": 99, "kind": "javascript", "url": "https://x/incomplete.js", "output_path": "resources/missing.js", "body_complete": false}
+            ],
+            "inline_scripts": [{"parent_resource_id": 42, "ordinal": 3, "output_path": "resources/inline.json", "script_type": "application/json"}],
+            "counts": {}
+        });
+        let manifest = validate_manifest_value(&raw, "test")?;
+        write_manifest(&project.join("capture-manifest.json"), &manifest)?;
+        Ok(())
+    }
+
     #[test]
     fn materializes_sparse_ids_deduplicates_and_normalizes_text() -> Result<()> {
         let project = test_project()?;
         let result = (|| -> Result<()> {
-            fs::write(project.join("resources/a.js"), "const x = 1;\n")?;
-            fs::write(project.join("resources/b.js"), "const x = 1;\n")?;
-            fs::write(
-                project.join("resources/legacy.js"),
-                b"// Copyright \xa9 2012\nconst y = 2;\n",
-            )?;
-            fs::write(project.join("resources/bad.js"), "const = ;\n")?;
-            fs::write(
-                project.join("resources/latin1.js"),
-                b"const marker = '\x81';\n",
-            )?;
-            fs::write(
-                project.join("resources/data.json"),
-                ")]}'\n{\"payload\":{\"value\":42}}",
-            )?;
-            fs::write(
-                project.join("resources/inline.json"),
-                "{\"hello\":\"world\"}",
-            )?;
-            let raw = json!({
-                "schema": "capture-project/v1",
-                "source": {"kind": "synthetic", "input": "test", "salvaged": false},
-                "pages": [],
-                "resources": [
-                    {"id": 42, "kind": "javascript", "url": "https://x/a.js", "output_path": "resources/a.js"},
-                    {"id": 7, "kind": "javascript", "url": "https://x/b.js", "output_path": "resources/b.js"},
-                    {"id": 90, "kind": "javascript", "url": "https://x/legacy.js", "output_path": "resources/legacy.js", "mime_type": "text/javascript; charset=iso-8859-1"},
-                    {"id": 91, "kind": "javascript", "url": "https://x/bad.js", "output_path": "resources/bad.js"},
-                    {"id": 92, "kind": "javascript", "url": "https://x/latin1.js", "output_path": "resources/latin1.js"},
-                    {"id": 5, "kind": "json", "url": "https://x/data", "output_path": "resources/data.json"},
-                    {"id": 99, "kind": "javascript", "url": "https://x/incomplete.js", "output_path": "resources/missing.js", "body_complete": false}
-                ],
-                "inline_scripts": [{"parent_resource_id": 42, "ordinal": 3, "output_path": "resources/inline.json", "script_type": "application/json"}],
-                "counts": {}
-            });
-            let manifest = validate_manifest_value(&raw, "test")?;
-            write_manifest(&project.join("capture-manifest.json"), &manifest)?;
+            write_sparse_source_fixture(&project)?;
             let summary = materialize_capture_source(
                 &project,
                 Some(2),

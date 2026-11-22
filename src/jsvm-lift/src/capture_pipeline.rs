@@ -31,12 +31,12 @@ pub enum SourceRecovery {
 }
 
 impl SourceRecovery {
-    #[must_use]
+    #[must_use = "Check whether source recovery includes deobfuscation"]
     pub const fn deobfuscates(self) -> bool {
         !matches!(self, Self::Disabled)
     }
 
-    #[must_use]
+    #[must_use = "Check whether source recovery includes bundle materialization"]
     pub const fn materializes_bundles(self) -> bool {
         matches!(self, Self::Bundles)
     }

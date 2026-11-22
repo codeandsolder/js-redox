@@ -349,7 +349,7 @@ impl<'a> Visit<'a> for ReturnFlow<'_> {
 /// temporary. Independently reparse/re-resolve each edit to avoid overlaps.
 ///
 /// Unsupported or invalid source is returned unchanged instead of raising an error.
-#[must_use]
+#[must_use = "Use the returned source and recovery evidence; the input is unchanged"]
 pub fn recover_terminal_returns(source: &str) -> RecoveredReturns {
     let mut output = source.to_owned();
     let mut adjacent_returns = 0;

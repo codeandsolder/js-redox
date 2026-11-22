@@ -18,7 +18,7 @@ use oxc_syntax::number::ToJsString;
 /// [0, 2^32 - 2]. Computed members use `ToPropertyKey`, *not* `ToNumber`:
 /// `arr[true]` reads `"true"`, not index 1, and `arr["01"]` is not `arr[1]`.
 /// Signed numeric zero becomes "0"; the string "-0" remains distinct.
-#[must_use]
+#[must_use = "Use the returned index only when the property key is canonical"]
 pub fn canonical_array_index(value: &Value) -> Option<u32> {
     canonical_array_index_key(&value.js_string())
 }
@@ -32,7 +32,7 @@ pub fn canonical_array_index_key(key: &str) -> Option<u32> {
 ///
 /// Oxc preserves lone UTF-16 surrogates in `JSStr`; js-redox's proof domain
 /// uses Rust `String`, so those values are deliberately not approximated.
-#[must_use]
+#[must_use = "Use the returned string only when it can be represented losslessly"]
 pub fn string_literal_value(literal: &StringLiteral<'_>) -> Option<String> {
     literal.value.as_str().map(str::to_owned)
 }
@@ -53,7 +53,7 @@ pub fn literal_property_key(key: &PropertyKey<'_>) -> Option<String> {
 /// Evaluate a computed property key only when its complete primitive
 /// evaluation is proven. `BigInt` literals are exact even though `BigInt`
 /// arithmetic is not in the shared primitive evaluator's domain.
-#[must_use]
+#[must_use = "Use the property key only when its value is proven"]
 pub fn exact_computed_property_key(
     expression: &Expression<'_>,
     primitive: impl FnOnce(&Expression<'_>) -> Option<Value>,
@@ -70,7 +70,7 @@ pub fn exact_computed_property_key(
 ///
 /// In particular, never treat a computed `RegExp` or object literal
 /// as a statically known name: `ToPrimitive` can invoke user code.
-#[must_use]
+#[must_use = "Use the property key only when its value is proven"]
 pub fn exact_property_key(
     key: &PropertyKey<'_>,
     computed: bool,
@@ -86,7 +86,7 @@ pub fn exact_property_key(
 /// The special object initializer colon-form is a prototype setter, not an
 /// own property. Computed, shorthand, method and accessor forms are ordinary
 /// definitions, even if the key has the same text.
-#[must_use]
+#[must_use = "Check whether the property has special prototype setter semantics"]
 pub fn is_prototype_setter(property: &oxc_ast::ast::ObjectProperty<'_>, name: &str) -> bool {
     name == "__proto__"
         && property.kind == oxc_ast::ast::PropertyKind::Init
@@ -100,7 +100,7 @@ pub fn is_prototype_setter(property: &oxc_ast::ast::ObjectProperty<'_>, name: &s
 /// Prefer cooked text, falling back to raw spelling when cooked is absent.
 /// A lone surrogate in cooked text cannot be represented in Rust's string
 /// proof domain, so the recovery fails closed.
-#[must_use]
+#[must_use = "Use the returned template value only when decoding succeeds"]
 pub fn template_element_value(quasi: &TemplateElement<'_>) -> Option<String> {
     quasi.value.cooked.as_ref().map_or_else(
         || Some(quasi.value.raw.as_str().to_owned()),
@@ -118,7 +118,7 @@ pub enum Value {
 }
 
 impl Value {
-    #[must_use]
+    #[must_use = "Use the returned ECMAScript truthiness result"]
     pub fn truthy(&self) -> bool {
         match self {
             Self::String(s) => !s.is_empty(),
@@ -128,7 +128,7 @@ impl Value {
         }
     }
 
-    #[must_use]
+    #[must_use = "Use the converted ECMAScript number, including NaN"]
     pub fn number(&self) -> f64 {
         match self {
             Self::Number(n) => *n,
@@ -139,7 +139,7 @@ impl Value {
         }
     }
 
-    #[must_use]
+    #[must_use = "Use the converted ECMAScript string"]
     pub fn js_string(&self) -> String {
         match self {
             Self::String(s) => s.clone(),
@@ -150,7 +150,7 @@ impl Value {
         }
     }
 
-    #[must_use]
+    #[must_use = "Use the returned rendering only when the value is representable"]
     pub fn render(&self) -> Option<String> {
         match self {
             Self::String(s) => serde_json::to_string(s).ok(),
@@ -166,7 +166,7 @@ impl Value {
     /// A negative number and undefined are unary expressions, not atoms:
     /// substituting them without grouping can change a surrounding member,
     /// call, optional chain or exponentiation.
-    #[must_use]
+    #[must_use = "Use the returned rendering only when the value is representable as an expression"]
     pub fn render_expression(&self) -> Option<String> {
         let text = self.render()?;
         if matches!(self, Self::Undefined)
@@ -213,7 +213,7 @@ pub fn render_value_array(values: &[Value]) -> Option<String> {
     Some(format!("[{}]", rendered.join(", ")))
 }
 
-#[must_use]
+#[must_use = "Use the returned value only for supported constant expressions"]
 pub fn eval(expr: &Expression<'_>) -> Option<Value> {
     eval_with_resolver(expr, &|_| None)
 }

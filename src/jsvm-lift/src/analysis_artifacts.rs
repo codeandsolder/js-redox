@@ -195,7 +195,7 @@ pub const ALL_ARTIFACTS: &[ArtifactSpec] = &[
     API_SURFACE,
 ];
 
-#[must_use]
+#[must_use = "Use the returned path to address the selected analysis artifact"]
 pub fn artifact_path(project: &Path, spec: ArtifactSpec) -> PathBuf {
     project.join(spec.relative_path)
 }

@@ -552,6 +552,40 @@ mod tests {
         (second, runtime, trace)
     }
 
+    fn assert_uncertain_outer_frame(
+        hit: &Value,
+        instances: &super::super::runtime_evidence::RuntimeInstances,
+        budget: &WorkBudget,
+    ) -> Result<()> {
+        let mut uncertain = hit.clone();
+        let outer = json!({"source_identity":"exact","sourceSha256":"c".repeat(64),"location":{"scriptId":"99","lineNumber":1,"columnNumber":0},"functionLocation":{"scriptId":"99","lineNumber":0,"columnNumber":0}});
+        for step in uncertain["steps"]
+            .as_array_mut()
+            .ok_or_else(|| anyhow::anyhow!("steps"))?
+        {
+            step["frames"]
+                .as_array_mut()
+                .ok_or_else(|| anyhow::anyhow!("frames"))?
+                .push(outer.clone());
+        }
+        let mut graph = GraphBuilder::default();
+        seed_selective_trace_witnesses(
+            &mut graph,
+            &json!({"hits":[uncertain]}),
+            instances,
+            budget,
+        )?;
+        assert!(graph
+            .edges()
+            .values()
+            .any(|edge| edge["kind"] == "observed_ast_guard_value"));
+        assert!(!graph
+            .edges()
+            .values()
+            .any(|edge| edge["kind"] == "observed_next_pause_in_selected_arm"));
+        Ok(())
+    }
+
     #[test]
     fn runtime_script_collisions_cannot_turn_pauses_into_exact_execution_proof() -> Result<()> {
         let (second, runtime, trace) = conflicting_runtime_instance_fixture();
@@ -643,32 +677,7 @@ mod tests {
             .values()
             .any(|edge| edge["to"] == "observed-step:2:0"
                 && edge["kind"] == "observed_executed_location"));
-        let mut uncertain = trace["hits"][1].clone();
-        let outer = json!({"source_identity":"exact","sourceSha256":"c".repeat(64),"location":{"scriptId":"99","lineNumber":1,"columnNumber":0},"functionLocation":{"scriptId":"99","lineNumber":0,"columnNumber":0}});
-        for step in uncertain["steps"]
-            .as_array_mut()
-            .ok_or_else(|| anyhow::anyhow!("steps"))?
-        {
-            step["frames"]
-                .as_array_mut()
-                .ok_or_else(|| anyhow::anyhow!("frames"))?
-                .push(outer.clone());
-        }
-        let mut graph = GraphBuilder::default();
-        seed_selective_trace_witnesses(
-            &mut graph,
-            &json!({"hits":[uncertain]}),
-            instances,
-            &budget,
-        )?;
-        assert!(graph
-            .edges()
-            .values()
-            .any(|edge| edge["kind"] == "observed_ast_guard_value"));
-        assert!(!graph
-            .edges()
-            .values()
-            .any(|edge| edge["kind"] == "observed_next_pause_in_selected_arm"));
+        assert_uncertain_outer_frame(&trace["hits"][1], instances, &budget)?;
         Ok(())
     }
 

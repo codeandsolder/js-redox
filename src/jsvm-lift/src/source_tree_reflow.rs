@@ -267,7 +267,7 @@ impl<'a> Visit<'a> for LoopCandidate<'_> {
 /// Reparse each pass so nested candidates become eligible after the containing
 /// loop has been rewritten.
 /// Invalid detached syntax is left unchanged; this pass has no recoverable errors.
-#[must_use]
+#[must_use = "Use the returned source and reflow evidence; the input is unchanged"]
 pub fn reflow_single_trip_loops(source: &str) -> ReflowedLoops {
     let mut output = source.to_owned();
     let mut rewritten_loops = 0;

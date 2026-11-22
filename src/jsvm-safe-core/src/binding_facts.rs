@@ -117,7 +117,7 @@ impl BindingFacts {
         }
     }
 
-    #[must_use]
+    #[must_use = "Use the returned binding facts to justify lexical proofs"]
     pub fn analyze(program: &oxc_ast::ast::Program<'_>, scoping: &Scoping) -> Self {
         let mut facts = Self {
             hoisted_vars: HashSet::new(),
@@ -224,7 +224,7 @@ impl BindingFacts {
 
     /// Resolve the identity at this exact reference. A missing static symbol
     /// is not sufficient evidence of a global lookup.
-    #[must_use]
+    #[must_use = "Use the proven reference identity rather than assuming lexical resolution"]
     pub fn resolve_reference(
         &self,
         scoping: &Scoping,
@@ -234,7 +234,7 @@ impl BindingFacts {
         self.resolve_scope(scoping, reference.scope_id(), reference.symbol_id())
     }
 
-    #[must_use]
+    #[must_use = "Use the returned symbol only when its identity is resolved"]
     pub fn resolved_symbol(
         &self,
         scoping: &Scoping,
@@ -246,7 +246,7 @@ impl BindingFacts {
         }
     }
 
-    #[must_use]
+    #[must_use = "Only a true result proves that this reference is global"]
     pub fn proves_global_reference(&self, scoping: &Scoping, reference_id: ReferenceId) -> bool {
         self.resolve_reference(scoping, reference_id) == ReferenceIdentity::Global
     }
@@ -299,7 +299,7 @@ impl BindingFacts {
     /// initialized, their value cannot be changed. A hoisted declaration is
     /// different; the enclosing lexical scope's entry (not the declaration's
     /// text) is its earliest creation site.
-    #[must_use]
+    #[must_use = "Only a true result proves that the binding value is initialized"]
     pub fn proves_value_initialized(
         &self,
         scoping: &Scoping,
@@ -481,7 +481,7 @@ impl BindingFacts {
     /// parameter initializer executes in the parameter environment, before
     /// the separate body variable environment exists. Respect that boundary
     /// also for a closure created in a parameter initializer.
-    #[must_use]
+    #[must_use = "Check whether direct eval can expose the binding"]
     pub fn is_eval_exposed(&self, scoping: &Scoping, symbol: SymbolId) -> bool {
         let name = scoping.symbol_name(symbol);
         self.eval_sites.iter().any(|site| {
@@ -510,14 +510,14 @@ impl BindingFacts {
     /// Binding value cannot be reassigned by potential direct eval.
     /// This does not prove the absence of ordinary writes or mutation of
     /// objects stored in the binding.
-    #[must_use]
+    #[must_use = "Only a true result proves the binding is unmodified by eval"]
     pub fn binding_unmodified_by_eval(&self, scoping: &Scoping, symbol: SymbolId) -> bool {
         scoping.symbol_flags(symbol).is_const_variable() || !self.is_eval_exposed(scoping, symbol)
     }
 
     /// A single declaration and no known binding reassignment, including
     /// direct eval. Still requires an initialization proof at each use.
-    #[must_use]
+    #[must_use = "Only a true result proves the binding has a stable value"]
     pub fn binding_has_stable_value(&self, scoping: &Scoping, symbol: SymbolId) -> bool {
         scoping.symbol_redeclarations(symbol).is_empty()
             && self.binding_unmodified_by_eval(scoping, symbol)
@@ -541,7 +541,7 @@ impl BindingFacts {
             .then_some(symbol)
     }
 
-    #[must_use]
+    #[must_use = "Use the returned evidence only when the read is initialized"]
     pub fn initialized_read(
         &self,
         scoping: &Scoping,
@@ -555,7 +555,7 @@ impl BindingFacts {
 
     /// The same initialized-read proof for callers already visiting an
     /// `IdentifierReference` rather than its containing Expression.
-    #[must_use]
+    #[must_use = "Use the returned evidence only when the reference is initialized"]
     pub fn initialized_reference(
         &self,
         scoping: &Scoping,

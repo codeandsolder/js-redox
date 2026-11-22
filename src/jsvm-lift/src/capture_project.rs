@@ -246,7 +246,7 @@ pub fn write_manifest(path: &Path, manifest: &CaptureManifest) -> Result<()> {
     crate::report_file::write_json(path, manifest)
 }
 
-#[must_use]
+#[must_use = "Use the returned path to address the capture manifest"]
 pub fn manifest_path(project: &Path) -> PathBuf {
     project.join(MANIFEST_NAME)
 }

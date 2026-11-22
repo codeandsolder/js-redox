@@ -1037,7 +1037,7 @@ pub fn prove_detected_if_ladder_event_unreachable_with_integer_bindings(
 ///
 /// Parameter bindings are keyed by formal-parameter index, so callers can join
 /// against symbol-resolved direct-call proofs without relying on source names.
-#[must_use]
+#[must_use = "Use the returned exact bindings only for proven parameter values"]
 fn exact_integer_parameter_env(
     function: &Function<'_>,
     scoping: &Scoping,
@@ -1500,7 +1500,7 @@ impl<'a> Visit<'a> for ProtectedLoopReachabilityRunner<'_> {
 /// plain formal parameters are exact `undefined` values. Unsupported control,
 /// non-terminal ambiguous effects, dynamic scalar state, and recoverable
 /// exception paths all fail closed.
-#[must_use]
+#[must_use = "Only a true result proves the protected event unreachable for these arguments"]
 pub fn prove_function_protected_if_ladder_event_unreachable_with_call_arguments(
     source: &str,
     program: &Program<'_>,
@@ -1615,7 +1615,7 @@ impl<'a> Visit<'a> for ExactBooleanExpressionProbe<'_> {
 /// requested function body. Parameter facts use the same fail-closed scalar
 /// environment as the structured-branch proofs: mutable parameters are
 /// omitted, while dynamic scope or `arguments` makes the result unknown.
-#[must_use]
+#[must_use = "Use the returned boolean only when the expression result is proven"]
 pub fn proven_function_boolean_expression_with_integer_parameters(
     program: &Program<'_>,
     scoping: &Scoping,
@@ -1776,7 +1776,7 @@ impl<'a> Visit<'a> for StructuredBranchExclusionProbe<'_> {
 /// Only the scalar evaluator's side-effect-free subset participates. Unknown
 /// tests, targets not contained by a recognized branch, and dynamic scalar
 /// bindings fail closed.
-#[must_use]
+#[must_use = "Only a true result proves the branch event unreachable for these parameters"]
 pub fn prove_function_structured_branch_event_unreachable_with_integer_parameters(
     program: &Program<'_>,
     scoping: &Scoping,
@@ -1944,7 +1944,7 @@ impl<'a> Visit<'a> for StructuredSwitchExclusionProbe<'_> {
 /// The proof accepts only scalar-pure case selection and a selected case that
 /// either lies after the target or ends in an unconditional top-level
 /// break/return/throw before any later target case.
-#[must_use]
+#[must_use = "Only a true result proves the switch event unreachable for these parameters"]
 pub fn prove_function_switch_event_unreachable_with_integer_parameters(
     program: &Program<'_>,
     scoping: &Scoping,
@@ -2021,7 +2021,7 @@ pub fn prove_function_if_ladder_event_unreachable_with_integer_parameters(
 /// state transitions with the supplied call facts. The scalar/control subset,
 /// lexical-safety checks, and fail-closed behavior are identical to the exact
 /// unreachable-event theorem above.
-#[must_use]
+#[must_use = "Only a true result proves the required states precede the event for these parameters"]
 pub fn prove_function_if_ladder_states_before_event_with_integer_parameters(
     source: &str,
     program: &Program<'_>,
@@ -3083,7 +3083,7 @@ fn prove_protected_machine_event_unreachable_after_state(
 /// The unique machine containing `event` must use a `try` body with one catch
 /// handler and no finalizer. Unsupported scalar effects and non-finite
 /// unresolved state transitions fail closed.
-#[must_use]
+#[must_use = "Only a true result proves the protected event unreachable after the given state"]
 pub fn prove_function_protected_if_ladder_event_unreachable_after_state(
     source: &str,
     program: &Program<'_>,
@@ -3268,7 +3268,7 @@ fn prove_identifier_equalities_in_machine(
 /// closed. Direct writes in the declaring factory are allowed because the
 /// returned inner function cannot execute until that factory invocation has
 /// completed.
-#[must_use]
+#[must_use = "Use the returned equality evidence rather than assuming identifier values"]
 pub fn structurally_proven_if_ladder_identifier_equalities_at_event(
     source: &str,
     program: &Program<'_>,
@@ -3375,7 +3375,7 @@ pub fn structurally_proven_if_ladder_identifier_equalities_at_event(
 
 /// Prove required flattened-machine states dominate an event in one already
 /// detected machine.
-#[must_use]
+#[must_use = "Only a true result proves the detected machine visits the required states first"]
 pub fn prove_detected_if_ladder_states_before_event(
     program: &Program<'_>,
     machine: &IfLadderStateMachineCandidate,
@@ -3531,7 +3531,7 @@ fn prove_function_if_ladder_machine<'a>(
 
 /// Prove required state visitation inside the unique detected flattened
 /// if-ladder machine containing `event` in one exact function.
-#[must_use]
+#[must_use = "Only a true result proves the function visits the required states first"]
 pub fn prove_function_if_ladder_states_before_event(
     source: &str,
     program: &Program<'_>,
@@ -3679,7 +3679,7 @@ fn detect_if_ladder_candidate(
     })
 }
 
-#[must_use]
+#[must_use = "Use the detected machine evidence only when recognition succeeds"]
 pub fn detect_while_state_machine(
     source: &str,
     function_id: &str,

@@ -2919,7 +2919,7 @@ pub fn structurally_proven_origin_direct_calls(
 /// This composes the supported structured switch, ordinary flattened-ladder, and
 /// protected try/catch ladder theorems; unsupported control remains
 /// reachable/unknown.
-#[must_use]
+#[must_use = "Only a true result proves the event unreachable for this call"]
 pub fn proven_origin_direct_call_event_unreachable(
     source: &str,
     program: &Program<'_>,
@@ -3680,7 +3680,7 @@ pub fn structurally_proven_prototype_method_phase_closures(
 
 /// Join a structural phase closure to an independently proven lexical equality
 /// at one event inside the exact returned method body.
-#[must_use]
+#[must_use = "Only a returned proof establishes the phase at the specified event"]
 pub fn proven_prototype_method_phase_at_event(
     source: &str,
     program: &Program<'_>,

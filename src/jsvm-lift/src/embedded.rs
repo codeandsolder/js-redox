@@ -351,7 +351,7 @@ pub fn detect_static_string_join(call: &CallExpression<'_>) -> Option<EmbeddedCo
     })
 }
 
-#[must_use]
+#[must_use = "Use the returned constructor evidence only when detection succeeds"]
 pub fn detect_function_constructor(
     kind: &str,
     start: u32,

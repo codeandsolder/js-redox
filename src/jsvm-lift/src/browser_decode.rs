@@ -32,7 +32,7 @@ pub enum DecodeSource {
 }
 
 impl DecodeSource {
-    #[must_use]
+    #[must_use = "Use the returned stable spelling when serializing or displaying this value"]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Bom => "bom",
@@ -260,7 +260,7 @@ fn sniff_html_meta_encoding(bytes: &[u8]) -> Option<&'static Encoding> {
 /// charset, early meta declaration, then a caller-supplied/default browser
 /// fallback. The fallback is explicitly marked uncertain because real browser
 /// defaults are locale/container dependent.
-#[must_use]
+#[must_use = "Use the decoded text and encoding evidence together"]
 pub fn decode_html(
     bytes: &[u8],
     transport_content_type: Option<&str>,
@@ -306,7 +306,7 @@ pub struct ScriptDecodeContext<'a> {
 }
 
 impl ScriptDecodeContext<'_> {
-    #[must_use]
+    #[must_use = "Use the returned decoding context for module scripts"]
     pub const fn module() -> Self {
         Self {
             kind: ScriptKind::Module,
@@ -316,7 +316,7 @@ impl ScriptDecodeContext<'_> {
         }
     }
 
-    #[must_use]
+    #[must_use = "Use the returned decoding context when classic script encoding is unknown"]
     pub const fn classic_unknown() -> Self {
         Self {
             kind: ScriptKind::Classic,
@@ -373,7 +373,7 @@ fn selected_encoding(context: ScriptDecodeContext<'_>) -> (&'static Encoding, De
 /// decoder behavior browsers apply before JavaScript parsing. Malformed byte
 /// sequences become replacement characters and are reported through
 /// `had_errors`; they never turn into a process-level failure.
-#[must_use]
+#[must_use = "Use the decoded script and its original encoding evidence"]
 pub fn decode_script(bytes: &[u8], context: ScriptDecodeContext<'_>) -> DecodedScript {
     let (selected, selected_source, uncertain) = selected_encoding(context);
     let bom_encoding = Encoding::for_bom(bytes).map(|(encoding, _)| encoding.name().to_string());

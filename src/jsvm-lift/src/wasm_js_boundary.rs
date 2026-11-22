@@ -2639,7 +2639,7 @@ mod tests {
         CopyWordInterpretation, FreshCleanupRange, FreshCleanupSequence, FreshCleanupSetup,
         FreshDestinationProof,
     };
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     #[test]
     fn fresh_cleanup_range_rejects_overlapping_or_unproven_post_copy_accesses() {
@@ -2948,8 +2948,7 @@ mod tests {
         .is_none());
     }
 
-    #[test]
-    fn source_word_overlay_tracks_transitive_runtime_dependencies() {
+    fn transitive_word_fixture() -> (Value, Vec<Value>) {
         let analysis = json!({
             "runtime_bindings": [
                 {
@@ -3003,6 +3002,12 @@ mod tests {
             "source_element_index": 2,
             "source_conversion": "ToUint32",
         })];
+        (analysis, interpretations)
+    }
+
+    #[test]
+    fn source_word_overlay_tracks_transitive_runtime_dependencies() {
+        let (analysis, interpretations) = transitive_word_fixture();
         let (bindings, returns, proven) = source_word_semantic_overlay(&analysis, &interpretations);
         assert!(proven);
         assert_eq!(bindings.len(), 1);

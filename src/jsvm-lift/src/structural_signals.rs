@@ -382,7 +382,7 @@ fn is_tiny_proxy_function(expr: &Expression<'_>) -> bool {
     }
 }
 
-#[must_use]
+#[must_use = "Check the returned classification before treating a name as an API hint"]
 pub fn apiish_name(value: &str) -> bool {
     matches!(
         value,

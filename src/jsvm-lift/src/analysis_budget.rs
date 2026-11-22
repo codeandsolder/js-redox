@@ -32,7 +32,7 @@ pub enum AnalysisOperation {
 }
 
 impl AnalysisOperation {
-    #[must_use]
+    #[must_use = "Use the returned stable spelling when serializing or displaying this value"]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::CaptureImport => "capture-import",
@@ -56,7 +56,7 @@ impl AnalysisOperation {
         }
     }
 
-    #[must_use]
+    #[must_use = "Apply the returned limits to bound the analysis operation"]
     pub const fn limits(self) -> BudgetLimits {
         // These envelopes preserve the useful containment behavior of the old
         // process wrappers while moving enforcement into the algorithms. The
@@ -87,7 +87,7 @@ impl AnalysisOperation {
     /// Derive an operation-specific envelope from its actual parent.
     /// The parent carries the cancellation and resource limits; the root
     /// budget container is not involved once a stage is already established.
-    #[must_use]
+    #[must_use = "Use the returned child budget to enforce both operation and parent limits"]
     pub fn under(self, parent: &WorkBudget, label: impl AsRef<str>) -> WorkBudget {
         let scope = format!("{}:{}", self.as_str(), label.as_ref());
         parent.child(scope, self.limits())
@@ -100,19 +100,19 @@ pub struct AnalysisBudgets {
 }
 
 impl AnalysisBudgets {
-    #[must_use]
+    #[must_use = "Use the constructed budget set to account for subsequent analysis"]
     pub fn new(scope: impl Into<std::sync::Arc<str>>, limits: BudgetLimits) -> Self {
         Self {
             root: WorkBudget::new(scope, limits),
         }
     }
 
-    #[must_use]
+    #[must_use = "Use the returned budget set to enforce standard analysis limits"]
     pub fn standard(scope: impl Into<std::sync::Arc<str>>) -> Self {
         Self::new(scope, BudgetLimits::unlimited())
     }
 
-    #[must_use]
+    #[must_use = "Use the returned scope value for attribution or scoped budget enforcement"]
     pub fn scope(&self, label: impl AsRef<str>) -> WorkBudget {
         self.root.child(
             format!("scope:{}", label.as_ref()),
@@ -120,12 +120,12 @@ impl AnalysisBudgets {
         )
     }
 
-    #[must_use]
+    #[must_use = "Use the returned operation budget when performing the analysis"]
     pub fn operation(&self, operation: AnalysisOperation, label: impl AsRef<str>) -> WorkBudget {
         operation.under(&self.root, label)
     }
 
-    #[must_use]
+    #[must_use = "Use the returned budget to account for project-wide work"]
     pub const fn root(&self) -> &WorkBudget {
         &self.root
     }

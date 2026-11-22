@@ -791,7 +791,7 @@ fn propagate_reachable_parameter_origins(
 impl CallerView {
     /// Render a focused subset of the full source-resolved graph. The JSON
     /// manifest can still retain all reachable paths for deeper inspection.
-    #[must_use]
+    #[must_use = "Use the returned path rendering; the original source is unchanged"]
     pub fn render_paths(&self, original: &str, selected: &BTreeSet<usize>) -> String {
         let mut view = self.clone();
         view.paths = self

@@ -77,7 +77,7 @@ impl<'a> Visit<'a> for EvidenceVisitor<'_> {
     }
 }
 
-#[must_use]
+#[must_use = "Use the returned expression evidence when assessing dependencies"]
 pub fn expression_evidence(source: &str, expr: &Expression<'_>) -> ExprEvidence {
     let mut visitor = EvidenceVisitor {
         source,
@@ -108,7 +108,7 @@ fn evidence_reaches_computed_inner(
     false
 }
 
-#[must_use]
+#[must_use = "Check whether expression evidence reaches a computed access"]
 pub fn evidence_reaches_computed(
     evidence: &ExprEvidence,
     vars: &HashMap<String, ExprEvidence, impl std::hash::BuildHasher>,
@@ -152,7 +152,7 @@ pub struct FunctionState {
 }
 
 impl FunctionState {
-    #[must_use]
+    #[must_use = "Use the constructed function analysis to collect function-level evidence"]
     pub fn new(kind: &str, name: Option<String>, start: u32, end: u32) -> Self {
         Self {
             m: FunctionMetrics {
@@ -194,7 +194,7 @@ impl FunctionState {
         self.decoder_candidates = self.linked_decoder_candidates();
     }
 
-    #[must_use]
+    #[must_use = "Use the returned decoder-control evidence"]
     pub fn decoder_controls(&self, builders: &[PushBuilderCandidate]) -> Vec<DecoderControlInfo> {
         let mut candidates = self.linked_decoder_candidates();
 

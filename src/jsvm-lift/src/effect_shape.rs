@@ -145,12 +145,12 @@ impl<'a> Visit<'a> for ShapeVisitor {
     }
 }
 
-#[must_use]
+#[must_use = "Use the returned hash when comparing structural shapes"]
 pub fn hash_shape_text(text: &str) -> u64 {
     crate::fnv1a64(text.as_bytes())
 }
 
-#[must_use]
+#[must_use = "Use the returned structural effect summary"]
 pub fn analyze_program(program: &Program<'_>, property_mode: PropertyMode) -> EffectShape {
     let mut visitor = ShapeVisitor::new(property_mode);
     visitor.visit_program(program);
@@ -163,7 +163,7 @@ pub fn analyze_program(program: &Program<'_>, property_mode: PropertyMode) -> Ef
     }
 }
 
-#[must_use]
+#[must_use = "Use the returned structural effect summary"]
 pub fn analyze_effect(source: &str) -> EffectShape {
     for candidate in [source.to_string(), format!("({source})")] {
         let allocator = Allocator::default();
@@ -181,7 +181,7 @@ pub fn analyze_effect(source: &str) -> EffectShape {
     }
 }
 
-#[must_use]
+#[must_use = "Use the derived family name for grouping"]
 pub fn family_name(file: &str) -> String {
     Path::new(file)
         .file_name()

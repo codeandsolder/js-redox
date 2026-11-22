@@ -17,7 +17,7 @@ pub enum SourceMode {
 }
 
 impl SourceMode {
-    #[must_use]
+    #[must_use = "Use the returned stable spelling when serializing or displaying this value"]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Auto => "auto",
@@ -26,7 +26,7 @@ impl SourceMode {
         }
     }
 
-    #[must_use]
+    #[must_use = "Use the returned suffix for the selected source mode"]
     pub const fn suffix(self) -> &'static str {
         match self {
             Self::Auto => ".js",
@@ -35,7 +35,7 @@ impl SourceMode {
         }
     }
 
-    #[must_use]
+    #[must_use = "Use the converted mode when invoking the safe analysis"]
     pub const fn safe_mode(self) -> SafeSourceMode {
         match self {
             Self::Auto => SafeSourceMode::Auto,
@@ -44,7 +44,7 @@ impl SourceMode {
         }
     }
 
-    #[must_use]
+    #[must_use = "Use the returned parser source type to preserve language semantics"]
     pub const fn source_type(self) -> SourceType {
         match self {
             Self::Auto => SourceType::unambiguous(),
@@ -53,7 +53,7 @@ impl SourceMode {
         }
     }
 
-    #[must_use]
+    #[must_use = "Use the inferred source mode when parsing this path"]
     pub fn for_path(path: &Path) -> Self {
         match path.extension().and_then(|extension| extension.to_str()) {
             Some(extension) if extension.eq_ignore_ascii_case("mjs") => Self::Module,

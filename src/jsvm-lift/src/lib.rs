@@ -85,7 +85,7 @@ pub mod pipeline;
 mod probe_result;
 
 /// Stable FNV-1a 64-bit hash used by persisted js-redox shape/identity formats.
-#[must_use]
+#[must_use = "Use the returned hash for the input bytes"]
 pub fn fnv1a64(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
         (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)

@@ -438,7 +438,7 @@ impl AliasEdits {
 ///
 /// Aliases capture values once; substituted member lookups occur later
 /// and depend on the pristine-builtins assumption.
-#[must_use]
+#[must_use = "Apply the returned source view; the input is unchanged"]
 pub fn inline_readable_intrinsic_aliases(source: &str) -> Option<(String, usize)> {
     for source_type in [SourceType::mjs(), SourceType::cjs()] {
         let allocator = Allocator::default();

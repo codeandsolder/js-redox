@@ -44,7 +44,7 @@ fn expression_is_call(source: &str) -> bool {
 /// The returned source is analysis-only: each invalid target is replaced by an
 /// identifier of exactly the same byte length, and the replaced spans are
 /// reported explicitly. Callers must never publish or execute the masked view.
-#[must_use]
+#[must_use = "Use the recovered source and recovery evidence together"]
 pub fn recover_browser_legacy_call_assignments(
     source: &str,
     source_type: SourceType,

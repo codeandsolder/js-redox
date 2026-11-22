@@ -16,7 +16,7 @@ pub struct IntegerPolynomial {
 }
 
 impl IntegerPolynomial {
-    #[must_use]
+    #[must_use = "Use the returned constant polynomial; no existing polynomial is modified"]
     pub fn constant(value: i128) -> Self {
         let mut terms = BTreeMap::new();
         if value != 0 {
@@ -25,14 +25,14 @@ impl IntegerPolynomial {
         Self { terms }
     }
 
-    #[must_use]
+    #[must_use = "Use the returned symbolic polynomial; no existing polynomial is modified"]
     pub fn variable(symbol: SymbolId) -> Self {
         Self {
             terms: BTreeMap::from([(vec![symbol], 1)]),
         }
     }
 
-    #[must_use]
+    #[must_use = "Use the returned value only if the polynomial is constant"]
     pub fn constant_value(&self) -> Option<i128> {
         if self.terms.is_empty() {
             return Some(0);
@@ -48,7 +48,7 @@ impl IntegerPolynomial {
 
     /// Return the distinct symbol-resolved variables participating in this
     /// polynomial, sorted by `SymbolId` for stable proof comparisons.
-    #[must_use]
+    #[must_use = "Use the returned symbolic dependency set"]
     pub fn variables(&self) -> Vec<SymbolId> {
         let mut variables = self
             .terms
@@ -233,7 +233,7 @@ impl<C: std::hash::BuildHasher, A: std::hash::BuildHasher> Normalizer<'_, '_, '_
 /// exact source span. Assignments whose RHS is intentionally unconstrained may be
 /// listed in `arbitrary_assignments`; their post-assignment value becomes a fresh
 /// symbolic value of that variable.
-#[must_use]
+#[must_use = "Use the normalized polynomial only when the expression is supported"]
 pub fn normalize_integer_polynomial(
     expression: &Expression<'_>,
     scoping: &Scoping,

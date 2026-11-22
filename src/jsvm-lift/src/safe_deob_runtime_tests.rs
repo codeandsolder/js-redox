@@ -196,6 +196,13 @@ fn assert_main_contract(file: &str, outcome: &SafeDeobOutcome) {
                 "function(selector,left,p2,p3,p4,p5,p6,p7,p8,p9){return(left|0);}",
             )));
         }
+        _ => assert_state_and_alias_contract(file, outcome),
+    }
+}
+
+fn assert_state_and_alias_contract(file: &str, outcome: &SafeDeobOutcome) {
+    let report = &outcome.report;
+    match file {
         "reference-identity-table.js" | "reference-identity-table-sync.js" => {
             assert!(count(report, "reference_identity_compare") >= 2);
             assert!(count(report, "reference_state_unflatten") >= 1);
@@ -225,6 +232,44 @@ fn assert_main_contract(file: &str, outcome: &SafeDeobOutcome) {
             assert_eq!(outcome.source.matches("log.push('guard')").count(), 1);
             assert_eq!(outcome.source.matches("get value()").count(), 1);
         }
+        "arithmetic-state-primitive-branches.js" => {
+            assert_eq!(count(report, "arithmetic_state_unflatten"), 5);
+            assert_eq!(report.arithmetic_state_proofs.len(), 5);
+            assert!(
+                report.arithmetic_state_proofs.iter().any(|proof| {
+                    proof.branch_paths.is_empty()
+                        && proof.state_path.iter().any(|state| state == "void 0")
+                }),
+                "direct undefined state must dispatch through its next switch"
+            );
+            for value in ["\"3\"", "true", "null", "void 0"] {
+                assert!(
+                    report.arithmetic_state_proofs.iter().any(|proof| {
+                        proof
+                            .branch_paths
+                            .first()
+                            .and_then(|path| path.first())
+                            .is_some_and(|state| state == value)
+                    }),
+                    "missing typed state {value}"
+                );
+            }
+        }
+        "static-alias-installer-calls.js" => {
+            assert_eq!(report.static_alias_installer_calls.len(), 2);
+            assert!(!report.static_alias_installer_calls[0].forwarding_installer_proven);
+        }
+        "static-alias-live-forwarding.js" => {
+            assert_eq!(report.static_alias_installer_calls.len(), 1);
+            assert!(report.static_alias_installer_calls[0].forwarding_installer_proven);
+        }
+        _ => assert_exception_state_contract(file, outcome),
+    }
+}
+
+fn assert_exception_state_contract(file: &str, outcome: &SafeDeobOutcome) {
+    let report = &outcome.report;
+    match file {
         "exception-state-structured-liveness.js" => {
             assert!(
                 count(report, "dead_intermediate_state_write") >= 3,
@@ -304,49 +349,11 @@ fn assert_main_contract(file: &str, outcome: &SafeDeobOutcome) {
                 }
             }
         }
-        "arithmetic-state-primitive-branches.js" => {
-            assert_eq!(count(report, "arithmetic_state_unflatten"), 5);
-            assert_eq!(report.arithmetic_state_proofs.len(), 5);
-            assert!(
-                report.arithmetic_state_proofs.iter().any(|proof| {
-                    proof.branch_paths.is_empty()
-                        && proof.state_path.iter().any(|state| state == "void 0")
-                }),
-                "direct undefined state must dispatch through its next switch"
-            );
-            for value in ["\"3\"", "true", "null", "void 0"] {
-                assert!(
-                    report.arithmetic_state_proofs.iter().any(|proof| {
-                        proof
-                            .branch_paths
-                            .first()
-                            .and_then(|path| path.first())
-                            .is_some_and(|state| state == value)
-                    }),
-                    "missing typed state {value}"
-                );
-            }
-        }
-        "static-alias-installer-calls.js" => {
-            assert_eq!(report.static_alias_installer_calls.len(), 2);
-            assert!(!report.static_alias_installer_calls[0].forwarding_installer_proven);
-        }
-        "static-alias-live-forwarding.js" => {
-            assert_eq!(report.static_alias_installer_calls.len(), 1);
-            assert!(report.static_alias_installer_calls[0].forwarding_installer_proven);
-        }
         _ => {}
     }
 }
 
-#[test]
-#[ignore = "requires Node; semantic CI invokes explicitly"]
-#[expect(
-    clippy::literal_string_with_formatting_args,
-    reason = "JavaScript fixture braces are source syntax, not Rust format placeholders"
-)]
-fn depythonify_safe_deob_script_completion_runtime_equivalence() -> Result<()> {
-    let sources = [
+const SCRIPT_COMPLETION_SOURCES: &[&str] = &[
         "let x=0;function f(){x=(eval('var x=1'),2);return x;}[f(),x];",
         "let x=0;function f(){x=eval('var x=1;true')?2:3;return x;}[f(),x];",
         "let x=0;function f(){'use strict';x=(eval('var x=1'),2);return x;}[f(),x];",
@@ -722,8 +729,12 @@ fn depythonify_safe_deob_script_completion_runtime_equivalence() -> Result<()> {
         "Array.prototype[Symbol.iterator]=function*(){yield 99;};let a=[7,8];let b={...a};b[0];",
         "let a=[7,8];let b={...a};[b[0],b[1],b.length];",
         "let a={__proto__:null,[Symbol('a')]:7};let b={...a};Reflect.ownKeys(b).length;",
-    ];
-    script_runtime_equivalence(&sources, "script-completion", false)
+];
+
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_script_completion_runtime_equivalence() -> Result<()> {
+    script_runtime_equivalence(SCRIPT_COMPLETION_SOURCES, "script-completion", false)
 }
 
 #[test]
@@ -1687,6 +1698,13 @@ fn depythonify_safe_deob_safety_runtime_equivalence() -> Result<()> {
     )?;
     assert!(eval.source.contains("function hiddenHelper"));
 
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_arithmetic_proof_runtime_equivalence() -> Result<()> {
+    let scratch = TempDir::new()?;
     let iife = deob_fixture(scratch.path(), "arithmetic-state-iife-recovery.js")?;
     assert_eq!(count(&iife.report, "arithmetic_state_unflatten"), 1);
     assert_eq!(iife.report.arithmetic_state_proofs.len(), 1);

@@ -13,7 +13,7 @@ pub enum Materialization {
 }
 
 /// Return the SHA-256 digest of `bytes` as lowercase hexadecimal.
-#[must_use]
+#[must_use = "Use the digest to identify the exact input bytes"]
 pub fn sha256_hex(bytes: &[u8]) -> String {
     encode_digest(&Sha256::digest(bytes))
 }
@@ -87,7 +87,7 @@ pub fn sha256_path(path: &Path) -> Result<String> {
         .sha256)
 }
 
-#[must_use]
+#[must_use = "Use the returned worker count to bound parallelism"]
 pub fn default_jobs(cap: usize) -> usize {
     std::thread::available_parallelism()
         .map_or(1, usize::from)

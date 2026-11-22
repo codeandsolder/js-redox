@@ -28,7 +28,7 @@ fn is_standard_executable_script_type(ty: &str) -> bool {
     )
 }
 
-#[must_use]
+#[must_use = "Use the normalized MIME essence for script classification"]
 pub fn script_type_essence(value: Option<&str>) -> String {
     let mut ty = value
         .unwrap_or("text/javascript")
@@ -43,7 +43,7 @@ pub fn script_type_essence(value: Option<&str>) -> String {
     ty
 }
 
-#[must_use]
+#[must_use = "Use the normalized type for script classification"]
 pub fn normalize_script_type(value: Option<&str>) -> String {
     let ty = script_type_essence(value);
     if let Some((prefix, suffix)) = ty.split_once('-') {
@@ -57,7 +57,7 @@ pub fn normalize_script_type(value: Option<&str>) -> String {
     ty
 }
 
-#[must_use]
+#[must_use = "Use the returned kind to distinguish executable and data scripts"]
 pub fn inline_script_kind(value: Option<&str>) -> InlineScriptKind {
     let ty = normalize_script_type(value);
     if is_standard_executable_script_type(&ty) {
@@ -69,7 +69,7 @@ pub fn inline_script_kind(value: Option<&str>) -> InlineScriptKind {
     }
 }
 
-#[must_use]
+#[must_use = "Use the returned extension for the classified script kind"]
 pub fn inline_script_extension(value: Option<&str>) -> &'static str {
     match inline_script_kind(value) {
         InlineScriptKind::JavaScript => "js",
@@ -78,12 +78,12 @@ pub fn inline_script_extension(value: Option<&str>) -> &'static str {
     }
 }
 
-#[must_use]
+#[must_use = "Check whether the script is executable before treating it as code"]
 pub fn is_executable_script(value: Option<&str>) -> bool {
     inline_script_kind(value) == InlineScriptKind::JavaScript
 }
 
-#[must_use]
+#[must_use = "Check whether the script represents JSON data"]
 pub fn is_json_script(value: Option<&str>) -> bool {
     inline_script_kind(value) == InlineScriptKind::Json
 }

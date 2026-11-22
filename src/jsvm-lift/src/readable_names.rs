@@ -624,7 +624,7 @@ fn rename_in_program(
 
 /// Readability-only transformation: original executable deobfuscation output
 /// remains untouched. Exact parsed lexical bindings, not textual substitution.
-#[must_use]
+#[must_use = "Use the returned renamed source view; the input is unchanged"]
 pub fn recover_readable_names(source: &str) -> Option<(String, usize)> {
     recover_readable_names_with_imports(source, None)
 }
@@ -633,7 +633,7 @@ pub fn recover_readable_names(source: &str) -> Option<(String, usize)> {
 ///
 /// The caller supplies exact specifier-to-export mappings resolved by the project
 /// graph. Public ESM export names and import paths remain exactly as captured.
-#[must_use]
+#[must_use = "Use the returned renamed source view and change count"]
 pub fn recover_readable_names_with_imports(
     source: &str,
     imports: Option<&ImportedNames>,
