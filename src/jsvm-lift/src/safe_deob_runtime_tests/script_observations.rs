@@ -49,6 +49,16 @@ fn depythonify_safe_deob_observation_runner_detects_mismatches() -> Result<()> {
         ("nested-shape", "[[1,2]]", "[1,2]"),
         ("event-signed-zero", "events.push(0);0", "events.push(-0);0"),
         ("exception-message", "throw Error('a')", "throw Error('b')"),
+        ("exception-value-type", "throw 0", "throw '0'"),
+        ("exception-signed-zero", "throw 0", "throw -0"),
+        ("exception-bigint", "throw 0n", "throw 0"),
+        ("exception-array-shape", "throw [void 0]", "throw [,]"),
+        (
+            "exception-native-error-type",
+            "throw Error('a')",
+            "throw 'Error: a'",
+        ),
+        ("abrupt-vs-normal", "throw 0", "0"),
         ("syntax-failure", "function (", "function ("),
     ];
     for (label, original, rewritten) in cases {
@@ -63,6 +73,27 @@ fn depythonify_safe_deob_observation_runner_detects_mismatches() -> Result<()> {
         );
         assert!(result.is_err(), "{label} must not compare equal");
     }
+    compare_pairs(
+        "matching-abrupt-values",
+        &[
+            Comparison {
+                label: "matching-zero".into(),
+                original: "throw -0".into(),
+                rewritten: "throw -(0)".into(),
+            },
+            Comparison {
+                label: "matching-error".into(),
+                original: "throw TypeError('a')".into(),
+                rewritten: "throw new TypeError('a')".into(),
+            },
+            Comparison {
+                label: "matching-thrown-array".into(),
+                original: "throw [NaN,,-0]".into(),
+                rewritten: "throw [0/0,,-0]".into(),
+            },
+        ],
+        false,
+    )?;
     compare_pairs(
         "matching-typed-values",
         &[Comparison {

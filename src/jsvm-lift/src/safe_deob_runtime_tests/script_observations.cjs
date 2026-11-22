@@ -1,5 +1,6 @@
 // Test-only runtime for synthetic fixtures, injected after the input batch.
 const vm = require('node:vm');
+const {isNativeError} = require('node:util').types;
 
 // Match the observable scalar domain of the tests. Arrays are traversed by
 // their index descriptors to distinguish holes and undefined without invoking
@@ -46,12 +47,17 @@ function observe(text, label) {
     try {
         result = script.runInNewContext(globals, {timeout: 10000});
     } catch (error) {
-        if (error?.code === 'ERR_SCRIPT_EXECUTION_TIMEOUT') throw error;
+        if (isNativeError(error) &&
+            Object.getOwnPropertyDescriptor(error, 'code')?.value === 'ERR_SCRIPT_EXECUTION_TIMEOUT') {
+            throw error;
+        }
         result = error;
         thrown = true;
     }
     return JSON.stringify([
-        thrown ? ['throw', String(result)] : ['return', encode(result)],
+        thrown
+            ? ['throw', isNativeError(result) ? ['error', String(result)] : encode(result)]
+            : ['return', encode(result)],
         encode(events)
     ]);
 }
