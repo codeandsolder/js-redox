@@ -2647,9 +2647,10 @@ pub fn correlate_project(
 #[cfg(test)]
 mod tests {
     use super::{
-        source_word_semantic_overlay, BoundaryCorrelation, BoundaryExport, CopiedSourceEvidence,
-        CopyDestinationRequirements, CopyImportNames, CopyWordInterpretation, FreshCleanupRange,
-        FreshCleanupSequence, FreshCleanupSetup, FreshDestinationProof,
+        contextual_handler_usages, source_word_semantic_overlay, BoundaryCorrelation,
+        BoundaryExport, CopiedSourceEvidence, CopyDestinationRequirements, CopyImportNames,
+        CopyWordInterpretation, FreshCleanupRange, FreshCleanupSequence, FreshCleanupSetup,
+        FreshDestinationProof,
     };
     use serde_json::json;
 
