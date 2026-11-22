@@ -6,6 +6,7 @@ use crate::{
     analysis_budget::{recoverable_unit_error, AnalysisBudgets, AnalysisOperation},
     content_dedup::{link_or_copy, sha256_path},
     js_format::format_source,
+    report_file::write_json,
     safe_deob::{deobfuscate_source, SourceMode},
     scan_report::{scan_file, ScanReport},
     string_recovery::recover_static_strings,
@@ -45,15 +46,6 @@ pub struct ProjectScanSummary {
     pub confirmed_vm_units: usize,
     pub handler_table_candidates: usize,
     pub failures: usize,
-}
-
-fn write_json(path: &Path, value: &impl serde::Serialize) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    }
-    let mut encoded = serde_json::to_string_pretty(value)?;
-    encoded.push('\n');
-    fs::write(path, encoded).with_context(|| format!("writing {}", path.display()))
 }
 
 fn value_string(value: &Value, field: &str) -> Option<String> {

@@ -8,6 +8,7 @@ use crate::{
     project_import_names::propagate_imported_names,
     readable_aliases::inline_readable_intrinsic_aliases,
     readable_names::recover_readable_names,
+    report_file::write_json,
     safe_deob::{deobfuscate_source, SafeDeobReport, SourceMode},
     sha256_hex,
     string_recovery::recover_static_strings,
@@ -101,15 +102,6 @@ fn derived_path(raw_path: &str, root: &str) -> PathBuf {
         None => {}
     }
     output
-}
-
-fn write_json(path: &Path, value: &impl serde::Serialize) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    }
-    let mut encoded = serde_json::to_string_pretty(value)?;
-    encoded.push('\n');
-    fs::write(path, encoded).with_context(|| format!("writing {}", path.display()))
 }
 
 fn run_string_recovery(

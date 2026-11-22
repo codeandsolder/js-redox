@@ -11,7 +11,7 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{collections::BTreeMap, path::Path};
 
 fn array<'a>(value: &'a Value, key: &str) -> &'a [Value] {
     value
@@ -617,7 +617,7 @@ pub fn refresh_project_readme(project: &Path, budgets: &AnalysisBudgets) -> Resu
         String::new(),
     ]);
 
-    fs::write(project.join("README.md"), lines.join("\n"))
+    crate::report_file::write_text(&project.join("README.md"), &lines.join("\n"))
         .with_context(|| format!("writing {}/README.md", project.display()))?;
     Ok(())
 }
@@ -627,7 +627,10 @@ mod tests {
     use super::*;
     use crate::capture_project::{validate_manifest_value, write_manifest};
     use serde_json::json;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     #[test]
     fn http_project_readme_uses_original_url_and_exposes_entrypoints() -> Result<()> {

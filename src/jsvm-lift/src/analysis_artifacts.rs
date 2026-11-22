@@ -286,28 +286,22 @@ pub fn load_artifact(project: &Path, spec: ArtifactSpec, optional: bool) -> Resu
     }
 }
 
-/// Validate and write a pretty-printed artifact to a path.
-///
-/// # Errors
-///
-/// Fails on schema or field-shape violations, directory creation errors, serialization errors or file-write errors.
-pub fn write_artifact_path(path: &Path, spec: ArtifactSpec, document: &Value) -> Result<()> {
+/// Stage a validated artifact without replacing its published file.
+pub(crate) fn stage_artifact(
+    project: &Path,
+    spec: ArtifactSpec,
+    document: &Value,
+) -> Result<crate::report_file::StagedReport> {
+    let path = artifact_path(project, spec);
     validate_artifact(document, spec, &path.display().to_string())?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    }
-    let mut encoded = serde_json::to_string_pretty(document)?;
-    encoded.push('\n');
-    fs::write(path, encoded).with_context(|| format!("writing {}", path.display()))
+    crate::report_file::stage_json(&path, document)
 }
 
 /// Write a validated analysis artifact at its project-relative path.
-///
 /// # Errors
-///
-/// Propagates validation, serialization and filesystem errors from `write_artifact_path`.
+/// Propagates validation, serialization and filesystem errors.
 pub fn write_artifact(project: &Path, spec: ArtifactSpec, document: &Value) -> Result<()> {
-    write_artifact_path(&artifact_path(project, spec), spec, document)
+    stage_artifact(project, spec, document)?.publish()
 }
 
 #[cfg(test)]
