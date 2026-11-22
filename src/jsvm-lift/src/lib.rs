@@ -53,6 +53,7 @@ pub mod project_deob;
 mod project_entrypoints;
 pub mod project_import_names;
 pub mod project_js_refs;
+mod project_output;
 pub mod project_readme;
 pub mod project_scan;
 pub mod project_sourcemaps;

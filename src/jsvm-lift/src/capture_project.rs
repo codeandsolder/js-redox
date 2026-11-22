@@ -171,40 +171,6 @@ pub fn read_manifest(path: &Path) -> Result<CaptureManifest> {
     Ok(manifest)
 }
 
-/// Prepare an output directory without overwriting unrelated data.
-///
-/// # Errors
-///
-/// Rejects symlink output paths, existing paths without overwrite permission, non-directories and nonempty directories lacking a capture manifest; also propagates filesystem errors.
-pub(crate) fn prepare_project_output(output: &Path, overwrite: bool) -> Result<()> {
-    if let Ok(metadata) = fs::symlink_metadata(output) {
-        if metadata.file_type().is_symlink() {
-            bail!("refusing symlink output path: {}", output.display());
-        }
-    }
-    if output.exists() {
-        if !overwrite {
-            bail!(
-                "output directory already exists: {} (use --overwrite)",
-                output.display()
-            );
-        }
-        if !output.is_dir() {
-            bail!(
-                "refusing to replace non-directory output: {}",
-                output.display()
-            );
-        }
-        let empty = fs::read_dir(output)?.next().is_none();
-        if !empty && !output.join(MANIFEST_NAME).is_file() {
-            bail!("refusing to recursively replace non-project output: {}; expected an empty directory or {MANIFEST_NAME}", output.display());
-        }
-        fs::remove_dir_all(output)?;
-    }
-    fs::create_dir_all(output)?;
-    Ok(())
-}
-
 /// Validate and serialize the capture manifest to its destination.
 ///
 /// # Errors

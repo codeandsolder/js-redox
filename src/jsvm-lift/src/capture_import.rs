@@ -7,6 +7,7 @@ use crate::{
     analysis_budget::{AnalysisBudgets, AnalysisOperation},
     capture_project::{load_manifest, write_manifest, CaptureManifest},
     har_project::{import_har_project, HarProjectOptions},
+    project_output::ProjectOutput,
 };
 use anyhow::{bail, Context, Result};
 use runtime_scripts::analyze_recorder_runtime_scripts;
@@ -161,16 +162,17 @@ pub fn import_capture_project(
             } else {
                 input.clone()
             };
+            let staged = ProjectOutput::new(&options.output, options.overwrite, &[&input, &har])?;
+            let output = staged.path();
             let summary = import_har_project(
                 &HarProjectOptions {
                     har: har.clone(),
-                    output: options.output.clone(),
-                    overwrite: options.overwrite,
+                    output: output.to_owned(),
                 },
                 &budget,
             )?;
             if kind == CaptureInputKind::Recorder {
-                let mut manifest = load_manifest(&options.output)?;
+                let mut manifest = load_manifest(output)?;
                 manifest.source.kind = "recorder".into();
                 manifest.source.input = input.display().to_string();
                 manifest
@@ -182,10 +184,12 @@ pub fn import_capture_project(
                     serde_json::from_slice(&std::fs::read(&recorder_manifest_path)?)
                         .with_context(|| format!("parsing {}", recorder_manifest_path.display()))?;
                 add_recorder_navigation(&mut manifest, &recorder_metadata);
-                write_manifest(&options.output.join("capture-manifest.json"), &manifest)?;
-                analyze_recorder_runtime_scripts(&input, &options.output, &manifest, &budget)?;
-                import_selective_trace(&input, &options.output, budgets)?;
+                write_manifest(&output.join("capture-manifest.json"), &manifest)?;
+                analyze_recorder_runtime_scripts(&input, output, &manifest, &budget)?;
+                import_selective_trace(&input, output, budgets)?;
             }
+            budget.checkpoint()?;
+            staged.publish()?;
             Ok(CaptureImportSummary {
                 kind,
                 resources: summary.resources,
@@ -239,6 +243,59 @@ mod tests {
             manifest.source.extra["capture_created_at"],
             "2026-11-04T01:00:00Z"
         );
+    }
+
+    #[test]
+    fn failed_capture_replacement_preserves_previous_project() -> Result<()> {
+        use serde_json::json;
+        use std::fs;
+        let root = tempfile::tempdir()?;
+        let page = root.path().join("page.html");
+        let output = root.path().join("project");
+        fs::write(&page, "<!doctype html><title>fixture</title>")?;
+        let budgets = AnalysisBudgets::standard("import publication");
+        let options = CaptureImportOptions {
+            input: page,
+            output: output.clone(),
+            assets_dir: None,
+            overwrite: false,
+        };
+        import_capture_project(&options, &budgets)?;
+        let original = fs::read(output.join(crate::capture_project::MANIFEST_NAME))?;
+        fs::write(output.join("previous.txt"), "previous")?;
+
+        let invalid = root.path().join("invalid.har");
+        fs::write(&invalid, "not a HAR")?;
+        let options = CaptureImportOptions {
+            input: invalid,
+            overwrite: true,
+            ..options
+        };
+        assert!(import_capture_project(&options, &budgets).is_err());
+        assert_eq!(
+            fs::read(output.join(crate::capture_project::MANIFEST_NAME))?,
+            original
+        );
+
+        // A later import stage fails after HAR resources have already been written.
+        let recorder = root.path().join("recorder");
+        fs::create_dir(&recorder)?;
+        let har = json!({"log":{"version":"1.2","entries":[{"request":{"method":"GET","url":"https://fixture.invalid/index.html"},"response":{"status":200,"content":{"mimeType":"text/html","text":"<title>new</title>"}}}]}});
+        fs::write(recorder.join("capture.har"), serde_json::to_vec(&har)?)?;
+        fs::write(recorder.join("recorder-manifest.json"), "invalid metadata")?;
+        let options = CaptureImportOptions {
+            input: recorder,
+            overwrite: true,
+            ..options
+        };
+        assert!(import_capture_project(&options, &budgets).is_err());
+        assert_eq!(
+            fs::read(output.join(crate::capture_project::MANIFEST_NAME))?,
+            original
+        );
+        assert_eq!(fs::read_to_string(output.join("previous.txt"))?, "previous");
+        assert_eq!(fs::read_dir(root.path())?.count(), 4);
+        Ok(())
     }
 
     #[test]
