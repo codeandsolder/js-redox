@@ -3,7 +3,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
     path::{Path, PathBuf},
 };
 
@@ -196,6 +195,7 @@ pub fn load_manifest(project: &Path) -> Result<CaptureManifest> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::fs;
 
     fn valid_manifest() -> CaptureManifest {
         let mut source_extra = Map::new();
