@@ -47,7 +47,7 @@ const ATOMS: [&str; 30] = [
     "class {static {effect('static')}}",
 ];
 
-const ENVIRONMENT: &str = r#"
+const ENVIRONMENT: &str = r"
 function effect(value) { events.push(value); return value; }
 function fail() { events.push('throw'); throw Error('fixture throw'); }
 Object.prototype.toString = function() { events.push('coercion'); return 'key'; };
@@ -55,7 +55,7 @@ const iterator = Array.prototype[Symbol.iterator];
 Array.prototype[Symbol.iterator] = function() {
     events.push('iteration'); return iterator.call(this);
 };
-"#;
+";
 
 struct Claim {
     label: String,
