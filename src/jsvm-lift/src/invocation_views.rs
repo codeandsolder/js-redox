@@ -1,6 +1,8 @@
 //! Human-readable browser execution witnesses with exact original-source context.
 //! This is evidence from a particular paused invocation, never a general proof.
 mod observed_guards;
+mod source_cache;
+use source_cache::{VerifiedSource, VerifiedSources, SOURCE_CACHE_BYTES};
 
 use crate::{
     analysis_artifacts::{load_artifact, write_artifact, RUNTIME_SCRIPTS, SELECTIVE_TRACE},
@@ -9,10 +11,9 @@ use crate::{
     runtime_identity::{
         retain_agreed, script_id_text, session_name, ScriptIdentityIndex, ScriptOriginContext,
     },
-    sha256_hex,
-    source_text::{clip_chars, js_line_ranges},
+    source_text::clip_chars,
 };
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::fmt::Write as _;
 use std::{collections::BTreeMap, fs, path::Path};
@@ -33,7 +34,7 @@ fn verified_sha(value: &Value) -> Option<&str> {
         .filter(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
-fn source_excerpt(raw: &str, line: u64, first_line: Option<u64>) -> String {
+fn source_excerpt(source: &VerifiedSource, line: u64, first_line: Option<u64>) -> String {
     let Some(start) = first_line else {
         return "CDP script start offset was not recorded; raw source link is authoritative.\n"
             .into();
@@ -46,27 +47,23 @@ fn source_excerpt(raw: &str, line: u64, first_line: Option<u64>) -> String {
     };
     let begin = local_line.saturating_sub(2);
     let end = local_line.saturating_add(3);
+    if source.lines.line_text(&source.text, local_line).is_none() {
+        return "Paused location is outside the captured raw source lines; no excerpt claimed.\n"
+            .into();
+    }
     let mut excerpt = String::new();
-    let mut found = false;
-    for (index, text) in js_line_ranges(raw)
-        .map(|range| &raw[range])
-        .enumerate()
-        .take(end)
-        .skip(begin)
-    {
-        found |= index == local_line;
+    for index in begin..end {
+        let Some(text) = source.lines.line_text(&source.text, index) else {
+            break;
+        };
         let (shown, clipped) = clip_chars(text, 260);
         let cropped = if clipped { " …" } else { "" };
         let _ = writeln!(
             excerpt,
             "{} {:>6} | {shown}{cropped}",
             if index == local_line { ">" } else { " " },
-            u128::from(start) + index as u128 + 1,
+            u128::from(start) + index as u128 + 1
         );
-    }
-    if !found {
-        return "Paused location is outside the captured raw source lines; no excerpt claimed.\n"
-            .into();
     }
     fenced_code(excerpt.trim_end(), "js")
 }
@@ -124,7 +121,7 @@ fn runtime_identity_index(
 /// definition site; observations remain separate from reference equality.
 fn append_observed_callable_definitions(
     page: &mut String,
-    project: &Path,
+    sources: &mut VerifiedSources<'_>,
     identities: &RuntimeIdentityIndex,
     session: Option<&str>,
     hit: &Value,
@@ -210,14 +207,7 @@ fn append_observed_callable_definitions(
         let location = identities
             .get(session, &script)
             .context("missing verified runtime source location")?;
-        let raw_path = format!("resources/runtime-scripts/{sha}.js");
-        let bytes = fs::read(project.join(&raw_path))
-            .with_context(|| format!("missing original callable definition source {sha}"))?;
-        if sha256_hex(&bytes) != sha {
-            bail!("original callable definition hash mismatch: {sha}");
-        }
-        let source = String::from_utf8(bytes)
-            .with_context(|| format!("non-UTF8 callable definition source: {sha}"))?;
+        let source = sources.load(&sha)?;
         let script = code_span(&script);
         let _ = write!(
             page,
@@ -229,7 +219,7 @@ fn append_observed_callable_definitions(
             "Source SHA-256: **{sha}**. [Original code](../../../resources/runtime-scripts/{sha}.js).\n\n"
         );
         let readable = format!("src/_readable/runtime-scripts/{sha}.js");
-        if project.join(&readable).is_file() {
+        if sources.project.join(&readable).is_file() {
             let _ = write!(page, "[Shared readable code](../../../{readable}) — original V8 coordinates do not apply to transformed code.\n\n");
         }
         page.push_str("Observed references to this **definition site**:\n\n");
@@ -244,7 +234,7 @@ fn append_observed_callable_definitions(
 /// Render a separate sequential execution witness; never filter unreachable
 /// branches or replace a general source tree based on a single observed run.
 fn build_observed_path_view(
-    project: &Path,
+    sources: &mut VerifiedSources<'_>,
     identities: &RuntimeIdentityIndex,
     session: Option<&str>,
     hit: &Value,
@@ -336,26 +326,19 @@ fn build_observed_path_view(
             let sha = sha.context("checked exact original step source")?;
             let raw_path = format!("resources/runtime-scripts/{sha}.js");
             if identity.is_some_and(|source| source.capture_instrumentation == Some(true))
-                && !project.join(&raw_path).is_file()
+                && !sources.project.join(&raw_path).is_file()
             {
                 let _ = write!(page,
                     "Exact captured script SHA-256 **{sha}**; this is **recorder instrumentation**,                      intentionally excluded from the recovered application source tree.                      No original-source excerpt or application link is claimed.\n\n"
                 );
             } else {
-                let bytes = fs::read(project.join(&raw_path)).with_context(|| {
-                    format!("missing original application execution step source {sha}")
-                })?;
-                if sha256_hex(&bytes) != sha {
-                    bail!("original execution step source hash mismatch: {sha}");
-                }
-                let raw = String::from_utf8(bytes)
-                    .with_context(|| format!("execution step code is not UTF-8: {sha}"))?;
+                let raw = sources.load(sha)?;
                 let _ = write!(
                     page,
                     "Verified [original source](../../../{raw_path}), SHA-256 **{sha}**.\n\n"
                 );
                 let readable = format!("src/_readable/runtime-scripts/{sha}.js");
-                if project.join(&readable).is_file() {
+                if sources.project.join(&readable).is_file() {
                     let _ = write!(page,
                         "[General safe-readable view](../../../{readable}) (different source offsets).\n\n"
                     );
@@ -406,6 +389,7 @@ pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -
         "observed invocation views",
     );
     let identities = runtime_identity_index(&runtime, &budget)?;
+    let mut sources = VerifiedSources::new(project, &budget, SOURCE_CACHE_BYTES);
     let output = project.join("src/_observed/invocations");
     fs::create_dir_all(&output)?;
     let hits = trace
@@ -476,14 +460,7 @@ pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -
                 continue;
             }
             let sha = expected.context("checked exact source identity")?;
-            let raw_path = format!("resources/runtime-scripts/{sha}.js");
-            let raw_bytes = fs::read(project.join(&raw_path))
-                .with_context(|| format!("missing exact recorded runtime source {sha}"))?;
-            if sha256_hex(&raw_bytes) != sha {
-                bail!("captured runtime source byte identity mismatch: {sha}");
-            }
-            let raw = String::from_utf8(raw_bytes)
-                .with_context(|| format!("runtime source is not UTF-8: {sha}"))?;
+            let raw = sources.load(sha)?;
             let _ = write!(view,
                 "Exact captured source SHA-256: **{sha}**. [Raw recorded code](../../../resources/runtime-scripts/{sha}.js).\n\n"
             );
@@ -528,7 +505,7 @@ pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -
         }
         append_observed_callable_definitions(
             &mut view,
-            project,
+            &mut sources,
             &identities,
             session.as_deref(),
             hit,
@@ -541,17 +518,21 @@ pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -
             let path_name = format!("{ordinal:04}-path.md");
             let path_destination = format!("src/_observed/invocations/{path_name}");
             let guards = observed_guards::observe(
-                project,
+                &mut sources,
                 &identities,
                 session.as_deref(),
                 hit.get("steps")
                     .and_then(Value::as_array)
                     .context("steps")?,
-                &budget,
             )?;
             hit["observed_guard_witnesses"] = json!(guards);
-            let path_view =
-                build_observed_path_view(project, &identities, session.as_deref(), hit, ordinal)?;
+            let path_view = build_observed_path_view(
+                &mut sources,
+                &identities,
+                session.as_deref(),
+                hit,
+                ordinal,
+            )?;
             fs::write(output.join(&path_name), path_view)?;
             hit["path_view_path"] = json!(path_destination);
             let _ = write!(view,
@@ -619,15 +600,17 @@ pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{sha256_hex, source_text::js_line_ranges};
     use tempfile::TempDir;
 
     #[test]
     fn embedded_script_start_offset_is_applied_to_original_source_only() {
         let source = "const a = 1;\nconst b = a + 2;\n";
-        let excerpt = source_excerpt(source, 11, Some(10));
+        let indexed = VerifiedSource::from_text(source.to_owned());
+        let excerpt = source_excerpt(&indexed, 11, Some(10));
         assert!(excerpt.contains(">     12 | const b = a + 2;"));
-        assert!(source_excerpt(source, 11, None).contains("start offset was not recorded"));
-        assert!(source_excerpt(source, 9, Some(10)).contains("precedes"));
+        assert!(source_excerpt(&indexed, 11, None).contains("start offset was not recorded"));
+        assert!(source_excerpt(&indexed, 9, Some(10)).contains("precedes"));
     }
 
     #[test]
@@ -639,10 +622,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["zero", "one", "two", "", "four", ""]
         );
-        assert!(source_excerpt(source, 14, Some(10)).contains(">     15 | four"));
-        assert!(source_excerpt(source, 15, Some(10)).contains(">     16 |"));
-        assert!(source_excerpt(source, 16, Some(10)).contains("outside"));
-        assert!(source_excerpt(source, u64::MAX, Some(u64::MAX))
+        let indexed = VerifiedSource::from_text(source.to_owned());
+        assert!(source_excerpt(&indexed, 14, Some(10)).contains(">     15 | four"));
+        assert!(source_excerpt(&indexed, 15, Some(10)).contains(">     16 |"));
+        assert!(source_excerpt(&indexed, 16, Some(10)).contains("outside"));
+        assert!(source_excerpt(&indexed, u64::MAX, Some(u64::MAX))
             .contains("18446744073709551616 | zero"));
     }
 

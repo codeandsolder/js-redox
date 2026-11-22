@@ -1,10 +1,7 @@
 //! Proof-bounded correspondence between a concrete debugger pause and an AST
 //! control guard in the exact original script. Never specialize the shared JS.
-use super::{verified_sha, RuntimeIdentityIndex};
-use crate::{
-    runtime_identity::script_id_text, source_text::SourceLineIndex,
-    trace_identity::same_verified_stack_shape,
-};
+use super::{source_cache::VerifiedSources, verified_sha, RuntimeIdentityIndex};
+use crate::{runtime_identity::script_id_text, trace_identity::same_verified_stack_shape};
 use anyhow::Result;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
@@ -14,8 +11,7 @@ use oxc_ast_visit::{walk, Visit};
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType, Span};
 use serde_json::{json, Value};
-use std::{collections::HashMap, fs, path::Path};
-use work_budget::WorkBudget;
+use std::collections::HashMap;
 
 #[derive(Clone, Copy)]
 struct Guard {
@@ -97,12 +93,6 @@ fn parse_guards(source: &str) -> Option<Vec<Guard>> {
     None
 }
 
-struct GuardSource {
-    source: String,
-    lines: SourceLineIndex,
-    guards: Vec<Guard>,
-}
-
 fn top_frame(step: &Value) -> Option<&Value> {
     step.get("frames")?.as_array()?.first()
 }
@@ -112,16 +102,16 @@ fn top_frame(step: &Value) -> Option<&Value> {
 /// A next pause in an AST arm is additional evidence, never a claim about all
 /// possible inputs or a complete path.
 pub(super) fn observe(
-    project: &Path,
+    sources: &mut VerifiedSources<'_>,
     identities: &RuntimeIdentityIndex,
     session: Option<&str>,
     steps: &[Value],
-    budget: &WorkBudget,
 ) -> Result<Vec<Value>> {
     let Some(session) = session else {
         return Ok(Vec::new());
     };
-    let mut by_sha: HashMap<String, Option<GuardSource>> = HashMap::new();
+    let budget = sources.budget;
+    let mut by_sha: HashMap<String, Option<Vec<Guard>>> = HashMap::new();
     let mut out = Vec::new();
     for (step_index, step) in steps.iter().enumerate() {
         budget.consume(1)?;
@@ -157,31 +147,18 @@ pub(super) fn observe(
         ) else {
             continue;
         };
+        let snapshot = sources.load(sha)?;
+        let source = &snapshot.text;
+        let lines = &snapshot.lines;
         if !by_sha.contains_key(sha) {
-            let bytes = fs::read(project.join(format!("resources/runtime-scripts/{sha}.js")))?;
-            if super::sha256_hex(&bytes) != sha {
-                anyhow::bail!("observed guard original source hash mismatch {sha}");
-            }
-            budget.consume(u64::try_from(bytes.len().div_ceil(1024)).unwrap_or(u64::MAX))?;
+            // Parsing work is independent of whether the source bytes are
+            // already in the operation-local snapshot cache.
+            budget.consume(u64::try_from(source.len().div_ceil(1024))?)?;
+            let parsed = parse_guards(source);
             budget.checkpoint()?;
-            let source = String::from_utf8(bytes)?;
-            let guards = parse_guards(&source);
-            budget.checkpoint()?;
-            by_sha.insert(
-                sha.to_owned(),
-                guards.map(|guards| GuardSource {
-                    lines: SourceLineIndex::new(&source),
-                    source,
-                    guards,
-                }),
-            );
+            by_sha.insert(sha.to_owned(), parsed);
         }
-        let Some(Some(GuardSource {
-            source,
-            lines,
-            guards,
-        })) = by_sha.get(sha)
-        else {
+        let Some(Some(guards)) = by_sha.get(sha) else {
             continue;
         };
         let Some(position) = lines.cdp_byte_offset(source, line, column, start_line, start_column)
@@ -277,6 +254,8 @@ pub(super) fn observe(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::invocation_views::source_cache::SOURCE_CACHE_BYTES;
+    use std::fs;
 
     #[test]
     fn exact_boolean_guard_and_next_selected_arm_are_distinct_evidence() -> Result<()> {
@@ -321,12 +300,12 @@ mod tests {
         });
         let consequent = json!({"frames":[frame(20)], "expressions":[]});
         let budget = crate::analysis_budget::AnalysisBudgets::standard("guard-test").scope("guard");
+        let mut sources = VerifiedSources::new(project, &budget, SOURCE_CACHE_BYTES);
         let witnesses = observe(
-            project,
+            &mut sources,
             &identities,
             Some("main"),
             &[guard.clone(), consequent.clone()],
-            &budget,
         )?;
         assert_eq!(witnesses.len(), 1);
         assert_eq!(witnesses[0]["kind"], "if");
@@ -343,7 +322,7 @@ mod tests {
                 .ok_or_else(|| anyhow::anyhow!("frames"))?
                 .push(outer.clone());
         }
-        let witnesses = observe(project, &identities, Some("main"), &uncertain, &budget)?;
+        let witnesses = observe(&mut sources, &identities, Some("main"), &uncertain)?;
         assert_eq!(witnesses.len(), 1);
         assert!(witnesses[0]["next_pause_in_selected_arm"].is_null());
 
@@ -356,11 +335,10 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("test alternate not found"))?;
         let alternate = json!({"frames":[frame(else_column)], "expressions":[]});
         let false_witnesses = observe(
-            project,
+            &mut sources,
             &identities,
             Some("main"),
             &[false_guard, alternate],
-            &budget,
         )?;
         assert_eq!(
             false_witnesses[0]["next_pause_in_selected_arm"],
@@ -369,11 +347,10 @@ mod tests {
 
         // A side-effect-checked value alone is not a witnessed taken arm.
         let none = observe(
-            project,
+            &mut sources,
             &identities,
             Some("main"),
             std::slice::from_ref(&guard),
-            &budget,
         )?;
         assert!(none[0]["next_pause_in_selected_arm"].is_null());
 
@@ -381,7 +358,7 @@ mod tests {
         let mut unrelated = guard.clone();
         unrelated["expressions"][0]["expression"] = json!("value !== 34");
         assert_eq!(
-            observe(project, &identities, Some("main"), &[unrelated], &budget)?.len(),
+            observe(&mut sources, &identities, Some("main"), &[unrelated])?.len(),
             0
         );
 
@@ -389,7 +366,7 @@ mod tests {
         let mut unresolved = guard;
         unresolved["frames"][0]["source_identity"] = json!("unresolved");
         assert_eq!(
-            observe(project, &identities, Some("main"), &[unresolved], &budget)?.len(),
+            observe(&mut sources, &identities, Some("main"), &[unresolved])?.len(),
             0
         );
         Ok(())

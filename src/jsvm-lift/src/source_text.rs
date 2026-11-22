@@ -89,6 +89,16 @@ impl SourceLineIndex {
         }
     }
 
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.ranges
+            .capacity()
+            .saturating_mul(std::mem::size_of::<std::ops::Range<usize>>())
+    }
+
+    pub(crate) fn line_text<'a>(&self, source: &'a str, local_line: usize) -> Option<&'a str> {
+        source.get(self.ranges.get(local_line)?.clone())
+    }
+
     /// One-based line, zero-based UTF-8 byte column (not a CDP column).
     pub(crate) fn byte_line_column(&self, offset: usize) -> (usize, usize) {
         let index = self
