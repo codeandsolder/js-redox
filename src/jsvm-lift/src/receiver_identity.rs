@@ -403,6 +403,22 @@ impl<'a> Visit<'a> for AllocationCollector<'_, '_> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct DirectInvocation {
+    callee: FunctionKey,
+    argument_offset: usize,
+    this_origin: Option<ObjectOrigin>,
+    standard_call: bool,
+}
+
+struct MemberCallee<'a> {
+    receiver: &'a Expression<'a>,
+    property: Option<String>,
+    origin: ObjectOrigin,
+    optional: bool,
+    span: Span,
+}
+
 struct ContextProbe<'c, 'f> {
     scoping: &'c Scoping,
     functions: &'f HashMap<SymbolId, FunctionKey>,
@@ -503,6 +519,113 @@ impl<'c, 'f> ContextProbe<'c, 'f> {
             return None;
         }
         self.functions.get(&symbol).copied()
+    }
+
+    fn resolve_direct_invocation(&self, call: &CallExpression<'_>) -> Option<DirectInvocation> {
+        if call.optional {
+            return None;
+        }
+        let invocation = if let Some(callee) = self.direct_callee(&call.callee) {
+            DirectInvocation {
+                callee,
+                argument_offset: 0,
+                this_origin: None,
+                standard_call: false,
+            }
+        } else {
+            let Expression::StaticMemberExpression(member) = last_sequence_expression(&call.callee)
+            else {
+                return None;
+            };
+            if member.optional || member.property.name.as_str() != "call" {
+                return None;
+            }
+            DirectInvocation {
+                callee: self.direct_callee(&member.object)?,
+                argument_offset: 1,
+                this_origin: call
+                    .arguments
+                    .first()
+                    .and_then(Argument::as_expression)
+                    .and_then(|argument| self.expression_origin(argument)),
+                standard_call: true,
+            }
+        };
+        self.function_info
+            .get(&invocation.callee)
+            .is_some_and(|info| !info.dynamic_scope)
+            .then_some(invocation)
+    }
+
+    fn resolve_member_callee<'a>(&self, callee: &'a Expression<'a>) -> Option<MemberCallee<'a>> {
+        match last_sequence_expression(callee) {
+            Expression::StaticMemberExpression(member) => Some(MemberCallee {
+                receiver: &member.object,
+                property: Some(member.property.name.to_string()),
+                origin: self.expression_origin(&member.object)?,
+                optional: member.optional,
+                span: member.span,
+            }),
+            Expression::ComputedMemberExpression(member) => Some(MemberCallee {
+                receiver: &member.object,
+                property: proof_property_key(&member.expression, self.scoping, self.property_keys),
+                origin: self.expression_origin(&member.object)?,
+                optional: member.optional,
+                span: member.span,
+            }),
+            _ => None,
+        }
+    }
+
+    fn record_member_invocation(&mut self, call: &CallExpression<'_>, member: MemberCallee<'_>) {
+        if call.optional || member.optional {
+            self.record_exposure(member.receiver, call.span, "unresolved_member_call");
+            return;
+        }
+        let Some(property) = member.property else {
+            self.record_exposure(member.receiver, call.span, "unresolved_member_call");
+            return;
+        };
+        let origin = member.origin;
+        if let Some(context) = self.context.proven_origin_context(origin) {
+            let evaluation_order = self.next_evaluation_order();
+            self.member_calls.push(ProvenMemberReceiverOrigin {
+                context,
+                call_start: call.span.start,
+                call_end: call.span.end,
+                evaluation_order,
+                receiver_start: member.receiver.span().start,
+                receiver_end: member.receiver.span().end,
+                property,
+                allocation_start: origin.allocation_start,
+                allocation_end: origin.allocation_end,
+                constructor_start: origin.constructor.start,
+                constructor_end: origin.constructor.end,
+            });
+        }
+    }
+
+    fn record_argument_exposures(
+        &mut self,
+        call: &CallExpression<'_>,
+        invocation: Option<DirectInvocation>,
+    ) {
+        let proven_parameter_count = invocation
+            .and_then(|invocation| self.function_info.get(&invocation.callee))
+            .map_or(0, |info| info.parameters.len());
+        let argument_offset = invocation.map_or(0, |invocation| invocation.argument_offset);
+        for (index, argument) in call.arguments.iter().enumerate() {
+            let Some(argument) = argument.as_expression() else {
+                continue;
+            };
+            let consumed_as_this = invocation.is_some() && argument_offset == 1 && index == 0;
+            let mapped_index = index.checked_sub(argument_offset);
+            let consumed_as_parameter =
+                mapped_index.is_some_and(|index| index < proven_parameter_count);
+            if invocation.is_none() || (!consumed_as_this && !consumed_as_parameter) {
+                self.record_exposure(argument, argument.span(), "call_argument");
+            }
+        }
     }
 
     fn record_direct_call(
@@ -851,142 +974,36 @@ impl<'a> Visit<'a> for ContextProbe<'_, '_> {
             return;
         }
 
-        let ordinary_callee = (!call.optional)
-            .then(|| self.direct_callee(&call.callee))
-            .flatten();
-        let function_call_callee = if !call.optional && ordinary_callee.is_none() {
-            match last_sequence_expression(&call.callee) {
-                Expression::StaticMemberExpression(member)
-                    if !member.optional && member.property.name.as_str() == "call" =>
-                {
-                    self.direct_callee(&member.object)
-                }
-                _ => None,
-            }
+        let invocation = self.resolve_direct_invocation(call);
+        let exact_member = if invocation.is_none() {
+            self.resolve_member_callee(&call.callee)
         } else {
             None
         };
-        let invocation = ordinary_callee
-            .map(|callee| (callee, 0usize, None, false))
-            .or_else(|| {
-                let callee = function_call_callee?;
-                let this_origin = call
-                    .arguments
-                    .first()
-                    .and_then(Argument::as_expression)
-                    .and_then(|argument| self.expression_origin(argument));
-                Some((callee, 1usize, this_origin, true))
-            })
-            .filter(|(callee, _, _, _)| {
-                self.function_info
-                    .get(callee)
-                    .is_some_and(|info| !info.dynamic_scope)
-            });
-
-        let exact_member_callee = if invocation.is_none() {
-            match last_sequence_expression(&call.callee) {
-                Expression::StaticMemberExpression(member) => {
-                    self.expression_origin(&member.object).map(|origin| {
-                        (
-                            &member.object,
-                            Some(member.property.name.to_string()),
-                            origin,
-                            member.optional,
-                            member.span,
-                        )
-                    })
-                }
-                Expression::ComputedMemberExpression(member) => {
-                    self.expression_origin(&member.object).map(|origin| {
-                        let property = proof_property_key(
-                            &member.expression,
-                            self.scoping,
-                            self.property_keys,
-                        );
-                        (
-                            &member.object,
-                            property,
-                            origin,
-                            member.optional,
-                            member.span,
-                        )
-                    })
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
-        let member_receiver = exact_member_callee.as_ref().and_then(
-            |(receiver, property, origin, member_optional, _)| {
-                (!call.optional && !*member_optional)
-                    .then(|| {
-                        property
-                            .clone()
-                            .map(|property| (*receiver, property, *origin))
-                    })
-                    .flatten()
-            },
-        );
-        let unresolved_member_barrier =
-            exact_member_callee
-                .as_ref()
-                .and_then(|(receiver, property, _, member_optional, _)| {
-                    (call.optional || *member_optional || property.is_none()).then_some(*receiver)
-                });
-        let suppressed_callee = exact_member_callee.as_ref().map(|(_, _, _, _, span)| {
-            let key = (span.start, span.end);
+        let suppressed = exact_member
+            .as_ref()
+            .map(|member| (member.span.start, member.span.end));
+        if let Some(key) = suppressed {
             self.suppressed_member_reads.insert(key);
-            key
-        });
-
-        let proven_parameter_count = invocation
-            .and_then(|(callee, _, _, _)| self.function_info.get(&callee))
-            .map_or(0, |info| info.parameters.len());
-        let argument_offset = invocation.map_or(0, |(_, offset, _, _)| offset);
-
-        // JavaScript evaluates callee/receiver and arguments before invocation.
-        // Record nested effects first, then the invocation/exposure event.
+        }
+        // Evaluate callee and arguments before recording invocation/exposure.
         walk::walk_call_expression(self, call);
-        if let Some(key) = suppressed_callee {
+        if let Some(key) = suppressed {
             self.suppressed_member_reads.remove(&key);
         }
 
-        if let Some((callee, offset, this_origin, standard_call)) = invocation {
-            self.record_direct_call(call, callee, offset, this_origin, standard_call);
-        } else if let Some((receiver, property, origin)) = member_receiver {
-            if let Some(context) = self.context.proven_origin_context(origin) {
-                let evaluation_order = self.next_evaluation_order();
-                self.member_calls.push(ProvenMemberReceiverOrigin {
-                    context,
-                    call_start: call.span.start,
-                    call_end: call.span.end,
-                    evaluation_order,
-                    receiver_start: receiver.span().start,
-                    receiver_end: receiver.span().end,
-                    property,
-                    allocation_start: origin.allocation_start,
-                    allocation_end: origin.allocation_end,
-                    constructor_start: origin.constructor.start,
-                    constructor_end: origin.constructor.end,
-                });
-            }
-        } else if let Some(receiver) = unresolved_member_barrier {
-            self.record_exposure(receiver, call.span, "unresolved_member_call");
+        if let Some(invocation) = invocation {
+            self.record_direct_call(
+                call,
+                invocation.callee,
+                invocation.argument_offset,
+                invocation.this_origin,
+                invocation.standard_call,
+            );
+        } else if let Some(member) = exact_member {
+            self.record_member_invocation(call, member);
         }
-
-        for (index, argument) in call.arguments.iter().enumerate() {
-            let Some(argument) = argument.as_expression() else {
-                continue;
-            };
-            let consumed_as_this = invocation.is_some() && argument_offset == 1 && index == 0;
-            let mapped_index = index.checked_sub(argument_offset);
-            let consumed_as_parameter =
-                mapped_index.is_some_and(|index| index < proven_parameter_count);
-            if invocation.is_none() || (!consumed_as_this && !consumed_as_parameter) {
-                self.record_exposure(argument, argument.span(), "call_argument");
-            }
-        }
+        self.record_argument_exposures(call, invocation);
     }
 
     fn visit_static_member_expression(
@@ -1427,62 +1444,37 @@ fn direct_call_preserves_field(
         )
     };
 
-    let mut result = true;
-    for exposure in flow
+    let mut result = flow
         .exposures
         .iter()
         .filter(|event| event.context == call.callee)
-    {
-        if !unreachable(exposure.exposure_start, exposure.exposure_end) {
-            result = false;
-            break;
-        }
-    }
-    if result {
-        for read in flow
+        .all(|event| unreachable(event.exposure_start, event.exposure_end))
+        && flow
             .member_reads
             .iter()
             .filter(|event| event.context == call.callee)
-        {
-            if !unreachable(read.read_start, read.read_end)
-                && !static_member_read_is_getter_free(read, stable_prototypes)
-            {
-                result = false;
-                break;
-            }
-        }
-    }
-    if result {
-        for write in flow
+            .all(|read| {
+                unreachable(read.read_start, read.read_end)
+                    || static_member_read_is_getter_free(read, stable_prototypes)
+            })
+        && flow
             .member_writes
             .iter()
             .filter(|event| event.context == call.callee)
-        {
-            if !unreachable(write.write_start, write.write_end)
-                && !member_write_preserves_field(
-                    write,
-                    property,
-                    stable_prototypes,
-                    preserve_exact_value,
-                )
-            {
-                result = false;
-                break;
-            }
-        }
-    }
-    if result {
-        for member_call in flow
+            .all(|write| {
+                unreachable(write.write_start, write.write_end)
+                    || member_write_preserves_field(
+                        write,
+                        property,
+                        stable_prototypes,
+                        preserve_exact_value,
+                    )
+            })
+        && flow
             .member_calls
             .iter()
             .filter(|event| event.context == call.callee)
-        {
-            if !unreachable(member_call.call_start, member_call.call_end) {
-                result = false;
-                break;
-            }
-        }
-    }
+            .all(|event| unreachable(event.call_start, event.call_end));
     if result {
         for nested in flow
             .direct_calls
@@ -1916,6 +1908,110 @@ pub fn structurally_proven_own_data_fields_at_member_calls(
     Ok(proven)
 }
 
+struct ExactFieldProof<'a, 'ast> {
+    source: &'a str,
+    program: &'a Program<'ast>,
+    semantic: &'a Semantic<'ast>,
+    flow: &'a ProvenOriginFlow,
+    stable_prototypes: &'a HashSet<(u32, u32)>,
+    memo: HashMap<PreservationKey, bool>,
+    visiting: HashSet<PreservationKey>,
+}
+
+impl ExactFieldProof<'_, '_> {
+    fn collect(
+        &mut self,
+        initialization: &ProvenOwnDataFieldInitialization,
+        target: &ProvenOriginDirectCall,
+        proven: &mut Vec<ProvenExactOwnDataFieldAtDirectCall>,
+    ) {
+        if target.caller == initialization.context
+            && context_entry_has_no_prior_property_write(
+                self.source,
+                self.program,
+                self.semantic.scoping(),
+                self.flow,
+                &initialization.context,
+                &initialization.property,
+                self.stable_prototypes,
+            )
+            && initialization.evaluation_order < target.evaluation_order
+            && prove_event_completion_before_event(
+                self.semantic,
+                Span::new(initialization.write_start, initialization.write_end),
+                Span::new(target.call_start, target.call_end),
+            )
+            && root_context_segment_preserves_field(
+                self.source,
+                self.program,
+                self.semantic.scoping(),
+                self.flow,
+                &initialization.context,
+                initialization.evaluation_order,
+                target.evaluation_order,
+                &initialization.property,
+                self.stable_prototypes,
+                true,
+                &mut self.memo,
+                &mut self.visiting,
+            )
+        {
+            proven.push(ProvenExactOwnDataFieldAtDirectCall {
+                initialization: initialization.clone(),
+                entry_call: target.clone(),
+                direct_call: target.clone(),
+            });
+        }
+
+        for entry in self.flow.direct_calls.iter().filter(|call| {
+            call.caller == initialization.context
+                && call.callee == target.caller
+                && initialization.evaluation_order < call.evaluation_order
+                && prove_event_completion_before_event(
+                    self.semantic,
+                    Span::new(initialization.write_start, initialization.write_end),
+                    Span::new(call.call_start, call.call_end),
+                )
+        }) {
+            if !root_context_segment_preserves_field(
+                self.source,
+                self.program,
+                self.semantic.scoping(),
+                self.flow,
+                &initialization.context,
+                initialization.evaluation_order,
+                entry.evaluation_order,
+                &initialization.property,
+                self.stable_prototypes,
+                true,
+                &mut self.memo,
+                &mut self.visiting,
+            ) {
+                continue;
+            }
+            if direct_call_prefix_preserves_field(
+                self.source,
+                self.program,
+                self.semantic.scoping(),
+                self.flow,
+                entry,
+                target.evaluation_order,
+                &initialization.property,
+                self.stable_prototypes,
+                true,
+                &mut self.memo,
+                &mut self.visiting,
+            ) {
+                proven.push(ProvenExactOwnDataFieldAtDirectCall {
+                    initialization: initialization.clone(),
+                    entry_call: entry.clone(),
+                    direct_call: target.clone(),
+                });
+            }
+        }
+    }
+}
+
 /// Prove that the exact value written by a fresh ordinary own-data field
 /// initialization is unchanged at one already-proven nested exact-origin
 /// direct call.
@@ -1951,98 +2047,21 @@ pub fn proven_exact_own_data_field_at_direct_call(
             .into_iter()
             .map(|prototype| (prototype.constructor_start, prototype.constructor_end))
             .collect::<HashSet<_>>();
-    let mut memo = HashMap::new();
-    let mut visiting = HashSet::new();
+    let mut proof = ExactFieldProof {
+        source,
+        program,
+        semantic,
+        flow: &flow,
+        stable_prototypes: &stable_prototypes,
+        memo: HashMap::new(),
+        visiting: HashSet::new(),
+    };
     let mut proven = Vec::new();
-
     for initialization in initializations
         .iter()
         .filter(|initialization| initialization.property == property)
     {
-        if target.caller == initialization.context
-            && context_entry_has_no_prior_property_write(
-                source,
-                program,
-                scoping,
-                &flow,
-                &initialization.context,
-                &initialization.property,
-                &stable_prototypes,
-            )
-            && initialization.evaluation_order < target.evaluation_order
-            && prove_event_completion_before_event(
-                semantic,
-                Span::new(initialization.write_start, initialization.write_end),
-                Span::new(target.call_start, target.call_end),
-            )
-            && root_context_segment_preserves_field(
-                source,
-                program,
-                scoping,
-                &flow,
-                &initialization.context,
-                initialization.evaluation_order,
-                target.evaluation_order,
-                &initialization.property,
-                &stable_prototypes,
-                true,
-                &mut memo,
-                &mut visiting,
-            )
-        {
-            proven.push(ProvenExactOwnDataFieldAtDirectCall {
-                initialization: initialization.clone(),
-                entry_call: target.clone(),
-                direct_call: target.clone(),
-            });
-        }
-
-        for entry in flow.direct_calls.iter().filter(|call| {
-            call.caller == initialization.context
-                && call.callee == target.caller
-                && initialization.evaluation_order < call.evaluation_order
-                && prove_event_completion_before_event(
-                    semantic,
-                    Span::new(initialization.write_start, initialization.write_end),
-                    Span::new(call.call_start, call.call_end),
-                )
-        }) {
-            if !root_context_segment_preserves_field(
-                source,
-                program,
-                scoping,
-                &flow,
-                &initialization.context,
-                initialization.evaluation_order,
-                entry.evaluation_order,
-                &initialization.property,
-                &stable_prototypes,
-                true,
-                &mut memo,
-                &mut visiting,
-            ) {
-                continue;
-            }
-            if direct_call_prefix_preserves_field(
-                source,
-                program,
-                scoping,
-                &flow,
-                entry,
-                target.evaluation_order,
-                &initialization.property,
-                &stable_prototypes,
-                true,
-                &mut memo,
-                &mut visiting,
-            ) {
-                proven.push(ProvenExactOwnDataFieldAtDirectCall {
-                    initialization: initialization.clone(),
-                    entry_call: entry.clone(),
-                    direct_call: target.clone(),
-                });
-            }
-        }
+        proof.collect(initialization, target, &mut proven);
     }
 
     proven.sort_by_key(|proof| {
@@ -2110,6 +2129,61 @@ fn collect_unique_direct_call_path(
     Some(path.clone())
 }
 
+fn unique_runtime_method_target<'a>(
+    runtime_calls: &'a [ProvenPrototypeMethodCallTarget],
+    member_call: &ProvenMemberReceiverOrigin,
+) -> Option<&'a ProvenPrototypeMethodCallTarget> {
+    let mut targets = runtime_calls
+        .iter()
+        .filter(|target| target.candidate.call == *member_call);
+    let target = targets.next()?;
+    targets.next().is_none().then_some(target)
+}
+
+fn noncall_field_barriers(
+    flow: &ProvenOriginFlow,
+    context: &ProvenOriginContext,
+    property: &str,
+    stable_prototypes: &HashSet<(u32, u32)>,
+    unreachable: impl Fn(u32, u32) -> bool,
+) -> Vec<Span> {
+    let mut barriers = Vec::new();
+
+    for exposure in flow
+        .exposures
+        .iter()
+        .filter(|candidate| candidate.context == *context)
+    {
+        if !unreachable(exposure.exposure_start, exposure.exposure_end) {
+            barriers.push(Span::new(exposure.exposure_start, exposure.exposure_end));
+        }
+    }
+    for read in flow
+        .member_reads
+        .iter()
+        .filter(|candidate| candidate.context == *context)
+    {
+        if !unreachable(read.read_start, read.read_end)
+            && !static_member_read_is_getter_free(read, stable_prototypes)
+        {
+            barriers.push(Span::new(read.read_start, read.read_end));
+        }
+    }
+    for write in flow
+        .member_writes
+        .iter()
+        .filter(|candidate| candidate.context == *context)
+    {
+        if !unreachable(write.write_start, write.write_end)
+            && !member_write_preserves_field(write, property, stable_prototypes, false)
+        {
+            barriers.push(Span::new(write.write_start, write.write_end));
+        }
+    }
+
+    barriers
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "Event proof uses distinct call graph, runtime targets, and proof obligations"
@@ -2150,39 +2224,8 @@ fn context_field_prefix_before_event(
             Span::new(start, end),
         )
     };
-    let mut barriers = Vec::new();
-
-    for exposure in flow
-        .exposures
-        .iter()
-        .filter(|candidate| candidate.context == *context)
-    {
-        if !unreachable(exposure.exposure_start, exposure.exposure_end) {
-            barriers.push(Span::new(exposure.exposure_start, exposure.exposure_end));
-        }
-    }
-    for read in flow
-        .member_reads
-        .iter()
-        .filter(|candidate| candidate.context == *context)
-    {
-        if !unreachable(read.read_start, read.read_end)
-            && !static_member_read_is_getter_free(read, stable_prototypes)
-        {
-            barriers.push(Span::new(read.read_start, read.read_end));
-        }
-    }
-    for write in flow
-        .member_writes
-        .iter()
-        .filter(|candidate| candidate.context == *context)
-    {
-        if !unreachable(write.write_start, write.write_end)
-            && !member_write_preserves_field(write, property, stable_prototypes, false)
-        {
-            barriers.push(Span::new(write.write_start, write.write_end));
-        }
-    }
+    let mut barriers =
+        noncall_field_barriers(flow, context, property, stable_prototypes, unreachable);
 
     for member_call in flow
         .member_calls
@@ -2194,17 +2237,10 @@ fn context_field_prefix_before_event(
         {
             continue;
         }
-        let mut targets = runtime_calls
-            .iter()
-            .filter(|target| target.candidate.call == *member_call);
-        let Some(target) = targets.next() else {
+        let Some(target) = unique_runtime_method_target(runtime_calls, member_call) else {
             barriers.push(Span::new(member_call.call_start, member_call.call_end));
             continue;
         };
-        if targets.next().is_some() {
-            barriers.push(Span::new(member_call.call_start, member_call.call_end));
-            continue;
-        }
         let Some(summary) = proven_prototype_method_receiver_preservation_summary(
             source, program, semantic, target, budget,
         )?
@@ -2271,6 +2307,30 @@ fn context_field_prefix_before_event(
         ))
 }
 
+fn root_field_event(
+    initialization: &ProvenOwnDataFieldInitialization,
+    call: &ProvenMemberReceiverOrigin,
+    path: &[ProvenOriginDirectCall],
+) -> Option<(Span, u64)> {
+    if let Some(first) = path.first() {
+        let initialization_context = &initialization.context;
+        if &first.caller != initialization_context
+            || initialization.evaluation_order >= first.evaluation_order
+        {
+            return None;
+        }
+        Some((
+            Span::new(first.call_start, first.call_end),
+            first.evaluation_order,
+        ))
+    } else {
+        Some((
+            Span::new(call.call_start, call.call_end),
+            call.evaluation_order,
+        ))
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "Runtime field proof requires its separate initialization and call-target facts"
@@ -2302,54 +2362,30 @@ fn prove_own_data_field_at_runtime_method_call_with_facts(
     let mut discharged_preserving_method_calls = Vec::new();
     let mut standard_function_call_semantics_required = false;
 
-    if path.is_empty() {
-        if !prove_event_completion_before_event(
-            semantic,
-            Span::new(initialization.write_start, initialization.write_end),
-            Span::new(call.call_start, call.call_end),
-        ) || !root_context_segment_preserves_field(
-            source,
-            program,
-            scoping,
-            flow,
-            &initialization.context,
-            initialization.evaluation_order,
-            call.evaluation_order,
-            &initialization.property,
-            stable_prototypes,
-            false,
-            &mut HashMap::new(),
-            &mut HashSet::new(),
-        ) {
-            return Ok(None);
-        }
-    } else {
-        let first = &path[0];
-        let initialization_context = &initialization.context;
-        if &first.caller != initialization_context
-            || initialization.evaluation_order >= first.evaluation_order
-            || !prove_event_completion_before_event(
-                semantic,
-                Span::new(initialization.write_start, initialization.write_end),
-                Span::new(first.call_start, first.call_end),
-            )
-            || !root_context_segment_preserves_field(
-                source,
-                program,
-                scoping,
-                flow,
-                &initialization.context,
-                initialization.evaluation_order,
-                first.evaluation_order,
-                &initialization.property,
-                stable_prototypes,
-                false,
-                &mut HashMap::new(),
-                &mut HashSet::new(),
-            )
-        {
-            return Ok(None);
-        }
+    let Some((root_event, root_order)) = root_field_event(initialization, call, &path) else {
+        return Ok(None);
+    };
+    if !prove_event_completion_before_event(
+        semantic,
+        Span::new(initialization.write_start, initialization.write_end),
+        root_event,
+    ) || !root_context_segment_preserves_field(
+        source,
+        program,
+        scoping,
+        flow,
+        &initialization.context,
+        initialization.evaluation_order,
+        root_order,
+        &initialization.property,
+        stable_prototypes,
+        false,
+        &mut HashMap::new(),
+        &mut HashSet::new(),
+    ) {
+        return Ok(None);
+    }
+    if let Some(first) = path.first() {
         standard_function_call_semantics_required |=
             first.standard_function_call_semantics_required;
 
@@ -3443,6 +3479,49 @@ fn pure_phase_function(
     Some((left_symbol, right_symbol, equal_value, unequal_value))
 }
 
+fn phase_factory_prefix<'a>(
+    assignment: &'a oxc_ast::ast::AssignmentExpression<'a>,
+    method_function: Span,
+) -> Option<(
+    &'a Function<'a>,
+    Vec<&'a oxc_ast::ast::AssignmentExpression<'a>>,
+)> {
+    let Expression::CallExpression(call) = last_sequence_expression(&assignment.right) else {
+        return None;
+    };
+    if call.optional || !call.arguments.is_empty() {
+        return None;
+    }
+    let Expression::FunctionExpression(factory) = last_sequence_expression(&call.callee) else {
+        return None;
+    };
+    if factory.r#async || factory.generator {
+        return None;
+    }
+    let body = factory.body.as_ref()?;
+    if has_dynamic_scope(body) {
+        return None;
+    }
+    let [Statement::ReturnStatement(ret)] = body.statements.as_slice() else {
+        return None;
+    };
+    let returned = ret.argument.as_ref()?;
+    let mut prefix_assignments = Vec::new();
+    let returned_value = guaranteed_return_prefix_assignments(returned, &mut prefix_assignments);
+    let Expression::FunctionExpression(returned_function) =
+        last_sequence_expression(returned_value)
+    else {
+        return None;
+    };
+    if returned_function.span.start != method_function.start
+        || returned_function.span.end != method_function.end
+    {
+        return None;
+    }
+
+    Some((factory, prefix_assignments))
+}
+
 fn phase_closure_for_method_assignment(
     assignment: &oxc_ast::ast::AssignmentExpression<'_>,
     method: &ProvenPrototypeMethodAssignment,
@@ -3451,43 +3530,12 @@ fn phase_closure_for_method_assignment(
     let [method_function] = method.possible_functions.as_slice() else {
         return Vec::new();
     };
-    let Expression::CallExpression(call) = last_sequence_expression(&assignment.right) else {
+    let Some((factory, prefix_assignments)) = phase_factory_prefix(
+        assignment,
+        Span::new(method_function.function_start, method_function.function_end),
+    ) else {
         return Vec::new();
     };
-    if call.optional || !call.arguments.is_empty() {
-        return Vec::new();
-    }
-    let Expression::FunctionExpression(factory) = last_sequence_expression(&call.callee) else {
-        return Vec::new();
-    };
-    if factory.r#async || factory.generator {
-        return Vec::new();
-    }
-    let Some(body) = factory.body.as_ref() else {
-        return Vec::new();
-    };
-    if has_dynamic_scope(body) {
-        return Vec::new();
-    }
-    let [Statement::ReturnStatement(ret)] = body.statements.as_slice() else {
-        return Vec::new();
-    };
-    let Some(returned) = ret.argument.as_ref() else {
-        return Vec::new();
-    };
-    let mut prefix_assignments = Vec::new();
-    let returned_value = guaranteed_return_prefix_assignments(returned, &mut prefix_assignments);
-    let Expression::FunctionExpression(returned_function) =
-        last_sequence_expression(returned_value)
-    else {
-        return Vec::new();
-    };
-    if returned_function.span.start != method_function.function_start
-        || returned_function.span.end != method_function.function_end
-    {
-        return Vec::new();
-    }
-
     let mut proven = Vec::new();
     for phase_assignment in &prefix_assignments {
         let AssignmentTarget::AssignmentTargetIdentifier(target) = &phase_assignment.left else {
@@ -4316,6 +4364,155 @@ impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
         }
     }
 
+    fn invalidate_compound_assignment(&mut self, target: &AssignmentTarget<'_>) {
+        match target {
+            AssignmentTarget::AssignmentTargetIdentifier(identifier) => {
+                if let Some(symbol) = identifier
+                    .reference_id
+                    .get()
+                    .and_then(|reference_id| self.scoping.get_reference(reference_id).symbol_id())
+                {
+                    self.aliases.remove(&symbol);
+                }
+            }
+            AssignmentTarget::StaticMemberExpression(member) => {
+                self.invalidate_static_prototype_member(
+                    &member.object,
+                    member.property.name.to_string(),
+                );
+            }
+            AssignmentTarget::ComputedMemberExpression(member) => {
+                self.invalidate_computed_prototype_member(&member.object, &member.expression);
+            }
+            _ => {}
+        }
+        self.aliases.clear();
+    }
+
+    fn process_assignment(&mut self, assignment: &oxc_ast::ast::AssignmentExpression<'_>) {
+        if assignment.operator.as_str() != "=" {
+            self.invalidate_compound_assignment(&assignment.left);
+            return;
+        }
+        if let AssignmentTarget::AssignmentTargetIdentifier(identifier) = &assignment.left {
+            self.process_expression(&assignment.right);
+            if let Some(owner) = self.constructor_value(&assignment.right) {
+                self.invalidate_constructor(owner);
+            }
+            let Some(symbol) = identifier
+                .reference_id
+                .get()
+                .and_then(|reference_id| self.scoping.get_reference(reference_id).symbol_id())
+            else {
+                self.aliases.clear();
+                return;
+            };
+            if let Some(owner) = self.prototype_value(&assignment.right) {
+                self.aliases.insert(symbol, owner);
+            } else {
+                self.aliases.remove(&symbol);
+            }
+            return;
+        }
+
+        if let Some(owner) = self.prototype_value(&assignment.right) {
+            self.invalidate_lookup(owner);
+        }
+
+        match &assignment.left {
+            AssignmentTarget::StaticMemberExpression(member) => {
+                self.process_expression(&member.object);
+                let owner = self.prototype_value(&member.object);
+                let property = member.property.name.to_string();
+                self.process_expression(&assignment.right);
+                if property == "prototype" {
+                    if let Some(symbol) = reference_symbol(self.scoping, &member.object) {
+                        if let Some(constructor) = self.constructors.get(&symbol).copied() {
+                            self.invalidate_constructor(constructor);
+                        }
+                    }
+                    return;
+                }
+                if let Some(owner) = owner {
+                    self.record_prototype_member_assignment(
+                        owner,
+                        property,
+                        &assignment.right,
+                        assignment.span,
+                    );
+                }
+            }
+            AssignmentTarget::ComputedMemberExpression(member) => {
+                self.process_expression(&member.object);
+                let owner = self.prototype_value(&member.object);
+                self.process_expression(&member.expression);
+                let property =
+                    proof_property_key(&member.expression, self.scoping, self.property_keys);
+                if let Some(constructor) = self.constructor_value(&member.object) {
+                    if property
+                        .as_deref()
+                        .is_none_or(|property| property == "prototype")
+                    {
+                        self.invalidate_constructor(constructor);
+                    }
+                }
+                self.process_expression(&assignment.right);
+                if let Some(owner) = owner {
+                    if let Some(property) = property {
+                        self.record_prototype_member_assignment(
+                            owner,
+                            property,
+                            &assignment.right,
+                            assignment.span,
+                        );
+                    } else {
+                        self.invalidate_lookup(owner);
+                    }
+                }
+            }
+            _ => {
+                self.process_expression(&assignment.right);
+                self.aliases.clear();
+            }
+        }
+    }
+
+    fn process_call(&mut self, call: &CallExpression<'_>) {
+        if let Some(owner) = self.prototype_value(&call.callee) {
+            self.invalidate_lookup(owner);
+        }
+        if let Some(owner) = self.member_receiver_owner(&call.callee) {
+            self.invalidate_lookup(owner);
+        }
+        let argument_owners = call
+            .arguments
+            .iter()
+            .filter_map(Argument::as_expression)
+            .flat_map(|argument| self.prototype_value_owners(argument))
+            .collect::<HashSet<_>>();
+        for owner in argument_owners {
+            self.invalidate_lookup(owner);
+        }
+        let constructor_owners = call
+            .arguments
+            .iter()
+            .filter_map(Argument::as_expression)
+            .flat_map(|argument| self.constructor_value_owners(argument))
+            .collect::<HashSet<_>>();
+        for owner in constructor_owners {
+            self.invalidate_constructor(owner);
+        }
+        self.process_expression(&call.callee);
+        for argument in &call.arguments {
+            if let Some(argument) = argument.as_expression() {
+                self.process_expression(argument);
+            } else {
+                self.aliases.clear();
+            }
+        }
+        self.aliases.clear();
+    }
+
     fn process_expression(&mut self, expression: &Expression<'_>) {
         if self.budget_error.is_some() || !self.poller.poll(1) {
             return;
@@ -4329,159 +4526,13 @@ impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
                     self.process_expression(expression);
                 }
             }
-            Expression::AssignmentExpression(assignment) => {
-                if assignment.operator.as_str() != "=" {
-                    match &assignment.left {
-                        AssignmentTarget::AssignmentTargetIdentifier(identifier) => {
-                            if let Some(symbol) =
-                                identifier.reference_id.get().and_then(|reference_id| {
-                                    self.scoping.get_reference(reference_id).symbol_id()
-                                })
-                            {
-                                self.aliases.remove(&symbol);
-                            }
-                        }
-                        AssignmentTarget::StaticMemberExpression(member) => {
-                            self.invalidate_static_prototype_member(
-                                &member.object,
-                                member.property.name.to_string(),
-                            );
-                        }
-                        AssignmentTarget::ComputedMemberExpression(member) => {
-                            self.invalidate_computed_prototype_member(
-                                &member.object,
-                                &member.expression,
-                            );
-                        }
-                        _ => {}
-                    }
-                    self.aliases.clear();
-                    return;
-                }
-
-                if let AssignmentTarget::AssignmentTargetIdentifier(identifier) = &assignment.left {
-                    self.process_expression(&assignment.right);
-                    if let Some(owner) = self.constructor_value(&assignment.right) {
-                        self.invalidate_constructor(owner);
-                    }
-                    let Some(symbol) = identifier.reference_id.get().and_then(|reference_id| {
-                        self.scoping.get_reference(reference_id).symbol_id()
-                    }) else {
-                        self.aliases.clear();
-                        return;
-                    };
-                    if let Some(owner) = self.prototype_value(&assignment.right) {
-                        self.aliases.insert(symbol, owner);
-                    } else {
-                        self.aliases.remove(&symbol);
-                    }
-                    return;
-                }
-
-                if let Some(owner) = self.prototype_value(&assignment.right) {
-                    self.invalidate_lookup(owner);
-                }
-
-                match &assignment.left {
-                    AssignmentTarget::StaticMemberExpression(member) => {
-                        self.process_expression(&member.object);
-                        let owner = self.prototype_value(&member.object);
-                        let property = member.property.name.to_string();
-                        self.process_expression(&assignment.right);
-                        if property == "prototype" {
-                            if let Some(symbol) = reference_symbol(self.scoping, &member.object) {
-                                if let Some(constructor) = self.constructors.get(&symbol).copied() {
-                                    self.invalidate_constructor(constructor);
-                                }
-                            }
-                            return;
-                        }
-                        if let Some(owner) = owner {
-                            self.record_prototype_member_assignment(
-                                owner,
-                                property,
-                                &assignment.right,
-                                assignment.span,
-                            );
-                        }
-                    }
-                    AssignmentTarget::ComputedMemberExpression(member) => {
-                        self.process_expression(&member.object);
-                        let owner = self.prototype_value(&member.object);
-                        self.process_expression(&member.expression);
-                        let property = proof_property_key(
-                            &member.expression,
-                            self.scoping,
-                            self.property_keys,
-                        );
-                        if let Some(constructor) = self.constructor_value(&member.object) {
-                            if property
-                                .as_deref()
-                                .is_none_or(|property| property == "prototype")
-                            {
-                                self.invalidate_constructor(constructor);
-                            }
-                        }
-                        self.process_expression(&assignment.right);
-                        if let Some(owner) = owner {
-                            if let Some(property) = property {
-                                self.record_prototype_member_assignment(
-                                    owner,
-                                    property,
-                                    &assignment.right,
-                                    assignment.span,
-                                );
-                            } else {
-                                self.invalidate_lookup(owner);
-                            }
-                        }
-                    }
-                    _ => {
-                        self.process_expression(&assignment.right);
-                        self.aliases.clear();
-                    }
-                }
-            }
+            Expression::AssignmentExpression(assignment) => self.process_assignment(assignment),
             Expression::StaticMemberExpression(member) => self.process_expression(&member.object),
             Expression::ComputedMemberExpression(member) => {
                 self.process_expression(&member.object);
                 self.process_expression(&member.expression);
             }
-            Expression::CallExpression(call) => {
-                if let Some(owner) = self.prototype_value(&call.callee) {
-                    self.invalidate_lookup(owner);
-                }
-                if let Some(owner) = self.member_receiver_owner(&call.callee) {
-                    self.invalidate_lookup(owner);
-                }
-                let argument_owners = call
-                    .arguments
-                    .iter()
-                    .filter_map(Argument::as_expression)
-                    .flat_map(|argument| self.prototype_value_owners(argument))
-                    .collect::<HashSet<_>>();
-                for owner in argument_owners {
-                    self.invalidate_lookup(owner);
-                }
-                let constructor_owners = call
-                    .arguments
-                    .iter()
-                    .filter_map(Argument::as_expression)
-                    .flat_map(|argument| self.constructor_value_owners(argument))
-                    .collect::<HashSet<_>>();
-                for owner in constructor_owners {
-                    self.invalidate_constructor(owner);
-                }
-                self.process_expression(&call.callee);
-                for argument in &call.arguments {
-                    if let Some(argument) = argument.as_expression() {
-                        self.process_expression(argument);
-                    } else {
-                        self.aliases.clear();
-                    }
-                }
-                self.aliases.clear();
-            }
+            Expression::CallExpression(call) => self.process_call(call),
             Expression::ConditionalExpression(conditional) => {
                 self.process_expression(&conditional.test);
                 self.aliases.clear();
@@ -5520,6 +5571,53 @@ fn direct_call_event_unreachable_if_specialized(
     })
 }
 
+fn receiver_has_reachable_mutation(
+    flow: &ProvenOriginFlow,
+    context: &ProvenOriginContext,
+    unreachable: impl Fn(u32, u32) -> bool,
+) -> bool {
+    flow.exposures.iter().any(|event| {
+        event.context == *context && !unreachable(event.exposure_start, event.exposure_end)
+    }) || flow
+        .member_writes
+        .iter()
+        .any(|event| event.context == *context && !unreachable(event.write_start, event.write_end))
+}
+
+fn receiver_own_data_requirements(
+    flow: &ProvenOriginFlow,
+    context: &ProvenOriginContext,
+    unreachable: impl Fn(u32, u32) -> bool,
+    budget: &WorkBudget,
+) -> Result<Option<HashSet<String>>, BudgetExceeded> {
+    let mut fields = HashSet::new();
+    let mut poller = BudgetPoller::new(budget, 128);
+    for read in flow
+        .member_reads
+        .iter()
+        .filter(|event| event.context == *context)
+    {
+        if !poller.poll(1) {
+            break;
+        }
+        if unreachable(read.read_start, read.read_end) {
+            continue;
+        }
+        let Some(property) = read.property.as_ref() else {
+            poller.finish()?;
+            return Ok(None);
+        };
+        if property == "__proto__" {
+            poller.finish()?;
+            return Ok(None);
+        }
+        fields.insert(property.clone());
+    }
+    poller.finish()?;
+
+    Ok(Some(fields))
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "Recursive receiver summary requires separate method and context visitation caches"
@@ -5551,42 +5649,16 @@ fn summarize_receiver_context(
     };
     let mut requirements = ReceiverPreservationRequirements::default();
 
-    if flow.exposures.iter().any(|event| {
-        event.context == *context && !unreachable(event.exposure_start, event.exposure_end)
-    }) || flow
-        .member_writes
-        .iter()
-        .any(|event| event.context == *context && !unreachable(event.write_start, event.write_end))
-    {
+    if receiver_has_reachable_mutation(flow, context, unreachable) {
         context_visiting.remove(&key);
         return Ok(None);
     }
 
-    let mut poller = BudgetPoller::new(budget, 128);
-    for read in flow
-        .member_reads
-        .iter()
-        .filter(|event| event.context == *context)
-    {
-        if !poller.poll(1) {
-            break;
-        }
-        if unreachable(read.read_start, read.read_end) {
-            continue;
-        }
-        let Some(property) = read.property.as_ref() else {
-            context_visiting.remove(&key);
-            poller.finish()?;
-            return Ok(None);
-        };
-        if property == "__proto__" {
-            context_visiting.remove(&key);
-            poller.finish()?;
-            return Ok(None);
-        }
-        requirements.own_data_fields.insert(property.clone());
-    }
-    poller.finish()?;
+    let Some(fields) = receiver_own_data_requirements(flow, context, unreachable, budget)? else {
+        context_visiting.remove(&key);
+        return Ok(None);
+    };
+    requirements.own_data_fields = fields;
 
     let mut poller = BudgetPoller::new(budget, 128);
     for member_call in flow
@@ -5600,19 +5672,11 @@ fn summarize_receiver_context(
         if unreachable(member_call.call_start, member_call.call_end) {
             continue;
         }
-        let mut matches = runtime_calls
-            .iter()
-            .filter(|proof| proof.candidate.call == *member_call);
-        let Some(nested) = matches.next() else {
+        let Some(nested) = unique_runtime_method_target(runtime_calls, member_call) else {
             context_visiting.remove(&key);
             poller.finish()?;
             return Ok(None);
         };
-        if matches.next().is_some() {
-            context_visiting.remove(&key);
-            poller.finish()?;
-            return Ok(None);
-        }
         let Some(nested_requirements) = summarize_runtime_prototype_method_preservation(
             source,
             program,
