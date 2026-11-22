@@ -560,7 +560,7 @@ pub fn materialize_bundle_modules(
             .par_iter()
             .map(|(digest, group)| {
                 let Some(&index) = group.first() else {
-                    return Ok::<_, anyhow::Error>((digest.to_string(), String::new(), false));
+                    return Ok::<_, anyhow::Error>(((*digest).clone(), String::new(), false));
                 };
                 let task = &tasks[index];
                 let budget = budgets.operation_under(
@@ -570,10 +570,10 @@ pub fn materialize_bundle_modules(
                 );
                 let raw = &task.raw;
                 let result = match format_source(raw, &budget) {
-                    Ok(formatted) => (digest.to_string(), formatted, true),
+                    Ok(formatted) => ((*digest).clone(), formatted, true),
                     Err(error) => {
                         let _error = recoverable_unit_error(error)?;
-                        (digest.to_string(), raw.clone(), false)
+                        ((*digest).clone(), raw.clone(), false)
                     }
                 };
                 Ok(result)

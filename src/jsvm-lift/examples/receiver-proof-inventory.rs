@@ -158,19 +158,17 @@ fn main() -> Result<()> {
         let base = structurally_proven_origin_flow(&parsed.program, scoping, &budget)?;
         let base_elapsed_ms = timer.elapsed().as_millis();
         eprintln!(
-            "base exact-origin flow: {} calls, {} reads, {} ms",
+            "base exact-origin flow: {} calls, {} reads, {base_elapsed_ms} ms",
             base.direct_calls.len(),
-            base.member_reads.len(),
-            base_elapsed_ms
+            base.member_reads.len()
         );
         let runtime =
             structurally_proven_runtime_origin_flow(&parsed.program, &semantic.semantic, &budget)?;
         let runtime_elapsed_ms = timer.elapsed().as_millis();
         eprintln!(
-            "runtime exact-origin flow: {} calls, {} reads, {} ms",
+            "runtime exact-origin flow: {} calls, {} reads, {runtime_elapsed_ms} ms",
             runtime.direct_calls.len(),
-            runtime.member_reads.len(),
-            runtime_elapsed_ms
+            runtime.member_reads.len()
         );
         let structural_installs =
             structurally_proven_registry_forwarding_calls(&parsed.program, scoping, &budget)?;

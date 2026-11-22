@@ -118,7 +118,7 @@ fn existing_destination(path: &Path, overwrite: bool) -> Result<bool> {
 
 /// Single-writer directory publication. Keep existing projects intact during
 /// import, and retain the backup if a failed rename cannot be rolled back.
-pub(crate) struct ProjectOutput {
+pub struct ProjectOutput {
     directory: tempfile::TempDir,
     staged: PathBuf,
     destination: PathBuf,

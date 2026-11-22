@@ -91,7 +91,7 @@ fn print_text(report: &SusScanReport) {
                 )
             };
             println!(
-                "  #{:<2} score={:<3} density={:>6.1}/KiB L{}-{} @{:x}-{:x} signals={} {}{}",
+                "  #{:<2} score={:<3} density={:>6.1}/KiB L{}-{} @{:x}-{:x} signals={} {kinds}{repeated}",
                 index + 1,
                 cluster.score,
                 cluster.density_per_kib,
@@ -100,8 +100,6 @@ fn print_text(report: &SusScanReport) {
                 cluster.start,
                 cluster.end,
                 cluster.signal_count,
-                kinds,
-                repeated,
             );
             for signal in cluster.signals.iter().take(6) {
                 println!(

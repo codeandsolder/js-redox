@@ -245,7 +245,10 @@ mod tests {
         assert_eq!(conflicted.source_parsed_matches, 1);
         assert_eq!(conflicted.positively_executed_source_matches, 0);
         assert_eq!(conflicted.url_correlated_positive_instances, 0);
-        assert!(conflicted.roots[0].positive_instances.is_empty());
+        assert_eq!(
+            conflicted.roots[0].positive_instances,
+            [] as [static_execution_witness::PositiveScriptInstance; 0]
+        );
         Ok(())
     }
 }

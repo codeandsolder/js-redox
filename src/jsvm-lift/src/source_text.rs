@@ -22,7 +22,7 @@ pub(crate) fn clip_chars(text: &str, cap: usize) -> (&str, bool) {
     }
 }
 
-/// A lazy equivalent of joining split_whitespace() with single spaces.
+/// A lazy equivalent of joining `split_whitespace()` with single spaces.
 /// Leading/trailing whitespace is omitted; inner runs become one ASCII space.
 pub(crate) fn collapsed_whitespace(text: &str) -> impl Iterator<Item = char> + '_ {
     let mut chars = text.trim_start().chars().peekable();
@@ -89,7 +89,7 @@ impl SourceLineIndex {
         }
     }
 
-    pub(crate) fn retained_bytes(&self) -> usize {
+    pub(crate) const fn retained_bytes(&self) -> usize {
         self.starts
             .capacity()
             .saturating_mul(std::mem::size_of::<usize>())

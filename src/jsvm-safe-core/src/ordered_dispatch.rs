@@ -235,7 +235,7 @@ impl Collector<'_, '_> {
 
         let mut serial = 0;
         let name = loop {
-            let candidate = format!("__jsvm_selector_{}_{}", switch.span.start, serial);
+            let candidate = format!("__jsvm_selector_{}_{serial}", switch.span.start);
             if !self.source.contains(&candidate)
                 && !self.scoping.symbol_names().any(|name| name == candidate)
                 && !self

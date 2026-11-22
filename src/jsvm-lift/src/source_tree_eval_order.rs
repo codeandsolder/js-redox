@@ -124,7 +124,7 @@ impl<'s> Plan<'s> {
                 );
             }
             SimpleAssignmentTarget::ComputedMemberExpression(member) if !member.optional => {
-                self.computed_reference(member)
+                self.computed_reference(member);
             }
             SimpleAssignmentTarget::PrivateFieldExpression(member) if !member.optional => {
                 self.expression(&member.object);
@@ -520,7 +520,7 @@ impl<'a> Visit<'a> for Collector<'_> {
         walk::walk_assignment_expression(self, assign);
     }
 }
-pub(crate) fn ordered_assignment_phases(
+pub fn ordered_assignment_phases(
     source: &str,
     program: &Program<'_>,
     lines: &SourceLineIndex,

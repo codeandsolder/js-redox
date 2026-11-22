@@ -4,7 +4,15 @@
 //! object identity; binding creates a new function object. Prefix arguments are
 //! captured at the bind expression, and unknown spreads never shift a later
 //! argument into a falsely proven position.
-use super::*;
+use super::{
+    allowed_fetch_path, allowed_send_beacon_path, allowed_websocket_path, allowed_xhr_path,
+    direct_reference_id, exact_property_key, expression_symbol, fetch_init_method, global_path,
+    literal_method_evidence, method_from_init, method_value_evidence, source_fragment,
+    static_string, unparenthesized, walk, xhr_binding_is_not_reassigned, ApiBindingWitness,
+    BTreeSet, BindingPattern, CallExpression, Expression, FetchInitMethod, GetSpan, MutationPath,
+    Program, ProvenConstantEnvironment, ReferenceId, Scoping, Span, StaticPrimitiveValue, SymbolId,
+    VariableDeclarator, Visit,
+};
 use oxc_ast::ast::{
     Argument, ArrayExpression, ArrayExpressionElement, VariableDeclaration, VariableDeclarationKind,
 };
@@ -34,7 +42,7 @@ impl ApiKind {
         }
     }
 
-    pub(super) fn family(self) -> &'static str {
+    pub(super) const fn family(self) -> &'static str {
         match self {
             Self::Fetch => "fetch",
             Self::Beacon => "send_beacon",
@@ -44,7 +52,7 @@ impl ApiKind {
         }
     }
 
-    pub(super) fn canonical_path(self) -> &'static str {
+    pub(super) const fn canonical_path(self) -> &'static str {
         match self {
             Self::Fetch => "fetch",
             Self::Beacon => "navigator.sendBeacon",
@@ -54,15 +62,15 @@ impl ApiKind {
         }
     }
 
-    fn is_constructor(self) -> bool {
+    const fn is_constructor(self) -> bool {
         matches!(self, Self::WebSocket | Self::XhrConstructor)
     }
 
-    fn needs_receiver(self) -> bool {
+    const fn needs_receiver(self) -> bool {
         matches!(self, Self::Beacon | Self::XhrOpen)
     }
 
-    pub(super) fn callsite_kind(self, candidate: bool) -> &'static str {
+    pub(super) const fn callsite_kind(self, candidate: bool) -> &'static str {
         match (self, candidate) {
             (Self::Fetch, false) => "fetch",
             (Self::Fetch, true) => "fetch_candidate",
@@ -94,14 +102,14 @@ pub(super) enum ForwardedValue<'e, 'a> {
     },
     Object {
         span: Span,
-        fields: Rc<BTreeMap<String, ForwardedValue<'e, 'a>>>,
+        fields: Rc<BTreeMap<String, Self>>,
     },
     Unknown(Option<Span>),
     Missing,
 }
 
 impl<'e, 'a> ForwardedValue<'e, 'a> {
-    pub(super) fn expression(&self) -> Option<&'e Expression<'a>> {
+    pub(super) const fn expression(&self) -> Option<&'e Expression<'a>> {
         match self {
             Self::Expression(expression) => Some(expression),
             _ => None,
@@ -173,7 +181,7 @@ enum ArraySource<'e, 'a> {
     Unknown(Span),
 }
 
-/// Classify CreateListFromArrayLike inputs for both ordinary and forwarded
+/// Classify `CreateListFromArrayLike` inputs for both ordinary and forwarded
 /// dispatch. Only Function.prototype.apply treats null/undefined as empty.
 fn apply_array_source<'e, 'a>(
     value: ForwardedValue<'e, 'a>,
@@ -273,7 +281,7 @@ impl ApiArguments {
             }
             match value {
                 ForwardedValue::Expression(expr) => {
-                    self.push_expression(expr, source, scoping, constants)
+                    self.push_expression(expr, source, scoping, constants);
                 }
                 ForwardedValue::Primitive { value, span } => {
                     self.prefix.push(Rc::new(ArgumentEvidence {
@@ -283,7 +291,7 @@ impl ApiArguments {
                         },
                         expression: Some(source_fragment(source, span)),
                         init: FetchInitMethod::Unknown,
-                    }))
+                    }));
                 }
                 ForwardedValue::Array { span, .. } => self.prefix.push(Rc::new(ArgumentEvidence {
                     string: None,
@@ -299,7 +307,7 @@ impl ApiArguments {
                             .map_or(FetchInitMethod::NoOwnMethod, |value| {
                                 value.init_method(source, scoping, constants)
                             }),
-                    }))
+                    }));
                 }
                 ForwardedValue::Unknown(span) => self.prefix.push(Rc::new(ArgumentEvidence {
                     string: None,
@@ -318,7 +326,7 @@ impl ApiArguments {
         }
     }
 
-    fn complete(&self) -> bool {
+    const fn complete(&self) -> bool {
         self.prefix.len() >= 2 || self.unknown_tail.is_some()
     }
 
@@ -356,7 +364,7 @@ impl ApiArguments {
                                 string: None,
                                 expression: None,
                                 init: FetchInitMethod::Unknown,
-                            }))
+                            }));
                         }
                         ArrayExpressionElement::SpreadElement(_) => {
                             self.unknown_tail =
@@ -563,7 +571,7 @@ impl Callable {
         )
     }
 
-    pub(super) fn invocation_form(&self) -> &'static str {
+    pub(super) const fn invocation_form(&self) -> &'static str {
         if let Some(dispatch) = self.dispatch {
             dispatch
         } else if self.bound {
@@ -629,7 +637,7 @@ impl Namespace {
     }
 
     fn property(&self, name: &str) -> Option<String> {
-        (!name.contains('.')).then(|| format!("{}.{}", self.path, name))
+        (!name.contains('.')).then(|| format!("{}.{name}", self.path))
     }
 
     fn child(&self, key: &str) -> Option<Self> {
@@ -672,7 +680,7 @@ impl DispatchMode {
         usize::from(self.reflect())
     }
 
-    fn name(self) -> &'static str {
+    const fn name(self) -> &'static str {
         match self {
             Self::Call => "call",
             Self::Apply => "apply",
@@ -986,13 +994,10 @@ impl CallableIndex {
             || callable.kind.is_constructor()
             || match callable.kind {
                 ApiKind::Fetch => {
-                    receiver.is_none()
-                        || receiver.is_some_and(|expr| {
-                            matches!(unparenthesized(expr), Expression::NullLiteral(_))
-                                || global_path(scoping, constants, expr).as_deref()
-                                    == Some("undefined")
-                        })
-                        || path.is_some_and(is_global_receiver)
+                    receiver.is_none_or(|expr| {
+                        matches!(unparenthesized(expr), Expression::NullLiteral(_))
+                            || global_path(scoping, constants, expr).as_deref() == Some("undefined")
+                    }) || path.is_some_and(is_global_receiver)
                 }
                 ApiKind::Beacon => path.is_some_and(is_navigator_receiver),
                 ApiKind::XhrOpen => receiver

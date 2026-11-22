@@ -6022,7 +6022,7 @@ mod tests {
             result: Option<bool>,
         }
         impl Harness<'_> {
-            fn inspect_statements<'a>(&mut self, statements: &[Statement<'a>]) {
+            fn inspect_statements(&mut self, statements: &[Statement<'_>]) {
                 for pair in statements.windows(2) {
                     let [init, Statement::WhileStatement(while_statement)] = pair else {
                         continue;

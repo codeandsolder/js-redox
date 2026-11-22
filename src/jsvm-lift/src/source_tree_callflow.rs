@@ -859,11 +859,10 @@ fn format_view(view: &CallerView, original: &str) -> String {
                 (Some(name), Some(index)) => {
                     let _ = writeln!(
                         output,
-                        "- {} (parameter {}) ← entry {} (parameter {})",
+                        "- {} (parameter {}) ← entry {} (parameter {index})",
                         code_span(&param.param),
                         param.index,
-                        code_span(name),
-                        index
+                        code_span(name)
                     );
                 }
                 _ => {

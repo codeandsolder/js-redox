@@ -199,10 +199,8 @@ fn main() -> Result<()> {
     });
     jsvm_lift::report_file::write_json(&args.output, &output)?;
     println!(
-        "Documents: {}; executable script roots: {}; source-local static graphs: {}; output: {}",
+        "Documents: {}; executable script roots: {root_count}; source-local static graphs: {analyzed_count}; output: {}",
         output["document_count"],
-        root_count,
-        analyzed_count,
         args.output.display()
     );
     Ok(())

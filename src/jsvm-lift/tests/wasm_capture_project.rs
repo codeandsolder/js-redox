@@ -229,11 +229,10 @@ fn wasm_capture_deduplicates_origins_and_correlates_host_effects() -> Result<()>
     );
     let split = wasm.len() / 2;
     let split_js = format!(
-        "function loadSplit() {{ const left = atob(\"{}\"); const right = atob(\"{}\"); const output = new Uint8Array({}); function copy(chunk, offset) {{ for (let i = 0; i < chunk.length; i++) output[offset + i] = chunk.charCodeAt(i); }} copy(left, 0); copy(right, {}); return new WebAssembly.Module(output); }}\n",
+        "function loadSplit() {{ const left = atob(\"{}\"); const right = atob(\"{}\"); const output = new Uint8Array({}); function copy(chunk, offset) {{ for (let i = 0; i < chunk.length; i++) output[offset + i] = chunk.charCodeAt(i); }} copy(left, 0); copy(right, {split}); return new WebAssembly.Module(output); }}\n",
         STANDARD.encode(&wasm[..split]),
         STANDARD.encode(&wasm[split..]),
         wasm.len(),
-        split,
     );
     write_har(
         &har,

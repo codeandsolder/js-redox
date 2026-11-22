@@ -969,7 +969,7 @@ fn build_source_tree(args: &SourceTreeArgs) -> Result<serde_json::Value> {
                     "aliases": explained.aliases,
                 }));
             }
-            let _ = write!(helper_index, "- [{}]({})", helper.name, relative);
+            let _ = write!(helper_index, "- [{}]({relative})", helper.name);
             if helper.mutable_binding {
                 helper_index.push_str(" — **binding reassigned in original program**");
             }
@@ -1025,14 +1025,12 @@ fn build_source_tree(args: &SourceTreeArgs) -> Result<serde_json::Value> {
                     );
                     let _ = writeln!(
                         report,
-                        "| {}..{} | {}..{} | {} | {} | {} |",
+                        "| {}..{} | {}..{} | {} | {owner} | {value} |",
                         site.reference[0],
                         site.reference[1],
                         site.operation[0],
                         site.operation[1],
                         site.operation_kind,
-                        owner,
-                        value,
                     );
                 }
                 fs::write(folder.join(&report_path), report)?;
@@ -1064,8 +1062,7 @@ fn build_source_tree(args: &SourceTreeArgs) -> Result<serde_json::Value> {
             for (name, path) in &binding_write_rows {
                 let _ = writeln!(
                     index,
-                    "- [{}]({})",
-                    name,
+                    "- [{name}]({})",
                     path.trim_start_matches("binding-writes/"),
                 );
             }
@@ -1213,10 +1210,7 @@ fn build_source_tree(args: &SourceTreeArgs) -> Result<serde_json::Value> {
                 Ok(SpecializedHelperCall {
                     helper: specialized.helper.clone(),
                     constants: specialized.arguments.clone(),
-                    file: format!(
-                        "specializations/{}-{}-{suffix}.js",
-                        specialized.helper, hint
-                    ),
+                    file: format!("specializations/{}-{hint}-{suffix}.js", specialized.helper),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1433,11 +1427,11 @@ fn build_source_tree(args: &SourceTreeArgs) -> Result<serde_json::Value> {
                 .filter_map(|name| {
                     helper_files
                         .get(name.as_str())
-                        .map(|file| format!("[{}](lexical-context/{})", name, file))
+                        .map(|file| format!("[{name}](lexical-context/{file})"))
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
-            let _ = writeln!(md, "- [{}]({}) — {}", handler.path, handler.path, links);
+            let _ = writeln!(md, "- [{}]({}) — {links}", handler.path, handler.path);
         }
         // Only a *byte-identical raw* original allows the source spans and
         // the pre-existing SHA-256 headers to identify external lexical
@@ -1607,12 +1601,11 @@ fn build_source_tree(args: &SourceTreeArgs) -> Result<serde_json::Value> {
                         for path in &linked {
                             let _ = writeln!(
                                 source,
-                                "- [Original-bound `{}`](../{})",
+                                "- [Original-bound `{}`](../{path})",
                                 Path::new(path)
                                     .file_name()
                                     .and_then(|name| name.to_str())
-                                    .unwrap_or(path),
-                                path
+                                    .unwrap_or(path)
                             );
                         }
                         source.push('\n');

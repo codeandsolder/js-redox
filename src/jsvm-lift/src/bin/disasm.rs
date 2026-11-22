@@ -106,7 +106,7 @@ fn compact_semantics(paths: &[NormalizedPath]) -> String {
             if path.guards.is_empty() {
                 body
             } else {
-                format!("[{}] {}", path.guards.join(" && "), body)
+                format!("[{}] {body}", path.guards.join(" && "))
             }
         })
         .collect::<Vec<_>>()
@@ -240,11 +240,10 @@ fn render_disassembly(disasm: &Disassembly) -> String {
         let clipped: String = semantic.chars().take(500).collect();
         let _ = writeln!(
             text,
-            "{:04} pc={:04}  {:<32} | {}",
+            "{:04} pc={:04}  {:<32} | {clipped}",
             instruction.index,
             instruction.pc,
-            words.join(" "),
-            clipped
+            words.join(" ")
         );
     }
     text
@@ -299,11 +298,8 @@ fn print_summary(all: &[Disassembly], output_dir: &Path) {
         .map(|disasm| disasm.resolved_symbolic_fields)
         .sum();
     println!(
-        "disassembled {} VMs / {} instructions; resolved {} symbolic fields, {} unresolved -> {}",
+        "disassembled {} VMs / {instructions} instructions; resolved {resolved} symbolic fields, {unresolved} unresolved -> {}",
         all.len(),
-        instructions,
-        resolved,
-        unresolved,
         output_dir.display()
     );
 }

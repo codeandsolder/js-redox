@@ -14,7 +14,7 @@ pub const fn js_number_equal(left: f64, right: f64) -> bool {
     left_bits == right_bits || ((left_bits & ABS_MASK) == 0 && (right_bits & ABS_MASK) == 0)
 }
 
-/// ECMAScript Number::exponentiate differs from IEEE 754 pow at NaN
+/// ECMAScript `Number::exponentiate` differs from IEEE 754 pow at NaN
 /// exponents and infinite exponents with a unit-magnitude base. Delegate
 /// the remaining (implementation-approximated) finite computation to powf.
 #[must_use]

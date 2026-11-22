@@ -21,7 +21,7 @@ fn single_line(value: &str) -> String {
 
 /// Literal inline text, also safe inside a GFM table cell or link label.
 /// These are presentation escapes, not changes to the source or its spans.
-pub(crate) fn literal_text(value: &str) -> String {
+pub fn literal_text(value: &str) -> String {
     let safe = single_line(value);
     let mut chars = safe.chars().peekable();
     let mut out = String::with_capacity(safe.len());
@@ -31,7 +31,7 @@ pub(crate) fn literal_text(value: &str) -> String {
                 .peek()
                 .is_some_and(|next| next.is_ascii_alphabetic() || *next == '#') =>
             {
-                out.push_str("&amp;")
+                out.push_str("&amp;");
             }
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
@@ -46,7 +46,7 @@ pub(crate) fn literal_text(value: &str) -> String {
 }
 
 /// A CommonMark code span with an unambiguous delimiter and padding.
-pub(crate) fn code_span(value: &str) -> String {
+pub fn code_span(value: &str) -> String {
     let safe = single_line(value);
     if safe.is_empty() {
         return "`\"\"`".to_owned();
@@ -71,13 +71,13 @@ pub(crate) fn code_span(value: &str) -> String {
 /// GitHub-flavored Markdown removes exactly the extra backslash before a
 /// pipe during table parsing, including in code spans. Existing backslashes
 /// remain part of the displayed source fragment.
-pub(crate) fn table_code(value: &str) -> String {
+pub fn table_code(value: &str) -> String {
     code_span(&value.replace('|', "\\|"))
 }
 
 /// URL-encode a path that its caller has already established is local.
 /// A literal filename must not be parsed as a query, fragment or URL scheme.
-pub(crate) fn link_destination(path: &str) -> String {
+pub fn link_destination(path: &str) -> String {
     let mut output = String::with_capacity(path.len());
     for byte in path.bytes() {
         if byte.is_ascii_alphanumeric() || b"/-_.~".contains(&byte) {
@@ -91,7 +91,7 @@ pub(crate) fn link_destination(path: &str) -> String {
 
 /// Fence is always longer than any backtick run in the supplied content.
 /// The language is a fixed report-format identifier, never a captured value.
-pub(crate) fn fenced_code(value: &str, language: &str) -> String {
+pub fn fenced_code(value: &str, language: &str) -> String {
     let longest = value
         .split(|ch| ch != '`')
         .map(str::len)
@@ -137,10 +137,7 @@ impl std::io::Write for JsonPrefix {
 
 /// Pretty-print a value without materializing the discarded serialization.
 /// Returns the same prefix as clipping the full pretty-printed string.
-pub(crate) fn json_preview(
-    value: &serde_json::Value,
-    cap: usize,
-) -> anyhow::Result<(String, bool)> {
+pub fn json_preview(value: &serde_json::Value, cap: usize) -> anyhow::Result<(String, bool)> {
     let mut prefix = JsonPrefix {
         bytes: Vec::new(),
         remaining: cap,

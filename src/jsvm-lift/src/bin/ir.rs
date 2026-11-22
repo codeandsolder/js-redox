@@ -179,11 +179,9 @@ fn main() -> Result<()> {
     jsvm_lift::report_file::write_json(&args.output, &output)?;
 
     println!(
-        "IR VMs {} ops {} classified {} raw {}",
+        "IR VMs {} ops {total_ops} classified {} raw {raw_ops}",
         output.len(),
-        total_ops,
-        total_ops.saturating_sub(raw_ops),
-        raw_ops
+        total_ops.saturating_sub(raw_ops)
     );
     println!("KINDS");
     for (kind, count) in by_kind {

@@ -14,7 +14,7 @@ use work_budget::{BudgetExceeded, BudgetPoller, WorkBudget};
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum ExprKey {
     Symbol(SymbolId),
-    Index(Box<ExprKey>, u32),
+    Index(Box<Self>, u32),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

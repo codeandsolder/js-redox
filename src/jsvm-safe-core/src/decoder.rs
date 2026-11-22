@@ -1820,27 +1820,23 @@ pub struct Decoder {
 impl DecoderTransform {
     fn transform_value(&self, value: Value, key: Option<&str>) -> Option<Value> {
         match (self, value) {
-            (DecoderTransform::LowerAlphabetBase64Uri, Value::String(encoded)) => {
+            (Self::LowerAlphabetBase64Uri, Value::String(encoded)) => {
                 decode_lower_alphabet_base64_uri(&encoded).map(Value::String)
             }
-            (DecoderTransform::LowerAlphabetBase64Rc4, Value::String(encoded)) => {
+            (Self::LowerAlphabetBase64Rc4, Value::String(encoded)) => {
                 decode_lower_alphabet_base64_rc4(&encoded, key?).map(Value::String)
             }
-            (DecoderTransform::StandardBase64, Value::String(encoded)) => {
+            (Self::StandardBase64, Value::String(encoded)) => {
                 decode_standard_base64_latin1(&encoded).map(Value::String)
             }
-            (DecoderTransform::FixedBase64Alphabet(alphabet), Value::String(encoded)) => {
+            (Self::FixedBase64Alphabet(alphabet), Value::String(encoded)) => {
                 decode_fixed_base64_latin1(&encoded, alphabet).map(Value::String)
             }
             (
-                DecoderTransform::LowerAlphabetBase64Uri
-                | DecoderTransform::LowerAlphabetBase64Rc4
-                | DecoderTransform::StandardBase64,
+                Self::LowerAlphabetBase64Uri | Self::LowerAlphabetBase64Rc4 | Self::StandardBase64,
                 _,
             ) => None,
-            (DecoderTransform::Plain | DecoderTransform::FixedBase64Alphabet(_), value) => {
-                Some(value)
-            }
+            (Self::Plain | Self::FixedBase64Alphabet(_), value) => Some(value),
         }
     }
 }

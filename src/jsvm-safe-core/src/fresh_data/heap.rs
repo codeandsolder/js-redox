@@ -135,7 +135,7 @@ impl Fact {
         })
     }
 
-    pub(super) fn primitive(&self) -> Option<&Value> {
+    pub(super) const fn primitive(&self) -> Option<&Value> {
         match self {
             Self::Primitive(value) => Some(value),
             Self::Objects(_) => None,
@@ -160,7 +160,7 @@ pub(super) fn value_weight(value: &Value) -> usize {
 }
 
 /// The value lattice is separate from the descriptor lattice. Unknown data
-/// values do not imply arbitrary getters or setters. MaybeData means either
+/// values do not imply arbitrary getters or setters. `MaybeData` means either
 /// an absent own property or a writable own data property on every path.
 fn join_value(left: &Option<Fact>, right: &Option<Fact>) -> Option<Fact> {
     left.as_ref()?.join_proven(right.as_ref()?)
@@ -465,7 +465,7 @@ impl OwnData {
         Ok(properties.data_only().then_some(properties))
     }
 
-    /// CopyDataProperties ignores inherited data, uses own enumerability,
+    /// `CopyDataProperties` ignores inherited data, uses own enumerability,
     /// and defines rather than sets the destination's property. We can
     /// model it only if all possible source descriptors are data/absent.
     pub(super) fn spread(

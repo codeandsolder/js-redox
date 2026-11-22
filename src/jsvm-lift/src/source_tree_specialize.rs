@@ -403,15 +403,11 @@ impl<'a> Visit<'a> for OriginalCallLiterals<'_> {
 
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         if !call.optional {
-            let offset = if matches!(
+            let offset = usize::from(matches!(
                 unparen(&call.callee),
                 Expression::StaticMemberExpression(member)
                     if !member.optional && member.property.name == "call"
-            ) {
-                1
-            } else {
-                0
-            };
+            ));
             self.remember(call.span, call.arguments.get(offset..).unwrap_or_default());
         }
         walk::walk_call_expression(self, call);

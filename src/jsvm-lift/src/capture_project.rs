@@ -9,7 +9,7 @@ use std::{
 pub const SCHEMA: &str = "capture-project/v1";
 pub const MANIFEST_NAME: &str = "capture-manifest.json";
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CaptureSource {
     pub kind: String,
     pub input: String,

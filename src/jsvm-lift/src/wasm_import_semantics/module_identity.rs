@@ -778,7 +778,7 @@ mod tests {
 
     #[test]
     fn deferred_alias_proof_is_anchored_to_each_invocation() -> Result<(), BudgetExceeded> {
-        let source = r#"
+        let source = r"
             const input = null;
             const early = identity(input);
             const host = globalThis;
@@ -788,7 +788,7 @@ mod tests {
                     if (host.Array.isArray(value)) return value;
                 }(value) || fallback(value);
             }
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         assert!(parsed.is_clean());

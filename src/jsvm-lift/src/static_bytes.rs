@@ -2066,14 +2066,17 @@ mod tests {
 
         // A hoisted declaration can run before the alias initializer.
         // Textual order alone does not establish a stable acquisition.
-        let early = r#"
+        let early = r"
             load({});
             var host = window;
             function load(imports) {
                 return host.WebAssembly.instantiate(new Uint8Array([0,97,115,109,1,0,0,0]), imports);
             }
-        "#;
-        assert!(recover(early).is_empty());
+        ";
+        assert_eq!(
+            recover(early),
+            [] as [static_bytes::RecoveredByteArtifact; 0]
+        );
     }
 
     #[test]

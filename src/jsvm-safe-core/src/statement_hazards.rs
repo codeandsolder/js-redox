@@ -4,7 +4,7 @@ use oxc_ast::ast::{Statement, VariableDeclaration, VariableDeclarationKind};
 use oxc_ast_visit::{walk, Visit};
 
 #[derive(Clone, Copy)]
-pub(crate) enum DeclarationHazard {
+pub enum DeclarationHazard {
     /// Removing an unreachable statement can still remove a hoisted binding.
     Discard,
     /// Moving a guard across a scope exit can move disposal or Annex B effects.

@@ -657,22 +657,21 @@ pub fn scan_project(project: &Path, options: &ProjectScanOptions) -> Result<Proj
             let raw_rel = relative_string(project, &raw)?;
             let depth = parent_depth + 1;
             let raw_sha = sha256_path(&raw)?;
-            let recovery = match generated_recovery_cache.get(&raw_sha) {
-                Some(cached) => reuse_generated_unit(project, &raw_rel, scan_id, ordinal, cached)?,
-                None => {
-                    let mut recovery = recover_generated_unit(
-                        project,
-                        &raw,
-                        &raw_rel,
-                        scan_id,
-                        ordinal,
-                        &options.budgets,
-                        &stage_budget,
-                    )?;
-                    recovery["deduplicated"] = false.into();
-                    generated_recovery_cache.insert(raw_sha, recovery.clone());
-                    recovery
-                }
+            let recovery = if let Some(cached) = generated_recovery_cache.get(&raw_sha) {
+                reuse_generated_unit(project, &raw_rel, scan_id, ordinal, cached)?
+            } else {
+                let mut recovery = recover_generated_unit(
+                    project,
+                    &raw,
+                    &raw_rel,
+                    scan_id,
+                    ordinal,
+                    &options.budgets,
+                    &stage_budget,
+                )?;
+                recovery["deduplicated"] = false.into();
+                generated_recovery_cache.insert(raw_sha, recovery.clone());
+                recovery
             };
             let recovery_ordinal = generated_recovery.len();
             generated_recovery.push(recovery.clone());

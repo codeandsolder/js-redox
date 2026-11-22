@@ -2234,7 +2234,7 @@ fn context_field_prefix_before_event(
         {
             continue;
         }
-        if !direct_call_preserves_field(
+        if direct_call_preserves_field(
             source,
             program,
             semantic.scoping(),
@@ -2246,10 +2246,10 @@ fn context_field_prefix_before_event(
             &mut HashMap::new(),
             &mut HashSet::new(),
         ) {
-            barriers.push(Span::new(direct.call_start, direct.call_end));
-        } else {
             *standard_function_call_semantics_required |=
                 direct.standard_function_call_semantics_required;
+        } else {
+            barriers.push(Span::new(direct.call_start, direct.call_end));
         }
     }
 
@@ -4986,7 +4986,7 @@ impl<'a> Visit<'a> for ReceiverEffectProbe {
     ) {
         // Arrow bodies capture the surrounding `this`. Treat any such closure as
         // an exposure obligation instead of recursively pretending it executes now.
-        let mut nested = ReceiverEffectProbe::new(&self.budget);
+        let mut nested = Self::new(&self.budget);
         walk::walk_arrow_function_expression(&mut nested, function);
         if let Err(error) = nested.finish() {
             self.budget_error = Some(error);
@@ -5030,12 +5030,12 @@ impl<'a> Visit<'a> for ReceiverEffectProbe {
             oxc_ast::ast::SimpleAssignmentTarget::StaticMemberExpression(member)
                 if direct_this(&member.object) =>
             {
-                self.mutates = true
+                self.mutates = true;
             }
             oxc_ast::ast::SimpleAssignmentTarget::ComputedMemberExpression(member)
                 if direct_this(&member.object) =>
             {
-                self.mutates = true
+                self.mutates = true;
             }
             _ => walk::walk_update_expression(self, expression),
         }

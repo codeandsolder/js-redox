@@ -152,6 +152,7 @@ pub struct FunctionState {
 }
 
 impl FunctionState {
+    #[must_use]
     pub fn new(kind: &str, name: Option<String>, start: u32, end: u32) -> Self {
         Self {
             m: FunctionMetrics {
@@ -193,6 +194,7 @@ impl FunctionState {
         self.decoder_candidates = self.linked_decoder_candidates();
     }
 
+    #[must_use]
     pub fn decoder_controls(&self, builders: &[PushBuilderCandidate]) -> Vec<DecoderControlInfo> {
         let mut candidates = self.linked_decoder_candidates();
 

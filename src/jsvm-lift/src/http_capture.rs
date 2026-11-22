@@ -116,7 +116,7 @@ fn add_code_references(
     let references = match extract_js_references(source, &budget) {
         Ok(refs) => refs,
         Err(error) => {
-            warnings.push(format!("{}: JavaScript reference parse: {error}", from));
+            warnings.push(format!("{from}: JavaScript reference parse: {error}"));
             return;
         }
     };
@@ -142,8 +142,8 @@ fn add_code_references(
             }
         } else if reference.kind != "require" {
             warnings.push(format!(
-                "{}: unresolved {} {}",
-                from, reference.kind, reference.specifier
+                "{from}: unresolved {} {}",
+                reference.kind, reference.specifier
             ));
         }
     }
@@ -172,7 +172,7 @@ fn add_document_references(
                     let parsed = parse_import_map(base.as_str(), &payload, warnings);
                     *import_map = merge_import_map(import_map, &parsed);
                 }
-                Err(error) => warnings.push(format!("{}: import map: {error}", final_url)),
+                Err(error) => warnings.push(format!("{final_url}: import map: {error}")),
             }
         }
     }

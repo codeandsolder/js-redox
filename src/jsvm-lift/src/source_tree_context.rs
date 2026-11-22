@@ -465,14 +465,13 @@ impl<'a> Visit<'a> for HandlerCallAnnotator<'_> {
                                         self.specialized.get(&(name.to_owned(), constants.clone()))
                                     {
                                         details.push(format!(
-                                            "specialized at {} => {}{}",
+                                            "specialized at {} => {}{path}",
                                             constants
                                                 .iter()
                                                 .map(|(index, value)| format!("arg{index}={value}"))
                                                 .collect::<Vec<_>>()
                                                 .join(", "),
-                                            self.helper_prefix,
-                                            path
+                                            self.helper_prefix
                                         ));
                                     }
                                 }
@@ -842,7 +841,7 @@ mod tests {
         let shadowed = context
             .helpers
             .iter()
-            .find(|helper| helper.name == "Hm" && helper.source.contains("3"))
+            .find(|helper| helper.name == "Hm" && helper.source.contains('3'))
             .context("missing shadowed Hm")?;
         assert_eq!(shadowed.write_sites.len(), 1);
         assert_eq!(

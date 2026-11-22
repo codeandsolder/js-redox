@@ -42,7 +42,7 @@ impl<'a> FunctionFrameIdentity<'a> {
 /// Compare the entire recorded stack's normalized function coordinates and
 /// verify every frame against the session-local captured source inventory.
 /// Matching shapes do not establish that the same dynamic activation survived.
-pub(crate) fn same_verified_stack_shape(
+pub fn same_verified_stack_shape(
     first: &Value,
     second: &Value,
     budget: &WorkBudget,

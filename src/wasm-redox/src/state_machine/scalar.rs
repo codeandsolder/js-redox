@@ -200,7 +200,7 @@ pub(super) fn render_instruction(
         .iter()
         .map(|arg| render_value(body, dispatcher, state, *arg, 4))
         .collect::<Vec<_>>();
-    Some(format!("v{} = {}({})", value.index(), op, args.join(", ")))
+    Some(format!("v{} = {op}({})", value.index(), args.join(", ")))
 }
 
 fn substitute_params(expression: &str, environment: &[String]) -> String {

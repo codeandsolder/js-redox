@@ -272,20 +272,15 @@ fn append_assignment_outline_node(
     };
     let guard = node.nearest_guard.as_ref().map_or_else(
         || "none".to_owned(),
-        |guard| format!("{} ({} total)", guard, node.guard_depth),
+        |guard| format!("{guard} ({} total)", node.guard_depth),
     );
     let _ = writeln!(
         output,
-        "| {} | {} | {} {} | {} | {} | {} | {}:{} ({}–{}) |",
-        depth,
+        "| {depth} | {} | {target} {} | {} | {role} | {} | {line}:{col} ({}–{}) |",
         index + 1,
-        target,
         literal_text(&node.operator),
         node.rhs,
-        role,
         literal_text(&guard),
-        line,
-        col,
         node.span.start,
         node.span.end,
     );

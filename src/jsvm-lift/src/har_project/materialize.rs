@@ -436,9 +436,8 @@ fn write_project_metadata(args: &HarProjectOptions, manifest: &CaptureManifest) 
     crate::report_file::write_text(
         &args.output.join("README.md"),
         &format!(
-            "# Capture source project\n\nGenerated from {}.\n\nResponse bodies are preserved by URL under resources/. Inline script bodies are extracted beside their parent HTML. capture-manifest.json keeps capture provenance and discovered script/source-map references.\n\n## Counts\n\n{}",
-            crate::report_markdown::code_span(&args.har.to_string_lossy()),
-            summary
+            "# Capture source project\n\nGenerated from {}.\n\nResponse bodies are preserved by URL under resources/. Inline script bodies are extracted beside their parent HTML. capture-manifest.json keeps capture provenance and discovered script/source-map references.\n\n## Counts\n\n{summary}",
+            crate::report_markdown::code_span(&args.har.to_string_lossy())
         ),
     )?;
     Ok(())

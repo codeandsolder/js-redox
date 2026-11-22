@@ -1640,7 +1640,7 @@ mod tests {
 
     #[test]
     fn captured_namespace_evidence_is_scoped_to_specific_factory_invocations() {
-        let source = r#"
+        let source = r"
             const early = make();
             WebAssembly.instantiate(bytes, early);
             const host = globalThis;
@@ -1651,7 +1651,7 @@ mod tests {
                 imports.wbg.ctor = function(value) { return new host.Uint32Array(value); };
                 return imports;
             }
-        "#;
+        ";
         let analysis = proven_wasm_import_semantics(source);
         let constructor = analysis
             .handler_semantics
@@ -1686,11 +1686,11 @@ mod tests {
         // Unknown invocation, dynamic reassignment, and nonordinary factory
         // returns cannot establish the captured initializer.
         for source in [
-            r#"const host=globalThis; function make(){const imports={wbg:{}};imports.wbg.ctor=function(v){return new host.Uint32Array(v)};return imports} consume(make);"#,
-            r#"let host=globalThis;host=fake;const result=make();WebAssembly.instantiate(bytes,result);function make(){const imports={wbg:{}};imports.wbg.ctor=function(v){return new host.Uint32Array(v)};return imports}"#,
-            r#"const host=globalThis;const result=make();WebAssembly.instantiate(bytes,result);async function make(){const imports={wbg:{}};imports.wbg.ctor=function(v){return new host.Uint32Array(v)};return imports}"#,
-            r#"const host=globalThis;const result=make();WebAssembly.instantiate(bytes,result);function* make(){const imports={wbg:{}};imports.wbg.ctor=function(v){return new host.Uint32Array(v)};return imports}"#,
-            r#"const result=make();WebAssembly.instantiate(bytes,result);const host=globalThis;function make(){const imports={wbg:{}};imports.wbg.ctor=function(v){return new host.Uint32Array(v)};return imports}"#,
+            r"const host=globalThis; function make(){const imports={wbg:{}};imports.wbg.ctor=function(v){return new host.Uint32Array(v)};return imports} consume(make);",
+            r"let host=globalThis;host=fake;const result=make();WebAssembly.instantiate(bytes,result);function make(){const imports={wbg:{}};imports.wbg.ctor=function(v){return new host.Uint32Array(v)};return imports}",
+            r"const host=globalThis;const result=make();WebAssembly.instantiate(bytes,result);async function make(){const imports={wbg:{}};imports.wbg.ctor=function(v){return new host.Uint32Array(v)};return imports}",
+            r"const host=globalThis;const result=make();WebAssembly.instantiate(bytes,result);function* make(){const imports={wbg:{}};imports.wbg.ctor=function(v){return new host.Uint32Array(v)};return imports}",
+            r"const result=make();WebAssembly.instantiate(bytes,result);const host=globalThis;function make(){const imports={wbg:{}};imports.wbg.ctor=function(v){return new host.Uint32Array(v)};return imports}",
         ] {
             let analysis = proven_wasm_import_semantics(source);
             assert!(

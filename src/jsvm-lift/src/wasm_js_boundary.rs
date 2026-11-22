@@ -2035,10 +2035,8 @@ impl BoundaryCorrelation<'_> {
                 let writes = array_field(probe, "shapes");
                 anyhow::ensure!(
                     writes.len() <= 1,
-                    "ambiguous JS WASM-import proof for {}: {}@{}",
-                    source.display(),
-                    raw_import,
-                    offset
+                    "ambiguous JS WASM-import proof for {}: {raw_import}@{offset}",
+                    source.display()
                 );
                 if let Some(write) = writes.first() {
                     let mut proof = write.clone();
@@ -2389,8 +2387,7 @@ impl BoundaryCorrelation<'_> {
             row["import_binding_identity_proven"] = false.into();
             let prefix = string_field(row, "ambiguity").unwrap_or_default();
             row["ambiguity"] = format!(
-                "{}{}multiple exact module/import-object binding proofs",
-                prefix,
+                "{prefix}{}multiple exact module/import-object binding proofs",
                 if prefix.is_empty() { "" } else { "; " }
             )
             .into();
@@ -2401,8 +2398,7 @@ impl BoundaryCorrelation<'_> {
                 "multiple carrier sources prove module-memory identity".into();
             let prefix = string_field(row, "ambiguity").unwrap_or_default();
             row["ambiguity"] = format!(
-                "{}{}multiple module-memory carrier proofs",
-                prefix,
+                "{prefix}{}multiple module-memory carrier proofs",
                 if prefix.is_empty() { "" } else { "; " }
             )
             .into();

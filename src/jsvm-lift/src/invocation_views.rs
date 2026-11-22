@@ -556,7 +556,7 @@ pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -
                     }
                 }
                 if let Some(context) = identity.origin.execution_context_id {
-                    let _ = write!(view, "V8 execution context ID: {}\n\n", context);
+                    let _ = write!(view, "V8 execution context ID: {context}\n\n");
                 }
             }
 

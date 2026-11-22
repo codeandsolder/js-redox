@@ -1534,7 +1534,9 @@ pub fn analyze_bundle_source(
 
     let mut diagnostics = parsed.diagnostics;
     let fatal_error = parsed.fatal_error;
-    let mut bundles = if !fatal_error {
+    let mut bundles = if fatal_error {
+        Vec::new()
+    } else {
         let semantic_ret = SemanticBuilder::new()
             .with_check_syntax_error(true)
             .build(&parsed.program);
@@ -1599,8 +1601,6 @@ pub fn analyze_bundle_source(
             });
         }
         collector.bundles
-    } else {
-        Vec::new()
     };
 
     // Explicit generated-table contexts may also satisfy the conservative
@@ -1680,7 +1680,7 @@ mod tests {
 
     #[test]
     fn webpack_and_browserify_factory_roles_remain_distinct() -> Result<(), BudgetExceeded> {
-        let webpack = r#"
+        let webpack = r"
             (function(modules) {
                 function load(id) { return modules[id]; }
                 load.m = modules;
@@ -1693,7 +1693,7 @@ mod tests {
                     exports.other = 1;
                 }
             });
-        "#;
+        ";
         let browserify = r#"
             (function(modules, cache, entries) {})({
                 1: [function(require, module, exports) {

@@ -669,7 +669,7 @@ fn render_symbolic(field: &Value) -> String {
         Some("literal") => field
             .get("value")
             .map_or_else(|| "?".to_owned(), Value::to_string),
-        Some("folded") | Some("symbolic") => field
+        Some("folded" | "symbolic") => field
             .get("expr")
             .and_then(Value::as_str)
             .unwrap_or("?")

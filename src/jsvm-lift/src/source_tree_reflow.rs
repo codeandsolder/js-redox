@@ -339,7 +339,7 @@ mod tests {
             return Hm;
         };"#;
         let out = reflow_single_trip_loops(src);
-        assert_eq!(out.rewritten_loops, 1, "{:?}", out);
+        assert_eq!(out.rewritten_loops, 1, "{out:?}");
         assert!(!out.source.contains("while"), "{}", out.source);
         assert!(out.source.contains("log.push"), "{}", out.source);
     }

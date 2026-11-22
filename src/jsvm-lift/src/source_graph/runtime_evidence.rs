@@ -589,7 +589,7 @@ pub(super) fn seed_runtime_script_evidence(
         let classification = string_field(source, "classification");
         let generated = source.get("generated").unwrap_or(&Value::Null);
         graph.insert_node(
-            runtime_node.clone(),
+            runtime_node,
             json!({
                 "type":"runtime_script",
                 "classification":field(source,"classification"),

@@ -412,10 +412,8 @@ fn print_summary(output: &[VmRoles]) {
         let vm_count = u32::try_from(counts.len().max(1)).unwrap_or(u32::MAX);
         let avg = f64::from(total_roles) / f64::from(vm_count);
         println!(
-            "{} vms {} avg_roles {:.2} >=5 {} >=8 {} >=10 {}",
-            fam,
+            "{fam} vms {} avg_roles {avg:.2} >=5 {} >=8 {} >=10 {}",
             counts.len(),
-            avg,
             counts.iter().filter(|x| **x >= 5).count(),
             counts.iter().filter(|x| **x >= 8).count(),
             counts.iter().filter(|x| **x >= 10).count()
@@ -426,16 +424,15 @@ fn print_summary(output: &[VmRoles]) {
         let roles = vm
             .roles
             .iter()
-            .map(|(role, value)| format!("{}={}[{}]", role, value.name, value.source))
+            .map(|(role, value)| format!("{role}={}[{}]", value.name, value.source))
             .collect::<Vec<_>>()
             .join(" ");
         println!(
-            "{} {} matched {} roles {} {}",
+            "{} {} matched {} roles {} {roles}",
             vm.file,
             vm.decoder,
             vm.matched_paths,
-            vm.roles.len(),
-            roles
+            vm.roles.len()
         );
     }
 }

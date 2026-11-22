@@ -271,7 +271,7 @@ impl BindingFacts {
     ///
     /// This is a reference-identity proof, not an initialized-value proof:
     /// simple assignment to an uninitialized or immutable declarative
-    /// binding still evaluates the RHS before PutValue throws.
+    /// binding still evaluates the RHS before `PutValue` throws.
     pub(crate) fn fixed_assignment_reference(
         &self,
         scoping: &Scoping,
@@ -299,6 +299,7 @@ impl BindingFacts {
     /// initialized, their value cannot be changed. A hoisted declaration is
     /// different; the enclosing lexical scope's entry (not the declaration's
     /// text) is its earliest creation site.
+    #[must_use]
     pub fn proves_value_initialized(
         &self,
         scoping: &Scoping,
@@ -552,7 +553,7 @@ impl BindingFacts {
     }
 
     /// The same initialized-read proof for callers already visiting an
-    /// IdentifierReference rather than its containing Expression.
+    /// `IdentifierReference` rather than its containing Expression.
     #[must_use]
     pub fn initialized_reference(
         &self,

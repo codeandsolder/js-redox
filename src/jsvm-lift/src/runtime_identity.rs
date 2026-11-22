@@ -1,6 +1,6 @@
 //! Shared normalization of CDP session-local script identities.
 
-pub(crate) fn script_id_text(value: &serde_json::Value) -> Option<std::borrow::Cow<'_, str>> {
+pub fn script_id_text(value: &serde_json::Value) -> Option<std::borrow::Cow<'_, str>> {
     use std::borrow::Cow;
     match value {
         serde_json::Value::String(id) if !id.is_empty() => Some(Cow::Borrowed(id)),
@@ -11,7 +11,7 @@ pub(crate) fn script_id_text(value: &serde_json::Value) -> Option<std::borrow::C
 
 /// A session is an explicit nonempty recorder label, never a default or an ID
 /// obtained by stringifying arbitrary JSON. Missing labels cannot join scripts.
-pub(crate) fn session_name(value: Option<&Value>) -> Option<&str> {
+pub fn session_name(value: Option<&Value>) -> Option<&str> {
     nonempty_text(value).filter(|session| !session.trim().is_empty())
 }
 
@@ -22,12 +22,12 @@ use work_budget::WorkBudget;
 
 /// A conflicting identity remains unresolved even if a later row repeats one
 /// of its claims. This applies to byte identity and richer coordinate evidence.
-pub(crate) enum IdentityState<T> {
+pub enum IdentityState<T> {
     Unique(T),
     Conflict,
 }
 
-pub(crate) struct ScriptIdentityIndex<T> {
+pub struct ScriptIdentityIndex<T> {
     sessions: BTreeMap<String, BTreeMap<String, IdentityState<T>>>,
 }
 
@@ -159,14 +159,14 @@ impl<T: Eq> ScriptIdentityIndex<T> {
 
 /// Retain only fields on which all inventory occurrences agree. Unknown or
 /// contradictory values remain unknown when more occurrences are merged.
-pub(crate) fn retain_agreed<T: Eq>(current: &mut Option<T>, next: Option<T>) {
+pub fn retain_agreed<T: Eq>(current: &mut Option<T>, next: Option<T>) {
     if *current != next {
         *current = None;
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ScriptOriginContext {
+pub struct ScriptOriginContext {
     pub(crate) url: Option<String>,
     pub(crate) execution_context_id: Option<u64>,
 }
@@ -184,7 +184,7 @@ impl ScriptOriginContext {
     }
 }
 
-pub(crate) fn captured_javascript_digest(event: &Map<String, Value>) -> Option<&str> {
+pub fn captured_javascript_digest(event: &Map<String, Value>) -> Option<&str> {
     let captured = event.get("captured")?.as_object()?;
     (nonempty_text(captured.get("kind")) == Some("javascript"))
         .then(|| nonempty_text(captured.get("sha256")))

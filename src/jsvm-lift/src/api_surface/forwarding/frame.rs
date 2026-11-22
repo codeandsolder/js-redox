@@ -1,5 +1,10 @@
 //! Ordered lexical frame plans, initializer purity, and reference confinement.
-use super::super::{callables::ForwardedValue, *};
+use super::super::{
+    callables::ForwardedValue, expression_symbol, global_path, literal_data_key, static_string,
+    unparenthesized, xhr_binding_is_not_reassigned, ApiBindingWitness, BTreeSet, Collector,
+    Expression, GetSpan, ObjectPropertyKind, PropertyKind, ProvenConstantEnvironment, Result,
+    Scoping, Span, SymbolId, Visit, WorkBudget,
+};
 use super::values::{known_array, ArgumentList, ValueBuilder, ValueFrame};
 use super::FrameContext;
 use oxc_ast::{

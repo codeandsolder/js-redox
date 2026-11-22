@@ -196,9 +196,8 @@ pub(super) fn read_har(
     let first = raw.iter().copied().find(|byte| !byte.is_ascii_whitespace());
     if first != Some(b'{') {
         bail!(
-            "{} is not HAR JSON (first non-whitespace byte {:?})",
-            path.display(),
-            first
+            "{} is not HAR JSON (first non-whitespace byte {first:?})",
+            path.display()
         );
     }
     let parsed = match serde_json::from_slice::<Har>(&raw) {

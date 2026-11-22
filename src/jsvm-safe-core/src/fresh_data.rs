@@ -69,7 +69,7 @@ struct Evaluation {
 }
 
 impl Evaluation {
-    fn primitive(value: Value, inert: bool) -> Self {
+    const fn primitive(value: Value, inert: bool) -> Self {
         Self {
             fact: Some(Fact::Primitive(value)),
             inert,
@@ -80,7 +80,7 @@ impl Evaluation {
         self.fact.as_ref()?.primitive()
     }
 
-    fn unknown_inert() -> Self {
+    const fn unknown_inert() -> Self {
         Self {
             fact: None,
             inert: true,
@@ -89,7 +89,7 @@ impl Evaluation {
 }
 
 #[derive(Default)]
-pub(crate) struct FreshDataReads {
+pub struct FreshDataReads {
     values: HashMap<(u32, u32), Value>,
 }
 
@@ -745,8 +745,7 @@ impl Analyzer<'_> {
                                 let result = property
                                     .key
                                     .as_expression()
-                                    .map(|key| self.key(key, environment))
-                                    .unwrap_or_default();
+                                    .map_or_default(|key| self.key(key, environment));
                                 inert &= result.inert;
                                 let key = result.primitive_value().and_then(Value::js_string);
                                 if key.is_none() {
@@ -837,11 +836,10 @@ impl Analyzer<'_> {
                 }
                 environment.clear();
             }
-            let value = declarator
-                .init
-                .as_ref()
-                .map(|init| self.expression(init, environment))
-                .unwrap_or_else(|| Evaluation::primitive(Value::Undefined, true));
+            let value = declarator.init.as_ref().map_or_else(
+                || Evaluation::primitive(Value::Undefined, true),
+                |init| self.expression(init, environment),
+            );
             let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
                 environment.clear();
                 continue;
@@ -909,7 +907,7 @@ impl Analyzer<'_> {
         }
         match statement {
             Statement::VariableDeclaration(declaration) => {
-                self.declaration(declaration, environment)
+                self.declaration(declaration, environment);
             }
             Statement::ExportDeclaration(export) => {
                 if let Declaration::VariableDeclaration(declaration) = &export.declaration {

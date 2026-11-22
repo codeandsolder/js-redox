@@ -230,7 +230,7 @@ fn optimized_body(source: &str) -> Option<String> {
 #[derive(Default)]
 struct SelectorDispatch {
     body: Option<String>,
-    children: BTreeMap<(usize, String), SelectorDispatch>,
+    children: BTreeMap<(usize, String), Self>,
 }
 
 impl SelectorDispatch {

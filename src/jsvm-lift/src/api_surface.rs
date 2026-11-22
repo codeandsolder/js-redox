@@ -46,7 +46,7 @@ pub struct ApiCallsite {
     /// "candidate" retains syntax and arguments without proving the API binding.
     pub binding_status: String,
     pub standard_browser_api_semantics_required: bool,
-    /// Stable ordinals into the same source unit's mutation_sites collection.
+    /// Stable ordinals into the same source unit's `mutation_sites` collection.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub mutation_site_ordinals: Vec<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -903,18 +903,15 @@ type MethodEvidence = (Option<String>, Option<String>, Option<String>);
 
 fn xhr_method(arguments: &ApiArguments) -> MethodEvidence {
     let (literal, expression) = arguments.exact(0);
-    let (method, status) = literal.map_or_else(
-        || (None, "unknown"),
-        |literal| {
-            let normalized = effective_http_method(&literal);
-            let status = if normalized.is_some() {
-                "exact"
-            } else {
-                "invalid"
-            };
-            (normalized, status)
-        },
-    );
+    let (method, status) = literal.map_or((None, "unknown"), |literal| {
+        let normalized = effective_http_method(&literal);
+        let status = if normalized.is_some() {
+            "exact"
+        } else {
+            "invalid"
+        };
+        (normalized, status)
+    });
     (method, expression, Some(status.into()))
 }
 
@@ -1875,7 +1872,10 @@ safe(fetch)("/standard");
             .iter()
             .any(|family| family.starts_with("wrapper_global:")));
         assert_eq!(analysis.callsites[1].kind, "fetch");
-        assert!(analysis.callsites[1].mutation_site_ordinals.is_empty());
+        assert_eq!(
+            analysis.callsites[1].mutation_site_ordinals,
+            [] as [usize; 0]
+        );
         Ok(())
     }
 
@@ -2078,7 +2078,7 @@ reflect(Reflect, request, window, ["/reflect"]);
                 [family]
             );
         }
-        assert!(rows[1].mutation_site_ordinals.is_empty());
+        assert_eq!(rows[1].mutation_site_ordinals, [] as [usize; 0]);
         Ok(())
     }
 
@@ -2098,7 +2098,7 @@ alias();
         let rebound = &analysis.callsites[1];
         assert_eq!(direct.kind, "fetch");
         assert_eq!(direct.url.as_deref(), Some("/chain"));
-        assert!(direct.mutation_site_ordinals.is_empty());
+        assert_eq!(direct.mutation_site_ordinals, [] as [usize; 0]);
         assert_eq!(rebound.kind, "fetch_candidate");
         let site = &analysis.mutation_sites[rebound.mutation_site_ordinals[0]];
         let [start, end] = site
@@ -2280,7 +2280,7 @@ Array.prototype[Symbol.iterator] = unsafeIterator;
             .find(|row| row.callee == "omitted")
             .context("missing omitted initializer wrapper")?;
         assert_eq!(omitted.method.as_deref(), Some("GET"));
-        assert!(omitted.mutation_site_ordinals.is_empty());
+        assert_eq!(omitted.mutation_site_ordinals, [] as [usize; 0]);
         Ok(())
     }
 
@@ -2334,7 +2334,7 @@ fetch.call(window, "/receiver");
             result.mutation_sites[0].affected_families,
             ["namespace_window"]
         );
-        assert!(rows[2].mutation_site_ordinals.is_empty());
+        assert_eq!(rows[2].mutation_site_ordinals, [] as [usize; 0]);
         assert_eq!(rows[4].mutation_site_ordinals, [0]);
         Ok(())
     }
@@ -2479,7 +2479,7 @@ nav.sendBeacon("/beacon", payload);
         assert_eq!(rows.len(), 5, "{rows:#?}");
         assert!(rows[..3].iter().all(|row| row.kind == "fetch_candidate"));
         assert_eq!(rows[3].kind, "fetch");
-        assert!(rows[3].mutation_site_ordinals.is_empty());
+        assert_eq!(rows[3].mutation_site_ordinals, [] as [usize; 0]);
         for (row, family) in rows[..3]
             .iter()
             .zip(["function_call", "fetch_apply", "reflect_apply"])
@@ -2703,7 +2703,7 @@ original("https://example.test/direct");
         assert_eq!(rows.len(), 5, "{rows:#?}");
         assert!(rows[..4].iter().all(|row| row.kind == "fetch_candidate"));
         assert_eq!(rows[4].kind, "fetch");
-        assert!(rows[4].mutation_site_ordinals.is_empty());
+        assert_eq!(rows[4].mutation_site_ordinals, [] as [usize; 0]);
         let own = analysis
             .mutation_sites
             .iter()
@@ -2734,7 +2734,10 @@ navigator.sendBeacon("https://example.test/direct", payload);
         assert_eq!(analysis.callsites[0].kind, "send_beacon_candidate");
         assert_eq!(analysis.callsites[0].mutation_site_ordinals, [0]);
         assert_eq!(analysis.callsites[1].kind, "send_beacon");
-        assert!(analysis.callsites[1].mutation_site_ordinals.is_empty());
+        assert_eq!(
+            analysis.callsites[1].mutation_site_ordinals,
+            [] as [usize; 0]
+        );
         assert_eq!(
             analysis.mutation_sites[0].affected_families,
             ["function_bind"]
@@ -2794,7 +2797,7 @@ navigator.sendBeacon("https://api.example.test/two", payload);
         );
         assert_eq!(result.callsites[0].mutation_site_ordinals, [0]);
         assert_eq!(result.callsites[1].kind, "send_beacon");
-        assert!(result.callsites[1].mutation_site_ordinals.is_empty());
+        assert_eq!(result.callsites[1].mutation_site_ordinals, [] as [usize; 0]);
         Ok(())
     }
 
@@ -2916,10 +2919,10 @@ xhr.open("POST", "https://api.example.test/xhr");
             Some("unknown")
         );
         assert_eq!(result.callsites[1].method.as_deref(), Some("PATCH"));
-        assert!(result.callsites[1].mutation_site_ordinals.is_empty());
+        assert_eq!(result.callsites[1].mutation_site_ordinals, [] as [usize; 0]);
         assert_eq!(result.callsites[0].mutation_site_ordinals.len(), 1);
         assert_eq!(result.callsites[2].method.as_deref(), Some("GET"));
-        assert!(result.callsites[2].mutation_site_ordinals.is_empty());
+        assert_eq!(result.callsites[2].mutation_site_ordinals, [] as [usize; 0]);
         assert_eq!(result.callsites[3].kind, "xhr_open_candidate");
         assert_eq!(
             result.callsites[3].method_status.as_deref(),
@@ -2978,7 +2981,7 @@ new WebSocket("wss://api.example.test/c");
         assert_eq!(result.mutation_sites.len(), 2);
         assert!(result.mutation_sites.iter().any(|site| {
             site.target_pattern == [Some("globalThis".into()), None]
-                && site.affected_families.contains(&"fetch".to_string())
+                && site.affected_families.iter().any(|i: &String| i == "fetch")
         }));
         assert!(result.mutation_sites.iter().any(|site| {
             site.target_pattern == [Some("navigator".into()), None]

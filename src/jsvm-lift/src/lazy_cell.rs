@@ -3973,7 +3973,7 @@ fn helper_state_for_create_event(
         states: Vec<u64>,
     }
     impl MachineProbe<'_> {
-        fn inspect<'a>(&mut self, statements: &[Statement<'a>]) {
+        fn inspect(&mut self, statements: &[Statement<'_>]) {
             for pair in statements.windows(2) {
                 let [init, Statement::WhileStatement(while_statement)] = pair else {
                     continue;

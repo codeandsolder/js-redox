@@ -427,8 +427,8 @@ fn depythonify_safe_deob_script_completion_runtime_equivalence() -> Result<()> {
         "function f(){const p={x:1,[(events.push('key'),'x')]:2,x:3};return p.x;}f();",
         "function f(){let p={op(a,b){return a+b;}};return p.op(1,2);}f();",
         "function f(){var p={x:1};const g=()=>p.x;return g();}f();",
-        r#"['😀'<'\uE000','😀'<='\uE000','😀'>'\uE000','😀'>='\uE000'];"#,
-        r#"['\u{10000}'<'\uFFFF','\uFFFF'<'\u{10000}','a'<'ab','😀'==='😀'];"#,
+        r"['😀'<'\uE000','😀'<='\uE000','😀'>'\uE000','😀'>='\uE000'];",
+        r"['\u{10000}'<'\uFFFF','\uFFFF'<'\u{10000}','a'<'ab','😀'==='😀'];",
         "''+(1**(0/0));",
         "''+((-1)**(1/0));",
         "''+(1**(-1/0));",
@@ -1036,7 +1036,7 @@ fn script_runtime_equivalence(sources: &[&str], suite: &str, browser_globals: bo
         let runner = |text: &str| -> Result<String> {
             let encoded = serde_json::to_string(text)?;
             Ok(format!(
-                r#"const vm=require('node:vm');const events=[];try{{const value=vm.runInNewContext({encoded},{{{globals}}},{{timeout:1000}});console.log(JSON.stringify([typeof value,String(value),events]));}}catch(e){{console.log(JSON.stringify(['throw',String(e),events]));}}"#
+                r"const vm=require('node:vm');const events=[];try{{const value=vm.runInNewContext({encoded},{{{globals}}},{{timeout:1000}});console.log(JSON.stringify([typeof value,String(value),events]));}}catch(e){{console.log(JSON.stringify(['throw',String(e),events]));}}"
             ))
         };
         runtime_equivalent(
@@ -1052,7 +1052,7 @@ fn script_runtime_equivalence(sources: &[&str], suite: &str, browser_globals: bo
 #[test]
 #[ignore = "requires Node; run the focused test explicitly"]
 fn depythonify_safe_deob_statement_boundary_and_directive_runtime_equivalence() -> Result<()> {
-    let source = r#"
+    let source = r"
 function example1(log) {
  function a(){log.push('a');return ()=>log.push('bad');}
  function b(){log.push('b');}
@@ -1097,7 +1097,7 @@ function example13(){'use strict'
 }
 const results=[];for(const example of [example1,example2,example6,example7,example12]){const events=[];try{example(events)}catch(e){events.push(e.name)}results.push(events)}
 console.log(JSON.stringify([results,example3(),example4(),example5(),example8(),example9(),example10(),example11(),example13()]));
-"#;
+";
     let scratch = TempDir::new()?;
     let result = deobfuscate_source(
         source,

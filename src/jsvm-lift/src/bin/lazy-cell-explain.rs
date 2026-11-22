@@ -335,10 +335,10 @@ For the complete evidence, see the per-handler evidence JSON files and analysis.
     for (capture, surface) in captured_handlers.iter().zip(&handler_surfaces) {
         budget.consume(1)?;
         let [start, end] = capture.handler;
-        let name = format!("key-{}-source-{}-{}.js", capture.exact_key, start, end);
+        let name = format!("key-{}-source-{start}-{end}.js", capture.exact_key);
         let evidence_name = format!(
-            "key-{}-source-{}-{}-evidence.json",
-            capture.exact_key, start, end
+            "key-{}-source-{start}-{end}-evidence.json",
+            capture.exact_key
         );
         let eval_sites = surface
             .effects
@@ -364,14 +364,9 @@ For the complete evidence, see the per-handler evidence JSON files and analysis.
         }
         let _ =
             writeln!(index,
-            "| {} | [view](handlers/{}) | [evidence](handlers/{}) | {} | {} | {}..{} | {}..{} |",
+            "| {} | [view](handlers/{name}) | [evidence](handlers/{evidence_name}) | {eval_sites} | {} | {start}..{end} | {}..{} |",
             capture.exact_key,
-            name,
-            evidence_name,
-            eval_sites,
             surface.external_references.len(),
-            start,
-            end,
             capture.factory_call[0],
             capture.factory_call[1]
         );

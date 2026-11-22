@@ -9,7 +9,7 @@ use std::{
 };
 use work_budget::WorkBudget;
 
-pub(crate) fn insert_suffix(path: &str, suffix: &str) -> String {
+pub fn insert_suffix(path: &str, suffix: &str) -> String {
     let p = Path::new(path);
     let parent = p.parent().unwrap_or_else(|| Path::new(""));
     let stem = p.file_stem().and_then(|x| x.to_str()).unwrap_or("resource");
@@ -27,7 +27,7 @@ pub(crate) fn insert_suffix(path: &str, suffix: &str) -> String {
 
 /// Reserve a fresh directory under an already allocated parent. Existing
 /// files and directories are never reused as a new allocation.
-pub(crate) fn reserve_directory(root: &Path, base: &str, budget: &WorkBudget) -> Result<String> {
+pub fn reserve_directory(root: &Path, base: &str, budget: &WorkBudget) -> Result<String> {
     validate_project_relative_path(base, "archive directory path")?;
     let mut version = 1usize;
     loop {
@@ -59,14 +59,14 @@ struct FileVersions {
     next: usize,
 }
 
-pub(crate) struct StoredResource {
+pub struct StoredResource {
     pub(crate) path: String,
     pub(crate) sha256: String,
     pub(crate) reused: bool,
 }
 
 /// Owns the filesystem namespace of a single private import staging directory.
-pub(crate) struct ResourceStore<'a> {
+pub struct ResourceStore<'a> {
     root: &'a Path,
     budget: &'a WorkBudget,
     directories: HashMap<String, String>,

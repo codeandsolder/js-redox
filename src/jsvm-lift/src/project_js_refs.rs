@@ -328,7 +328,7 @@ pub fn scan_project_references(
             "content_group_size": result.group_size,
             "deduplicated": occurrence > 0,
             "deduplicated_from": if occurrence > 0 { Value::String(result.canonical_source_path.clone()) } else { Value::Null },
-            "extractor_exit": if result.error.is_some() { 1 } else { 0 },
+            "extractor_exit": i32::from(result.error.is_some()),
             "document_resource_ids": [],
             "references": result.references,
         });

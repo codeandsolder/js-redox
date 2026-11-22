@@ -1080,7 +1080,7 @@ mod tests {
             &index,
             &WorkBudget::unlimited("unscoped-generation"),
         )?;
-        assert!(!origins.is_empty());
+        assert_ne!(origins, [] as [serde_json::Value; 0]);
         for origin in origins {
             assert!(origin["cdp_session"].is_null());
             assert_eq!(origin["chain_termination"], "unresolved_session_identity");

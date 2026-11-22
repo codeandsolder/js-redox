@@ -19,7 +19,7 @@ use oxc_span::{GetSpan, Span};
 /// consume unlabeled breaks but not continues; nested iteration statements
 /// consume both. Named continues are resolved by their attached iteration
 /// statement's exact source span, including chains of labels on one loop.
-pub(crate) struct LoopBodyControl<'s> {
+pub struct LoopBodyControl<'s> {
     labels: &'s [(Span, String)],
     target: Span,
     breakable_depth: usize,
@@ -106,7 +106,7 @@ pub fn inert_literal_statement(expr: &Expression<'_>) -> bool {
 /// entirely can change direct eval and member-method receiver identity.
 /// Only collapse to the final expression if its AST produces a value, not a
 /// Reference. Otherwise keep an effectful prefix to retain comma semantics.
-pub(super) fn inherently_value(expr: &Expression<'_>) -> bool {
+pub fn inherently_value(expr: &Expression<'_>) -> bool {
     match expr {
         Expression::ParenthesizedExpression(paren) => inherently_value(&paren.expression),
         Expression::BooleanLiteral(_)

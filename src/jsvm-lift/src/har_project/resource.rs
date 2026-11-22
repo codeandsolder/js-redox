@@ -236,7 +236,7 @@ pub(super) fn refine_resource_kind(
     if lower_prefix.starts_with("<?xml") || lower_prefix.starts_with("<svg") {
         return "text".into();
     }
-    if (had_xssi_prefix || matches!(candidate.as_bytes().first(), Some(b'{') | Some(b'[')))
+    if (had_xssi_prefix || matches!(candidate.as_bytes().first(), Some(b'{' | b'[')))
         && serde_json::from_str::<serde_json::Value>(candidate).is_ok()
     {
         return "json".into();

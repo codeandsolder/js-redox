@@ -115,7 +115,7 @@ impl<'a> NavigationIndex<'a> {
     }
 }
 
-pub(crate) struct EntrypointIndex {
+pub struct EntrypointIndex {
     pub(crate) markdown: String,
     pub(crate) declared_scripts: usize,
 }
@@ -124,7 +124,7 @@ pub(crate) struct EntrypointIndex {
 /// statically resolved transitive JavaScript imports. Returns the number of
 /// distinct declared script entries; an empty index is still useful for
 /// explaining why there is no HTML-root code path in a capture.
-pub(crate) fn render_entrypoint_index(
+pub fn render_entrypoint_index(
     manifest: &Value,
     source_index: &Value,
     deob: &Value,

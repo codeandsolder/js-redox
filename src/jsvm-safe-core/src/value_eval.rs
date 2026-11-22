@@ -23,7 +23,7 @@ pub fn canonical_array_index(value: &Value) -> Option<u32> {
     canonical_array_index_key(&value.js_string()?)
 }
 
-pub(crate) fn canonical_array_index_key(key: &str) -> Option<u32> {
+pub fn canonical_array_index_key(key: &str) -> Option<u32> {
     let index = key.parse::<u32>().ok()?;
     (index != u32::MAX && index.to_string() == key).then_some(index)
 }
@@ -37,10 +37,10 @@ pub fn string_literal_value(literal: &StringLiteral<'_>) -> Option<String> {
     literal.value.as_str().map(str::to_owned)
 }
 
-/// Exact ToPropertyKey for noncomputed object-literal keys. Oxc's
-/// StaticPropertyName uses Rust float display for numeric literals, which
+/// Exact `ToPropertyKey` for noncomputed object-literal keys. Oxc's
+/// `StaticPropertyName` uses Rust float display for numeric literals, which
 /// disagrees with JavaScript at exponential magnitudes and signed zero.
-pub(crate) fn literal_property_key(key: &PropertyKey<'_>) -> Option<String> {
+pub fn literal_property_key(key: &PropertyKey<'_>) -> Option<String> {
     match key {
         PropertyKey::StaticIdentifier(identifier) => Some(identifier.name.to_string()),
         PropertyKey::StringLiteral(literal) => string_literal_value(literal),
@@ -51,7 +51,7 @@ pub(crate) fn literal_property_key(key: &PropertyKey<'_>) -> Option<String> {
 }
 
 /// Evaluate a computed property key only when its complete primitive
-/// evaluation is proven. BigInt literals are exact even though BigInt
+/// evaluation is proven. `BigInt` literals are exact even though `BigInt`
 /// arithmetic is not in the shared primitive evaluator's domain.
 #[must_use]
 pub fn exact_computed_property_key(
@@ -66,8 +66,8 @@ pub fn exact_computed_property_key(
 }
 
 /// Canonical ECMAScript property identity, with an explicit computed-key
-/// evaluator. In particular, never treat a computed RegExp or object literal
-/// as a statically known name: ToPrimitive can invoke user code.
+/// evaluator. In particular, never treat a computed `RegExp` or object literal
+/// as a statically known name: `ToPrimitive` can invoke user code.
 #[must_use]
 pub fn exact_property_key(
     key: &PropertyKey<'_>,

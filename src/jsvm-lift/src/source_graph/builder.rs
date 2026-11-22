@@ -75,7 +75,7 @@ impl GraphBuilder {
     }
 
     #[cfg(test)]
-    pub(super) fn edges(&self) -> &BTreeMap<EdgeIdentity, Value> {
+    pub(super) const fn edges(&self) -> &BTreeMap<EdgeIdentity, Value> {
         &self.edges
     }
 

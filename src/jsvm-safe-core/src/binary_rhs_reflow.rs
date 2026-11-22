@@ -36,9 +36,8 @@ fn slice(source: &str, span: Span) -> Option<&str> {
 
 fn replace_child(source: &str, parent: Span, child: Span, replacement: &str) -> Option<String> {
     Some(format!(
-        "{}{}{}",
+        "{}{replacement}{}",
         source.get(parent.start as usize..child.start as usize)?,
-        replacement,
         source.get(child.end as usize..parent.end as usize)?
     ))
 }
@@ -163,7 +162,7 @@ pub fn lower_if_binary_rhs_sequences(statement: &IfStatement<'_>, source: &str) 
     // Unused even in textual source, including unresolved references.
     let mut salt = 0;
     let nonce = loop {
-        let candidate = format!("__jsvm_binary_rhs_{}_{}", statement.span.start, salt);
+        let candidate = format!("__jsvm_binary_rhs_{}_{salt}", statement.span.start);
         if !source.contains(&candidate) {
             break candidate;
         }

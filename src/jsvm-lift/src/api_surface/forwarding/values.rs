@@ -1,7 +1,8 @@
 //! Materialized value origins and bounded positional argument construction.
 use super::super::{
     callables::{ForwardedValue, PositionalArguments},
-    *,
+    expression_symbol, literal_data_key, unparenthesized, Expression, GetSpan, ObjectPropertyKind,
+    ProvenConstantEnvironment, Result, Scoping, Span, StaticPrimitiveValue, SymbolId, WorkBudget,
 };
 use jsvm_safe_core::eval_static_primitive_with_resolver;
 use oxc_ast::ast::{Argument, ArrayExpression, ArrayExpressionElement};
@@ -24,7 +25,7 @@ pub(super) struct ValueBuilder<'s, 'a> {
 }
 
 impl<'s, 'a> ValueBuilder<'s, 'a> {
-    pub(super) fn new(
+    pub(super) const fn new(
         frame: Option<ValueFrame<'a>>,
         scoping: &'s Scoping,
         constants: &'s ProvenConstantEnvironment,
@@ -177,7 +178,7 @@ impl<'s, 'a> ValueBuilder<'s, 'a> {
         Ok(())
     }
 
-    fn full(&self, result: &mut ArgumentList<'a>, span: Span) -> bool {
+    const fn full(&self, result: &mut ArgumentList<'a>, span: Span) -> bool {
         if result.values.len() >= self.limit {
             result.unknown_tail = Some(span);
         }
@@ -212,7 +213,7 @@ impl<'s, 'a> ValueBuilder<'s, 'a> {
             }
             match element {
                 ArrayExpressionElement::Elision(_) => {
-                    result.values.push(ForwardedValue::Unknown(None))
+                    result.values.push(ForwardedValue::Unknown(None));
                 }
                 ArrayExpressionElement::SpreadElement(spread) => {
                     self.spread(&mut result, &spread.argument, spread.span)?;

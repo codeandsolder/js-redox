@@ -1047,8 +1047,8 @@ fn prepare_capture(output: &Path, input: &ObservedEvalInput) -> Result<PreparedC
         },
     );
     let relative = format!(
-        "{prefix}/eval-{}-{}/capture-{}",
-        executable_site.start, executable_site.end, capture_id
+        "{prefix}/eval-{}-{}/capture-{capture_id}",
+        executable_site.start, executable_site.end
     );
     let outer_loader = outer.cloned();
     Ok(PreparedCapture {
@@ -1130,9 +1130,9 @@ pub fn attach_observed_eval_sources(output: &Path, inputs: &[ObservedEvalInput])
             "# Verified executable eval site\n\n\
              Execution-observed only; matches do not imply whole-function equivalence.\n\n\
              - Capture SHA-256: {}\n\
-             - Original executable SHA-256: {}\n\
+             - Original executable SHA-256: {executable_sha}\n\
              - Executable direct eval interval: {}..{}\n",
-            capture.capture_id, executable_sha, site.start, site.end,
+            capture.capture_id, site.start, site.end,
         );
         if let Some(loader) = outer {
             let _ = write!(
@@ -1309,8 +1309,7 @@ pub fn attach_observed_eval_sources(output: &Path, inputs: &[ObservedEvalInput])
         for (origin, line) in refs {
             let _ = writeln!(
                 text,
-                "- Line {}: [verified observed eval origin]({})",
-                line,
+                "- Line {line}: [verified observed eval origin]({})",
                 relative_link(&sidecar, &origin)
             );
         }
