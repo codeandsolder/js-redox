@@ -180,6 +180,63 @@ fn semantic_blob(value: Option<&Value>) -> String {
         .join(";")
 }
 
+struct RouteComparison {
+    path_ok: usize,
+    terminal_ok: usize,
+    semantic_exact: usize,
+    mismatches: Vec<String>,
+}
+
+fn compare_routes(map: &Value, js: &BTreeMap<i64, Value>) -> Result<RouteComparison> {
+    let handlers = map
+        .get("handlers")
+        .and_then(Value::as_array)
+        .context("opcode map has no handlers array")?;
+    let by_opcode = handlers
+        .iter()
+        .filter_map(|handler| {
+            handler
+                .get("opcode")
+                .and_then(Value::as_i64)
+                .map(|opcode| (opcode, handler))
+        })
+        .collect::<HashMap<_, _>>();
+
+    let mut path_ok = 0_usize;
+    let mut terminal_ok = 0_usize;
+    let mut semantic_exact = 0_usize;
+    let mut mismatches = Vec::new();
+    for (opcode, route) in js {
+        let Some(handler) = by_opcode.get(opcode) else {
+            mismatches.push(format!("{opcode}: missing-rust-handler"));
+            continue;
+        };
+        let path_matches = handler.get("path") == route.get("trace");
+        let terminal_matches = handler.get("terminal") == route.get("terminal");
+        let semantics_match =
+            semantic_blob(handler.get("semantic")) == semantic_blob(route.get("semantic"));
+        path_ok += usize::from(path_matches);
+        terminal_ok += usize::from(terminal_matches);
+        semantic_exact += usize::from(semantics_match);
+        if !(path_matches && terminal_matches) && mismatches.len() < 20 {
+            mismatches.push(format!(
+                "{opcode}: rust_path={:?} js_path={:?} rust_terminal={:?} js_terminal={:?}",
+                handler.get("path"),
+                route.get("trace"),
+                handler.get("terminal"),
+                route.get("terminal")
+            ));
+        }
+    }
+
+    Ok(RouteComparison {
+        path_ok,
+        terminal_ok,
+        semantic_exact,
+        mismatches,
+    })
+}
+
 fn compare_opcode_maps(rust_json: &Path, decoder_id: &str, js_routes: &Path) -> Result<()> {
     let text = fs::read_to_string(rust_json)
         .with_context(|| format!("reading {}", rust_json.display()))?;
@@ -222,46 +279,12 @@ fn compare_opcode_maps(rust_json: &Path, decoder_id: &str, js_routes: &Path) -> 
         .iter()
         .max_by_key(|map| score(map))
         .context("failed to choose Rust opcode map")?;
-    let handlers = best
-        .get("handlers")
-        .and_then(Value::as_array)
-        .context("opcode map has no handlers array")?;
-    let by_opcode = handlers
-        .iter()
-        .filter_map(|handler| {
-            handler
-                .get("opcode")
-                .and_then(Value::as_i64)
-                .map(|opcode| (opcode, handler))
-        })
-        .collect::<HashMap<_, _>>();
-
-    let mut path_ok = 0_usize;
-    let mut terminal_ok = 0_usize;
-    let mut semantic_exact = 0_usize;
-    let mut mismatches = Vec::new();
-    for (opcode, route) in &js {
-        let Some(handler) = by_opcode.get(opcode) else {
-            mismatches.push(format!("{opcode}: missing-rust-handler"));
-            continue;
-        };
-        let path_matches = handler.get("path") == route.get("trace");
-        let terminal_matches = handler.get("terminal") == route.get("terminal");
-        let semantics_match =
-            semantic_blob(handler.get("semantic")) == semantic_blob(route.get("semantic"));
-        path_ok += usize::from(path_matches);
-        terminal_ok += usize::from(terminal_matches);
-        semantic_exact += usize::from(semantics_match);
-        if !(path_matches && terminal_matches) && mismatches.len() < 20 {
-            mismatches.push(format!(
-                "{opcode}: rust_path={:?} js_path={:?} rust_terminal={:?} js_terminal={:?}",
-                handler.get("path"),
-                route.get("trace"),
-                handler.get("terminal"),
-                route.get("terminal")
-            ));
-        }
-    }
+    let RouteComparison {
+        path_ok,
+        terminal_ok,
+        semantic_exact,
+        mismatches,
+    } = compare_routes(best, &js)?;
 
     println!(
         "parent={} state={} opcode_max={}",
@@ -321,13 +344,15 @@ fn classify_semantic(text: &str) -> Result<&'static str> {
     }
 }
 
-fn semantic_dictionary(batch_json: &Path, output: Option<&Path>) -> Result<()> {
+struct DictionaryMember<'a> {
+    decoder: &'a str,
+    opcode: Option<&'a Value>,
+    semantic: &'a str,
+}
+
+fn dictionary_clusters(rows: &[Value]) -> BTreeMap<&str, Vec<DictionaryMember<'_>>> {
     const EMPTY_SHA: &str = "e3b0c44298fc1c14";
-    let rows = read_json(batch_json)?;
-    let rows = rows
-        .as_array()
-        .context("batch JSON root must be an array")?;
-    let mut clusters = BTreeMap::<String, Vec<Value>>::new();
+    let mut clusters = BTreeMap::<&str, Vec<DictionaryMember>>::new();
     for vm in rows {
         if vm.get("status").and_then(Value::as_str) != Some("ok") {
             continue;
@@ -346,37 +371,40 @@ fn semantic_dictionary(batch_json: &Path, output: Option<&Path>) -> Result<()> {
                 continue;
             }
             clusters
-                .entry(signature.to_owned())
+                .entry(signature)
                 .or_default()
-                .push(json!({
-                    "decoder": decoder,
-                    "opcode": handler.get("opcode").cloned().unwrap_or(Value::Null),
-                    "semantic": handler.get("semantic").cloned().unwrap_or(Value::Null),
-                }));
+                .push(DictionaryMember {
+                    decoder,
+                    opcode: handler.get("opcode"),
+                    semantic: handler
+                        .get("semantic")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                });
         }
     }
 
+    clusters
+}
+
+fn dictionary_document(clusters: BTreeMap<&str, Vec<DictionaryMember<'_>>>) -> Result<Value> {
     let mut dictionary = Vec::new();
     let mut labels = BTreeMap::<String, usize>::new();
     for (signature, members) in clusters {
-        let exemplar = members
-            .first()
-            .and_then(|member| member.get("semantic"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
+        let exemplar = members.first().map_or("", |member| member.semantic);
         let label = classify_semantic(exemplar)?.to_owned();
         *labels.entry(label.clone()).or_default() += 1;
         let vm_count = members
             .iter()
-            .filter_map(|member| member.get("decoder").and_then(Value::as_str))
+            .map(|member| member.decoder)
             .collect::<BTreeSet<_>>()
             .len();
         let member_summary = members
             .iter()
             .map(|member| {
                 json!({
-                    "decoder": member.get("decoder").cloned().unwrap_or(Value::Null),
-                    "opcode": member.get("opcode").cloned().unwrap_or(Value::Null),
+                    "decoder": member.decoder,
+                    "opcode": member.opcode,
                 })
             })
             .collect::<Vec<_>>();
@@ -417,7 +445,7 @@ fn semantic_dictionary(batch_json: &Path, output: Option<&Path>) -> Result<()> {
                 .is_some_and(|count| count > 1)
         })
         .count();
-    let document = json!({
+    Ok(json!({
         "summary": {
             "signatures": dictionary.len(),
             "reused": reused,
@@ -425,7 +453,15 @@ fn semantic_dictionary(batch_json: &Path, output: Option<&Path>) -> Result<()> {
             "labels": labels,
         },
         "dictionary": dictionary,
-    });
+    }))
+}
+
+fn semantic_dictionary(batch_json: &Path, output: Option<&Path>) -> Result<()> {
+    let rows = read_json(batch_json)?;
+    let rows = rows
+        .as_array()
+        .context("batch JSON root must be an array")?;
+    let document = dictionary_document(dictionary_clusters(rows))?;
     let mut text = serde_json::to_string_pretty(&document)?;
     text.push('\n');
     if let Some(path) = output {
