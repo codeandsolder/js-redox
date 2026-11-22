@@ -232,7 +232,7 @@ pub fn read_manifest(path: &Path) -> Result<CaptureManifest> {
 pub(crate) fn write_editor_settings(project: &Path) -> Result<()> {
     crate::report_file::write_json(
         &project.join(".vscode/settings.json"),
-        &serde_json::json!({"editor.maxTokenizationLineLength": 200000}),
+        &serde_json::json!({"editor.maxTokenizationLineLength": 200_000}),
     )
 }
 

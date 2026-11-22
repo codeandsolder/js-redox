@@ -47,24 +47,27 @@ fn str_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value.get(key).and_then(Value::as_str)
 }
 
-fn default_artifact(
-    schema: &str,
-    fields: impl IntoIterator<Item = (&'static str, Value)>,
-) -> Value {
-    let mut value = serde_json::Map::new();
-    value.insert("schema".into(), Value::String(schema.into()));
-    for (key, item) in fields {
-        value.insert(key.into(), item);
-    }
-    Value::Object(value)
-}
-
-fn load_or(
+fn load_empty(
     project: &Path,
     spec: crate::analysis_artifacts::ArtifactSpec,
-    fallback: Value,
+    arrays: &[&str],
+    objects: &[&str],
 ) -> Result<Value> {
-    Ok(load_optional_artifact(project, spec)?.unwrap_or(fallback))
+    Ok(load_optional_artifact(project, spec)?.unwrap_or_else(|| {
+        let mut value = serde_json::Map::new();
+        value.insert("schema".into(), Value::String(spec.schema.into()));
+        for key in arrays {
+            value.insert((*key).into(), json!([]));
+        }
+        for key in objects {
+            value.insert((*key).into(), json!({}));
+        }
+        Value::Object(value)
+    }))
+}
+
+fn summary(value: &Value) -> &Value {
+    value.get("summary").unwrap_or(&Value::Null)
 }
 
 fn compact(value: Option<&Value>) -> String {
@@ -73,146 +76,88 @@ fn compact(value: Option<&Value>) -> String {
         .unwrap_or_else(|| "{}".into())
 }
 
-/// Regenerate the project README from its durable analysis artifacts.
-///
-/// # Errors
-///
-/// Fails if the project cannot be resolved, manifest/artifact data cannot be read or
-/// serialized, the README cannot be written, or the analysis budget is exhausted.
-pub fn refresh_project_readme(project: &Path, budgets: &AnalysisBudgets) -> Result<()> {
-    let budget = budgets.operation(
-        AnalysisOperation::ProjectReadme,
-        project.display().to_string(),
-    );
-    budget.checkpoint()?;
-    let project = project
-        .canonicalize()
-        .with_context(|| format!("resolving project {}", project.display()))?;
-    let manifest = load_manifest(&project)?;
-    let manifest_value = serde_json::to_value(&manifest)?;
-    budget.checkpoint()?;
+struct ReadmeArtifacts {
+    source_index: Value,
+    sourcemaps: Value,
+    jsrefs: Value,
+    import_maps: Value,
+    deob: Value,
+    jsvm: Value,
+    graph: Value,
+    api_surface_doc: Option<Value>,
+    bundles: Value,
+    generated_recovery: Value,
+    runtime_scripts: Value,
+    wasm_resource_provenance: Option<Value>,
+}
 
-    let source_index = load_or(
-        &project,
-        SOURCE_INDEX,
-        default_artifact(
-            SOURCE_INDEX.schema,
-            [("units", json!([])), ("summary", json!({}))],
-        ),
-    )?;
-    let sourcemaps = load_or(
-        &project,
-        SOURCEMAPS,
-        default_artifact(SOURCEMAPS.schema, [("source_maps", json!([]))]),
-    )?;
-    let jsrefs = load_or(
-        &project,
-        JS_REFERENCES,
-        default_artifact(
-            JS_REFERENCES.schema,
-            [("code_units", json!([])), ("summary", json!({}))],
-        ),
-    )?;
-    let import_maps = load_or(
-        &project,
-        IMPORT_MAPS,
-        default_artifact(
-            IMPORT_MAPS.schema,
-            [
-                ("maps", json!([])),
-                ("documents", json!({})),
-                ("summary", json!({})),
+impl ReadmeArtifacts {
+    fn load(project: &Path) -> Result<Self> {
+        let source_index = load_empty(project, SOURCE_INDEX, &["units"], &["summary"])?;
+        let sourcemaps = load_empty(project, SOURCEMAPS, &["source_maps"], &[])?;
+        let jsrefs = load_empty(project, JS_REFERENCES, &["code_units"], &["summary"])?;
+        let import_maps = load_empty(project, IMPORT_MAPS, &["maps"], &["documents", "summary"])?;
+        let deob = load_empty(project, DEOBFUSCATION, &["units"], &["summary"])?;
+        let jsvm = load_empty(
+            project,
+            JSVM_INDEX,
+            &["code_units", "dynamic_code_units", "devirtualized_units"],
+            &[],
+        )?;
+        let graph = load_empty(
+            project,
+            SOURCE_GRAPH,
+            &["nodes", "edges", "unresolved_edges"],
+            &["summary"],
+        )?;
+        let api_surface_doc = load_optional_artifact(project, API_SURFACE)?;
+        let bundles = load_empty(
+            project,
+            BUNDLES,
+            &["bundles", "modules", "failures"],
+            &["summary"],
+        )?;
+        let generated_recovery = load_empty(project, GENERATED_RECOVERY, &["units"], &["summary"])?;
+        let runtime_scripts = load_empty(
+            project,
+            RUNTIME_SCRIPTS,
+            &[
+                "sources",
+                "alpine_families",
+                "gtm_families",
+                "script_identity_conflicts",
             ],
-        ),
-    )?;
-    let deob = load_or(
-        &project,
-        DEOBFUSCATION,
-        default_artifact(
-            DEOBFUSCATION.schema,
-            [("units", json!([])), ("summary", json!({}))],
-        ),
-    )?;
-    let jsvm = load_or(
-        &project,
-        JSVM_INDEX,
-        default_artifact(
-            JSVM_INDEX.schema,
-            [
-                ("code_units", json!([])),
-                ("dynamic_code_units", json!([])),
-                ("devirtualized_units", json!([])),
-            ],
-        ),
-    )?;
-    let graph = load_or(
-        &project,
-        SOURCE_GRAPH,
-        default_artifact(
-            SOURCE_GRAPH.schema,
-            [
-                ("nodes", json!([])),
-                ("edges", json!([])),
-                ("unresolved_edges", json!([])),
-                ("summary", json!({})),
-            ],
-        ),
-    )?;
-    let api_surface_doc = load_optional_artifact(&project, API_SURFACE)?;
-    let api_surface = api_surface_doc.clone().unwrap_or_else(|| {
-        default_artifact(
-            API_SURFACE.schema,
-            [
-                ("callsites", json!([])),
-                ("failures", json!([])),
-                ("summary", json!({})),
-            ],
-        )
-    });
-    let bundles = load_or(
-        &project,
-        BUNDLES,
-        default_artifact(
-            BUNDLES.schema,
-            [
-                ("bundles", json!([])),
-                ("modules", json!([])),
-                ("failures", json!([])),
-                ("summary", json!({})),
-            ],
-        ),
-    )?;
-    let generated_recovery = load_or(
-        &project,
-        GENERATED_RECOVERY,
-        default_artifact(
-            GENERATED_RECOVERY.schema,
-            [("units", json!([])), ("summary", json!({}))],
-        ),
-    )?;
-    let runtime_scripts = load_or(
-        &project,
-        RUNTIME_SCRIPTS,
-        default_artifact(
-            RUNTIME_SCRIPTS.schema,
-            [
-                ("sources", json!([])),
-                ("alpine_families", json!([])),
-                ("gtm_families", json!([])),
-                ("script_identity_conflicts", json!([])),
-                ("summary", json!({})),
-            ],
-        ),
-    )?;
-    let wasm_resource_provenance = load_optional_artifact(&project, WASM_RESOURCE_PROVENANCE)?;
-    budget.checkpoint()?;
+            &["summary"],
+        )?;
+        let wasm_resource_provenance = load_optional_artifact(project, WASM_RESOURCE_PROVENANCE)?;
+        Ok(Self {
+            source_index,
+            sourcemaps,
+            jsrefs,
+            import_maps,
+            deob,
+            jsvm,
+            graph,
+            api_surface_doc,
+            bundles,
+            generated_recovery,
+            runtime_scripts,
+            wasm_resource_provenance,
+        })
+    }
+}
 
-    let resources = array(&manifest_value, "resources");
-    let source_units = array(&source_index, "units");
-    let js_units = source_units
-        .iter()
-        .filter(|unit| str_field(unit, "kind") == Some("javascript"))
-        .collect::<Vec<_>>();
+struct SourceCounts {
+    total: usize,
+    javascript: usize,
+    kinds: BTreeMap<String, usize>,
+}
+
+fn collect_source_counts(
+    source_index: &Value,
+    budget: &work_budget::WorkBudget,
+) -> Result<SourceCounts> {
+    let source_units = array(source_index, "units");
     let mut source_kinds = BTreeMap::<String, usize>::new();
     for unit in source_units {
         budget.checkpoint()?;
@@ -221,9 +166,20 @@ pub fn refresh_project_readme(project: &Path, budgets: &AnalysisBudgets) -> Resu
             .or_default() += 1;
     }
 
+    Ok(SourceCounts {
+        total: source_units.len(),
+        javascript: source_kinds.get("javascript").copied().unwrap_or_default(),
+        kinds: source_kinds,
+    })
+}
+
+fn sourcemap_counts(
+    sourcemaps: &Value,
+    budget: &work_budget::WorkBudget,
+) -> Result<(usize, usize)> {
     let mut recovered_originals = 0usize;
     let mut composed_sourcemap_links = 0usize;
-    for sm in array(&sourcemaps, "source_maps") {
+    for sm in array(sourcemaps, "source_maps") {
         budget.checkpoint()?;
         let composed = array(sm, "composed_recovered");
         let recovered = if composed.is_empty() {
@@ -242,67 +198,16 @@ pub fn refresh_project_readme(project: &Path, budgets: &AnalysisBudgets) -> Resu
             .unwrap_or_default();
     }
 
-    let vm_units = array(&jsvm, "code_units");
-    let confirmed = vm_units
-        .iter()
-        .filter(|unit| bool_field(unit, "confirmed_vm_signal"))
-        .collect::<Vec<_>>();
-    let candidates = vm_units
-        .iter()
-        .filter(|unit| bool_field(unit, "vm_signal") && !bool_field(unit, "confirmed_vm_signal"))
-        .collect::<Vec<_>>();
-    let devirtualized = array(&jsvm, "devirtualized_units");
-    let dynamic = array(&jsvm, "dynamic_code_units");
-    let recursive_generated = vm_units
-        .iter()
-        .filter(|unit| str_field(unit, "origin") == Some("generated_dynamic_code"))
-        .count();
-    let large_handler_candidates = candidates
-        .iter()
-        .copied()
-        .filter(|unit| bool_field(unit, "large_handler_table_candidate"))
-        .collect::<Vec<_>>();
-    let switch_devirtualized = devirtualized
-        .iter()
-        .filter(|unit| str_field(unit, "vm_kind") == Some("direct_switch"))
-        .count();
-    let table_devirtualized = devirtualized
-        .iter()
-        .filter(|unit| str_field(unit, "vm_kind") == Some("function_table"))
-        .count();
+    Ok((recovered_originals, composed_sourcemap_links))
+}
 
-    let deob_summary = deob.get("summary").unwrap_or(&Value::Null);
-    let changed_deob = deob_summary
-        .get("changed_units")
-        .and_then(Value::as_u64)
-        .and_then(|v| usize::try_from(v).ok())
-        .unwrap_or_else(|| {
-            array(&deob, "units")
-                .iter()
-                .filter(|unit| bool_field(unit, "changed"))
-                .count()
-        });
-    let deob_failures = deob_summary
-        .get("failures")
-        .and_then(Value::as_u64)
-        .and_then(|v| usize::try_from(v).ok())
-        .unwrap_or_else(|| {
-            array(&deob, "units")
-                .iter()
-                .filter(|unit| nonzero_integer_field(unit, "exit"))
-                .count()
-        });
-    let arithmetic_state_proofs = array(&deob, "units")
-        .iter()
-        .map(|unit| array(unit, "arithmetic_state_proofs").len())
-        .sum::<usize>();
-
-    let entrypoints =
-        render_entrypoint_index(&manifest_value, &source_index, &deob, &jsrefs, &budget)?;
-    let declared_scripts = entrypoints.declared_scripts;
-    let source = manifest_value
-        .get("source")
-        .context("capture manifest source missing")?;
+fn render_introduction(
+    project: &Path,
+    source: &Value,
+    artifacts: &ReadmeArtifacts,
+    declared_scripts: usize,
+) -> Vec<String> {
+    let runtime_summary = summary(&artifacts.runtime_scripts);
     let capture_state = if bool_field(source, "salvaged") {
         "SALVAGED / truncated"
     } else {
@@ -313,18 +218,6 @@ pub fn refresh_project_readme(project: &Path, budgets: &AnalysisBudgets) -> Resu
     let original_url =
         str_field(source, "original_page_url").or_else(|| str_field(source, "requested_url"));
     let final_url = str_field(source, "final_url");
-    let source_summary = source_index.get("summary").unwrap_or(&Value::Null);
-    let jsref_summary = jsrefs.get("summary").unwrap_or(&Value::Null);
-    let import_summary = import_maps.get("summary").unwrap_or(&Value::Null);
-    let bundle_summary = bundles.get("summary").unwrap_or(&Value::Null);
-    let generated_summary = generated_recovery.get("summary").unwrap_or(&Value::Null);
-    let runtime_summary = runtime_scripts.get("summary").unwrap_or(&Value::Null);
-    let runtime_classes = runtime_summary.get("classifications");
-    let api_summary = api_surface.get("summary").unwrap_or(&Value::Null);
-    let wasm_runtime_summary = wasm_resource_provenance
-        .as_ref()
-        .and_then(|doc| doc.get("summary"));
-
     let mut lines = vec![
         "# Recovered source project".to_owned(),
         String::new(),
@@ -375,7 +268,7 @@ pub fn refresh_project_readme(project: &Path, budgets: &AnalysisBudgets) -> Resu
         "- [analysis/import-maps.json](analysis/import-maps.json) — captured import-map definitions, normalized mappings and merge diagnostics.".into(),
         "- [analysis/source-graph.json](analysis/source-graph.json) — machine-readable relationship/provenance graph.".into(),
     ]);
-    if api_surface_doc.is_some() {
+    if artifacts.api_surface_doc.is_some() {
         lines.push("- [analysis/api-surface.json](analysis/api-surface.json) — proof-gated static browser API callsites with exact URL/method evidence and per-source failures.".into());
     }
     if runtime_summary
@@ -395,35 +288,55 @@ pub fn refresh_project_readme(project: &Path, budgets: &AnalysisBudgets) -> Resu
     {
         lines.push("- [src/_observed/invocations/README.md](src/_observed/invocations/README.md) — concrete breakpoint call stacks and bounded observed values with links to exact captured and safe-readable code; these are invocation-specific facts.".into());
     }
-    if wasm_resource_provenance.is_some() {
+    if artifacts.wasm_resource_provenance.is_some() {
         lines.push("- [analysis/wasm-resource-provenance.json](analysis/wasm-resource-provenance.json) — runtime-observed exact WASM responses linked to their CDP script initiators.".into());
     }
 
-    if source_kind == "http_static" {
-        let capture = source.get("http_static").unwrap_or(&Value::Null);
-        lines.extend([
-            String::new(),
-            "## HTTP-only acquisition".into(),
-            String::new(),
-            format!("- HTTP responses: **{}**; request failures: **{}**; pending due to limits: **{}**; response bytes: **{}**", usize_field(capture, "resources"), usize_field(capture, "failed_resources"), usize_field(capture, "pending_resources"), usize_field(capture, "bytes")),
-            "- [Raw HTTP capture](analysis/http-capture.har) and [fetch details](analysis/http-static.json).".into(),
-            "- This is HTTP-discovered source, not a browser execution trace. Runtime-generated scripts may require a browser capture.".into(),
-        ]);
-        for warning in array(capture, "warnings") {
-            if let Some(message) = warning.as_str() {
-                lines.push(format!("- Acquisition note: {}", literal_text(message)));
-            }
+    lines
+}
+
+fn append_http_acquisition(lines: &mut Vec<String>, source: &Value) {
+    if str_field(source, "kind") != Some("http_static") {
+        return;
+    }
+    let capture = source.get("http_static").unwrap_or(&Value::Null);
+    lines.extend([
+        String::new(),
+        "## HTTP-only acquisition".into(),
+        String::new(),
+        format!("- HTTP responses: **{}**; request failures: **{}**; pending due to limits: **{}**; response bytes: **{}**", usize_field(capture, "resources"), usize_field(capture, "failed_resources"), usize_field(capture, "pending_resources"), usize_field(capture, "bytes")),
+        "- [Raw HTTP capture](analysis/http-capture.har) and [fetch details](analysis/http-static.json).".into(),
+        "- This is HTTP-discovered source, not a browser execution trace. Runtime-generated scripts may require a browser capture.".into(),
+    ]);
+    for warning in array(capture, "warnings") {
+        if let Some(message) = warning.as_str() {
+            lines.push(format!("- Acquisition note: {}", literal_text(message)));
         }
     }
+}
 
+fn append_capture_summary(
+    lines: &mut Vec<String>,
+    manifest_value: &Value,
+    artifacts: &ReadmeArtifacts,
+) {
+    let runtime_summary = summary(&artifacts.runtime_scripts);
+    let runtime_classes = runtime_summary.get("classifications");
+    let wasm_runtime_summary = artifacts
+        .wasm_resource_provenance
+        .as_ref()
+        .and_then(|doc| doc.get("summary"));
     lines.extend([
         String::new(),
         "## Capture summary".into(),
         String::new(),
-        format!("- Captured resources: **{}**", resources.len()),
+        format!(
+            "- Captured resources: **{}**",
+            array(manifest_value, "resources").len()
+        ),
         format!(
             "- Inline scripts: **{}**",
-            array(&manifest_value, "inline_scripts").len()
+            array(manifest_value, "inline_scripts").len()
         ),
     ]);
     if runtime_summary
@@ -451,25 +364,41 @@ pub fn refresh_project_readme(project: &Path, budgets: &AnalysisBudgets) -> Resu
             ));
         }
     }
+}
+
+fn append_source_summary(
+    lines: &mut Vec<String>,
+    artifacts: &ReadmeArtifacts,
+    counts: &SourceCounts,
+    maps: (usize, usize),
+) -> Result<()> {
+    let source_summary = summary(&artifacts.source_index);
+    let jsref_summary = summary(&artifacts.jsrefs);
+    let import_summary = summary(&artifacts.import_maps);
+    let api_summary = artifacts
+        .api_surface_doc
+        .as_ref()
+        .map_or(&Value::Null, summary);
+    let (recovered_originals, composed_sourcemap_links) = maps;
     let unique_js = usize_field(source_summary, "unique_javascript_inputs");
     let unique_js = if source_summary.get("unique_javascript_inputs").is_some() {
         unique_js
     } else {
-        js_units.len()
+        counts.javascript
     };
     let extractor_invocations = if jsref_summary.get("extractor_invocations").is_some() {
         usize_field(jsref_summary, "extractor_invocations")
     } else {
-        js_units.len()
+        counts.javascript
     };
     lines.extend([
-        format!("- Readable source units: **{}** ({} JavaScript)", source_units.len(), js_units.len()),
-        format!("- Exact-content JS reuse: **{unique_js}** unique bodies / **{}** occurrences (**{}** formatter reuses)", js_units.len(), usize_field(source_summary, "deduplicated_javascript_units")),
+        format!("- Readable source units: **{}** ({} JavaScript)", counts.total, counts.javascript),
+        format!("- Exact-content JS reuse: **{unique_js}** unique bodies / **{}** occurrences (**{}** formatter reuses)", counts.javascript, usize_field(source_summary, "deduplicated_javascript_units")),
         format!("- JS-reference extraction: **{extractor_invocations}** parser invocations / **{}** exact-hash reuses", usize_field(jsref_summary, "deduplicated_units")),
-        format!("- Source kinds: {}", code_span(&serde_json::to_string(&source_kinds)?)),
+        format!("- Source kinds: {}", code_span(&serde_json::to_string(&counts.kinds)?)),
         format!("- JS/module/worker references: **{}**", usize_field(jsref_summary, "references")),
     ]);
-    if api_surface_doc.is_some() {
+    if artifacts.api_surface_doc.is_some() {
         lines.push(format!("- Static browser API callsites: **{}**; callsites with exact absolute network URLs: **{}**; proven invalid methods: **{}**; failed source units: **{}**", usize_field(api_summary, "callsites"), usize_field(api_summary, "absolute_network_urls"), usize_field(api_summary, "invalid_methods"), usize_field(api_summary, "failures")));
         lines.push(format!(
             "- Static browser API sink kinds: {}",
@@ -483,6 +412,18 @@ pub fn refresh_project_readme(project: &Path, budgets: &AnalysisBudgets) -> Resu
         format!("- Unresolved bare module specifiers: **{}**", usize_field(jsref_summary, "unresolved_bare_specifiers")),
         format!("- Source-map originals recovered: **{recovered_originals}**"),
         format!("- Nested source-map links composed: **{composed_sourcemap_links}**"),
+    ]);
+    Ok(())
+}
+
+fn append_generated_summary(lines: &mut Vec<String>, artifacts: &ReadmeArtifacts) {
+    let generated_summary = summary(&artifacts.generated_recovery);
+    let dynamic = array(&artifacts.jsvm, "dynamic_code_units");
+    let recursive_generated = array(&artifacts.jsvm, "code_units")
+        .iter()
+        .filter(|unit| str_field(unit, "origin") == Some("generated_dynamic_code"))
+        .count();
+    lines.extend([
         format!("- Literal generated-code units recovered: **{}**", dynamic.len()),
         format!("- Generated-code units recursively scanned: **{recursive_generated}**"),
         format!("- Generated-code safe recovery: **{}** safe deob, **{}** string-only, **{}** exact fallback", usize_field(generated_summary, "safe_deobfuscation"), usize_field(generated_summary, "string_recovery_only"), usize_field(generated_summary, "exact_fallback")),
@@ -490,17 +431,54 @@ pub fn refresh_project_readme(project: &Path, budgets: &AnalysisBudgets) -> Resu
         format!("- Generated children with full safe deobfuscation: **{}**", usize_field(generated_summary, "safe_deobfuscation")),
         format!("- Generated children with string-recovery only: **{}**", usize_field(generated_summary, "string_recovery_only")),
         format!("- Generated children scanned from exact fallback bytes: **{}**", usize_field(generated_summary, "exact_fallback")),
+    ]);
+}
+
+fn append_deobfuscation(lines: &mut Vec<String>, deob: &Value, javascript_units: usize) {
+    let deob_summary = deob.get("summary").unwrap_or(&Value::Null);
+    let changed_deob = deob_summary
+        .get("changed_units")
+        .and_then(Value::as_u64)
+        .and_then(|v| usize::try_from(v).ok())
+        .unwrap_or_else(|| {
+            array(deob, "units")
+                .iter()
+                .filter(|unit| bool_field(unit, "changed"))
+                .count()
+        });
+    let deob_failures = deob_summary
+        .get("failures")
+        .and_then(Value::as_u64)
+        .and_then(|v| usize::try_from(v).ok())
+        .unwrap_or_else(|| {
+            array(deob, "units")
+                .iter()
+                .filter(|unit| nonzero_integer_field(unit, "exit"))
+                .count()
+        });
+    let arithmetic_state_proofs = array(deob, "units")
+        .iter()
+        .map(|unit| array(unit, "arithmetic_state_proofs").len())
+        .sum::<usize>();
+
+    lines.extend([
         String::new(),
         "## Safe static deobfuscation".into(),
         String::new(),
         format!("- Changed JavaScript units: **{changed_deob}**"),
         format!("- Failed units: **{deob_failures}**"),
-        format!("- Content-addressed work: **{}** unique raw inputs, **{}** safe-deob invocations, **{}** readable-format invocations for **{}** JS occurrences", if deob_summary.get("unique_raw_inputs").is_some() { usize_field(deob_summary, "unique_raw_inputs") } else { js_units.len() }, if deob_summary.get("safe_deob_invocations").is_some() { usize_field(deob_summary, "safe_deob_invocations") } else { js_units.len() }, if deob_summary.get("readable_format_invocations").is_some() { usize_field(deob_summary, "readable_format_invocations") } else { js_units.len() }, if deob_summary.get("javascript_units").is_some() { usize_field(deob_summary, "javascript_units") } else { js_units.len() }),
+        format!("- Content-addressed work: **{}** unique raw inputs, **{}** safe-deob invocations, **{}** readable-format invocations for **{}** JS occurrences", if deob_summary.get("unique_raw_inputs").is_some() { usize_field(deob_summary, "unique_raw_inputs") } else { javascript_units }, if deob_summary.get("safe_deob_invocations").is_some() { usize_field(deob_summary, "safe_deob_invocations") } else { javascript_units }, if deob_summary.get("readable_format_invocations").is_some() { usize_field(deob_summary, "readable_format_invocations") } else { javascript_units }, if deob_summary.get("javascript_units").is_some() { usize_field(deob_summary, "javascript_units") } else { javascript_units }),
         format!("- Encoded string-decoder recovery: **{}** call sites across **{}** unit(s)", usize_field(deob_summary, "string_recovery_replacements"), usize_field(deob_summary, "string_recovery_changed_units")),
         format!("- Proven arithmetic-state unflattenings: **{arithmetic_state_proofs}**"),
         "- Encoded string-table proof/provenance: [analysis/string-recovery.json](analysis/string-recovery.json)".into(),
         "- Detailed captured-unit final-view hashes, pass counts and provenance: [analysis/deobfuscation.json](analysis/deobfuscation.json)".into(),
         "- Recursive generated-code recovery/fallback provenance: [analysis/generated-recovery.json](analysis/generated-recovery.json)".into(),
+    ]);
+}
+
+fn append_bundle_summary(lines: &mut Vec<String>, bundles: &Value) {
+    let bundle_summary = summary(bundles);
+    lines.extend([
         String::new(),
         "## Structured bundle modules".into(),
         String::new(),
@@ -513,10 +491,39 @@ pub fn refresh_project_readme(project: &Path, budgets: &AnalysisBudgets) -> Resu
         format!("- Modules with a static CommonJS `module.exports` write: **{}**", usize_field(bundle_summary, "commonjs_export_modules")),
         format!("- Bundle-analysis failures: **{}**", usize_field(bundle_summary, "failed_units")),
         "- Module inventory/provenance: [analysis/bundles.json](analysis/bundles.json)".into(),
+    ]);
+}
+
+fn append_vm_analysis(lines: &mut Vec<String>, jsvm: &Value) {
+    let vm_units = array(jsvm, "code_units");
+    let confirmed = vm_units
+        .iter()
+        .filter(|unit| bool_field(unit, "confirmed_vm_signal"))
+        .collect::<Vec<_>>();
+    let candidates = vm_units
+        .iter()
+        .filter(|unit| bool_field(unit, "vm_signal") && !bool_field(unit, "confirmed_vm_signal"))
+        .collect::<Vec<_>>();
+    let devirtualized = array(jsvm, "devirtualized_units");
+    let large_handler_candidates = candidates
+        .iter()
+        .copied()
+        .filter(|unit| bool_field(unit, "large_handler_table_candidate"))
+        .collect::<Vec<_>>();
+    let switch_devirtualized = devirtualized
+        .iter()
+        .filter(|unit| str_field(unit, "vm_kind") == Some("direct_switch"))
+        .count();
+    let table_devirtualized = devirtualized
+        .iter()
+        .filter(|unit| str_field(unit, "vm_kind") == Some("function_table"))
+        .count();
+
+    lines.extend([
         String::new(),
         "## VM analysis".into(),
         String::new(),
-        format!("- Scanner work: **{}** scanner invocations / **{}** exact-hash reuses", if jsvm.get("scanner_invocations").is_some() { usize_field(&jsvm, "scanner_invocations") } else { vm_units.len() }, usize_field(&jsvm, "deduplicated_scans")),
+        format!("- Scanner work: **{}** scanner invocations / **{}** exact-hash reuses", if jsvm.get("scanner_invocations").is_some() { usize_field(jsvm, "scanner_invocations") } else { vm_units.len() }, usize_field(jsvm, "deduplicated_scans")),
         format!("- Proven bundle module tables excluded from handler-table candidate scoring: **{}**", vm_units.iter().map(|unit| usize_field(unit, "bundle_module_table_handler_tables")).sum::<usize>()),
         format!("- Confirmed VM-bearing JavaScript units: **{}**", confirmed.len()),
         format!("- Weaker VM candidates: **{}**", candidates.len()),
@@ -566,7 +573,9 @@ pub fn refresh_project_readme(project: &Path, budgets: &AnalysisBudgets) -> Resu
             ));
         }
     }
+}
 
+fn append_provenance(lines: &mut Vec<String>, graph: &Value, source: &Value) {
     if let Some(summary) = graph
         .get("summary")
         .filter(|v| v.as_object().is_some_and(|o| !o.is_empty()))
@@ -611,6 +620,50 @@ pub fn refresh_project_readme(project: &Path, budgets: &AnalysisBudgets) -> Resu
         "resources/ is capture truth. Everything under src/, including _deobfuscated/, _readable/, _dynamic_deobfuscated/, _dynamic/, _devirtualized/, _modules/, and _sourcemap/, is a derived analyst view and should be traced through the files in analysis/ before treating it as original captured source.".into(),
         String::new(),
     ]);
+}
+
+/// Regenerate the project README from its durable analysis artifacts.
+///
+/// # Errors
+///
+/// Fails if the project cannot be resolved, manifest/artifact data cannot be read or
+/// serialized, the README cannot be written, or the analysis budget is exhausted.
+pub fn refresh_project_readme(project: &Path, budgets: &AnalysisBudgets) -> Result<()> {
+    let budget = budgets.operation(
+        AnalysisOperation::ProjectReadme,
+        project.display().to_string(),
+    );
+    budget.checkpoint()?;
+    let project = project
+        .canonicalize()
+        .with_context(|| format!("resolving project {}", project.display()))?;
+    let manifest = load_manifest(&project)?;
+    let manifest_value = serde_json::to_value(&manifest)?;
+    budget.checkpoint()?;
+
+    let artifacts = ReadmeArtifacts::load(&project)?;
+    budget.checkpoint()?;
+    let counts = collect_source_counts(&artifacts.source_index, &budget)?;
+    let maps = sourcemap_counts(&artifacts.sourcemaps, &budget)?;
+    let entrypoints = render_entrypoint_index(
+        &manifest_value,
+        &artifacts.source_index,
+        &artifacts.deob,
+        &artifacts.jsrefs,
+        &budget,
+    )?;
+    let source = manifest_value
+        .get("source")
+        .context("capture manifest source missing")?;
+    let mut lines = render_introduction(&project, source, &artifacts, entrypoints.declared_scripts);
+    append_http_acquisition(&mut lines, source);
+    append_capture_summary(&mut lines, &manifest_value, &artifacts);
+    append_source_summary(&mut lines, &artifacts, &counts, maps)?;
+    append_generated_summary(&mut lines, &artifacts);
+    append_deobfuscation(&mut lines, &artifacts.deob, counts.javascript);
+    append_bundle_summary(&mut lines, &artifacts.bundles);
+    append_vm_analysis(&mut lines, &artifacts.jsvm);
+    append_provenance(&mut lines, &artifacts.graph, source);
 
     // Both documents describe this generation. Render and stage both before
     // either is published, including failures at the second destination.
