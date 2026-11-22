@@ -39,6 +39,28 @@ pub(super) fn compare_pairs(
     Ok(())
 }
 
+fn assert_mismatch(label: &str, original: &str, rewritten: &str) -> Result<()> {
+    let result = compare_pairs(
+        label,
+        &[Comparison {
+            label: label.into(),
+            original: original.into(),
+            rewritten: rewritten.into(),
+        }],
+        false,
+    );
+    let Err(error) = result else {
+        bail!("{label} must not compare equal");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("{label}: mismatch at encoded offset")),
+        "{label}: unexpected harness error: {error}"
+    );
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires Node; semantic CI invokes explicitly"]
 fn depythonify_safe_deob_observation_runner_detects_mismatches() -> Result<()> {
@@ -91,24 +113,7 @@ fn depythonify_safe_deob_observation_runner_detects_mismatches() -> Result<()> {
         ("function-alias", "const f=()=>1;[f,f]", "[()=>1,()=>1]"),
     ];
     for (label, original, rewritten) in cases {
-        let result = compare_pairs(
-            label,
-            &[Comparison {
-                label: label.into(),
-                original: original.into(),
-                rewritten: rewritten.into(),
-            }],
-            false,
-        );
-        let Err(error) = result else {
-            bail!("{label} must not compare equal");
-        };
-        assert!(
-            error
-                .to_string()
-                .contains(&format!("{label}: mismatch at encoded offset")),
-            "{label}: unexpected harness error: {error}"
-        );
+        assert_mismatch(label, original, rewritten)?;
     }
 
     Ok(())
@@ -127,6 +132,21 @@ fn depythonify_safe_deob_observation_runner_rejects_invalid_observations() -> Re
         (
             "exotic-object",
             "new Map()",
+            "unsupported observation: exotic object",
+        ),
+        (
+            "reparented-exotic",
+            "Object.setPrototypeOf(new Map(),null)",
+            "unsupported observation: exotic object",
+        ),
+        (
+            "custom-record-prototype",
+            "Object.create({})",
+            "unsupported observation: object prototype",
+        ),
+        (
+            "custom-error-prototype",
+            "new (class extends Error {})('x')",
             "unsupported observation: object prototype",
         ),
         (
@@ -209,6 +229,70 @@ fn depythonify_safe_deob_observation_runner_compares_matching_graphs() -> Result
             original: "events.push(-0,void 0,0n);[NaN,-0,void 0,,0n]".into(),
             rewritten: "events.push(-0,void 0,0n);[0/0,-0,void 0,,0n]".into(),
         }],
+        false,
+    )
+}
+
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_observation_runner_preserves_error_properties() -> Result<()> {
+    for (label, original, rewritten) in [
+        (
+            "error-prototype",
+            "throw Object.assign(Error('x'),{'name':'Same'})",
+            "throw Object.assign(TypeError('x'),{'name':'Same'})",
+        ),
+        ("error-message-presence", "throw Error()", "throw Error('')"),
+        (
+            "error-cause",
+            "throw Error('x',{'cause':-0})",
+            "throw Error('x',{'cause':0})",
+        ),
+        (
+            "error-aggregate",
+            "throw AggregateError([Error('a')],'x')",
+            "throw AggregateError([Error('b')],'x')",
+        ),
+        (
+            "error-own-data",
+            "throw Object.assign(Error('x'),{'extra':1})",
+            "throw Error('x')",
+        ),
+        (
+            "error-extensibility",
+            "throw Object.freeze(Error('x'))",
+            "throw Error('x')",
+        ),
+        (
+            "error-cause-alias",
+            "const a={};events.push(a);throw Error('x',{'cause':a})",
+            "events.push({});throw Error('x',{'cause':{}})",
+        ),
+    ] {
+        assert_mismatch(label, original, rewritten)?;
+    }
+    compare_pairs(
+        "matching-error-graphs",
+        &[
+            Comparison {
+                label: "error-cycle".into(),
+                original: "const e=Error('x');e.cause=e;events.push(e);throw e".into(),
+                rewritten: "const f=new Error('x');f.cause=f;events.push(f);throw f".into(),
+            },
+            Comparison {
+                label: "aggregate-alias".into(),
+                original: "const e=Error('member');throw AggregateError([e,e],'x',{'cause':e})"
+                    .into(),
+                rewritten:
+                    "const f=new Error('member');throw new AggregateError([f,f],'x',{'cause':f})"
+                        .into(),
+            },
+            Comparison {
+                label: "stack-excluded".into(),
+                original: "throw Object.defineProperty(Error('x'),'stack',{get(){throw 1}})".into(),
+                rewritten: "throw Error('x')".into(),
+            },
+        ],
         false,
     )
 }
