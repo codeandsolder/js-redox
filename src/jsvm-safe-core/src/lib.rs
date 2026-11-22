@@ -2290,6 +2290,8 @@ pub fn recover_static_decoders_with_source_mode(
 #[derive(Debug, Clone)]
 pub struct SafeTransformResult {
     pub source: String,
+    /// Exact validated parser mode; absent for unparseable browser-legacy recovery.
+    pub resolved_source_type: Option<SourceType>,
     pub iterations: usize,
     pub transforms: BTreeMap<String, usize>,
     pub arithmetic_state_proofs: Vec<ArithmeticStateProof>,
@@ -2324,6 +2326,7 @@ fn deobfuscate_with_mode(
             budget.checkpoint()?;
             return Ok(Some(SafeTransformResult {
                 source: source.to_string(),
+                resolved_source_type: None,
                 iterations: 0,
                 transforms: BTreeMap::new(),
                 arithmetic_state_proofs: Vec::new(),
@@ -2396,6 +2399,7 @@ fn deobfuscate_with_mode(
 
     Ok(Some(SafeTransformResult {
         source: current,
+        resolved_source_type: Some(source_type),
         iterations,
         transforms: counts.into_inner(),
         arithmetic_state_proofs,
