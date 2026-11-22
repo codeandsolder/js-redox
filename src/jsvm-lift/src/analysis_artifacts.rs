@@ -156,8 +156,13 @@ artifact!(
     RUNTIME_SCRIPTS,
     "runtime scripts",
     "analysis/runtime-scripts.json",
-    "js-redox-runtime-scripts/v1",
-    arrays = ["alpine_families", "gtm_families", "sources"],
+    "js-redox-runtime-scripts/v2",
+    arrays = [
+        "alpine_families",
+        "gtm_families",
+        "sources",
+        "script_identity_conflicts"
+    ],
     objects = ["summary"]
 );
 artifact!(

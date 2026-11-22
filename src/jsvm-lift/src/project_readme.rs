@@ -198,6 +198,7 @@ pub fn refresh_project_readme(project: &Path, budgets: &AnalysisBudgets) -> Resu
                 ("sources", json!([])),
                 ("alpine_families", json!([])),
                 ("gtm_families", json!([])),
+                ("script_identity_conflicts", json!([])),
                 ("summary", json!({})),
             ],
         ),

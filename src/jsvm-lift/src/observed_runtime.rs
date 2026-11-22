@@ -341,7 +341,8 @@ mod tests {
             &project,
             RUNTIME_SCRIPTS,
             &json!({
-                "schema":RUNTIME_SCRIPTS.schema,"summary":{},"alpine_families":[],
+                "schema":RUNTIME_SCRIPTS.schema,
+                "script_identity_conflicts":[],"summary":{},"alpine_families":[],
                 "gtm_families":[],"sources":[{
                     "sha256":digest,"path":rel,"classification":"network_response",
                     "observed_executed":true,"script_instances":[{"cdp_session":"main",

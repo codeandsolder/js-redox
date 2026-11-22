@@ -2,10 +2,11 @@
 use crate::{
     analysis_artifacts::{load_artifact, write_artifact, RUNTIME_SCRIPTS, SELECTIVE_TRACE},
     analysis_budget::AnalysisBudgets,
+    runtime_identity::{script_id_text, ScriptIdentityIndex},
 };
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
-use std::{collections::HashMap, fs, path::Path};
+use std::{fs, path::Path};
 
 /// Verify an inspector-provided definition against the captured script
 /// inventory. This proves the code location of one observed function value,
@@ -13,14 +14,14 @@ use std::{collections::HashMap, fs, path::Path};
 fn verify_function_definition(
     value: &mut Value,
     session: &str,
-    identities: &HashMap<(String, String), Option<String>>,
+    identities: &ScriptIdentityIndex<String>,
     verified: &mut u64,
     unresolved: &mut u64,
 ) {
     let Some(definition) = value.get_mut("functionDefinition") else {
         return;
     };
-    let script = definition.get("scriptId").and_then(Value::as_str);
+    let script = definition.get("scriptId").and_then(script_id_text);
     let evidence = definition.get("evidence").and_then(Value::as_str);
     let line = definition.get("lineNumber").and_then(Value::as_u64);
     let column = definition.get("columnNumber").and_then(Value::as_u64);
@@ -32,9 +33,7 @@ fn verify_function_definition(
             return None;
         }
         let script = script?;
-        identities
-            .get(&(session.to_owned(), script.to_owned()))
-            .and_then(Option::as_deref)
+        identities.get(session, &script).map(String::as_str)
     })();
     if let Some(sha) = exact {
         definition["source_identity"] = json!("exact");
@@ -49,16 +48,16 @@ fn verify_function_definition(
 fn verify_observed_frame_source(
     frame: &mut Value,
     session: &str,
-    identities: &HashMap<(String, String), Option<String>>,
+    identities: &ScriptIdentityIndex<String>,
 ) -> bool {
     let script = frame
         .get("location")
         .and_then(|location| location.get("scriptId"))
-        .and_then(Value::as_str);
+        .and_then(script_id_text);
     let reported = frame.get("sourceSha256").and_then(Value::as_str);
     let actual = script
-        .and_then(|id| identities.get(&(session.to_owned(), id.to_owned())))
-        .and_then(Option::as_deref);
+        .and_then(|id| identities.get(session, &id))
+        .map(String::as_str);
     let exact = actual.is_some() && actual == reported;
     frame["source_identity"] = json!(if exact { "exact" } else { "unresolved" });
     exact
@@ -82,42 +81,9 @@ pub(super) fn import_selective_trace(
     }
     let runtime = load_artifact(project, RUNTIME_SCRIPTS, false)?
         .context("runtime inventory required for breakpoint source verification")?;
-    let mut identities = HashMap::<(String, String), Option<String>>::new();
-    for source in runtime
-        .get("sources")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        budget.consume(1)?;
-        let Some(sha) = source.get("sha256").and_then(Value::as_str) else {
-            continue;
-        };
-        for instance in source
-            .get("script_instances")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            budget.consume(1)?;
-            let Some(session) = instance.get("cdp_session").and_then(Value::as_str) else {
-                continue;
-            };
-            let Some(script) = instance.get("script_id").and_then(Value::as_str) else {
-                continue;
-            };
-            let key = (session.to_owned(), script.to_owned());
-            match identities.get(&key) {
-                Some(Some(previous)) if previous != sha => {
-                    identities.insert(key, None);
-                }
-                Some(None) => {}
-                _ => {
-                    identities.insert(key, Some(sha.to_owned()));
-                }
-            }
-        }
-    }
+    let identities = ScriptIdentityIndex::from_runtime_report(&runtime, &budget, |sha, _, _| {
+        Some(sha.to_owned())
+    })?;
     let mut verified = 0_u64;
     let mut unresolved = 0_u64;
     let mut verified_step_frames = 0_u64;
@@ -245,7 +211,8 @@ mod tests {
             RUNTIME_SCRIPTS,
             &json!({
                 "schema":RUNTIME_SCRIPTS.schema,
-                "sources":[{"sha256":"abc", "script_instances":[{"cdp_session":"main","script_id":"6"}]}],
+                "script_identity_conflicts":[{"cdp_session":"main","script_id":"8","sha256_claims":["abc","missing-body"]}],
+                "sources":[{"sha256":"abc", "script_instances":[{"cdp_session":"main","script_id":"6"},{"cdp_session":"main","script_id":"8"}]}],
                 "alpine_families":[], "gtm_families":[], "summary":{}
             }),
         )?;

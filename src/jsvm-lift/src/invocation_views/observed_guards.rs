@@ -1,7 +1,7 @@
 //! Proof-bounded correspondence between a concrete debugger pause and an AST
 //! control guard in the exact original script. Never specialize the shared JS.
 use super::{verified_sha, RuntimeIdentityIndex};
-use crate::trace_identity::same_observed_call_stack;
+use crate::{runtime_identity::script_id_text, trace_identity::same_observed_call_stack};
 use anyhow::Result;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
@@ -149,16 +149,13 @@ pub(super) fn observe(
         if frame.get("source_identity").and_then(Value::as_str) != Some("exact") {
             continue;
         }
-        let Some(script) = frame.pointer("/location/scriptId").and_then(Value::as_str) else {
+        let Some(script) = frame.pointer("/location/scriptId").and_then(script_id_text) else {
             continue;
         };
         let Some(sha) = frame.get("sourceSha256").and_then(verified_sha) else {
             continue;
         };
-        let Some(identity) = identities
-            .get(&(session.to_owned(), script.to_owned()))
-            .and_then(Option::as_ref)
-        else {
+        let Some(identity) = identities.get(session, &script) else {
             continue;
         };
         if identity.sha256 != sha || identity.capture_instrumentation {
@@ -243,7 +240,7 @@ pub(super) fn observe(
                 if let Some(next_frame) = top_frame(next) {
                     let next_script = next_frame
                         .pointer("/location/scriptId")
-                        .and_then(Value::as_str);
+                        .and_then(script_id_text);
                     let next_sha = next_frame.get("sourceSha256").and_then(Value::as_str);
                     let next_line = next_frame
                         .pointer("/location/lineNumber")
@@ -251,7 +248,7 @@ pub(super) fn observe(
                     let next_column = next_frame
                         .pointer("/location/columnNumber")
                         .and_then(Value::as_u64);
-                    if next_script == Some(script) && next_sha == Some(sha) {
+                    if next_script.as_deref() == Some(script.as_ref()) && next_sha == Some(sha) {
                         if let (Some(line), Some(column)) = (next_line, next_column) {
                             if let Some(at) = cdp_byte_offset(
                                 source,
@@ -320,15 +317,16 @@ mod tests {
             project.join(format!("resources/runtime-scripts/{sha}.js")),
             source,
         )?;
-        let mut identities = RuntimeIdentityIndex::new();
-        identities.insert(
-            ("main".into(), "7".into()),
-            Some(super::super::RuntimeSourceIdentity {
+        let mut identities = RuntimeIdentityIndex::default();
+        identities.register(
+            "main",
+            "7",
+            super::super::RuntimeSourceIdentity {
                 sha256: sha.clone(),
                 start_line: Some(10),
                 start_column: Some(0),
                 capture_instrumentation: false,
-            }),
+            },
         );
         let frame = |col| {
             json!({
