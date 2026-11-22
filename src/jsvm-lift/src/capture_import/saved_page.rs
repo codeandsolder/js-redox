@@ -17,7 +17,6 @@ use html_escape::decode_html_entities;
 use regex::Regex;
 use serde_json::{json, Map, Value};
 use std::{
-    borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     ffi::OsStr,
     fs,
@@ -399,12 +398,18 @@ fn materialize_saved_resources(
         let url = canonical_url(capture_rel)?;
         // The page body is exactly the snapshot decoded by the importer.
         // Other assets are read once into the staged capture.
-        let data = if source == page {
-            Cow::Borrowed(page_bytes)
+        let destination = output.join(&output_rel);
+        let identity = if source == page {
+            let bytes = u64::try_from(page_bytes.len())?;
+            budget.consume(bytes.div_ceil(1024))?;
+            crate::report_file::write_bytes(&destination, page_bytes)?;
+            crate::content_dedup::FileDigest {
+                sha256: sha256_hex(page_bytes),
+                bytes,
+            }
         } else {
-            Cow::Owned(crate::report_file::read_bytes(source)?)
+            crate::report_file::copy_snapshot(source, &destination, budget)?
         };
-        crate::report_file::write_bytes(&output.join(&output_rel), &data)?;
         let mime = guess_mime(source);
         let kind = resource_kind(&url, &mime);
         let mut object = Map::new();
@@ -417,11 +422,11 @@ fn materialize_saved_resources(
         object.insert("status".into(), json!(200));
         object.insert("status_text".into(), json!("Saved locally"));
         object.insert("mime_type".into(), json!(mime));
-        object.insert("declared_size".into(), json!(data.len()));
+        object.insert("declared_size".into(), json!(identity.bytes));
         object.insert("encoding".into(), Value::Null);
         object.insert("body_present".into(), json!(true));
-        object.insert("body_bytes".into(), json!(data.len()));
-        object.insert("sha256".into(), json!(sha256_hex(&data)));
+        object.insert("body_bytes".into(), json!(identity.bytes));
+        object.insert("sha256".into(), json!(identity.sha256));
         object.insert("kind".into(), json!(kind));
         object.insert("output_path".into(), json!(archive_path));
         object.insert("reused_body".into(), json!(false));

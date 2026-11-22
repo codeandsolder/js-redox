@@ -1,6 +1,10 @@
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
-use std::{fs, io::Read, path::Path};
+use std::{
+    fs,
+    io::{BufRead, BufReader, ErrorKind, Read},
+    path::Path,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Materialization {
@@ -32,25 +36,53 @@ pub(crate) fn is_canonical_sha256(value: &str) -> bool {
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+/// Identity and length of precisely the bytes consumed by a stream operation.
+pub(crate) struct FileDigest {
+    pub(crate) sha256: String,
+    pub(crate) bytes: u64,
+}
+
+pub(crate) fn digest_stream(
+    reader: impl Read,
+    mut visit: impl FnMut(&[u8], u64) -> Result<()>,
+) -> Result<FileDigest> {
+    // fill_buf lends the same storage to the digest and consumer and avoids
+    // initializing a megabyte of array contents for every small file.
+    let mut reader = BufReader::with_capacity(1024 * 1024, reader);
+    let mut hasher = Sha256::new();
+    let mut bytes = 0u64;
+    loop {
+        let chunk = match reader.fill_buf() {
+            Ok(chunk) => chunk,
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if chunk.is_empty() {
+            break;
+        }
+        let count = chunk.len();
+        bytes = bytes
+            .checked_add(u64::try_from(count)?)
+            .context("file size overflow")?;
+        visit(chunk, bytes)?;
+        hasher.update(chunk);
+        reader.consume(count);
+    }
+    Ok(FileDigest {
+        sha256: encode_digest(&hasher.finalize()),
+        bytes,
+    })
+}
+
 /// Compute a lowercase hexadecimal SHA-256 digest of a file.
 ///
 /// # Errors
-///
 /// Fails when the source file cannot be opened or read.
 pub fn sha256_path(path: &Path) -> Result<String> {
-    let mut file = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0_u8; 1024 * 1024];
-    loop {
-        let count = file
-            .read(&mut buffer)
-            .with_context(|| format!("reading {}", path.display()))?;
-        if count == 0 {
-            break;
-        }
-        hasher.update(&buffer[..count]);
-    }
-    Ok(encode_digest(&hasher.finalize()))
+    let file = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    Ok(digest_stream(file, |_, _| Ok(()))
+        .with_context(|| format!("reading {}", path.display()))?
+        .sha256)
 }
 
 #[must_use]
