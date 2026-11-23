@@ -1455,10 +1455,11 @@ mod tests {
                 coerced[0] < read && read < rhs && rhs < coerced[1] && coerced[1] < put,
                 "{phases}"
             );
-            for row in phases
-                .lines()
-                .filter(|row| row.contains("| Call | rhs;") || row.contains("| PutValue target |"))
-            {
+            let super_put = literal_text(&format!("super[key()] {op} (setter may run)"));
+            for row in [
+                phase_row(&phases, "| Call | rhs;"),
+                phase_row(&phases, &super_put),
+            ] {
                 assert!(row.contains(guard), "{row}");
             }
             assert!(phase_row(&phases, "| GetValue target |").contains("| unguarded |"));
