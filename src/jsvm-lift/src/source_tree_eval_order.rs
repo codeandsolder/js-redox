@@ -74,7 +74,11 @@ impl NormalPaths {
             unknown: self.unknown,
         };
         for path in &self.alternatives {
-            if let Some(existing) = path.conditions.iter().find(|c| c.site == site) {
+            if let Some(existing) = path
+                .conditions
+                .iter()
+                .find(|c| c.site == site && c.yes == yes && c.no == no)
+            {
                 if existing.positive == positive && existing.yes == yes && existing.no == no {
                     next.alternatives.push(path.clone());
                 }
@@ -103,10 +107,20 @@ impl NormalPaths {
         self.normalize();
     }
 
+    fn deduplicate(&mut self) {
+        let mut unique = Vec::new();
+        for path in std::mem::take(&mut self.alternatives) {
+            if !unique.contains(&path) {
+                unique.push(path);
+            }
+        }
+        self.alternatives = unique;
+    }
+
     fn normalize(&mut self) {
         // Merge complementary branch endings at their join; then repeat for
         // independent nested branches. Preserve source-order guard IDs.
-        self.alternatives.dedup();
+        self.deduplicate();
         loop {
             let mut merged = false;
             'pairs: for i in 0..self.alternatives.len() {
@@ -141,7 +155,7 @@ impl NormalPaths {
             if !merged {
                 break;
             }
-            self.alternatives.dedup();
+            self.deduplicate();
         }
         // A shorter conjunction already covers the longer conjunction.
         let all = self.alternatives.clone();
@@ -1173,6 +1187,46 @@ impl<'s> Plan<'s> {
         }
     }
 
+    /// Both operands complete before the relational object requirement is
+    /// checked. This differs from getter/key coercion and from callability.
+    fn binary(&mut self, binary: &oxc_ast::ast::BinaryExpression<'_>) {
+        self.expression(&binary.left);
+        self.expression(&binary.right);
+        let right = value_facts(&binary.right, 0);
+        if binary.operator.as_str() == "in" && right.has(ValueProperty::NonObject) {
+            self.mark(
+                binary.right.span(),
+                "RequireObject right",
+                "in requires an object as right operand; key coercion has not happened",
+            );
+            self.throw(
+                binary.span,
+                "in with a guaranteed primitive right operand throws TypeError",
+            );
+            return;
+        }
+        if binary.operator.as_str() == "instanceof" && right.has(ValueProperty::Nullish) {
+            self.mark(
+                binary.right.span(),
+                "GetMethod @@hasInstance",
+                "nullish right operand cannot supply @@hasInstance",
+            );
+            self.throw(
+                binary.span,
+                "instanceof with a guaranteed nullish right operand throws TypeError",
+            );
+            return;
+        }
+        self.mark(
+            binary.span,
+            "apply binary operator",
+            format!(
+                "{} (coercion follows both operands)",
+                binary.operator.as_str()
+            ),
+        );
+    }
+
     fn expression(&mut self, expr: &Expression<'_>) {
         match expr {
             Expression::ParenthesizedExpression(paren) => self.expression(&paren.expression),
@@ -1215,43 +1269,7 @@ impl<'s> Plan<'s> {
                     p.expression(&logical.right);
                 });
             }
-            Expression::BinaryExpression(binary) => {
-                self.expression(&binary.left);
-                self.expression(&binary.right);
-                let right = value_facts(&binary.right, 0);
-                if binary.operator.as_str() == "in" && right.has(ValueProperty::NonObject) {
-                    self.mark(
-                        binary.right.span(),
-                        "RequireObject right",
-                        "in requires an object as right operand; key coercion has not happened",
-                    );
-                    self.throw(
-                        binary.span,
-                        "in with a guaranteed primitive right operand throws TypeError",
-                    );
-                    return;
-                }
-                if binary.operator.as_str() == "instanceof" && right.has(ValueProperty::Nullish) {
-                    self.mark(
-                        binary.right.span(),
-                        "GetMethod @@hasInstance",
-                        "nullish right operand cannot supply @@hasInstance",
-                    );
-                    self.throw(
-                        binary.span,
-                        "instanceof with a guaranteed nullish right operand throws TypeError",
-                    );
-                    return;
-                }
-                self.mark(
-                    binary.span,
-                    "apply binary operator",
-                    format!(
-                        "{} (coercion follows both operands)",
-                        binary.operator.as_str()
-                    ),
-                );
-            }
+            Expression::BinaryExpression(binary) => self.binary(binary),
             Expression::ChainExpression(chain) => self.chain(chain, Access::Read),
             expr if expr.is_member_expression() => {
                 if let Some(member) = expr.as_member_expression() {
@@ -1805,6 +1823,21 @@ console.log(JSON.stringify(events));
         assert!(options.unknown, "exceeded path budget must be visible");
         assert!(options.labels()[0].contains("unknown"));
         assert!(!options.is_empty());
+
+        // Equal source spans may represent different branching operations.
+        // Only the same predicate identity can contradict an earlier choice.
+        let both = start
+            .assumed(site, true, "left truthy", "left falsy")
+            .assumed(site, false, "target falsy", "target truthy");
+        assert_eq!(both.alternatives.len(), 1);
+        assert_eq!(both.alternatives[0].conditions.len(), 2);
+        let impossible = both.assumed(site, false, "left truthy", "left falsy");
+        assert!(impossible.is_empty());
+
+        let repeated = start.assumed(site, true, "left truthy", "left falsy");
+        let mut joined = repeated.clone();
+        joined.merge(repeated);
+        assert_eq!(joined.alternatives.len(), 1);
     }
 
     #[test]
