@@ -30,6 +30,25 @@ enum Access {
     Delete,
 }
 
+/// Computed property references retain the evaluated key value across
+/// `GetValue` and `PutValue`; a `super` reference also retains its original `this`.
+#[derive(Clone, Copy)]
+struct ComputedKey {
+    base: Span,
+    key: Span,
+    super_reference: bool,
+}
+
+impl ComputedKey {
+    fn new(member: &ComputedMemberExpression<'_>) -> Self {
+        Self {
+            base: member.object.span(),
+            key: member.expression.span(),
+            super_reference: member.object.is_super(),
+        }
+    }
+}
+
 struct Plan<'s> {
     source: &'s str,
     guards: Vec<String>,
@@ -92,26 +111,68 @@ impl<'s> Plan<'s> {
         );
     }
 
-    fn assignment_key(target: &AssignmentTarget<'_>) -> Option<(Span, Span)> {
+    fn assignment_key(target: &AssignmentTarget<'_>) -> Option<ComputedKey> {
         match target {
             AssignmentTarget::ComputedMemberExpression(member) if !member.optional => {
-                Some((member.object.span(), member.expression.span()))
+                Some(ComputedKey::new(member))
             }
             _ => None,
         }
     }
 
-    fn key_coercion(&mut self, key: Option<(Span, Span)>) {
-        if let Some((base, key)) = key {
-            // GetValue/PutValue first runs ToObject(base). A nullish base
-            // throws before converting an object-valued property key.
-            self.mark(base, "ToObject base", "throws for null/undefined");
+    fn update_key(target: &SimpleAssignmentTarget<'_>) -> Option<ComputedKey> {
+        match target {
+            SimpleAssignmentTarget::ComputedMemberExpression(member) if !member.optional => {
+                Some(ComputedKey::new(member))
+            }
+            _ => None,
+        }
+    }
+
+    fn is_super_target(target: &SimpleAssignmentTarget<'_>) -> bool {
+        match target {
+            SimpleAssignmentTarget::StaticMemberExpression(member) => member.object.is_super(),
+            SimpleAssignmentTarget::ComputedMemberExpression(member) => member.object.is_super(),
+            _ => false,
+        }
+    }
+
+    fn key_coercion(&mut self, key: Option<ComputedKey>) {
+        if let Some(key) = key {
+            // GetValue/PutValue first runs ToObject on the reference base,
+            // which for super is GetSuperBase (not the original this receiver).
+            // Both operations may convert the original object-valued key.
             self.mark(
-                key,
+                key.base,
+                "ToObject base",
+                if key.super_reference {
+                    "GetSuperBase result; nullish throws; original this remains receiver"
+                } else {
+                    "throws for null/undefined"
+                },
+            );
+            self.mark(
+                key.key,
                 "ToPropertyKey",
                 "key conversion may invoke Symbol.toPrimitive or valueOf",
             );
         }
+    }
+
+    fn super_this_binding(&mut self, span: Span) {
+        self.mark(
+            span,
+            "GetThisBinding super",
+            "resolve this before property key; uninitialized this throws ReferenceError",
+        );
+    }
+
+    fn form_super_reference(&mut self, span: Span) {
+        self.mark(
+            span,
+            "form super reference",
+            "GetSuperBase; preserve original this as receiver and uncoerced key",
+        );
     }
     fn assignment_target(&mut self, target: &AssignmentTarget<'_>) -> bool {
         // OXC only exposes a simple view for the shared assignment-target
@@ -127,15 +188,26 @@ impl<'s> Plan<'s> {
                 self.mark(target.span(), "resolve reference", name);
             }
             SimpleAssignmentTarget::StaticMemberExpression(member) if !member.optional => {
-                self.expression(&member.object);
-                self.mark(
-                    target.span(),
-                    "form reference",
-                    format!("static property .{}", member.property.name),
-                );
+                if member.object.is_super() {
+                    self.super_this_binding(member.object.span());
+                    self.form_super_reference(member.span);
+                } else {
+                    self.expression(&member.object);
+                    self.mark(
+                        target.span(),
+                        "form reference",
+                        format!("static property .{}", member.property.name),
+                    );
+                }
             }
             SimpleAssignmentTarget::ComputedMemberExpression(member) if !member.optional => {
-                self.computed_reference(member);
+                if member.object.is_super() {
+                    self.super_this_binding(member.object.span());
+                    self.expression(&member.expression);
+                    self.form_super_reference(member.span);
+                } else {
+                    self.computed_reference(member);
+                }
             }
             SimpleAssignmentTarget::PrivateFieldExpression(member) if !member.optional => {
                 self.expression(&member.object);
@@ -206,11 +278,7 @@ impl<'s> Plan<'s> {
 
     fn member(&mut self, member: &MemberExpression<'_>, access: Access) {
         if member.object().is_super() {
-            self.mark(
-                member.object().span(),
-                "GetThisBinding super",
-                "resolve this before property key; uninitialized this throws ReferenceError",
-            );
+            self.super_this_binding(member.object().span());
         } else {
             self.expression(member.object());
         }
@@ -226,11 +294,7 @@ impl<'s> Plan<'s> {
             }
         }
         if member.object().is_super() {
-            self.mark(
-                member.span(),
-                "form super reference",
-                "GetSuperBase; preserve original this as receiver and uncoerced key",
-            );
+            self.form_super_reference(member.span());
         }
         // IsSuperReference is checked before ToObject, ToPropertyKey and
         // [[Delete]]. Evaluating the computed key expression can run user
@@ -244,7 +308,7 @@ impl<'s> Plan<'s> {
             return;
         }
         if let MemberExpression::ComputedMemberExpression(computed) = member {
-            self.key_coercion(Some((computed.object.span(), computed.expression.span())));
+            self.key_coercion(Some(ComputedKey::new(computed)));
         }
         if access == Access::Delete {
             self.mark(member.span(), "DeleteProperty",
@@ -523,7 +587,16 @@ impl<'s> Plan<'s> {
         }
         let op = assign.operator;
         let key = Self::assignment_key(&assign.left);
+        let super_target = assign
+            .left
+            .as_simple_assignment_target()
+            .is_some_and(Self::is_super_target);
         let target = self.snippet(assign.left.span());
+        let receiver = if super_target {
+            "; super accessor receiver is original this (not base prototype)"
+        } else {
+            ""
+        };
         if !op.is_assign() {
             self.key_coercion(key);
         }
@@ -531,7 +604,7 @@ impl<'s> Plan<'s> {
             self.mark(
                 assign.left.span(),
                 "GetValue target",
-                format!("{target}; getter/dynamic resolution/TDZ can throw before RHS"),
+                format!("{target}; getter/dynamic resolution/TDZ can throw before RHS{receiver}"),
             );
         }
         if op.is_logical() {
@@ -549,7 +622,7 @@ impl<'s> Plan<'s> {
                 plan.mark(
                     assign.left.span(),
                     "PutValue target",
-                    format!("{target} {} (setter may run)", op.as_str()),
+                    format!("{target} {} (setter may run){receiver}", op.as_str()),
                 );
             });
         } else {
@@ -564,21 +637,48 @@ impl<'s> Plan<'s> {
             self.mark(
                 assign.left.span(),
                 "PutValue target",
-                format!("{target} {} (setter may run)", op.as_str()),
+                format!("{target} {} (setter may run){receiver}", op.as_str()),
             );
         }
     }
     fn update(&mut self, update: &oxc_ast::ast::UpdateExpression<'_>) {
         if self.simple_target(&update.argument) {
-            if let SimpleAssignmentTarget::ComputedMemberExpression(member) = &update.argument {
-                self.key_coercion(Some((member.object.span(), member.expression.span())));
-            }
-            self.mark(update.argument.span(), "GetValue target", "getter may run");
-            self.mark(update.span, "numeric update", update.operator.as_str());
-            if let SimpleAssignmentTarget::ComputedMemberExpression(member) = &update.argument {
-                self.key_coercion(Some((member.object.span(), member.expression.span())));
-            }
-            self.mark(update.argument.span(), "PutValue target", "setter may run");
+            let key = Self::update_key(&update.argument);
+            let receiver = Self::is_super_target(&update.argument);
+            self.key_coercion(key);
+            self.mark(
+                update.argument.span(),
+                "GetValue target",
+                if receiver {
+                    "getter may run with original this as super receiver"
+                } else {
+                    "getter may run"
+                },
+            );
+            self.mark(
+                update.argument.span(),
+                "ToNumeric target",
+                "convert retrieved value to Number or BigInt; object valueOf/Symbol.toPrimitive may run or throw",
+            );
+            self.mark(
+                update.span,
+                "numeric update",
+                format!(
+                    "{}: compute Number/BigInt successor or predecessor; {} result is observable after PutValue",
+                    update.operator.as_str(),
+                    if update.prefix { "new" } else { "original" }
+                ),
+            );
+            self.key_coercion(key);
+            self.mark(
+                update.argument.span(),
+                "PutValue target",
+                if receiver {
+                    "setter may run with original this as super receiver"
+                } else {
+                    "setter may run"
+                },
+            );
         } else {
             self.opaque(update.span, "extended update expression");
         }
@@ -787,7 +887,9 @@ pub fn ordered_assignment_phases(
          converts after RHS at PutValue. Compound/logical assignments convert \
          before RHS at GetValue and AGAIN after RHS at PutValue; the same \
          object key can yield different names. Logical assignments gate \
-         RHS/PutValue. \
+         RHS/PutValue. Super references resolve the original this before \
+         computed-key evaluation and retain that receiver across getter and \
+         setter calls; GetSuperBase is distinct from the receiver. \
          Primitive literals are marked inert, while RegExp literals create \
          distinct objects. The void operator evaluates its operand (including \
          calls, binding reads and exceptions) before discarding its value; \
@@ -1246,6 +1348,347 @@ mod tests {
         );
         assert!(phase_row(&phases, "| expand spread argument |").contains("non-nullish"));
         assert_eq!(phases.matches("direct eval candidate:").count(), 1);
+    }
+
+    #[test]
+    fn super_simple_assignment_defers_key_coercion_until_after_rhs() {
+        let source = format!(
+            "class Base{{}}class Derived extends Base{{run(key,rhs,side){{root=(side.x=super[key()] = (side.rhs=rhs()),{});}}}}",
+            long_effects()
+        );
+        let phases = plan(&source);
+        let this = position(&phases, "| GetThisBinding super |");
+        let key = position(&phases, "| Call | key;");
+        let formed = position(&phases, "| form super reference |");
+        let rhs = position(&phases, "| Call | rhs;");
+        let object = position(&phases, "| ToObject base |");
+        let coerced = position(&phases, "| ToPropertyKey |");
+        let put = position(&phases, &literal_text("super[key()] = (setter may run)"));
+        assert!(
+            this < key
+                && key < formed
+                && formed < rhs
+                && rhs < object
+                && object < coerced
+                && coerced < put,
+            "{phases}"
+        );
+        assert_eq!(phases.matches("| ToPropertyKey |").count(), 1);
+        assert!(
+            phases.contains("GetSuperBase result; nullish throws; original this remains receiver")
+        );
+        assert!(
+            phase_row(&phases, &literal_text("super[key()] = (setter may run)"))
+                .contains("super accessor receiver is original this")
+        );
+        assert!(!phases.contains("| GetValue target |"), "{phases}");
+    }
+
+    #[test]
+    fn super_compound_assignment_converts_original_key_twice_and_reads_before_rhs() {
+        let source = format!(
+            "class Base{{}}class Derived extends Base{{run(key,rhs,side){{root=(side.x=super[key()] += (side.rhs=rhs()),{});}}}}",
+            long_effects()
+        );
+        let phases = plan(&source);
+        let coercions = phases
+            .match_indices("| ToPropertyKey |")
+            .map(|(i, _)| i)
+            .collect::<Vec<_>>();
+        let objects = phases
+            .match_indices("| ToObject base |")
+            .map(|(i, _)| i)
+            .collect::<Vec<_>>();
+        assert_eq!(coercions.len(), 2, "{phases}");
+        assert_eq!(objects.len(), 2, "{phases}");
+        let this = position(&phases, "| GetThisBinding super |");
+        let key = position(&phases, "| Call | key;");
+        let formed = position(&phases, "| form super reference |");
+        let read = position(&phases, "| GetValue target |");
+        let rhs = position(&phases, "| Call | rhs;");
+        let applied = position(&phases, "| apply assignment operator |");
+        let put = position(&phases, &literal_text("super[key()] += (setter may run)"));
+        assert!(
+            this < key
+                && key < formed
+                && formed < objects[0]
+                && objects[0] < coercions[0]
+                && coercions[0] < read
+                && read < rhs
+                && rhs < applied
+                && applied < objects[1]
+                && objects[1] < coercions[1]
+                && coercions[1] < put,
+            "{phases}"
+        );
+        assert!(phase_row(&phases, "| GetValue target |").contains("super accessor receiver"));
+        assert!(
+            phase_row(&phases, &literal_text("super[key()] += (setter may run)"))
+                .contains("super accessor receiver")
+        );
+    }
+
+    #[test]
+    fn super_logical_assignments_guard_rhs_second_conversion_and_putvalue() {
+        for (op, guard) in [
+            ("&&=", "target truthy"),
+            ("||=", "target falsy"),
+            ("??=", "target nullish"),
+        ] {
+            let source = format!(
+                "class Base{{}}class Derived extends Base{{run(key,rhs,side){{root=(side.x=super[key()] {op} (side.rhs=rhs()),{});}}}}",
+                long_effects()
+            );
+            let phases = plan(&source);
+            let coerced = phases
+                .match_indices("| ToPropertyKey |")
+                .map(|(i, _)| i)
+                .collect::<Vec<_>>();
+            assert_eq!(coerced.len(), 2, "{phases}");
+            let read = position(&phases, "| GetValue target |");
+            let rhs = position(&phases, "| Call | rhs;");
+            let put = position(
+                &phases,
+                &literal_text(&format!("super[key()] {op} (setter may run)")),
+            );
+            assert!(
+                coerced[0] < read && read < rhs && rhs < coerced[1] && coerced[1] < put,
+                "{phases}"
+            );
+            let super_put = literal_text(&format!("super[key()] {op} (setter may run)"));
+            for row in [
+                phase_row(&phases, "| Call | rhs;"),
+                phase_row(&phases, &super_put),
+            ] {
+                assert!(row.contains(guard), "{row}");
+            }
+            assert!(phase_row(&phases, "| GetValue target |").contains("| unguarded |"));
+            assert!(
+                !phases.contains("| apply assignment operator |"),
+                "{phases}"
+            );
+        }
+    }
+
+    #[test]
+    fn super_prefix_and_postfix_update_read_convert_and_write_with_this_receiver() {
+        for expression in [
+            "super[key()]++",
+            "++super[key()]",
+            "super[key()]--",
+            "--super[key()]",
+        ] {
+            let source = format!(
+                "class Base{{}}class Derived extends Base{{run(key,side){{root=(side.x={expression},{});}}}}",
+                long_effects()
+            );
+            let phases = plan(&source);
+            let coercions = phases
+                .match_indices("| ToPropertyKey |")
+                .map(|(i, _)| i)
+                .collect::<Vec<_>>();
+            assert_eq!(coercions.len(), 2, "{phases}");
+            let this = position(&phases, "| GetThisBinding super |");
+            let key = position(&phases, "| Call | key;");
+            let formed = position(&phases, "| form super reference |");
+            let read = position(&phases, "| GetValue target |");
+            let numeric = position(&phases, "| ToNumeric target |");
+            let update = position(&phases, "| numeric update |");
+            let put = position(&phases, "| PutValue target |");
+            assert!(
+                this < key
+                    && key < formed
+                    && formed < coercions[0]
+                    && coercions[0] < read
+                    && read < numeric
+                    && numeric < update
+                    && update < coercions[1]
+                    && coercions[1] < put,
+                "{phases}"
+            );
+            assert!(phase_row(&phases, "| numeric update |").contains(
+                if expression.starts_with("super") {
+                    "original result"
+                } else {
+                    "new result"
+                }
+            ));
+            assert!(phase_row(&phases, "| GetValue target |").contains("original this"));
+            assert!(phase_row(&phases, "| PutValue target |").contains("original this"));
+            assert!(!phases.contains("| opaque expression |"), "{phases}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires installed Node; super class and static receiver with BigInt numeric update"]
+    fn node_confirms_super_static_receivers_and_numeric_update_conversion() -> anyhow::Result<()> {
+        use std::process::Command;
+        let source = r"
+const log=[];
+const key={ [Symbol.toPrimitive](){log.push('key-coerce');return 'x'} };
+class Base {
+  static get x(){log.push('static-get:'+String(this===Derived));return 1}
+  static set x(v){log.push('static-set:'+v+':'+String(this===Derived))}
+  get x(){log.push('instance-get:'+String(this instanceof Derived));return {valueOf(){log.push('ToNumeric');return 1n}}}
+  set x(v){log.push('instance-set:'+typeof v+':'+String(v)+':'+String(this instanceof Derived))}
+}
+class Derived extends Base {
+  static run(){super[key]+=(log.push('static-rhs'),4)}
+  run(){const old=super[key]++;const newValue=++super[key];return [String(old),String(newValue)]}
+}
+Derived.run();
+console.log(JSON.stringify([new Derived().run(),log]));
+";
+        let result = Command::new("node").arg("-e").arg(source).output()?;
+        assert!(result.status.success(), "{result:?}");
+        let actual: serde_json::Value = serde_json::from_slice(&result.stdout)?;
+        assert_eq!(
+            actual,
+            serde_json::json!([
+                ["1", "2"],
+                [
+                    "key-coerce",
+                    "static-get:true",
+                    "static-rhs",
+                    "key-coerce",
+                    "static-set:5:true",
+                    "key-coerce",
+                    "instance-get:true",
+                    "ToNumeric",
+                    "key-coerce",
+                    "instance-set:bigint:2:true",
+                    "key-coerce",
+                    "instance-get:true",
+                    "ToNumeric",
+                    "key-coerce",
+                    "instance-set:bigint:2:true"
+                ]
+            ])
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed Node; super assignment operator family oracle"]
+    fn node_confirms_super_assignment_update_and_logical_operator_events() -> anyhow::Result<()> {
+        use std::process::Command;
+        let source = r"
+const log=[];
+const key={ [Symbol.toPrimitive](){log.push('coerce');return 'x'} };
+class Base {
+  get x(){log.push('get:'+this.value+':'+this.id);return this.value}
+  set x(value){log.push('set:'+String(value)+':'+this.id);this.value=value}
+}
+class Derived extends Base {
+  constructor(){super();this.id='derived';this.value=3}
+  run(){
+    super[key]=(log.push('simple-rhs'),4);
+    super[key]+=(log.push('compound-rhs'),5);
+    super[key] &&= (log.push('and-rhs'),7);
+    super[key] ||= (log.push('or-rhs'),11);
+    super[key] ??= (log.push('nullish-rhs'),13);
+    super[key]++;
+    ++super[key];
+    this.value=null;
+    super[key] ??= (log.push('nullish-rhs2'),12);
+    this.value=0;
+    super[key] ||= (log.push('or-rhs2'),14);
+    super[key] &&= (log.push('and-rhs2'),99);
+    return this.value;
+  }
+}
+const value=new Derived().run();
+console.log(JSON.stringify([value,log]));
+";
+        let result = Command::new("node").arg("-e").arg(source).output()?;
+        assert!(result.status.success(), "{result:?}");
+        let actual: serde_json::Value = serde_json::from_slice(&result.stdout)?;
+        assert_eq!(
+            actual,
+            serde_json::json!([
+                99,
+                [
+                    "simple-rhs",
+                    "coerce",
+                    "set:4:derived",
+                    "coerce",
+                    "get:4:derived",
+                    "compound-rhs",
+                    "coerce",
+                    "set:9:derived",
+                    "coerce",
+                    "get:9:derived",
+                    "and-rhs",
+                    "coerce",
+                    "set:7:derived",
+                    "coerce",
+                    "get:7:derived",
+                    "coerce",
+                    "get:7:derived",
+                    "coerce",
+                    "get:7:derived",
+                    "coerce",
+                    "set:8:derived",
+                    "coerce",
+                    "get:8:derived",
+                    "coerce",
+                    "set:9:derived",
+                    "coerce",
+                    "get:null:derived",
+                    "nullish-rhs2",
+                    "coerce",
+                    "set:12:derived",
+                    "coerce",
+                    "get:0:derived",
+                    "or-rhs2",
+                    "coerce",
+                    "set:14:derived",
+                    "coerce",
+                    "get:14:derived",
+                    "and-rhs2",
+                    "coerce",
+                    "set:99:derived"
+                ]
+            ])
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed Node; super reference early-this and original-base oracle"]
+    fn node_confirms_super_reference_initialization_and_original_receiver() -> anyhow::Result<()> {
+        use std::process::Command;
+        let source = r"
+const log=[];
+const key={ [Symbol.toPrimitive](){log.push('key-coerce');return 'x'} };
+class Base {
+  set x(v){log.push('base:'+v+':'+this.tag)}
+}
+class Derived extends Base {
+  constructor(){super();this.tag='derived'}
+  run(){
+    super[key]=(log.push('rhs'),17);
+  }
+}
+new Derived().run();
+class Uninitialized extends Base {
+  constructor(){
+    try{super[(log.push('should-not-eval-key'),key)] = (log.push('should-not-eval-rhs'),42)}
+    catch(e){log.push(e.name)}
+    super();
+  }
+}
+new Uninitialized();
+console.log(JSON.stringify(log));
+";
+        let result = Command::new("node").arg("-e").arg(source).output()?;
+        assert!(result.status.success(), "{result:?}");
+        let actual: serde_json::Value = serde_json::from_slice(&result.stdout)?;
+        assert_eq!(
+            actual,
+            serde_json::json!(["rhs", "key-coerce", "base:17:derived", "ReferenceError"])
+        );
+        Ok(())
     }
 
     #[test]
