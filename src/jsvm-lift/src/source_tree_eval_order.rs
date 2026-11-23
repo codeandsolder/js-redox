@@ -232,6 +232,17 @@ impl<'s> Plan<'s> {
                 "GetSuperBase; preserve original this as receiver and uncoerced key",
             );
         }
+        // IsSuperReference is checked before ToObject, ToPropertyKey and
+        // [[Delete]]. Evaluating the computed key expression can run user
+        // code, but converting its resulting object must not.
+        if access == Access::Delete && member.object().is_super() {
+            self.mark(
+                member.span(),
+                "super delete ReferenceError",
+                "throw before key coercion, GetValue, getter or delete trap",
+            );
+            return;
+        }
         if let MemberExpression::ComputedMemberExpression(computed) = member {
             self.key_coercion(Some((computed.object.span(), computed.expression.span())));
         }
@@ -1322,6 +1333,62 @@ console.log(JSON.stringify([values,log]));
                     "ReferenceError"
                 ]
             ])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn deleting_super_reference_throws_after_key_value_but_without_coercion() {
+        let source = format!(
+            "class A{{}}class B extends A{{run(side){{root=(side.one=delete super[(side.key=1,key())],side.two=delete super.x,{});}}}}",
+            long_effects()
+        );
+        let phases = plan(&source);
+        let this = position(&phases, "| GetThisBinding super |");
+        let key_side_effect = position(&phases, "side.key = (setter may run)");
+        let key_call = position(&phases, "| Call | key;");
+        let super_reference = position(&phases, "| form super reference |");
+        let abrupt = position(&phases, "| super delete ReferenceError |");
+        assert!(
+            this < key_side_effect
+                && key_side_effect < key_call
+                && key_call < super_reference
+                && super_reference < abrupt,
+            "{phases}"
+        );
+        assert_eq!(phases.matches("| super delete ReferenceError |").count(), 2);
+        assert!(!phases.contains("| ToPropertyKey |"), "{phases}");
+        assert!(!phases.contains("| DeleteProperty |"), "{phases}");
+    }
+
+    #[test]
+    #[ignore = "requires installed Node; deletion of super reference ordering oracle"]
+    fn node_confirms_delete_super_skips_key_coercion_and_delete_traps() -> anyhow::Result<()> {
+        use std::process::Command;
+
+        let source = r"
+const events=[];
+const key={toString(){events.push('coerce');return 'x'}};
+const base=new Proxy({x:1},{deleteProperty(){events.push('delete-trap');return true}});
+class A {}
+Object.setPrototypeOf(A.prototype,base);
+class B extends A {
+  run(){
+    try { delete super[(events.push('key-expression'),key)] }
+    catch(e){events.push(e.name)}
+    try { delete super.x }
+    catch(e){events.push(e.name)}
+    return events;
+  }
+}
+console.log(JSON.stringify(new B().run()));
+";
+        let result = Command::new("node").arg("-e").arg(source).output()?;
+        assert!(result.status.success(), "{result:?}");
+        let actual: serde_json::Value = serde_json::from_slice(&result.stdout)?;
+        assert_eq!(
+            actual,
+            serde_json::json!(["key-expression", "ReferenceError", "ReferenceError"])
         );
         Ok(())
     }
