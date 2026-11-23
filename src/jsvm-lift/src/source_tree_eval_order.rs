@@ -31,7 +31,7 @@ enum Access {
 }
 
 /// Computed property references retain the evaluated key value across
-/// GetValue and PutValue; a super reference also retains its original this.
+/// `GetValue` and `PutValue`; a `super` reference also retains its original `this`.
 #[derive(Clone, Copy)]
 struct ComputedKey {
     base: Span,
