@@ -1621,11 +1621,13 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
             self.push(it.span, text, "ordered_switch_unflatten");
             return;
         }
+        if let Some(text) =
+            if_ladder_structure::reconstruct_for(it, self.source, live.then_some(self.scoping))
+        {
+            self.push(it.span, text, "if_ladder_structured");
+            return;
+        }
         if !live {
-            if let Some(text) = if_ladder_structure::reconstruct_for(it, self.source) {
-                self.push(it.span, text, "if_ladder_structured");
-                return;
-            }
             if let Some(text) = self.reference_state_replacement(it) {
                 self.push(it.span, text, "reference_state_unflatten");
                 return;
