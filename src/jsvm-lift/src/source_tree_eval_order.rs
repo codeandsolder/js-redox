@@ -219,60 +219,53 @@ impl ComputedKey {
             base: member.object.span(),
             key: member.expression.span(),
             super_reference: member.object.is_super(),
-            nullish_base: value_facts(&member.object, 0).nullish,
+            nullish_base: value_facts(&member.object, 0).has(ValueProperty::Nullish),
         }
     }
 }
 
 /// Facts are guarantees on *normal* completion, never claims about a
-/// mutable binding, accessor, Proxy, or unresolved call. Expression structure
-/// only strengthens facts where every possible normal result has the property.
-#[derive(Clone, Copy, Default)]
-struct ValueFacts {
-    nullish: bool,
-    non_nullish: bool,
-    non_callable: bool,
-    non_constructor: bool,
+/// mutable binding, accessor, Proxy, or unresolved call. A compact bitset
+/// represents independently provable properties, not mutually exclusive types.
+#[derive(Clone, Copy)]
+#[repr(u8)]
+enum ValueProperty {
+    Nullish = 1,
+    NonNullish = 2,
+    NonObject = 4,
+    NonCallable = 8,
+    NonConstructor = 16,
 }
+#[derive(Clone, Copy, Default)]
+struct ValueFacts(u8);
 impl ValueFacts {
-    const UNKNOWN: Self = Self {
-        nullish: false,
-        non_nullish: false,
-        non_callable: false,
-        non_constructor: false,
-    };
-    const NULLISH: Self = Self {
-        nullish: true,
-        non_nullish: false,
-        non_callable: true,
-        non_constructor: true,
-    };
-    const NON_CALLABLE_VALUE: Self = Self {
-        nullish: false,
-        non_nullish: true,
-        non_callable: true,
-        non_constructor: true,
-    };
-    const CLASS: Self = Self {
-        nullish: false,
-        non_nullish: true,
-        non_callable: true,
-        non_constructor: false,
-    };
-    const ARROW: Self = Self {
-        nullish: false,
-        non_nullish: true,
-        non_callable: false,
-        non_constructor: true,
-    };
+    const UNKNOWN: Self = Self(0);
+    const NON_NULLISH: Self = Self(ValueProperty::NonNullish as u8);
+    const NULLISH: Self = Self(
+        ValueProperty::Nullish as u8
+            | ValueProperty::NonObject as u8
+            | ValueProperty::NonCallable as u8
+            | ValueProperty::NonConstructor as u8,
+    );
+    const PRIMITIVE: Self = Self(
+        ValueProperty::NonNullish as u8
+            | ValueProperty::NonObject as u8
+            | ValueProperty::NonCallable as u8
+            | ValueProperty::NonConstructor as u8,
+    );
+    const NON_CALLABLE_OBJECT: Self = Self(
+        ValueProperty::NonNullish as u8
+            | ValueProperty::NonCallable as u8
+            | ValueProperty::NonConstructor as u8,
+    );
+    const CLASS: Self = Self(ValueProperty::NonNullish as u8 | ValueProperty::NonCallable as u8);
+    const ARROW: Self = Self(ValueProperty::NonNullish as u8 | ValueProperty::NonConstructor as u8);
 
+    const fn has(self, property: ValueProperty) -> bool {
+        self.0 & (property as u8) != 0
+    }
     const fn common(self, other: Self) -> Self {
-        Self {
-            nullish: self.nullish && other.nullish,
-            non_nullish: self.non_nullish && other.non_nullish,
-            non_callable: self.non_callable && other.non_callable,
-            non_constructor: self.non_constructor && other.non_constructor,
-        }
+        Self(self.0 & other.0)
     }
 }
 
@@ -289,22 +282,23 @@ fn value_facts(expr: &Expression<'_>, depth: usize) -> ValueFacts {
         | Expression::NumericLiteral(_)
         | Expression::BigIntLiteral(_)
         | Expression::StringLiteral(_)
-        | Expression::RegExpLiteral(_)
+        | Expression::TemplateLiteral(_)
+        | Expression::BinaryExpression(_) => ValueFacts::PRIMITIVE,
+        Expression::RegExpLiteral(_)
         | Expression::ArrayExpression(_)
-        | Expression::ObjectExpression(_)
-        | Expression::TemplateLiteral(_) => ValueFacts::NON_CALLABLE_VALUE,
+        | Expression::ObjectExpression(_) => ValueFacts::NON_CALLABLE_OBJECT,
         Expression::ClassExpression(_) => ValueFacts::CLASS,
         Expression::ArrowFunctionExpression(_) => ValueFacts::ARROW,
-        Expression::FunctionExpression(_) | Expression::NewExpression(_) => ValueFacts {
-            non_nullish: true,
-            ..ValueFacts::UNKNOWN
-        },
+        Expression::FunctionExpression(_) | Expression::NewExpression(_) => ValueFacts::NON_NULLISH,
         Expression::UnaryExpression(unary) => {
             if unary.operator == UnaryOperator::Void {
                 ValueFacts::NULLISH
             } else {
-                ValueFacts::NON_CALLABLE_VALUE
+                ValueFacts::PRIMITIVE
             }
+        }
+        Expression::LogicalExpression(logical) => {
+            value_facts(&logical.left, next).common(value_facts(&logical.right, next))
         }
         Expression::SequenceExpression(sequence) => sequence
             .expressions
@@ -467,7 +461,7 @@ impl<'s> Plan<'s> {
 
     fn static_target_nullish(&mut self, target: &SimpleAssignmentTarget<'_>) {
         if let SimpleAssignmentTarget::StaticMemberExpression(member) = target {
-            if value_facts(&member.object, 0).nullish {
+            if value_facts(&member.object, 0).has(ValueProperty::Nullish) {
                 self.mark(
                     member.object.span(),
                     "ToObject base",
@@ -588,7 +582,7 @@ impl<'s> Plan<'s> {
             Self::receiver_kind(&call.callee, !call.optional),
         );
         self.arguments(&call.arguments);
-        if !call.optional && value_facts(&call.callee, 0).non_callable {
+        if !call.optional && value_facts(&call.callee, 0).has(ValueProperty::NonCallable) {
             self.mark(
                 call.callee.span(),
                 "IsCallable",
@@ -647,7 +641,7 @@ impl<'s> Plan<'s> {
         }
         if let MemberExpression::ComputedMemberExpression(computed) = member {
             self.key_coercion(Some(ComputedKey::new(computed)));
-        } else if value_facts(member.object(), 0).nullish {
+        } else if value_facts(member.object(), 0).has(ValueProperty::Nullish) {
             self.mark(
                 member.object().span(),
                 "ToObject base",
@@ -696,9 +690,9 @@ impl<'s> Plan<'s> {
         );
         let incoming = self.normal.clone();
         let facts = value_facts(value, 0);
-        let short = if facts.non_nullish {
+        let short = if facts.has(ValueProperty::NonNullish) {
             NormalPaths::default()
-        } else if facts.nullish {
+        } else if facts.has(ValueProperty::Nullish) {
             incoming.clone()
         } else {
             incoming.assumed(
@@ -720,9 +714,9 @@ impl<'s> Plan<'s> {
         if let Some(shortcuts) = self.chain_shortcuts.last_mut() {
             shortcuts.merge(self.normal.clone());
         }
-        self.normal = if facts.nullish {
+        self.normal = if facts.has(ValueProperty::Nullish) {
             NormalPaths::default()
-        } else if facts.non_nullish {
+        } else if facts.has(ValueProperty::NonNullish) {
             incoming
         } else {
             incoming.assumed(
@@ -829,7 +823,7 @@ impl<'s> Plan<'s> {
             "IsConstructor",
             "check after argument evaluation; non-constructible values throw TypeError here",
         );
-        if value_facts(&construct.callee, 0).non_constructor {
+        if value_facts(&construct.callee, 0).has(ValueProperty::NonConstructor) {
             self.throw(
                 construct.span,
                 "Construct with a guaranteed non-constructor throws TypeError after arguments",
@@ -1112,6 +1106,15 @@ impl<'s> Plan<'s> {
         for substitution in &tagged.quasi.expressions {
             self.expression(substitution);
         }
+        if value_facts(&tagged.tag, 0).has(ValueProperty::NonCallable) {
+            self.mark(
+                tagged.tag.span(),
+                "IsCallable tag",
+                "statically non-callable tagged-template receiver",
+            );
+            self.throw(tagged.span, "tagged-template invocation with a non-callable tag throws TypeError after substitutions");
+            return;
+        }
         self.mark(tagged.span, "Call tag",
             "check callability after substitutions and invoke with original receiver, template object and uncoerced values; effects opaque");
     }
@@ -1215,6 +1218,31 @@ impl<'s> Plan<'s> {
             Expression::BinaryExpression(binary) => {
                 self.expression(&binary.left);
                 self.expression(&binary.right);
+                let right = value_facts(&binary.right, 0);
+                if binary.operator.as_str() == "in" && right.has(ValueProperty::NonObject) {
+                    self.mark(
+                        binary.right.span(),
+                        "RequireObject right",
+                        "in requires an object as right operand; key coercion has not happened",
+                    );
+                    self.throw(
+                        binary.span,
+                        "in with a guaranteed primitive right operand throws TypeError",
+                    );
+                    return;
+                }
+                if binary.operator.as_str() == "instanceof" && right.has(ValueProperty::Nullish) {
+                    self.mark(
+                        binary.right.span(),
+                        "GetMethod @@hasInstance",
+                        "nullish right operand cannot supply @@hasInstance",
+                    );
+                    self.throw(
+                        binary.span,
+                        "instanceof with a guaranteed nullish right operand throws TypeError",
+                    );
+                    return;
+                }
                 self.mark(
                     binary.span,
                     "apply binary operator",
@@ -1579,6 +1607,140 @@ console.log(JSON.stringify(events));
                 "{phases}"
             );
         }
+    }
+
+    #[test]
+    fn thrown_computed_object_key_and_call_arguments_stop_enclosing_phases() {
+        for expression in [
+            "({[delete super.x]: side.value(), after: side.later()})",
+            "call(side.before(), delete super.x, side.after())",
+            "call(...[side.before(), delete super.x], side.after())",
+        ] {
+            let source = format!(
+                "class A{{}}class B extends A{{run(side,call){{root=({expression},{});}}}}",
+                long_effects()
+            );
+            let phases = plan(&source);
+            assert_eq!(phases.matches("| super delete ReferenceError |").count(), 1);
+            assert!(
+                phases.contains("| definite abrupt completion |"),
+                "{phases}"
+            );
+            assert!(!phases.contains("| Call | side.after;"), "{phases}");
+            assert!(!phases.contains("| Call | side.later;"), "{phases}");
+            assert!(!phases.contains("| Call | call;"), "{phases}");
+            assert!(!phases.contains("| CopyDataProperties |"), "{phases}");
+        }
+    }
+
+    #[test]
+    fn non_callable_tag_fails_after_template_substitutions() {
+        let source = format!(
+            "function f(side,arg){{root=(null`segment${{arg()}}`,side.after=2,{});}}",
+            long_effects()
+        );
+        let phases = plan(&source);
+        let substitution = position(&phases, "| Call | arg;");
+        let check = position(&phases, "| IsCallable tag |");
+        let abrupt = position(&phases, "| definite abrupt completion |");
+        assert!(substitution < check && check < abrupt, "{phases}");
+        assert!(!phases.contains("| Call tag |"), "{phases}");
+        assert!(
+            !phases.contains("side.after = (setter may run)"),
+            "{phases}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires installed Node; tagged-template and argument exceptions"]
+    fn node_confirms_tagged_template_and_call_arguments_stop_in_order() -> anyhow::Result<()> {
+        use std::process::Command;
+        let source = r"
+const events=[];
+const log=(tag,val)=>{events.push(tag);return val};
+try{(null)`x${log('substitution',2)}`}catch(e){events.push(e.name)}
+class A{}
+class B extends A {
+  run(){
+    const f=()=>events.push('should-not-call');
+    try {f(log('arg-before',1),delete super.x,log('arg-after',2))}
+    catch(e){events.push(e.name)}
+    try {f(...[log('array-before',1),delete super.x],log('spread-after',2))}
+    catch(e){events.push(e.name)}
+  }
+}
+new B().run();
+console.log(JSON.stringify(events));
+";
+        let result = Command::new("node").arg("-e").arg(source).output()?;
+        assert!(result.status.success(), "{result:?}");
+        let actual: serde_json::Value = serde_json::from_slice(&result.stdout)?;
+        assert_eq!(
+            actual,
+            serde_json::json!([
+                "substitution",
+                "TypeError",
+                "arg-before",
+                "ReferenceError",
+                "array-before",
+                "ReferenceError"
+            ])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn binary_rhs_object_requirement_throws_after_operands_not_key_coercion() {
+        for expression in ["key() in null", "key() in 7", "key() instanceof null"] {
+            let source = format!(
+                "function f(side,key){{root=(side.before={expression},side.after=2,{});}}",
+                long_effects()
+            );
+            let phases = plan(&source);
+            let key = position(&phases, "| Call | key;");
+            let abrupt = position(&phases, "| definite abrupt completion |");
+            assert!(key < abrupt, "{phases}");
+            assert!(
+                !phases.contains("side.after = (setter may run)"),
+                "{phases}"
+            );
+        }
+        let works = format!(
+            "function f(side,key){{root=(key() in ({{}}),side.after=2,{});}}",
+            long_effects()
+        );
+        assert!(plan(&works).contains("side.after = (setter may run)"));
+    }
+
+    #[test]
+    #[ignore = "requires Node; property-in and instanceof abrupt completion oracle"]
+    fn node_confirms_binary_rhs_primitive_errors_before_key_coercion() -> anyhow::Result<()> {
+        use std::process::Command;
+        let source = r"
+const events=[];
+const key={ [Symbol.toPrimitive](){events.push('coerce-key');return 'x'} };
+try{(events.push('lhs'),key) in (events.push('rhs'),7)}
+catch(e){events.push(e.name)}
+try{1 instanceof (events.push('instanceof-rhs'),null)}
+catch(e){events.push(e.name)}
+events.push('done');
+console.log(JSON.stringify(events));
+";
+        let result = Command::new("node").arg("-e").arg(source).output()?;
+        assert!(result.status.success(), "{result:?}");
+        let actual: serde_json::Value = serde_json::from_slice(&result.stdout)?;
+        assert_eq!(
+            actual,
+            serde_json::json!([
+                "lhs",
+                "rhs",
+                "TypeError",
+                "instanceof-rhs",
+                "TypeError",
+                "done"
+            ])
+        );
+        Ok(())
     }
 
     #[test]
