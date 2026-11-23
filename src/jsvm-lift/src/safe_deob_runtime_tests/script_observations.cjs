@@ -1,6 +1,18 @@
 // Test-only runtime for synthetic fixtures, injected after the input batch.
 const vm = require('node:vm');
-const {isNativeError, isProxy} = require('node:util').types;
+const types = require('node:util').types;
+const {isNativeError, isProxy} = types;
+const intrinsicNames = [
+    'Object', 'Array', 'Error', 'EvalError', 'RangeError', 'ReferenceError',
+    'SyntaxError', 'TypeError', 'URIError', 'AggregateError', 'SuppressedError'
+];
+const exoticChecks = [
+    types.isArgumentsObject, types.isAnyArrayBuffer, types.isArrayBufferView,
+    types.isBoxedPrimitive, types.isDate, types.isExternal,
+    types.isGeneratorObject, types.isMap, types.isMapIterator,
+    types.isModuleNamespaceObject, types.isPromise, types.isRegExp,
+    types.isSet, types.isSetIterator, types.isWeakMap, types.isWeakSet
+];
 const symbolDescription = Object.getOwnPropertyDescriptor(Symbol.prototype, 'description').get;
 const wellKnownSymbols = new Map(
     Object.getOwnPropertyNames(Symbol)
@@ -25,19 +37,19 @@ function dataProperty(value, key) {
 
 // One identity table for the final completion and the event trace. Ordinary
 // records/arrays preserve ordered own keys, data/accessor descriptors,
-// extensibility, and aliases/cycles. Functions and native errors still have
-// deliberately limited source-text and name/message projections.
-// Unsupported exotic objects fail the harness instead of silently comparing
-// equal through an arbitrary coercion.
+// extensibility, and aliases/cycles. Native errors also preserve own
+// descriptors (except stack) and the data values of inherited name/message.
+// Function bodies have only a source-text projection, not callable equivalence.
+// Known exotic objects and unrecognized prototypes fail the harness.
 function makeEncoder(realmPrototypes) {
     const seen = new Map();
-    const prototypes = new Map([
-        [null, 'null'],
-        [Object.prototype, 'host-object'],
-        [Array.prototype, 'host-array'],
-        [realmPrototypes[0], 'object'],
-        [realmPrototypes[1], 'array']
-    ]);
+    const prototypes = new Map([[null, 'null']]);
+    for (const [index, name] of intrinsicNames.entries()) {
+        const host = globalThis[name]?.prototype;
+        if (host !== undefined) prototypes.set(host, 'host-' + name);
+        const realm = realmPrototypes[index];
+        if (realm !== undefined) prototypes.set(realm, name);
+    }
 
     function encodeDescriptor(descriptor) {
         const flags = [descriptor.enumerable, descriptor.configurable];
@@ -69,21 +81,27 @@ function makeEncoder(realmPrototypes) {
         seen.set(value, id);
         if (type === 'symbol') return ['symbol', id, encode(symbolDescription.call(value))];
         if (type === 'function') return ['function', id, Function.prototype.toString.call(value)];
-        if (isNativeError(value)) {
-            return ['error', id, encode(dataProperty(value, 'name')), encode(dataProperty(value, 'message'))];
+        const error = isNativeError(value);
+        if (!error && exoticChecks.some(check => check(value))) {
+            throw Error('unsupported observation: exotic object');
         }
         const prototype = Object.getPrototypeOf(value);
         if (!prototypes.has(prototype)) throw Error('unsupported observation: object prototype');
-        const properties = Reflect.ownKeys(value).map(key => [
-            encode(key),
-            encodeDescriptor(Object.getOwnPropertyDescriptor(value, key))
-        ]);
+        // Stack traces contain source locations and may invoke prepareStackTrace
+        // on some Node versions. They are explicitly outside this projection.
+        const properties = Reflect.ownKeys(value)
+            .filter(key => !error || key !== 'stack')
+            .map(key => [
+                encode(key),
+                encodeDescriptor(Object.getOwnPropertyDescriptor(value, key))
+            ]);
         return [
-            Array.isArray(value) ? 'array' : 'record',
+            error ? 'error' : Array.isArray(value) ? 'array' : 'record',
             id,
             prototypes.get(prototype),
             Object.isExtensible(value),
-            properties
+            properties,
+            ...(error ? [encode(dataProperty(value, 'name')), encode(dataProperty(value, 'message'))] : [])
         ];
     }
     return encode;
@@ -96,7 +114,9 @@ function observe(text, label) {
     const events = [];
     const globals = browserGlobals ? {events, atob} : {events};
     const context = vm.createContext(globals);
-    const realmPrototypes = vm.runInContext('[Object.prototype, Array.prototype]', context);
+    const realmPrototypes = vm.runInContext(
+        JSON.stringify(intrinsicNames) + '.map(name => globalThis[name]?.prototype)', context
+    );
     let result;
     let thrown = false;
     try {
