@@ -725,6 +725,195 @@ mod tests {
     }
 
     #[test]
+    fn root_script_expression_lowering_requires_dead_completion() -> Result<(), BudgetExceeded> {
+        let overwritten = "var flag=choice; (flag && (emit('A'),emit('B')),emit('C'));42;";
+        let lowered = deobfuscate(
+            overwritten,
+            16,
+            &WorkBudget::unlimited("script-completion-dead"),
+        )?
+        .unwrap_or_else(|| unreachable!());
+        assert!(
+            lowered
+                .transforms
+                .get("effect_statement_lowering")
+                .is_some_and(|count| *count > 0),
+            "{:?}: {}",
+            lowered.transforms,
+            lowered.source
+        );
+        assert!(
+            !lowered.source.contains("flag && (emit('A'),emit('B'))"),
+            "{}",
+            lowered.source
+        );
+
+        let observable = "var flag=choice; (flag && (emit('A'),emit('B')),emit('C'));";
+        let preserved = deobfuscate(
+            observable,
+            16,
+            &WorkBudget::unlimited("script-completion-live"),
+        )?
+        .unwrap_or_else(|| unreachable!());
+        assert_eq!(
+            preserved.transforms.get("effect_statement_lowering"),
+            None,
+            "{:?}: {}",
+            preserved.transforms,
+            preserved.source
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn program_sibling_structuring_uses_the_same_completion_demand() -> Result<(), BudgetExceeded> {
+        let dead_if = "var flag=choice; if ((emit('P'),flag)) emit('Y'); else emit('N'); 42;";
+        let result = deobfuscate(
+            dead_if,
+            16,
+            &WorkBudget::unlimited("program-if-completion-dead"),
+        )?
+        .unwrap_or_else(|| unreachable!());
+        assert!(
+            result
+                .transforms
+                .get("if_test_sequence_lowering")
+                .is_some_and(|count| *count > 0),
+            "{:?}: {}",
+            result.transforms,
+            result.source
+        );
+        let live_if = "var flag=choice; if ((emit('P'),flag)) emit('Y'); else emit('N');";
+        let result = deobfuscate(
+            live_if,
+            16,
+            &WorkBudget::unlimited("program-if-completion-live"),
+        )?
+        .unwrap_or_else(|| unreachable!());
+        assert!(
+            !result.transforms.contains_key("if_test_sequence_lowering"),
+            "{:?}: {}",
+            result.transforms,
+            result.source
+        );
+
+        let dead_assign = "let state; state=choice ? (emit('Y'),2) : (emit('N'),4); 42;";
+        let result = deobfuscate(
+            dead_assign,
+            16,
+            &WorkBudget::unlimited("program-assignment-completion-dead"),
+        )?
+        .unwrap_or_else(|| unreachable!());
+        assert!(
+            result
+                .transforms
+                .get("assignment_conditional_lowering")
+                .is_some_and(|count| *count > 0),
+            "{:?}: {}",
+            result.transforms,
+            result.source
+        );
+        let live_assign = "let state; state=choice ? (emit('Y'),2) : (emit('N'),4);";
+        let result = deobfuscate(
+            live_assign,
+            16,
+            &WorkBudget::unlimited("program-assignment-completion-live"),
+        )?
+        .unwrap_or_else(|| unreachable!());
+        assert!(
+            !result
+                .transforms
+                .contains_key("assignment_conditional_lowering"),
+            "{:?}: {}",
+            result.transforms,
+            result.source
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires Node; compare script and direct-eval completion before/after source lowering"]
+    fn script_and_eval_completion_match_after_demand_gated_lowering(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::process::Command;
+
+        fn observe(
+            source: &str,
+            choice: bool,
+            mode: &str,
+        ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+            let harness = r"
+const vm = require('node:vm');
+const events = [];
+const context = {
+  choice: process.argv[2] === 'true',
+  emit(value) { events.push(value); return value.length; }
+};
+const source=process.argv[1];
+const code=process.argv[3]==='eval'?
+  'eval('+JSON.stringify(source)+')':source;
+try {
+  const options={};options.timeout=2000;
+  const result=vm.runInNewContext(code,context,options);
+  console.log(JSON.stringify({
+    type:result===undefined?'undefined':typeof result,
+    value:result===undefined?null:result,
+    events
+  }));
+} catch(e) {
+  console.log(JSON.stringify({type:'throw',name:e.name,events}));
+}
+";
+            let result = Command::new("node")
+                .arg("-e")
+                .arg(harness)
+                .arg(source)
+                .arg(if choice { "true" } else { "false" })
+                .arg(mode)
+                .output()?;
+            assert!(result.status.success(), "{result:?}");
+            Ok(serde_json::from_slice(&result.stdout)?)
+        }
+
+        let fixtures = [
+            "var flag=choice; (flag && (emit('A'),emit('B')),emit('C')); 42;",
+            "var flag=choice; (flag && (emit('A'),emit('B')),emit('C'));",
+            "var flag=choice; try {(flag && (emit('A'),emit('B')),emit('C'));}finally{emit('F');} 42;",
+            "var flag=choice; if(flag) {(emit('A'),emit('B'));}else{emit('N');} 42;",
+            "var flag=choice; (flag && (emit('A'),emit('B')),eval(\"emit('E')\")); 42;",
+            "var flag=choice; if ((emit('P'),flag)) emit('Y'); else emit('N'); 42;",
+            "var flag=choice; if ((emit('P'),flag)) emit('Y'); else emit('N');",
+            "let state; state=choice ? (emit('Y'),2) : (emit('N'),4); 42;",
+            "let state; state=choice ? (emit('Y'),2) : (emit('N'),4);",
+            "var obj={}; ((emit('P'),obj).value=emit('V')); 42;",
+        ];
+        let mut lowered = 0;
+        for source in fixtures {
+            let result = deobfuscate(source, 16, &WorkBudget::unlimited("script-eval-oracle"))?
+                .ok_or_else(|| std::io::Error::other("valid input must produce recovery"))?;
+            lowered += result
+                .transforms
+                .get("effect_statement_lowering")
+                .copied()
+                .unwrap_or(0);
+            for choice in [false, true] {
+                for mode in ["script", "eval"] {
+                    let before = observe(source, choice, mode)?;
+                    let after = observe(&result.source, choice, mode)?;
+                    assert_eq!(
+                        before, after,
+                        "Script/eval Completion Record changed for {source} \
+                        (choice={choice}, mode={mode}) -> {}",
+                        result.source
+                    );
+                }
+            }
+        }
+        assert!(lowered >= 2, "expected actual script-level effect lowering");
+        Ok(())
+    }
+
+    #[test]
     fn lowers_effectful_comma_and_short_circuit_without_repeating_test(
     ) -> Result<(), BudgetExceeded> {
         let input = "function f(Y){true && (U=AM(Y), 129 + (U&-129) + (~U^128) && (U=(L=U&127,v=AM(Y)<<7,~L-2*~(L|v)+(L|~v))),u=U), false;return u;}";
