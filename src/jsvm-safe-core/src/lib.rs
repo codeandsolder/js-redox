@@ -69,8 +69,8 @@ pub use string_exposure::{
 };
 use string_exposure::{static_array_lookup_text, static_readonly_arrays};
 use value_eval::{
-    eval, eval_binary, eval_logical, eval_unary, eval_with_resolver, js_to_uint32, known_bool,
-    Value,
+    eval, eval_binary_expression, eval_logical, eval_unary, eval_with_resolver, js_to_uint32,
+    known_bool, Value,
 };
 pub use value_eval::{
     eval as eval_static_primitive, eval_with_resolver as eval_static_primitive_with_resolver,
@@ -1460,10 +1460,8 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
                 }
             }
         }
-        if let (Some(left), Some(right)) = (eval(&it.left), eval(&it.right)) {
-            if let Some(value) = eval_binary(it.operator.as_str(), &left, &right) {
-                self.push_primitive(it.span, &value, "constant_fold");
-            }
+        if let Some(value) = eval_binary_expression(it) {
+            self.push_primitive(it.span, &value, "constant_fold");
         }
         walk::walk_binary_expression(self, it);
     }
@@ -1856,9 +1854,7 @@ fn eval_static_argument(arg: &Argument<'_>) -> Option<Value> {
             .map(Value::String),
         Argument::ParenthesizedExpression(v) => eval(&v.expression),
         Argument::UnaryExpression(v) => eval_unary(v),
-        Argument::BinaryExpression(v) => {
-            eval_binary(v.operator.as_str(), &eval(&v.left)?, &eval(&v.right)?)
-        }
+        Argument::BinaryExpression(v) => eval_binary_expression(v),
         Argument::LogicalExpression(v) => eval_logical(v),
         Argument::ConditionalExpression(v) => {
             let test = known_bool(&v.test)?;

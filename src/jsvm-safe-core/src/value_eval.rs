@@ -261,11 +261,7 @@ where
         }
         Expression::ParenthesizedExpression(v) => eval_with_resolver(&v.expression, resolve),
         Expression::UnaryExpression(v) => eval_unary_with_resolver(v, resolve),
-        Expression::BinaryExpression(v) => eval_binary(
-            v.operator.as_str(),
-            &eval_with_resolver(&v.left, resolve)?,
-            &eval_with_resolver(&v.right, resolve)?,
-        ),
+        Expression::BinaryExpression(v) => eval_binary_with_resolver(v, resolve),
         Expression::LogicalExpression(v) => eval_logical_with_resolver(v, resolve),
         Expression::ConditionalExpression(v) => {
             let test = known_bool_with_resolver(&v.test, resolve)?;
@@ -321,7 +317,9 @@ impl LiteralTypes {
     const ORDINARY_PRIMITIVE: Self =
         Self(Self::NUMBER.0 | Self::STRING.0 | Self::BOOLEAN.0 | Self::NULL.0 | Self::UNDEFINED.0);
     const OBJECT_TYPEOF: Self = Self(Self::NULL.0 | Self::OBJECT.0);
-    const ALWAYS_TRUTHY: Self = Self(Self::OBJECT.0 | Self::FUNCTION.0);
+    // All reference values in this domain are independently created by
+    // the expression being proved; unknown binding/property reads are excluded.
+    const FRESH_REFERENCE: Self = Self(Self::OBJECT.0 | Self::FUNCTION.0);
     const NULLISH: Self = Self(Self::NULL.0 | Self::UNDEFINED.0);
 
     const fn union(self, other: Self) -> Self {
@@ -358,7 +356,7 @@ impl LiteralTypes {
     }
 
     const fn truthiness(self) -> Option<bool> {
-        if self.subset_of(Self::ALWAYS_TRUTHY) {
+        if self.subset_of(Self::FRESH_REFERENCE) {
             Some(true)
         } else if self.subset_of(Self::NULLISH) {
             Some(false)
@@ -416,7 +414,7 @@ impl LiteralFacts {
     /// Restrict the LHS result to the branch where the RHS is skipped.
     fn short_circuit_left(self, op: &str) -> Option<Self> {
         let (excluded, truthiness) = match op {
-            "&&" => (LiteralTypes::ALWAYS_TRUTHY, Some(false)),
+            "&&" => (LiteralTypes::FRESH_REFERENCE, Some(false)),
             "||" => (LiteralTypes::NULLISH, Some(true)),
             "??" => (LiteralTypes::NULLISH, self.truthiness),
             _ => return None,
@@ -530,9 +528,46 @@ fn inert_literal_facts(expr: &Expression<'_>) -> Option<LiteralFacts> {
     }
 }
 
+/// Equality of independently evaluated inert literal expressions.
+///
+/// Distinct fresh references can never alias each other. Strict equality
+/// does not coerce types. Abstract equality also never coerces two objects,
+/// or compares a nullish value equal to an ordinary non-nullish value.
+/// This domain has no binding reads and cannot produce an `HTMLDDA` object.
+fn literal_equality(op: &str, left: LiteralFacts, right: LiteralFacts) -> Option<bool> {
+    let strict = matches!(op, "===" | "!==");
+    let negated = matches!(op, "!=" | "!==");
+    if !strict && !matches!(op, "==" | "!=") {
+        return None;
+    }
+    let lt = left.types;
+    let rt = right.types;
+    let equal =
+        if lt.union(rt).subset_of(LiteralTypes::FRESH_REFERENCE) || (strict && !lt.includes(rt)) {
+            false
+        } else if !strict && lt.union(rt).subset_of(LiteralTypes::NULLISH) {
+            true
+        } else if !strict
+            && ((lt.subset_of(LiteralTypes::NULLISH) && !rt.includes(LiteralTypes::NULLISH))
+                || (rt.subset_of(LiteralTypes::NULLISH) && !lt.includes(LiteralTypes::NULLISH)))
+        {
+            false
+        } else if lt == LiteralTypes::BOOLEAN && rt == LiteralTypes::BOOLEAN {
+            left.truthiness? == right.truthiness?
+        } else {
+            return None;
+        };
+    Some(equal != negated)
+}
+
 fn binary_literal_facts(binary: &BinaryExpression<'_>) -> Option<LiteralFacts> {
-    let left = inert_literal_facts(&binary.left)?.types;
-    let right = inert_literal_facts(&binary.right)?.types;
+    let left_facts = inert_literal_facts(&binary.left)?;
+    let right_facts = inert_literal_facts(&binary.right)?;
+    if let Some(equal) = literal_equality(binary.operator.as_str(), left_facts, right_facts) {
+        return Some(LiteralFacts::with_truthiness(LiteralTypes::BOOLEAN, equal));
+    }
+    let left = left_facts.types;
+    let right = right_facts.types;
     let ordinary = left
         .union(right)
         .subset_of(LiteralTypes::ORDINARY_PRIMITIVE);
@@ -678,6 +713,29 @@ fn abstract_primitive_equal(left: &Value, right: &Value) -> bool {
         (Value::Null | Value::Undefined, _) | (_, Value::Null | Value::Undefined) => false,
         _ => strict_primitive_equal(left, right),
     }
+}
+
+pub fn eval_binary_expression(binary: &BinaryExpression<'_>) -> Option<Value> {
+    eval_binary_with_resolver(binary, &|_| None)
+}
+
+fn eval_binary_with_resolver<'a, F>(binary: &BinaryExpression<'a>, resolve: &F) -> Option<Value>
+where
+    F: Fn(&Expression<'a>) -> Option<Value>,
+{
+    let op = binary.operator.as_str();
+    if let (Some(left), Some(right)) = (
+        eval_with_resolver(&binary.left, resolve),
+        eval_with_resolver(&binary.right, resolve),
+    ) {
+        return eval_binary(op, &left, &right);
+    }
+    literal_equality(
+        op,
+        inert_literal_facts(&binary.left)?,
+        inert_literal_facts(&binary.right)?,
+    )
+    .map(Value::Bool)
 }
 
 pub fn eval_binary(op: &str, left: &Value, right: &Value) -> Option<Value> {
@@ -1065,6 +1123,61 @@ mod tests {
             };
             let actual = super::eval(&statement.expression).and_then(|value| value.render());
             assert_eq!(actual.as_deref(), expected, "{expression}");
+        }
+    }
+
+    #[test]
+    fn literal_equality_proofs_require_independently_inert_operands() {
+        use oxc_allocator::Allocator;
+        use oxc_ast::ast::Statement;
+        use oxc_span::SourceType;
+
+        for (expression, expected) in [
+            ("(2 ** 1.5) === 'x'", Some(false)),
+            ("(2 ** 1.5) !== 'x'", Some(true)),
+            ("1n === 1", Some(false)),
+            ("1n !== 1", Some(true)),
+            ("[] === []", Some(false)),
+            ("({}) == ({})", Some(false)),
+            ("(()=>{}) != (function(){})", Some(true)),
+            ("(class {}) === (class {})", Some(false)),
+            ("(/x/) === (/x/)", Some(false)),
+            ("null == ({})", Some(false)),
+            ("(void 0) != (class {})", Some(true)),
+            ("((2 ** 1.5) ? null : void 0) == null", Some(true)),
+            ("((2 ** 1.5) ? null : void 0) === null", None),
+            ("((2 ** 1.5) ? [] : (class {})) == ({})", Some(false)),
+            ("(typeof (2 ** 1.5) === 'number') === true", Some(true)),
+            ("(![]) === false", Some(true)),
+            ("((2 ** 1.5) === 'x') === false", Some(true)),
+            ("((2 ** 1.5) === 'x') ? effect() : true", Some(true)),
+            ("1n == 1", None),
+            ("(2 ** 1.5) == 'x'", None),
+            ("(2 ** 1.5) === 2", None),
+            ("({valueOf(){effect();return 1}}) == 1", None),
+            ("[effect()] === 0", None),
+            ("(1n/0n) === 0", None),
+            ("(class {static {effect()}}) === 0", None),
+            ("missing === []", None),
+            ("obj.value == null", None),
+            ("(effect(),[]) == ({})", None),
+        ] {
+            let allocator = Allocator::default();
+            let source = format!("({expression});");
+            let program = crate::parse_as(&allocator, &source, SourceType::cjs())
+                .unwrap_or_else(|| unreachable!("{source}"));
+            let [Statement::ExpressionStatement(statement)] = program.body.as_slice() else {
+                unreachable!("one expression");
+            };
+            let actual = super::eval(&statement.expression);
+            assert!(
+                match (actual, expected) {
+                    (Some(Value::Bool(actual)), Some(expected)) => actual == expected,
+                    (None, None) => true,
+                    _ => false,
+                },
+                "{expression}"
+            );
         }
     }
 
