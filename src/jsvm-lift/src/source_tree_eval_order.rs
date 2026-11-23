@@ -655,7 +655,20 @@ impl<'s> Plan<'s> {
                     "getter may run"
                 },
             );
-            self.mark(update.span, "numeric update", update.operator.as_str());
+            self.mark(
+                update.argument.span(),
+                "ToNumeric target",
+                "convert retrieved value to Number or BigInt; object valueOf/Symbol.toPrimitive may run or throw",
+            );
+            self.mark(
+                update.span,
+                "numeric update",
+                format!(
+                    "{}: compute Number/BigInt successor or predecessor; {} result is observable after PutValue",
+                    update.operator.as_str(),
+                    if update.prefix { "new" } else { "original" }
+                ),
+            );
             self.key_coercion(key);
             self.mark(
                 update.argument.span(),
@@ -1470,6 +1483,7 @@ mod tests {
             let key = position(&phases, "| Call | key;");
             let formed = position(&phases, "| form super reference |");
             let read = position(&phases, "| GetValue target |");
+            let numeric = position(&phases, "| ToNumeric target |");
             let update = position(&phases, "| numeric update |");
             let put = position(&phases, "| PutValue target |");
             assert!(
@@ -1477,15 +1491,72 @@ mod tests {
                     && key < formed
                     && formed < coercions[0]
                     && coercions[0] < read
-                    && read < update
+                    && read < numeric
+                    && numeric < update
                     && update < coercions[1]
                     && coercions[1] < put,
                 "{phases}"
             );
+            assert!(phase_row(&phases, "| numeric update |").contains(
+                if expression.starts_with("super") {
+                    "original result"
+                } else {
+                    "new result"
+                }
+            ));
             assert!(phase_row(&phases, "| GetValue target |").contains("original this"));
             assert!(phase_row(&phases, "| PutValue target |").contains("original this"));
             assert!(!phases.contains("| opaque expression |"), "{phases}");
         }
+    }
+
+    #[test]
+    #[ignore = "requires installed Node; super class and static receiver with BigInt numeric update"]
+    fn node_confirms_super_static_receivers_and_numeric_update_conversion() -> anyhow::Result<()> {
+        use std::process::Command;
+        let source = r"
+const log=[];
+const key={ [Symbol.toPrimitive](){log.push('key-coerce');return 'x'} };
+class Base {
+  static get x(){log.push('static-get:'+String(this===Derived));return 1}
+  static set x(v){log.push('static-set:'+v+':'+String(this===Derived))}
+  get x(){log.push('instance-get:'+String(this instanceof Derived));return {valueOf(){log.push('ToNumeric');return 1n}}}
+  set x(v){log.push('instance-set:'+typeof v+':'+String(v)+':'+String(this instanceof Derived))}
+}
+class Derived extends Base {
+  static run(){super[key]+=(log.push('static-rhs'),4)}
+  run(){const old=super[key]++;const newValue=++super[key];return [String(old),String(newValue)]}
+}
+Derived.run();
+console.log(JSON.stringify([new Derived().run(),log]));
+";
+        let result = Command::new("node").arg("-e").arg(source).output()?;
+        assert!(result.status.success(), "{result:?}");
+        let actual: serde_json::Value = serde_json::from_slice(&result.stdout)?;
+        assert_eq!(
+            actual,
+            serde_json::json!([
+                ["1", "2"],
+                [
+                    "key-coerce",
+                    "static-get:true",
+                    "static-rhs",
+                    "key-coerce",
+                    "static-set:5:true",
+                    "key-coerce",
+                    "instance-get:true",
+                    "ToNumeric",
+                    "key-coerce",
+                    "instance-set:bigint:2:true",
+                    "key-coerce",
+                    "instance-get:true",
+                    "ToNumeric",
+                    "key-coerce",
+                    "instance-set:bigint:2:true"
+                ]
+            ])
+        );
+        Ok(())
     }
 
     #[test]
