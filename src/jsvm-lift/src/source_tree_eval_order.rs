@@ -2,9 +2,9 @@
 //! No executable rewrite, inferred branch outcome or runtime trace.
 use oxc_ast::ast::{
     Argument, ArrayExpression, ArrayExpressionElement, AssignmentExpression, AssignmentTarget,
-    CallExpression, ComputedMemberExpression, Expression, NewExpression, ObjectExpression,
-    ObjectPropertyKind, Program, SimpleAssignmentTarget, TaggedTemplateExpression, TemplateLiteral,
-    UnaryExpression,
+    CallExpression, ChainElement, ChainExpression, ComputedMemberExpression, Expression,
+    MemberExpression, NewExpression, ObjectExpression, ObjectPropertyKind, Program,
+    SimpleAssignmentTarget, TaggedTemplateExpression, TemplateLiteral, UnaryExpression,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_span::{GetSpan, Span};
@@ -24,6 +24,12 @@ struct Phase {
     detail: String,
     guards: Vec<String>,
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Access {
+    Read,
+    Delete,
+}
+
 struct Plan<'s> {
     source: &'s str,
     guards: Vec<String>,
@@ -72,6 +78,10 @@ impl<'s> Plan<'s> {
     }
     fn computed_reference(&mut self, member: &ComputedMemberExpression<'_>) {
         self.expression(&member.object);
+        self.computed_reference_after_base(member);
+    }
+
+    fn computed_reference_after_base(&mut self, member: &ComputedMemberExpression<'_>) {
         self.expression(&member.expression);
         // The reference retains an uncoerced key. ToPropertyKey runs on
         // GetValue or PutValue, possibly after a simple assignment's RHS.
@@ -139,24 +149,27 @@ impl<'s> Plan<'s> {
         }
         true
     }
-    /// Evaluate a regular call target before arguments. A member-reference
-    /// callee retains its base as the call receiver; a sequence (0, obj.f)
-    /// produces a value rather than a property reference. Parentheses alone
-    /// preserve a reference. Do not descend into optional call chains.
     fn receiver_kind(callee: &Expression<'_>, direct_eval_possible: bool) -> &'static str {
+        let callee = callee.without_parentheses();
+        if let Some(member) = callee.as_member_expression() {
+            if member.object().is_super() {
+                return "super member receiver is the original this binding";
+            }
+            return match member {
+                MemberExpression::StaticMemberExpression(_) => {
+                    "member receiver from evaluated reference"
+                }
+                MemberExpression::ComputedMemberExpression(_) => {
+                    "computed member receiver from evaluated reference"
+                }
+                MemberExpression::PrivateFieldExpression(_) => {
+                    "private member receiver from evaluated reference"
+                }
+            };
+        }
         match callee {
-            Expression::ParenthesizedExpression(paren) => {
-                Self::receiver_kind(&paren.expression, direct_eval_possible)
-            }
-            Expression::StaticMemberExpression(member) if !member.optional => {
-                "member receiver from evaluated reference"
-            }
-            Expression::ComputedMemberExpression(member) if !member.optional => {
-                "computed member receiver from evaluated reference"
-            }
-            Expression::PrivateFieldExpression(member) if !member.optional => {
-                "private member receiver from evaluated reference"
-            }
+            Expression::ChainExpression(chain) if chain.expression.is_member_expression() =>
+                "member receiver if the chain reaches its final reference; otherwise undefined value",
             Expression::Identifier(id) if direct_eval_possible && id.name == "eval" => {
                 "direct eval candidate: lexical environment remains observable"
             }
@@ -166,15 +179,19 @@ impl<'s> Plan<'s> {
     }
 
     fn call(&mut self, call: &CallExpression<'_>) {
-        if call.optional || matches!(call.callee, Expression::Super(_)) {
-            self.opaque(call.span, "optional/super call");
+        if call.optional || call.callee.is_super() {
+            self.opaque(call.span, "optional/super call outside chain plan");
             return;
         }
         self.expression(&call.callee);
+        self.call_after_callee(call);
+    }
+
+    fn call_after_callee(&mut self, call: &CallExpression<'_>) {
         self.mark(
             call.callee.span(),
             "callee ready",
-            Self::receiver_kind(&call.callee, true),
+            Self::receiver_kind(&call.callee, !call.optional),
         );
         self.arguments(&call.arguments);
         self.mark(
@@ -185,6 +202,142 @@ impl<'s> Plan<'s> {
                 self.snippet(call.callee.span()),
             ),
         );
+    }
+
+    fn member(&mut self, member: &MemberExpression<'_>, access: Access) {
+        if member.object().is_super() {
+            self.opaque(member.span(), "super property reference");
+            return;
+        }
+        self.expression(member.object());
+        self.member_after_base(member, access);
+    }
+
+    fn member_after_base(&mut self, member: &MemberExpression<'_>, access: Access) {
+        if let MemberExpression::ComputedMemberExpression(computed) = member {
+            self.computed_reference_after_base(computed);
+            self.key_coercion(Some((computed.object.span(), computed.expression.span())));
+        }
+        if access == Access::Delete {
+            self.mark(member.span(), "DeleteProperty",
+                "delete reference without GetValue; nullish base throws; Proxy delete trap and strict failure are dynamic");
+            return;
+        }
+        match member {
+            MemberExpression::StaticMemberExpression(member) => self.mark(
+                member.span,
+                "GetValue member",
+                format!(
+                    "property .{} (getter/Proxy trap may run)",
+                    member.property.name
+                ),
+            ),
+            MemberExpression::ComputedMemberExpression(member) => {
+                self.mark(member.span, "GetValue member", "getter/Proxy trap may run");
+            }
+            MemberExpression::PrivateFieldExpression(member) => {
+                self.mark(
+                    member.span,
+                    "GetValue private field",
+                    "private-brand check; private accessor may run",
+                );
+            }
+        }
+    }
+
+    /// Append a guard for the rest of THIS chain, rather than just the
+    /// optional link. A nested ChainExpression has its own guard lifetime.
+    fn optional_guard(&mut self, value: Span, link: Span, access: Access) {
+        let site = format!("optional link {}–{}", link.start, link.end);
+        self.mark(
+            value,
+            "nullish check",
+            format!("{site}: test evaluated value for null or undefined"),
+        );
+        self.guarded(&format!("{site} nullish"), |plan| {
+            plan.mark(
+                link,
+                "short circuit chain",
+                match access {
+                    Access::Read => "skip remaining chain links; produce undefined",
+                    Access::Delete => "skip remaining chain links; delete yields true",
+                },
+            );
+        });
+        self.guards.push(format!("{site} non-nullish"));
+    }
+
+    /// Descend only through the unparenthesized member/call spine. Other
+    /// expressions (including nested chains) use normal value evaluation.
+    fn chain_operand(&mut self, expr: &Expression<'_>, access: Access) {
+        if let Some(member) = expr.as_member_expression() {
+            self.chain_member(member, Access::Read, access);
+        } else if let Expression::CallExpression(call) = expr {
+            self.chain_call(call, access);
+        } else {
+            self.expression(expr);
+        }
+    }
+
+    fn chain_member(
+        &mut self,
+        member: &MemberExpression<'_>,
+        member_access: Access,
+        chain_access: Access,
+    ) {
+        if member.object().is_super() {
+            self.member(member, member_access);
+            return;
+        }
+        self.chain_operand(member.object(), chain_access);
+        if member.optional() {
+            self.optional_guard(member.object().span(), member.span(), chain_access);
+        }
+        self.member_after_base(member, member_access);
+    }
+
+    fn chain_call(&mut self, call: &CallExpression<'_>, access: Access) {
+        if call.callee.is_super() {
+            self.call(call);
+            return;
+        }
+        self.chain_operand(&call.callee, access);
+        if call.optional {
+            self.optional_guard(call.callee.span(), call.span, access);
+        }
+        self.call_after_callee(call);
+    }
+
+    fn chain(&mut self, chain: &ChainExpression<'_>, access: Access) {
+        let outer_guards = self.guards.len();
+        if let Some(member) = chain.expression.as_member_expression() {
+            self.chain_member(member, access, access);
+        } else if let ChainElement::CallExpression(call) = &chain.expression {
+            self.chain_call(call, access);
+            if access == Access::Delete {
+                self.mark(call.span, "delete value", "non-reference call result; true");
+            }
+        } else {
+            self.opaque(chain.span, "unmodeled chain element");
+        }
+        self.guards.truncate(outer_guards);
+    }
+
+    fn delete(&mut self, arg: &Expression<'_>) {
+        let arg = arg.without_parentheses();
+        if let Some(member) = arg.as_member_expression() {
+            self.member(member, Access::Delete);
+        } else {
+            match arg {
+                Expression::ChainExpression(chain) => self.chain(chain, Access::Delete),
+                Expression::Identifier(id) => self.mark(id.span, "delete binding",
+                    "resolve reference without GetValue; unresolvable yields true, bound name deletion depends on environment"),
+                other => {
+                    self.expression(other);
+                    self.mark(other.span(), "delete value", "non-reference result; true after operand evaluation");
+                }
+            }
+        }
     }
 
     /// Evaluate a constructor reference and its value before the arguments.
@@ -437,7 +590,7 @@ impl<'s> Plan<'s> {
 
     fn unary(&mut self, unary: &UnaryExpression<'_>) {
         if unary.operator == UnaryOperator::Delete {
-            self.opaque(unary.span, "delete reference semantics");
+            self.delete(&unary.argument);
             return;
         }
         if let (UnaryOperator::Typeof, Expression::Identifier(id)) =
@@ -525,25 +678,11 @@ impl<'s> Plan<'s> {
                     ),
                 );
             }
-            Expression::StaticMemberExpression(member) if !member.optional => {
-                self.expression(&member.object);
-                self.mark(
-                    member.span,
-                    "GetValue member",
-                    format!(
-                        "property .{} (getter/Proxy trap may run)",
-                        member.property.name
-                    ),
-                );
-            }
-            Expression::ComputedMemberExpression(member) if !member.optional => {
-                self.computed_reference(member);
-                self.key_coercion(Some((member.object.span(), member.expression.span())));
-                self.mark(member.span, "GetValue member", "getter/Proxy trap may run");
-            }
-            Expression::PrivateFieldExpression(member) if !member.optional => {
-                self.expression(&member.object);
-                self.mark(member.span, "GetValue private field", "private-brand check");
+            Expression::ChainExpression(chain) => self.chain(chain, Access::Read),
+            expr if expr.is_member_expression() => {
+                if let Some(member) = expr.as_member_expression() {
+                    self.member(member, Access::Read);
+                }
             }
             Expression::Identifier(id) => {
                 self.mark(id.span, "GetValue identifier", id.name.to_string());
@@ -567,7 +706,7 @@ impl<'s> Plan<'s> {
             Expression::TemplateLiteral(template) => self.template(template),
             Expression::TaggedTemplateExpression(tagged) => self.tagged_template(tagged),
             Expression::UpdateExpression(update) => self.update(update),
-            // Optional chains and class initializers remain opaque.
+            // Unexpanded expressions retain their original effects.
             _ => self.opaque(expr.span(), "unexpanded AST subtree"),
         }
     }
@@ -625,7 +764,11 @@ pub fn ordered_assignment_phases(
          distinct objects. The void operator evaluates its operand (including \
          calls, binding reads and exceptions) before discarding its value; \
          typeof preserves its special unresolvable-reference behavior; numeric unary \
-         operators distinguish ToNumber from ToNumeric. Delete stays opaque. Untagged \
+         operators distinguish ToNumber from ToNumeric. Delete uses a reference without a getter. \
+         Optional-chain guards identify the evaluated link by source bytes; a nullish value \
+         skips the remainder of that chain, but parentheses terminate propagation. \
+         Optional calls inspect the callee value before arguments; optional member access \
+         checks the base before computed-key evaluation. Untagged \
          templates convert each substitution immediately; tags receive uncoerced values \
          and a site-specific template object with the original receiver. New expressions evaluate the constructor \
          value and argument list (including spreads) before IsConstructor \
@@ -951,14 +1094,24 @@ mod tests {
     }
 
     #[test]
-    fn optional_call_remains_opaque_but_regular_constructor_is_expanded() {
+    fn optional_call_guards_arguments_and_regular_constructor_is_expanded() {
         let source = format!(
             "function f(obj,side){{root=obj?.method((side.bad=1,{}));}}",
             long_effects()
         );
         let phases = plan(&source);
-        assert!(phases.contains("opaque expression"), "{phases}");
-        assert!(!phases.contains("side.bad = (setter may run)"), "{phases}");
+        let check = position(&phases, "| nullish check |");
+        let short = position(&phases, "| short circuit chain |");
+        let nested = position(&phases, "side.bad = (setter may run)");
+        assert!(check < short && short < nested, "{phases}");
+        assert!(
+            phases
+                .lines()
+                .any(|line| line.contains("non-nullish")
+                    && line.contains("side.bad = (setter may run)")),
+            "{phases}"
+        );
+        assert!(!phases.contains("| opaque expression |"), "{phases}");
         let source = format!(
             "function f(C,side){{root=new C((side.bad=1,{}));}}",
             long_effects()
@@ -974,6 +1127,200 @@ mod tests {
             "{phases}"
         );
         assert!(!phases.contains("| opaque expression |"), "{phases}");
+    }
+
+    fn phase_row<'a>(phases: &'a str, fragment: &str) -> &'a str {
+        let row = phases
+            .lines()
+            .find(|line| line.starts_with("| ") && line.contains(fragment));
+        assert!(row.is_some(), "missing {fragment}: {phases}");
+        row.unwrap_or_default()
+    }
+
+    #[test]
+    fn optional_chain_guards_entire_suffix_but_not_grouped_outer_call() {
+        let source = format!(
+            "function f(o,k,a,b,side){{root=(side.x=o?.[k()]?.m(a()).z,side.y=(o?.m)(b()),side.end=1,{});}}",
+            long_effects()
+        );
+        let phases = plan(&source);
+        let key = phase_row(&phases, "| Call | k;");
+        let arg = phase_row(&phases, "| Call | a;");
+        let last = phase_row(&phases, "property .z (getter");
+        let grouped_arg = phase_row(&phases, "| Call | b;");
+        let outer = phase_row(&phases, "side.end = (setter may run)");
+        assert_eq!(key.matches("non-nullish").count(), 1, "{key}");
+        assert_eq!(arg.matches("non-nullish").count(), 2, "{arg}");
+        assert_eq!(last.matches("non-nullish").count(), 2, "{last}");
+        assert!(grouped_arg.contains("| unguarded |"), "{grouped_arg}");
+        assert!(outer.contains("| unguarded |"), "{outer}");
+        assert!(
+            phases.contains("member receiver if the chain reaches its final reference"),
+            "{phases}"
+        );
+        assert_eq!(
+            phases.matches("| short circuit chain |").count(),
+            3,
+            "{phases}"
+        );
+        let second = phases
+            .lines()
+            .filter(|line| line.contains("| short circuit chain |"))
+            .nth(1)
+            .unwrap_or_default();
+        assert_eq!(second.matches("non-nullish").count(), 1, "{second}");
+        assert!(second.contains(" nullish |"), "{second}");
+    }
+
+    #[test]
+    fn nested_key_chain_guards_do_not_escape_the_key_expression() {
+        let source = format!(
+            "function f(o,p,side){{root=(side.x=o?.[p?.key(inner())].m(outer()),side.y=after(),{});}}",
+            long_effects()
+        );
+        let phases = plan(&source);
+        assert_eq!(
+            phase_row(&phases, "| Call | inner;")
+                .matches("non-nullish")
+                .count(),
+            2
+        );
+        assert_eq!(
+            phase_row(&phases, "| ToPropertyKey |")
+                .matches("non-nullish")
+                .count(),
+            1
+        );
+        assert_eq!(
+            phase_row(&phases, "| Call | outer;")
+                .matches("non-nullish")
+                .count(),
+            1
+        );
+        assert!(phase_row(&phases, "| Call | after;").contains("| unguarded |"));
+    }
+
+    #[test]
+    fn optional_calls_check_callee_without_direct_eval_and_before_spread() {
+        let source = format!(
+            "function f(o,it,side){{root=(side.a=o.m?.(first(),...it,last()),side.b=eval?.('x'),side.c=eval('x')?.x,{});}}",
+            long_effects()
+        );
+        let phases = plan(&source);
+        let getter = position(&phases, "property .m (getter");
+        let check = position(&phases, "| nullish check |");
+        let first = position(&phases, "| Call | first;");
+        let spread = position(&phases, "| expand spread argument |");
+        let last = position(&phases, "| Call | last;");
+        assert!(
+            getter < check && check < first && first < spread && spread < last,
+            "{phases}"
+        );
+        assert!(phase_row(&phases, "| expand spread argument |").contains("non-nullish"));
+        assert_eq!(phases.matches("direct eval candidate:").count(), 1);
+    }
+
+    #[test]
+    fn optional_delete_preserves_reference_not_final_getter() {
+        let source = format!(
+            "function f(o,side){{root=(side.x=delete o?.a[key()],side.y=delete (o?.b).c,side.z=delete o?.m(),side.w=delete (0,o.d),{});}}",
+            long_effects()
+        );
+        let phases = plan(&source);
+        assert!(phase_row(&phases, "property .a (getter").contains("non-nullish"));
+        assert!(phase_row(&phases, "| Call | key;").contains("non-nullish"));
+        let deletes: Vec<_> = phases
+            .lines()
+            .filter(|line| line.contains("| DeleteProperty |"))
+            .collect();
+        assert_eq!(deletes.len(), 2, "{phases}");
+        assert!(deletes
+            .first()
+            .is_some_and(|row| row.contains("non-nullish")));
+        assert!(deletes
+            .last()
+            .is_some_and(|row| row.contains("| unguarded |")));
+        assert!(!phases.contains("property .c (getter"));
+        assert!(phases.contains("property .d (getter"));
+        assert_eq!(phases.matches("delete yields true").count(), 2);
+        assert_eq!(phases.matches("| delete value |").count(), 2);
+    }
+
+    #[test]
+    #[ignore = "requires installed Node; optional chain evaluation oracle"]
+    fn node_confirms_optional_chain_path_receiver_and_delete_order() -> anyhow::Result<()> {
+        use std::process::Command;
+        let source = r"
+const log=[];
+const nil=null;
+const key=()=>{log.push('key');return {[Symbol.toPrimitive](){log.push('coerce');return 'm'}}};
+const arg=()=>{log.push('arg');return 7};
+const obj={
+  get m(){log.push('get');return function(x){'use strict';log.push('call:'+String(this===obj)+':'+x);return {z:1}}},
+  get n(){log.push('get:n');return null}
+};
+const out=[];
+out.push(nil?.[key()]?.(arg()).z);
+out.push(obj?.[key()]?.(arg()).z);
+out.push(obj.n?.(arg()).z);
+try{(nil?.m)(arg())}catch(e){log.push(e.name)}
+out.push((obj?.m)(arg()).z);
+out.push((0,obj?.m)(arg()).z);
+try{nil?.m.x.z; (nil?.m)[key()]}catch(e){log.push(e.name)}
+const target=new Proxy({get m(){log.push('unexpected getter');return 0}},{
+    deleteProperty(t,k){log.push('delete:'+k);return Reflect.deleteProperty(t,k)}
+});
+out.push(delete nil?.[key()]);
+out.push(delete target?.[key()]);
+try{delete (nil?.m).x}catch(e){log.push(e.name)}
+function e(){const onlyLocal=1;return [eval('typeof onlyLocal'),eval?.('typeof onlyLocal')]}
+out.push(e());
+class Base {method(x){log.push('super:'+String(this instanceof Derived)+':'+x)}}
+class Derived extends Base {
+    #method(x){log.push('private:'+x)}
+    run(o){o?.#method?.(arg());super.method?.(arg())}
+}
+const d=new Derived();d.run(null);d.run(d);
+console.log(JSON.stringify([out,log]));
+";
+        let result = Command::new("node").arg("-e").arg(source).output()?;
+        assert!(result.status.success(), "{result:?}");
+        let actual: serde_json::Value = serde_json::from_slice(&result.stdout)?;
+        assert_eq!(
+            actual,
+            serde_json::json!([
+                [null, 1, null, 1, 1, true, true, ["number", "undefined"]],
+                [
+                    "key",
+                    "coerce",
+                    "get",
+                    "arg",
+                    "call:true:7",
+                    "get:n",
+                    "arg",
+                    "TypeError",
+                    "get",
+                    "arg",
+                    "call:true:7",
+                    "get",
+                    "arg",
+                    "call:false:7",
+                    "key",
+                    "TypeError",
+                    "key",
+                    "coerce",
+                    "delete:m",
+                    "TypeError",
+                    "arg",
+                    "super:true:7",
+                    "arg",
+                    "private:7",
+                    "arg",
+                    "super:true:7"
+                ]
+            ])
+        );
+        Ok(())
     }
 
     #[test]
@@ -1179,10 +1526,7 @@ console.log(JSON.stringify(output));
             phases.contains("| typeof identifier | missing; unresolvable reference"),
             "{phases}"
         );
-        assert!(
-            phases.contains("delete reference semantics: delete obj.x"),
-            "{phases}"
-        );
+        assert!(phases.contains("| DeleteProperty |"), "{phases}");
         let read = position(&phases, "| GetValue identifier | obj |");
         let coercion = position(&phases, "| ToNumber | unary +;");
         assert!(read < coercion, "{phases}");
