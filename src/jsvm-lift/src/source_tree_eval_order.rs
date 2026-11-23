@@ -24,6 +24,179 @@ struct Phase {
     detail: String,
     guards: Vec<String>,
 }
+
+/// A condition is keyed by its source location, not merely its human label.
+/// Each path describes one possible normal completion of the expression seen
+/// so far; only a *proven* abrupt operation can remove that path.
+#[derive(Clone, PartialEq, Eq)]
+struct PathCondition {
+    site: Span,
+    positive: bool,
+    yes: String,
+    no: String,
+}
+impl PathCondition {
+    fn description(&self) -> String {
+        let label = if self.positive { &self.yes } else { &self.no };
+        format!("{label} @{}–{}", self.site.start, self.site.end)
+    }
+}
+
+#[derive(Clone, Default, PartialEq, Eq)]
+struct NormalPath {
+    conditions: Vec<PathCondition>,
+}
+
+#[derive(Clone, Default)]
+struct NormalPaths {
+    alternatives: Vec<NormalPath>,
+    unknown: bool,
+}
+
+impl NormalPaths {
+    const MAX_ALTERNATIVES: usize = 32;
+    const MAX_CONDITIONS: usize = 32;
+
+    fn entry() -> Self {
+        Self {
+            alternatives: vec![NormalPath::default()],
+            unknown: false,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.alternatives.is_empty() && !self.unknown
+    }
+
+    fn assumed(&self, site: Span, positive: bool, yes: &str, no: &str) -> Self {
+        let mut next = Self {
+            alternatives: Vec::new(),
+            unknown: self.unknown,
+        };
+        for path in &self.alternatives {
+            if let Some(existing) = path.conditions.iter().find(|c| c.site == site) {
+                if existing.positive == positive && existing.yes == yes && existing.no == no {
+                    next.alternatives.push(path.clone());
+                }
+                continue;
+            }
+            if path.conditions.len() >= Self::MAX_CONDITIONS {
+                next.unknown = true;
+                continue;
+            }
+            let mut path = path.clone();
+            path.conditions.push(PathCondition {
+                site,
+                positive,
+                yes: yes.to_owned(),
+                no: no.to_owned(),
+            });
+            next.alternatives.push(path);
+        }
+        next.normalize();
+        next
+    }
+
+    fn merge(&mut self, mut other: Self) {
+        self.unknown |= other.unknown;
+        self.alternatives.append(&mut other.alternatives);
+        self.normalize();
+    }
+
+    fn normalize(&mut self) {
+        // Merge complementary branch endings at their join; then repeat for
+        // independent nested branches. Preserve source-order guard IDs.
+        self.alternatives.dedup();
+        loop {
+            let mut merged = false;
+            'pairs: for i in 0..self.alternatives.len() {
+                for j in i + 1..self.alternatives.len() {
+                    let a = &self.alternatives[i].conditions;
+                    let b = &self.alternatives[j].conditions;
+                    if a.len() != b.len() {
+                        continue;
+                    }
+                    let different = a
+                        .iter()
+                        .zip(b)
+                        .enumerate()
+                        .filter(|(_, (left, right))| left != right)
+                        .collect::<Vec<_>>();
+                    if let [(index, (left, right))] = different.as_slice() {
+                        if left.site == right.site
+                            && left.yes == right.yes
+                            && left.no == right.no
+                            && left.positive != right.positive
+                        {
+                            let mut path = self.alternatives[i].clone();
+                            path.conditions.remove(*index);
+                            self.alternatives.remove(j);
+                            self.alternatives[i] = path;
+                            merged = true;
+                            break 'pairs;
+                        }
+                    }
+                }
+            }
+            if !merged {
+                break;
+            }
+            self.alternatives.dedup();
+        }
+        // A shorter conjunction already covers the longer conjunction.
+        let all = self.alternatives.clone();
+        self.alternatives.retain(|path| {
+            !all.iter().any(|other| {
+                other.conditions.len() < path.conditions.len()
+                    && other
+                        .conditions
+                        .iter()
+                        .all(|guard| path.conditions.contains(guard))
+            })
+        });
+        if self.alternatives.len() > Self::MAX_ALTERNATIVES {
+            self.alternatives.clear();
+            self.unknown = true;
+        }
+    }
+
+    fn labels(&self) -> Vec<String> {
+        if self.unknown {
+            // A widening is intentionally visible; it cannot be treated as
+            // proof that any of the omitted branches are impossible.
+            return vec!["unknown (path budget exceeded)".to_owned()];
+        }
+        if let [path] = self.alternatives.as_slice() {
+            return path
+                .conditions
+                .iter()
+                .map(PathCondition::description)
+                .collect();
+        }
+        if self.alternatives.is_empty() {
+            return Vec::new();
+        }
+        vec![self
+            .alternatives
+            .iter()
+            .map(|path| {
+                if path.conditions.is_empty() {
+                    "unguarded".to_owned()
+                } else {
+                    format!(
+                        "({})",
+                        path.conditions
+                            .iter()
+                            .map(PathCondition::description)
+                            .collect::<Vec<_>>()
+                            .join(" and ")
+                    )
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" or ")]
+    }
+}
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Access {
     Read,
@@ -37,6 +210,7 @@ struct ComputedKey {
     base: Span,
     key: Span,
     super_reference: bool,
+    nullish_base: bool,
 }
 
 impl ComputedKey {
@@ -45,30 +219,133 @@ impl ComputedKey {
             base: member.object.span(),
             key: member.expression.span(),
             super_reference: member.object.is_super(),
+            nullish_base: definitely_nullish(&member.object),
         }
+    }
+}
+
+/// A value fact used only to identify operations that necessarily throw on
+/// normal completion. Never infer the value of a mutable binding or getter.
+fn definitely_nullish(expr: &Expression<'_>) -> bool {
+    match expr.without_parentheses() {
+        Expression::NullLiteral(_) => true,
+        Expression::UnaryExpression(unary) if unary.operator == UnaryOperator::Void => true,
+        Expression::SequenceExpression(sequence) => {
+            sequence.expressions.last().is_some_and(definitely_nullish)
+        }
+        Expression::ConditionalExpression(branch) => {
+            definitely_nullish(&branch.consequent) && definitely_nullish(&branch.alternate)
+        }
+        _ => false,
+    }
+}
+
+fn definitely_not_callable(expr: &Expression<'_>) -> bool {
+    match expr.without_parentheses() {
+        Expression::NullLiteral(_)
+        | Expression::BooleanLiteral(_)
+        | Expression::NumericLiteral(_)
+        | Expression::BigIntLiteral(_)
+        | Expression::StringLiteral(_)
+        | Expression::RegExpLiteral(_)
+        | Expression::ArrayExpression(_)
+        | Expression::ObjectExpression(_)
+        | Expression::ClassExpression(_) => true,
+        Expression::UnaryExpression(unary) if unary.operator == UnaryOperator::Void => true,
+        Expression::SequenceExpression(sequence) => sequence
+            .expressions
+            .last()
+            .is_some_and(definitely_not_callable),
+        Expression::ConditionalExpression(branch) => {
+            definitely_not_callable(&branch.consequent)
+                && definitely_not_callable(&branch.alternate)
+        }
+        _ => false,
+    }
+}
+
+/// Construction and calling have different admission rules: classes can
+/// construct but not call, while arrow functions can call but not construct.
+fn definitely_not_constructor(expr: &Expression<'_>) -> bool {
+    match expr.without_parentheses() {
+        Expression::NullLiteral(_)
+        | Expression::BooleanLiteral(_)
+        | Expression::NumericLiteral(_)
+        | Expression::BigIntLiteral(_)
+        | Expression::StringLiteral(_)
+        | Expression::RegExpLiteral(_)
+        | Expression::ArrayExpression(_)
+        | Expression::ObjectExpression(_)
+        | Expression::ArrowFunctionExpression(_) => true,
+        Expression::UnaryExpression(unary) if unary.operator == UnaryOperator::Void => true,
+        Expression::SequenceExpression(sequence) => sequence
+            .expressions
+            .last()
+            .is_some_and(definitely_not_constructor),
+        Expression::ConditionalExpression(branch) => {
+            definitely_not_constructor(&branch.consequent)
+                && definitely_not_constructor(&branch.alternate)
+        }
+        _ => false,
     }
 }
 
 struct Plan<'s> {
     source: &'s str,
-    guards: Vec<String>,
+    normal: NormalPaths,
+    chain_shortcuts: Vec<NormalPaths>,
     phases: Vec<Phase>,
 }
 impl<'s> Plan<'s> {
-    const fn new(source: &'s str) -> Self {
+    fn new(source: &'s str) -> Self {
         Self {
             source,
-            guards: Vec::new(),
+            normal: NormalPaths::entry(),
+            chain_shortcuts: Vec::new(),
             phases: Vec::new(),
         }
     }
     fn mark(&mut self, span: Span, kind: &'static str, detail: impl Into<String>) {
+        if self.normal.is_empty() {
+            return;
+        }
         self.phases.push(Phase {
             span,
             kind,
             detail: detail.into(),
-            guards: self.guards.clone(),
+            guards: self.normal.labels(),
         });
+    }
+
+    fn throw(&mut self, span: Span, reason: &'static str) {
+        self.mark(span, "definite abrupt completion", reason);
+        self.normal = NormalPaths::default();
+    }
+
+    fn branch(&mut self, site: Span, yes: &str, no: &str, then: impl FnOnce(&mut Self)) {
+        let incoming = self.normal.clone();
+        self.normal = incoming.assumed(site, true, yes, no);
+        then(self);
+        let surviving = self.normal.clone();
+        self.normal = incoming.assumed(site, false, yes, no);
+        self.normal.merge(surviving);
+    }
+
+    fn branch_both(
+        &mut self,
+        site: Span,
+        yes: &str,
+        no: &str,
+        then: impl FnOnce(&mut Self),
+        otherwise: impl FnOnce(&mut Self),
+    ) {
+        let incoming = self.normal.clone();
+        self.normal = incoming.assumed(site, true, yes, no);
+        then(self);
+        let surviving = self.normal.clone();
+        self.normal = incoming.assumed(site, false, yes, no);
+        otherwise(self);
+        self.normal.merge(surviving);
     }
     fn snippet(&self, span: Span) -> String {
         let text = self
@@ -89,11 +366,6 @@ impl<'s> Plan<'s> {
             "opaque expression",
             format!("{kind}: {snippet}; internal effects/writes/throws unexpanded"),
         );
-    }
-    fn guarded(&mut self, guard: &str, f: impl FnOnce(&mut Self)) {
-        self.guards.push(guard.to_owned());
-        f(self);
-        self.guards.pop();
     }
     fn computed_reference(&mut self, member: &ComputedMemberExpression<'_>) {
         self.expression(&member.object);
@@ -151,11 +423,31 @@ impl<'s> Plan<'s> {
                     "throws for null/undefined"
                 },
             );
+            if key.nullish_base {
+                self.throw(key.base, "property reference on a guaranteed nullish base throws TypeError before ToPropertyKey");
+                return;
+            }
             self.mark(
                 key.key,
                 "ToPropertyKey",
                 "key conversion may invoke Symbol.toPrimitive or valueOf",
             );
+        }
+    }
+
+    fn static_target_nullish(&mut self, target: &SimpleAssignmentTarget<'_>) {
+        if let SimpleAssignmentTarget::StaticMemberExpression(member) = target {
+            if definitely_nullish(&member.object) {
+                self.mark(
+                    member.object.span(),
+                    "ToObject base",
+                    "nullish base cannot be converted to an object",
+                );
+                self.throw(
+                    member.span,
+                    "static member reference on a guaranteed nullish base throws TypeError",
+                );
+            }
         }
     }
 
@@ -266,6 +558,18 @@ impl<'s> Plan<'s> {
             Self::receiver_kind(&call.callee, !call.optional),
         );
         self.arguments(&call.arguments);
+        if !call.optional && definitely_not_callable(&call.callee) {
+            self.mark(
+                call.callee.span(),
+                "IsCallable",
+                "statically non-callable callee",
+            );
+            self.throw(
+                call.span,
+                "Call with an always non-callable value throws TypeError after arguments",
+            );
+            return;
+        }
         self.mark(
             call.span,
             "Call",
@@ -305,10 +609,24 @@ impl<'s> Plan<'s> {
                 "super delete ReferenceError",
                 "throw before key coercion, GetValue, getter or delete trap",
             );
+            self.throw(
+                member.span(),
+                "delete of a super reference necessarily throws ReferenceError",
+            );
             return;
         }
         if let MemberExpression::ComputedMemberExpression(computed) = member {
             self.key_coercion(Some(ComputedKey::new(computed)));
+        } else if definitely_nullish(member.object()) {
+            self.mark(
+                member.object().span(),
+                "ToObject base",
+                "nullish base cannot be converted to an object",
+            );
+            self.throw(
+                member.span(),
+                "property reference on a guaranteed nullish base throws TypeError",
+            );
         }
         if access == Access::Delete {
             self.mark(member.span(), "DeleteProperty",
@@ -346,17 +664,30 @@ impl<'s> Plan<'s> {
             "nullish check",
             format!("{site}: test evaluated value for null or undefined"),
         );
-        self.guarded(&format!("{site} nullish"), |plan| {
-            plan.mark(
-                link,
-                "short circuit chain",
-                match access {
-                    Access::Read => "skip remaining chain links; produce undefined",
-                    Access::Delete => "skip remaining chain links; delete yields true",
-                },
-            );
-        });
-        self.guards.push(format!("{site} non-nullish"));
+        let incoming = self.normal.clone();
+        self.normal = incoming.assumed(
+            link,
+            true,
+            &format!("{site} nullish"),
+            &format!("{site} non-nullish"),
+        );
+        self.mark(
+            link,
+            "short circuit chain",
+            match access {
+                Access::Read => "skip remaining chain links; produce undefined",
+                Access::Delete => "skip remaining chain links; delete yields true",
+            },
+        );
+        if let Some(shortcuts) = self.chain_shortcuts.last_mut() {
+            shortcuts.merge(self.normal.clone());
+        }
+        self.normal = incoming.assumed(
+            link,
+            false,
+            &format!("{site} nullish"),
+            &format!("{site} non-nullish"),
+        );
     }
 
     /// Descend only through the unparenthesized member/call spine. Other
@@ -401,7 +732,7 @@ impl<'s> Plan<'s> {
     }
 
     fn chain(&mut self, chain: &ChainExpression<'_>, access: Access) {
-        let outer_guards = self.guards.len();
+        self.chain_shortcuts.push(NormalPaths::default());
         if let Some(member) = chain.expression.as_member_expression() {
             self.chain_member(member, access, access);
         } else if let ChainElement::CallExpression(call) = &chain.expression {
@@ -412,7 +743,9 @@ impl<'s> Plan<'s> {
         } else {
             self.opaque(chain.span, "unmodeled chain element");
         }
-        self.guards.truncate(outer_guards);
+        if let Some(shortcuts) = self.chain_shortcuts.pop() {
+            self.normal.merge(shortcuts);
+        }
     }
 
     fn delete(&mut self, arg: &Expression<'_>) {
@@ -452,6 +785,13 @@ impl<'s> Plan<'s> {
             "IsConstructor",
             "check after argument evaluation; non-constructible values throw TypeError here",
         );
+        if definitely_not_constructor(&construct.callee) {
+            self.throw(
+                construct.span,
+                "Construct with a guaranteed non-constructor throws TypeError after arguments",
+            );
+            return;
+        }
         self.mark(
             construct.span,
             "Construct",
@@ -599,6 +939,9 @@ impl<'s> Plan<'s> {
         };
         if !op.is_assign() {
             self.key_coercion(key);
+            if let Some(simple) = assign.left.as_simple_assignment_target() {
+                self.static_target_nullish(simple);
+            }
         }
         if !op.is_assign() {
             self.mark(
@@ -614,11 +957,20 @@ impl<'s> Plan<'s> {
                 AssignmentOperator::LogicalNullish => "target nullish",
                 _ => unreachable!(),
             };
-            self.guarded(guard, |plan| {
+            let inverse = match op {
+                AssignmentOperator::LogicalAnd => "target falsy",
+                AssignmentOperator::LogicalOr => "target truthy",
+                AssignmentOperator::LogicalNullish => "target non-nullish",
+                _ => unreachable!(),
+            };
+            self.branch(assign.span, guard, inverse, |plan| {
                 plan.expression(&assign.right);
                 // Re-convert the original reference's object-valued key for
                 // PutValue; GetValue's conversion was not cached into it.
                 plan.key_coercion(key);
+                if let Some(simple) = assign.left.as_simple_assignment_target() {
+                    plan.static_target_nullish(simple);
+                }
                 plan.mark(
                     assign.left.span(),
                     "PutValue target",
@@ -629,6 +981,9 @@ impl<'s> Plan<'s> {
             self.expression(&assign.right);
             if op.is_assign() {
                 self.key_coercion(key);
+                if let Some(simple) = assign.left.as_simple_assignment_target() {
+                    self.static_target_nullish(simple);
+                }
             }
             if !op.is_assign() {
                 self.mark(assign.span, "apply assignment operator", op.as_str());
@@ -646,6 +1001,7 @@ impl<'s> Plan<'s> {
             let key = Self::update_key(&update.argument);
             let receiver = Self::is_super_target(&update.argument);
             self.key_coercion(key);
+            self.static_target_nullish(&update.argument);
             self.mark(
                 update.argument.span(),
                 "GetValue target",
@@ -757,6 +1113,17 @@ impl<'s> Plan<'s> {
             UnaryOperator::Delete => return,
         };
         self.mark(unary.span, kind, detail);
+        if unary.operator == UnaryOperator::UnaryPlus
+            && matches!(
+                unary.argument.without_parentheses(),
+                Expression::BigIntLiteral(_)
+            )
+        {
+            self.throw(
+                unary.span,
+                "unary plus on a BigInt literal necessarily throws TypeError",
+            );
+        }
     }
 
     fn expression(&mut self, expr: &Expression<'_>) {
@@ -781,18 +1148,25 @@ impl<'s> Plan<'s> {
             }
             Expression::ConditionalExpression(cond) => {
                 self.expression(&cond.test);
-                self.guarded("test truthy", |p| p.expression(&cond.consequent));
-                self.guarded("test falsy", |p| p.expression(&cond.alternate));
+                self.branch_both(
+                    cond.span,
+                    "test truthy",
+                    "test falsy",
+                    |p| p.expression(&cond.consequent),
+                    |p| p.expression(&cond.alternate),
+                );
             }
             Expression::LogicalExpression(logical) => {
                 self.expression(&logical.left);
-                let guard = match logical.operator.as_str() {
-                    "&&" => "left truthy",
-                    "||" => "left falsy",
-                    "??" => "left nullish",
-                    _ => "logical branch",
+                let (guard, inverse) = match logical.operator.as_str() {
+                    "&&" => ("left truthy", "left falsy"),
+                    "||" => ("left falsy", "left truthy"),
+                    "??" => ("left nullish", "left non-nullish"),
+                    _ => ("logical branch", "logical skip"),
                 };
-                self.guarded(guard, |p| p.expression(&logical.right));
+                self.branch(logical.span, guard, inverse, |p| {
+                    p.expression(&logical.right)
+                });
             }
             Expression::BinaryExpression(binary) => {
                 self.expression(&binary.left);
@@ -877,6 +1251,9 @@ pub fn ordered_assignment_phases(
          This is a **static phase plan**, not an observed trace or executable \
          rewrite. Rows are ordered only **within one possible path**; guarded \
          alternative arms are mutually exclusive, and any phase may throw. \
+         Definite abrupt completions end the surviving normal path; subsequent \
+         phases are limited to other normally completing paths. Distinct source \
+         sites identify guards, and over-budget paths widen explicitly. \
          Opaque expressions may contain nested calls, writes, getters, \
          coercions and exceptions: their internal order is not expanded. \
          The separate assignment outline shows AST containment. A simple \
@@ -969,6 +1346,254 @@ mod tests {
     }
 
     #[test]
+    fn certain_throw_stops_sequence_nested_assignments_and_outer_putvalue() {
+        let source = format!(
+            "class A{{}}class B extends A{{run(side){{root=(side.before=1,delete super.x,side.after=2,{});}}}}",
+            long_effects()
+        );
+        let phases = plan(&source);
+        let before = position(&phases, "side.before = (setter may run)");
+        let abrupt = position(&phases, "| super delete ReferenceError |");
+        let completion = position(&phases, "| definite abrupt completion |");
+        assert!(before < abrupt && abrupt < completion, "{phases}");
+        assert!(
+            !phases.contains("side.after = (setter may run)"),
+            "{phases}"
+        );
+        assert!(
+            !phases.contains("side.member0 = (setter may run)"),
+            "{phases}"
+        );
+        assert!(!phases.contains("root = (setter may run)"), "{phases}");
+    }
+
+    #[test]
+    fn conditional_throw_retains_only_its_sibling_normal_path() {
+        let source = format!(
+            "class A{{}}class B extends A{{run(side,flag){{root=(flag?delete super.x:side.ok(),side.after=1,{});}}}}",
+            long_effects()
+        );
+        let phases = plan(&source);
+        assert!(
+            phase_row(&phases, "| super delete ReferenceError |").contains("test truthy"),
+            "{phases}"
+        );
+        assert!(
+            phase_row(&phases, "| Call | side.ok;").contains("test falsy"),
+            "{phases}"
+        );
+        for fragment in ["side.after = (setter may run)", "root = (setter may run)"] {
+            let row = phase_row(&phases, fragment);
+            assert!(row.contains("test falsy @"), "{row}");
+            assert!(!row.contains("test truthy"), "{row}");
+        }
+    }
+
+    #[test]
+    fn both_arms_throw_and_repeated_guards_use_distinct_source_sites() {
+        let both = format!(
+            "class A{{}}class B extends A{{run(side,flag){{root=(flag?delete super.x:delete super.y,side.after=1,{});}}}}",
+            long_effects()
+        );
+        let phases = plan(&both);
+        assert_eq!(phases.matches("| super delete ReferenceError |").count(), 2);
+        assert!(
+            !phases.contains("side.after = (setter may run)"),
+            "{phases}"
+        );
+
+        let nested = format!(
+            "class A{{}}class B extends A{{run(side,flag,other){{root=(flag?delete super.x:(other?delete super.y:side.ok()),side.after=1,{});}}}}",
+            long_effects()
+        );
+        let phases = plan(&nested);
+        let after = phase_row(&phases, "side.after = (setter may run)");
+        assert_eq!(after.matches("test falsy @").count(), 2, "{after}");
+        assert!(phase_row(&phases, "| Call | side.ok;").contains("test falsy @"));
+    }
+
+    #[test]
+    fn logical_throw_keeps_only_short_circuit_continuation() {
+        for (op, survival) in [
+            ("&&", "left falsy"),
+            ("||", "left truthy"),
+            ("??", "left non-nullish"),
+        ] {
+            let source = format!(
+                "class A{{}}class B extends A{{run(side,flag){{root=(flag {op} delete super.x,side.after=1,{});}}}}",
+                long_effects()
+            );
+            let phases = plan(&source);
+            let after = phase_row(&phases, "side.after = (setter may run)");
+            assert!(after.contains(survival), "{after}");
+            assert_eq!(phases.matches("| super delete ReferenceError |").count(), 1);
+        }
+    }
+
+    #[test]
+    fn optional_chain_short_circuit_survives_throwing_computed_key() {
+        let source = format!(
+            "class A{{}}class B extends A{{run(side,obj){{root=(obj?.[delete super.x],side.after=1,{});}}}}",
+            long_effects()
+        );
+        let phases = plan(&source);
+        assert!(phase_row(&phases, "| super delete ReferenceError |").contains("non-nullish"));
+        let after = phase_row(&phases, "side.after = (setter may run)");
+        assert!(after.contains("nullish"), "{after}");
+        assert!(!after.contains("non-nullish"), "{after}");
+        assert_eq!(phases.matches("| short circuit chain |").count(), 1);
+    }
+
+    #[test]
+    fn guaranteed_nullish_base_throws_after_key_expression_before_conversion() {
+        for offending in ["null[key()]", "(void effect())[key()]"] {
+            let source = format!(
+                "function f(side,key,effect){{root=(side.before={offending},side.after=2,{});}}",
+                long_effects()
+            );
+            let phases = plan(&source);
+            let key_call = position(&phases, "| Call | key;");
+            let to_object = position(&phases, "| ToObject base |");
+            let abrupt = position(&phases, "| definite abrupt completion |");
+            assert!(key_call < to_object && to_object < abrupt, "{phases}");
+            assert!(!phases.contains("| ToPropertyKey |"), "{phases}");
+            assert!(
+                !phases.contains("side.after = (setter may run)"),
+                "{phases}"
+            );
+        }
+    }
+
+    #[test]
+    fn definite_non_callable_and_non_constructor_check_after_arguments() {
+        for expression in ["(null)(arg())", "new null(arg())", "new (() => 1)(arg())"] {
+            let source = format!(
+                "function f(side,arg){{root=(side.before={expression},side.after=2,{});}}",
+                long_effects()
+            );
+            let phases = plan(&source);
+            let argument = position(&phases, "| Call | arg;");
+            let abrupt = position(&phases, "| definite abrupt completion |");
+            assert!(argument < abrupt, "{phases}");
+            assert!(
+                !phases.contains("side.after = (setter may run)"),
+                "{phases}"
+            );
+        }
+        let valid = format!(
+            "function f(side){{root=(side.before=new class X{{}}(),side.after=2,{});}}",
+            long_effects()
+        );
+        let phases = plan(&valid);
+        assert!(phases.contains("side.after = (setter may run)"), "{phases}");
+    }
+
+    #[test]
+    fn bigint_unary_plus_throws_but_other_numeric_expressions_continue() {
+        let throws = format!(
+            "function f(side){{root=(+1n,side.after=2,{});}}",
+            long_effects()
+        );
+        let phases = plan(&throws);
+        assert!(phases.contains("| definite abrupt completion |"));
+        assert!(
+            !phases.contains("side.after = (setter may run)"),
+            "{phases}"
+        );
+
+        let works = format!(
+            "function f(side){{root=(-1n,side.after=2,{});}}",
+            long_effects()
+        );
+        let phases = plan(&works);
+        assert!(phases.contains("side.after = (setter may run)"), "{phases}");
+    }
+
+    #[test]
+    fn symbolic_paths_join_complements_and_explicitly_widen_when_bounded() {
+        use super::NormalPaths;
+        use oxc_span::Span;
+        let start = NormalPaths::entry();
+        let site = Span::new(1, 2);
+        let mut a = start.assumed(site, true, "yes", "no");
+        a.merge(start.assumed(site, false, "yes", "no"));
+        assert!(a.labels().is_empty());
+
+        let mut options = NormalPaths::default();
+        for n in 0..40 {
+            options.merge(start.assumed(Span::new(n + 20, n + 21), true, "yes", "no"));
+        }
+        assert!(options.unknown, "exceeded path budget must be visible");
+        assert!(options.labels()[0].contains("unknown"));
+        assert!(!options.is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires installed Node; normal versus definite abrupt continuation oracle"]
+    fn node_confirms_definite_throw_path_survival_and_short_circuits() -> anyhow::Result<()> {
+        use std::process::Command;
+        let source = r"
+class Base{}
+class Derived extends Base {
+  conditional(flag){
+    const events=[];
+    try{
+      const result=(events.push('before'),flag?delete super.x:events.push('false'),
+                    events.push('after'));
+      events.push('result:'+result);
+    }catch(e){events.push(e.name)}
+    return events;
+  }
+  optional(obj){
+    const events=[];
+    try{
+      const result=(obj?.[delete super.x],events.push('after'));
+      events.push('result:'+result);
+    }catch(e){events.push(e.name)}
+    return events;
+  }
+  nullish(){
+    const events=[];
+    const key={toString(){events.push('bad-key-coercion');return 'x'}};
+    try {
+      const value=(null[(events.push('key-expression'),key)],events.push('after'));
+      events.push(value);
+    }catch(e){events.push(e.name)}
+    return events;
+  }
+  call(){
+    const events=[];
+    try{
+      (null)((events.push('argument'),1));
+      events.push('after');
+    }catch(e){events.push(e.name)}
+    return events;
+  }
+}
+const d=new Derived();
+console.log(JSON.stringify([
+  d.conditional(true),d.conditional(false),d.optional(null),d.optional({}),
+  d.nullish(),d.call()
+]));
+";
+        let result = Command::new("node").arg("-e").arg(source).output()?;
+        assert!(result.status.success(), "{result:?}");
+        let actual: serde_json::Value = serde_json::from_slice(&result.stdout)?;
+        assert_eq!(
+            actual,
+            serde_json::json!([
+                ["before", "ReferenceError"],
+                ["before", "false", "after", "result:3"],
+                ["after", "result:1"],
+                ["ReferenceError"],
+                ["key-expression", "TypeError"],
+                ["argument", "TypeError"]
+            ])
+        );
+        Ok(())
+    }
+
+    #[test]
     fn computed_target_coercion_waits_until_simple_assignment_putvalue() {
         let code = format!(
             "function f(obj,key,rhs,inner,side){{\
@@ -1014,7 +1639,7 @@ mod tests {
         );
         let phases = plan(&code);
         let get = position(&phases, "obj.value; getter/dynamic resolution");
-        let rhs = position(&phases, "| target truthy |");
+        let rhs = position(&phases, "target truthy @");
         let put = position(&phases, "obj.value &&= (setter may run)");
         assert!(get < rhs && rhs < put, "{phases}");
         assert!(
@@ -1030,8 +1655,8 @@ mod tests {
             long_effects()
         );
         let phases = plan(&code);
-        assert!(phases.contains("| test truthy |"), "{phases}");
-        assert!(phases.contains("| test falsy |"), "{phases}");
+        assert!(phases.contains("test truthy @"), "{phases}");
+        assert!(phases.contains("test falsy @"), "{phases}");
         let left = position(&phases, "obj.left = (setter may run)");
         let right = position(&phases, "obj.right = (setter may run)");
         assert!(left < right, "{phases}");
@@ -1299,7 +1924,7 @@ mod tests {
             .nth(1)
             .unwrap_or_default();
         assert_eq!(second.matches("non-nullish").count(), 1, "{second}");
-        assert!(second.contains(" nullish |"), "{second}");
+        assert!(second.contains(" nullish @"), "{second}");
     }
 
     #[test]
@@ -1799,7 +2424,9 @@ console.log(JSON.stringify([values,log]));
                 && super_reference < abrupt,
             "{phases}"
         );
-        assert_eq!(phases.matches("| super delete ReferenceError |").count(), 2);
+        // The first delete definitely throws; the next one is unreachable.
+        assert_eq!(phases.matches("| super delete ReferenceError |").count(), 1);
+        assert!(!phases.contains("side.two = (setter may run)"), "{phases}");
         assert!(!phases.contains("| ToPropertyKey |"), "{phases}");
         assert!(!phases.contains("| DeleteProperty |"), "{phases}");
     }
@@ -2007,8 +2634,8 @@ console.log(JSON.stringify([out,log]));
             long_effects()
         );
         let phases = plan(&source);
-        assert!(phases.contains("| test truthy |"), "{phases}");
-        assert!(phases.contains("| test falsy |"), "{phases}");
+        assert!(phases.contains("test truthy @"), "{phases}");
+        assert!(phases.contains("test falsy @"), "{phases}");
         let check = position(&phases, "| IsConstructor |");
         let construct = position(&phases, "| Construct |");
         assert!(check < construct, "{phases}");
