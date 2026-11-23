@@ -1369,7 +1369,7 @@ console.log(JSON.stringify([values,log]));
         let source = r"
 const events=[];
 const key={toString(){events.push('coerce');return 'x'}};
-const base=new Proxy({x:1},{deleteProperty(){events.push('delete-trap');return true}});
+const base=new Proxy(Object.create(null),{deleteProperty(){events.push('delete-trap');return true}});
 class A {}
 Object.setPrototypeOf(A.prototype,base);
 class B extends A {
