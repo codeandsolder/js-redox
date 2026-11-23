@@ -206,16 +206,33 @@ impl<'s> Plan<'s> {
 
     fn member(&mut self, member: &MemberExpression<'_>, access: Access) {
         if member.object().is_super() {
-            self.opaque(member.span(), "super property reference");
-            return;
+            self.mark(
+                member.object().span(),
+                "GetThisBinding super",
+                "resolve this before property key; uninitialized this throws ReferenceError",
+            );
+        } else {
+            self.expression(member.object());
         }
-        self.expression(member.object());
         self.member_after_base(member, access);
     }
 
     fn member_after_base(&mut self, member: &MemberExpression<'_>, access: Access) {
         if let MemberExpression::ComputedMemberExpression(computed) = member {
-            self.computed_reference_after_base(computed);
+            if member.object().is_super() {
+                self.expression(&computed.expression);
+            } else {
+                self.computed_reference_after_base(computed);
+            }
+        }
+        if member.object().is_super() {
+            self.mark(
+                member.span(),
+                "form super reference",
+                "GetSuperBase; preserve original this as receiver and uncoerced key",
+            );
+        }
+        if let MemberExpression::ComputedMemberExpression(computed) = member {
             self.key_coercion(Some((computed.object.span(), computed.expression.span())));
         }
         if access == Access::Delete {
@@ -246,7 +263,7 @@ impl<'s> Plan<'s> {
     }
 
     /// Append a guard for the rest of THIS chain, rather than just the
-    /// optional link. A nested ChainExpression has its own guard lifetime.
+    /// optional link. A nested `ChainExpression` has its own guard lifetime.
     fn optional_guard(&mut self, value: Span, link: Span, access: Access) {
         let site = format!("optional link {}–{}", link.start, link.end);
         self.mark(
@@ -1218,6 +1235,95 @@ mod tests {
         );
         assert!(phase_row(&phases, "| expand spread argument |").contains("non-nullish"));
         assert_eq!(phases.matches("direct eval candidate:").count(), 1);
+    }
+
+    #[test]
+    fn super_optional_call_preserves_receiver_and_this_check_order() {
+        let source = format!(
+            "class Base{{m(){{}}}}class Derived extends Base{{run(key,arg,side){{root=(side.x=super[key()]?.(arg()),side.y=super.m?.(arg()),{});}}}}",
+            long_effects()
+        );
+        let phases = plan(&source);
+        let this = position(&phases, "| GetThisBinding super |");
+        let key = position(&phases, "| Call | key;");
+        let form = position(&phases, "| form super reference |");
+        let convert = position(&phases, "| ToPropertyKey |");
+        let getter = position(&phases, "| GetValue member |");
+        let check = position(&phases, "| nullish check |");
+        let arg = position(&phases, "| Call | arg;");
+        assert!(
+            this < key
+                && key < form
+                && form < convert
+                && convert < getter
+                && getter < check
+                && check < arg,
+            "{phases}"
+        );
+        assert_eq!(
+            phases.matches("| GetThisBinding super |").count(),
+            2,
+            "{phases}"
+        );
+        assert_eq!(
+            phases
+                .matches("super member receiver is the original this binding")
+                .count(),
+            2,
+            "{phases}"
+        );
+        assert!(phase_row(&phases, "| Call | arg;").contains("non-nullish"));
+        assert!(!phases.contains("| opaque expression |"), "{phases}");
+    }
+
+    #[test]
+    #[ignore = "requires installed Node; super property reference ordering oracle"]
+    fn node_confirms_super_optional_receiver_and_early_this_throw() -> anyhow::Result<()> {
+        use std::process::Command;
+        let source = r"
+const log=[];
+class Base {
+  get method(){log.push('getter');return function(x){'use strict';log.push('receiver:'+String(this instanceof Derived)+':'+x);return x}}
+}
+class Derived extends Base {
+  run(){const key={toString(){log.push('coerce');return 'method'}};
+    return [
+      super[(log.push('key'),key)]?.((log.push('arg'),7)),
+      super.method?.((log.push('arg2'),8))
+    ]}
+}
+const d=new Derived();
+const values=d.run();
+class Uninitialized extends Base {
+  constructor(){
+    try{super[(log.push('should-not-run'),'method')]}catch(e){log.push(e.name)}
+    super()
+  }
+}
+new Uninitialized();
+console.log(JSON.stringify([values,log]));
+";
+        let result = Command::new("node").arg("-e").arg(source).output()?;
+        assert!(result.status.success(), "{result:?}");
+        let actual: serde_json::Value = serde_json::from_slice(&result.stdout)?;
+        assert_eq!(
+            actual,
+            serde_json::json!([
+                [7, 8],
+                [
+                    "key",
+                    "coerce",
+                    "getter",
+                    "arg",
+                    "receiver:true:7",
+                    "getter",
+                    "arg2",
+                    "receiver:true:8",
+                    "ReferenceError"
+                ]
+            ])
+        );
+        Ok(())
     }
 
     #[test]
