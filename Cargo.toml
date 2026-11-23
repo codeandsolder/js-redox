@@ -67,3 +67,4 @@ work-budget = { path = "src/work-budget" }
 [patch.crates-io]
 oxc_semantic = { path = "vendor/oxc_semantic" }
 oxc_compat = { path = "vendor/oxc_compat" }
+zlib-rs = { git = "https://github.com/codeandsolder/zlib-rs-fast.git", rev = "1ec3a5612ee28803a7756fa52bd013389507a2db" }
