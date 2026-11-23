@@ -225,7 +225,6 @@ mod tests {
     #[ignore = "requires Node; differential checks script completion liveness"]
     fn demand_never_drops_observable_preceding_completion() -> Result<(), Box<dyn std::error::Error>>
     {
-        use std::process::Command;
         let suffixes = [
             ";",
             "{}",
@@ -274,6 +273,18 @@ mod tests {
             "function f(){}",
             "class C{}",
         ];
+        let suffixes = suffixes.into_iter().map(str::to_owned).collect::<Vec<_>>();
+        assert_eq!(verify_normal_completion_demand(&suffixes)?, 13);
+        Ok(())
+    }
+
+    /// Check soundness, not exact precision: any script value that a real
+    /// engine carries from an earlier expression must be demanded. The same
+    /// oracle is shared by hand-picked and grammar-composed regressions.
+    fn verify_normal_completion_demand(
+        suffixes: &[String],
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        use std::process::Command;
         let harness = r"
 const vm=require('node:vm');
 const suffixes=JSON.parse(process.argv[1]);
@@ -295,13 +306,14 @@ console.log(JSON.stringify(suffixes.map(suffix=>{
         let output = Command::new("node")
             .arg("-e")
             .arg(harness)
-            .arg(serde_json::to_string(&suffixes[..])?)
+            .arg(serde_json::to_string(suffixes)?)
             .output()?;
         assert!(output.status.success(), "{output:?}");
         let observed: Vec<bool> = serde_json::from_slice(&output.stdout)?;
         assert_eq!(observed.len(), suffixes.len());
 
-        for (suffix, observable) in suffixes.into_iter().zip(observed) {
+        let count = observed.iter().filter(|&&flag| flag).count();
+        for (suffix, observable) in suffixes.iter().zip(observed) {
             let source = format!("1;{suffix}");
             let allocator = Allocator::default();
             let parsed = parse_program(&allocator, &source, SourceType::cjs());
@@ -317,6 +329,62 @@ console.log(JSON.stringify(suffixes.map(suffix=>{
                 "Dropped observable preceding script completion for {source}"
             );
         }
+        Ok(count)
+    }
+
+    #[test]
+    #[ignore = "requires Node; compositional script completion liveness oracle"]
+    fn generated_statement_grammar_preserves_preceding_completion_demand(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let bases = [
+            ";",
+            "{}",
+            "{;}",
+            "{let q;}",
+            "{2;}",
+            "2;",
+            "void 0;",
+            "if(false){}",
+            "if(true){2;}",
+            "if(false){2;}else{3;}",
+            "while(false){}",
+            "while(true){2;break;}",
+            "do{2;}while(false)",
+            "for(let i=0;i<1;i++){2;}",
+            "switch(1){case 1:2;break;}",
+            "switch(2){case 1:2;}",
+            "try{2;}finally{}",
+            "try{}finally{2;}",
+            "try{throw 2;}catch(e){3;}",
+            "with({}){2;}",
+            "function f(){}",
+            "class C{}",
+        ];
+        let mut suffixes = Vec::new();
+        for base in bases {
+            let contexts = [
+                base.to_owned(),
+                format!("{{{base}}}"),
+                format!("OUT:{{{base}}}"),
+                format!("OUT:{{{base} break OUT;}}"),
+                format!("try{{{base}}}finally{{;}}"),
+                format!("try{{;}}finally{{{base}}}"),
+                format!("if(true){{{base}}}"),
+                format!("if(false){{{base}}}"),
+                format!("switch(1){{case 1:{{{base}}} break;}}"),
+            ];
+            for context in contexts {
+                suffixes.push(context.clone());
+                suffixes.push(format!("{context};"));
+                suffixes.push(format!("{context} function after(){{}}"));
+            }
+        }
+        assert_eq!(suffixes.len(), 594);
+        let observable = verify_normal_completion_demand(&suffixes)?;
+        assert!(
+            observable >= 60,
+            "insufficient observable paths: {observable}"
+        );
         Ok(())
     }
 
