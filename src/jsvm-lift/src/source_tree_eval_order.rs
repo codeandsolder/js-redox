@@ -1363,7 +1363,7 @@ mod tests {
         let rhs = position(&phases, "| Call | rhs;");
         let object = position(&phases, "| ToObject base |");
         let coerced = position(&phases, "| ToPropertyKey |");
-        let put = position(&phases, "super[key()] = (setter may run)");
+        let put = position(&phases, &literal_text("super[key()] = (setter may run)"));
         assert!(
             this < key
                 && key < formed
@@ -1377,8 +1377,10 @@ mod tests {
         assert!(
             phases.contains("GetSuperBase result; nullish throws; original this remains receiver")
         );
-        assert!(phase_row(&phases, "super[key()] = (setter may run)")
-            .contains("super accessor receiver is original this"));
+        assert!(
+            phase_row(&phases, &literal_text("super[key()] = (setter may run)"))
+                .contains("super accessor receiver is original this")
+        );
         assert!(!phases.contains("| GetValue target |"), "{phases}");
     }
 
@@ -1405,7 +1407,7 @@ mod tests {
         let read = position(&phases, "| GetValue target |");
         let rhs = position(&phases, "| Call | rhs;");
         let applied = position(&phases, "| apply assignment operator |");
-        let put = position(&phases, "| PutValue target |");
+        let put = position(&phases, &literal_text("super[key()] += (setter may run)"));
         assert!(
             this < key
                 && key < formed
@@ -1420,7 +1422,10 @@ mod tests {
             "{phases}"
         );
         assert!(phase_row(&phases, "| GetValue target |").contains("super accessor receiver"));
-        assert!(phase_row(&phases, "| PutValue target |").contains("super accessor receiver"));
+        assert!(
+            phase_row(&phases, &literal_text("super[key()] += (setter may run)"))
+                .contains("super accessor receiver")
+        );
     }
 
     #[test]
@@ -1442,7 +1447,10 @@ mod tests {
             assert_eq!(coerced.len(), 2, "{phases}");
             let read = position(&phases, "| GetValue target |");
             let rhs = position(&phases, "| Call | rhs;");
-            let put = position(&phases, "| PutValue target |");
+            let put = position(
+                &phases,
+                &literal_text(&format!("super[key()] {op} (setter may run)")),
+            );
             assert!(
                 coerced[0] < read && read < rhs && rhs < coerced[1] && coerced[1] < put,
                 "{phases}"
