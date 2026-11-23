@@ -611,6 +611,89 @@ mod tests {
         Ok(())
     }
 
+    /// Compare the actual ScriptEvaluation Completion Record, not only
+    /// emitted effects. In particular Empty is distinct from an explicit
+    /// undefined completion, and an abrupt path may bypass a trailing arm.
+    #[test]
+    #[ignore = "requires Node; script completion and exception differential oracle"]
+    fn bounded_dispatch_preserves_script_completion_across_exit_shapes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::process::Command;
+
+        fn observe(source: &str) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+            let harness = r#"
+const vm=require('node:vm');
+const events=[];
+const context={
+  work(label) {events.push(label); return 'value:'+label;},
+  tick(label) {events.push('tick:'+label); return undefined;}
+};
+try {
+  const value=vm.runInNewContext(process.argv[1],context,{timeout:2000});
+  console.log(JSON.stringify({
+    kind:value===undefined?'undefined':typeof value,
+    value:value===undefined?null:value,
+    events
+  }));
+} catch(error) {
+  console.log(JSON.stringify({kind:'throw',name:error.name,events}));
+}
+"#;
+            let result = Command::new("node")
+                .arg("-e")
+                .arg(harness)
+                .arg(source)
+                .output()?;
+            assert!(result.status.success(), "{source}: {result:?}");
+            Ok(serde_json::from_slice(&result.stdout)?)
+        }
+
+        let cases = [
+            "for(let a=[1,2],i=0;i<a.length;){switch(a[i++]){case 1:work('A');continue;case 2:work('B');break;}break;}",
+            "for(let a=[1,2],i=0;i<a.length;){switch(a[i++]){case 1:work('A');continue;case 2:;break;}break;}",
+            "for(let a=[1,2],i=0;i<a.length;){switch(a[i++]){case 1:work('A');continue;case 2:;continue;}break;}",
+            "for(let a=[1,2],i=0;i<a.length;){switch(a[i++]){case 1:work('A');continue;case 2:try{work('B');}finally{work('F');}break;}break;}",
+            "for(let a=[1,2],i=0;i<a.length;){switch(a[i++]){case 1:work('A');continue;case 2:throw new Error('fail');}break;}",
+            "for(let a=[1,2],i=0;i<a.length;){switch(a[i++]){case 1:work('A');continue;case 2:work('B');continue;}break;}",
+            "for(let a=[1,2],i=0;i<a.length;){switch(a[i++]){case 1:work('A');continue;case 2:work('B');continue;}break;} 999;",
+            "1;for(let a=[2],i=0;i<a.length;){switch(a[i++]){case 1:work('A');continue;case 2:work('B');break;}break;}",
+            "1;for(let a=[9],i=0;i<a.length;){switch(a[i++]){case 1:work('A');continue;case 2:work('B');break;}break;}",
+            "for(let a=[1,2],i=0;i<a.length;){switch(a[i++]){case 1:tick('A');continue;case 2:work('B');break;}break;}",
+            "for(let a=[1,2],i=0;i<a.length;){switch(a[i++]){case 1:work('A');continue;case 2:work('B');break;}break;} var unused;",
+            "try {for(let a=[1,2],i=0;i<a.length;){switch(a[i++]){case 1:work('A');continue;case 2:work('B');break;}break;}} finally {tick('finally');}",
+            "outer:{for(let a=[1,2],i=0;i<a.length;){switch(a[i++]){case 1:work('A');continue;case 2:work('B');break;}break;}}",
+        ];
+        let mut transformations = 0;
+        for source in cases {
+            let recovered = deobfuscate(
+                source,
+                16,
+                &WorkBudget::unlimited("completion-dispatch-oracle"),
+            )?
+            .ok_or_else(|| std::io::Error::other("valid source must recover"))?;
+            transformations += recovered
+                .transforms
+                .get("ordered_switch_unflatten")
+                .copied()
+                .unwrap_or(0);
+            let original = observe(source)?;
+            let rewritten = observe(&recovered.source)?;
+            assert_eq!(
+                original, rewritten,
+                "Completion Record mismatch:
+ORIGINAL: {source}
+REWRITTEN: {}
+TRANSFORMS: {:?}",
+                recovered.source, recovered.transforms,
+            );
+        }
+        assert!(
+            transformations >= 5,
+            "expected to exercise bounded dispatch"
+        );
+        Ok(())
+    }
+
     #[test]
     fn shared_bindings_fallthrough_and_eval_block_dispatch_relocation() -> Result<(), BudgetExceeded>
     {

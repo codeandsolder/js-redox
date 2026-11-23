@@ -1694,11 +1694,13 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
             self.push(it.span, ";".to_owned(), "remove_inert_literal_statement");
             return;
         }
-        // Script/eval Completion values can expose the result of a top-level
-        // expression statement. Inside a function, a normal completion is
-        // discarded; the statement may be safely normalized to if/blocks.
+        // Completion demand, not function nesting, determines whether an
+        // expression statement's result may be discarded. A preceding
+        // script/eval expression overwritten by a later value is eligible;
+        // a final expression, or one flowing through a branch/jump, is not.
+        // The lowered block contains only statements, no new bindings.
         if self.allow_effect_statements
-            && self.function_context.depth > 0
+            && !live
             && effectful_constant::fold(&it.expression, self.source).is_none()
         {
             // A known-result effectful expression can eliminate enormous

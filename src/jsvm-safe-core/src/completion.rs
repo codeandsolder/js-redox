@@ -222,6 +222,104 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires Node; differential checks script completion liveness"]
+    fn demand_never_drops_observable_preceding_completion() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use std::process::Command;
+        let suffixes = [
+            ";",
+            "{}",
+            "{;}",
+            "{var x;}",
+            "{let x;}",
+            "{2;}",
+            "{var x;2;}",
+            "L:;",
+            "L:{}",
+            "L:{;}",
+            "L:{let x;}",
+            "L:{break L;}",
+            "L:{2;break L;}",
+            "L:{;break L;}",
+            "L:{try{break L;}finally{;}}",
+            "L:{try{2;break L;}finally{;}}",
+            "L:{try{}finally{break L;}}",
+            "if(false){}",
+            "if(true){}",
+            "if(false){2;}",
+            "if(true){2;}",
+            "while(false){}",
+            "while(true){break;}",
+            "do{}while(false)",
+            "do{2;break;}while(false)",
+            "for(;false;){}",
+            "for(let i=0;i<1;i++){2;}",
+            "switch(1){}",
+            "switch(1){case 2:22;}",
+            "switch(1){case 1:;}",
+            "switch(1){default:;}",
+            "switch(1){case 1:2;break;}",
+            "switch(1){case 1:;break;}",
+            "try{}catch(e){}",
+            "try{}finally{}",
+            "try{;}finally{;}",
+            "try{2;}finally{}",
+            "try{2;}finally{3;}",
+            "try{throw 2;}catch(e){}",
+            "try{throw 2;}catch(e){3;}",
+            "try{throw 2;}catch(e){;}finally{3;}",
+            "with({}){}",
+            "with({}){;}",
+            "with({}){2;}",
+            "function f(){}",
+            "class C{}",
+        ];
+        let harness = r#"
+const vm=require('node:vm');
+const suffixes=JSON.parse(process.argv[1]);
+function observe(source) {
+ try {
+   const v=vm.runInNewContext(source,Object.create(null),{timeout:500});
+   return v===undefined?['undefined']:['value',typeof v,String(v)];
+ } catch(e) {
+   return ['throw',e.name];
+ }
+}
+console.log(JSON.stringify(suffixes.map(suffix=>{
+ const value=observe('1;'+suffix);
+ const empty=observe(';'+suffix);
+ return JSON.stringify(value)!==JSON.stringify(empty);
+})));
+"#;
+        let output = Command::new("node")
+            .arg("-e")
+            .arg(harness)
+            .arg(serde_json::to_string(&suffixes[..])?)
+            .output()?;
+        assert!(output.status.success(), "{output:?}");
+        let observed: Vec<bool> = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(observed.len(), suffixes.len());
+
+        for (suffix, observable) in suffixes.into_iter().zip(observed) {
+            let source = format!("1;{suffix}");
+            let allocator = Allocator::default();
+            let parsed = parse_program(&allocator, &source, SourceType::cjs());
+            assert!(parsed.is_clean(), "{source}");
+            let analysis = CompletionLiveness::analyze(&parsed.program);
+            let first = parsed
+                .program
+                .body
+                .first()
+                .ok_or_else(|| std::io::Error::other("missing first expression"))?;
+            assert!(
+                !observable || analysis.needs_value(first.span()),
+                "Dropped observable preceding script completion for {source}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn tracks_values_through_empty_statements_and_abrupt_paths() {
         for (source, expected) in [
             ("1; 2; var x;", vec!["2"]),
