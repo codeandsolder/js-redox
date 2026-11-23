@@ -64,7 +64,7 @@ impl NormalPaths {
         }
     }
 
-    fn is_empty(&self) -> bool {
+    const fn is_empty(&self) -> bool {
         self.alternatives.is_empty() && !self.unknown
     }
 
@@ -219,74 +219,104 @@ impl ComputedKey {
             base: member.object.span(),
             key: member.expression.span(),
             super_reference: member.object.is_super(),
-            nullish_base: definitely_nullish(&member.object),
+            nullish_base: value_facts(&member.object, 0).nullish,
         }
     }
 }
 
-/// A value fact used only to identify operations that necessarily throw on
-/// normal completion. Never infer the value of a mutable binding or getter.
-fn definitely_nullish(expr: &Expression<'_>) -> bool {
-    match expr.without_parentheses() {
-        Expression::NullLiteral(_) => true,
-        Expression::UnaryExpression(unary) if unary.operator == UnaryOperator::Void => true,
-        Expression::SequenceExpression(sequence) => {
-            sequence.expressions.last().is_some_and(definitely_nullish)
+/// Facts are guarantees on *normal* completion, never claims about a
+/// mutable binding, accessor, Proxy, or unresolved call. Expression structure
+/// only strengthens facts where every possible normal result has the property.
+#[derive(Clone, Copy, Default)]
+struct ValueFacts {
+    nullish: bool,
+    non_nullish: bool,
+    non_callable: bool,
+    non_constructor: bool,
+}
+impl ValueFacts {
+    const UNKNOWN: Self = Self {
+        nullish: false,
+        non_nullish: false,
+        non_callable: false,
+        non_constructor: false,
+    };
+    const NULLISH: Self = Self {
+        nullish: true,
+        non_nullish: false,
+        non_callable: true,
+        non_constructor: true,
+    };
+    const NON_CALLABLE_VALUE: Self = Self {
+        nullish: false,
+        non_nullish: true,
+        non_callable: true,
+        non_constructor: true,
+    };
+    const CLASS: Self = Self {
+        nullish: false,
+        non_nullish: true,
+        non_callable: true,
+        non_constructor: false,
+    };
+    const ARROW: Self = Self {
+        nullish: false,
+        non_nullish: true,
+        non_callable: false,
+        non_constructor: true,
+    };
+
+    const fn common(self, other: Self) -> Self {
+        Self {
+            nullish: self.nullish && other.nullish,
+            non_nullish: self.non_nullish && other.non_nullish,
+            non_callable: self.non_callable && other.non_callable,
+            non_constructor: self.non_constructor && other.non_constructor,
         }
-        Expression::ConditionalExpression(branch) => {
-            definitely_nullish(&branch.consequent) && definitely_nullish(&branch.alternate)
-        }
-        _ => false,
     }
 }
 
-fn definitely_not_callable(expr: &Expression<'_>) -> bool {
+/// Bounded structural classification: neither its recursion nor its
+/// conclusions depend on runtime values or a speculative environment.
+fn value_facts(expr: &Expression<'_>, depth: usize) -> ValueFacts {
+    if depth >= 32 {
+        return ValueFacts::UNKNOWN;
+    }
+    let next = depth + 1;
     match expr.without_parentheses() {
-        Expression::NullLiteral(_)
-        | Expression::BooleanLiteral(_)
+        Expression::NullLiteral(_) => ValueFacts::NULLISH,
+        Expression::BooleanLiteral(_)
         | Expression::NumericLiteral(_)
         | Expression::BigIntLiteral(_)
         | Expression::StringLiteral(_)
         | Expression::RegExpLiteral(_)
         | Expression::ArrayExpression(_)
         | Expression::ObjectExpression(_)
-        | Expression::ClassExpression(_) => true,
-        Expression::UnaryExpression(unary) if unary.operator == UnaryOperator::Void => true,
+        | Expression::TemplateLiteral(_) => ValueFacts::NON_CALLABLE_VALUE,
+        Expression::ClassExpression(_) => ValueFacts::CLASS,
+        Expression::ArrowFunctionExpression(_) => ValueFacts::ARROW,
+        Expression::FunctionExpression(_) | Expression::NewExpression(_) => ValueFacts {
+            non_nullish: true,
+            ..ValueFacts::UNKNOWN
+        },
+        Expression::UnaryExpression(unary) => {
+            if unary.operator == UnaryOperator::Void {
+                ValueFacts::NULLISH
+            } else {
+                ValueFacts::NON_CALLABLE_VALUE
+            }
+        }
         Expression::SequenceExpression(sequence) => sequence
             .expressions
             .last()
-            .is_some_and(definitely_not_callable),
+            .map_or(ValueFacts::UNKNOWN, |last| value_facts(last, next)),
         Expression::ConditionalExpression(branch) => {
-            definitely_not_callable(&branch.consequent)
-                && definitely_not_callable(&branch.alternate)
+            value_facts(&branch.consequent, next).common(value_facts(&branch.alternate, next))
         }
-        _ => false,
-    }
-}
-
-/// Construction and calling have different admission rules: classes can
-/// construct but not call, while arrow functions can call but not construct.
-fn definitely_not_constructor(expr: &Expression<'_>) -> bool {
-    match expr.without_parentheses() {
-        Expression::NullLiteral(_)
-        | Expression::BooleanLiteral(_)
-        | Expression::NumericLiteral(_)
-        | Expression::BigIntLiteral(_)
-        | Expression::StringLiteral(_)
-        | Expression::RegExpLiteral(_)
-        | Expression::ArrayExpression(_)
-        | Expression::ObjectExpression(_)
-        | Expression::ArrowFunctionExpression(_) => true,
-        Expression::UnaryExpression(unary) if unary.operator == UnaryOperator::Void => true,
-        Expression::SequenceExpression(sequence) => sequence
-            .expressions
-            .last()
-            .is_some_and(definitely_not_constructor),
-        Expression::ConditionalExpression(branch) => {
-            definitely_not_constructor(&branch.consequent)
-                && definitely_not_constructor(&branch.alternate)
+        Expression::AssignmentExpression(assignment) if assignment.operator.is_assign() => {
+            value_facts(&assignment.right, next)
         }
-        _ => false,
+        _ => ValueFacts::UNKNOWN,
     }
 }
 
@@ -437,7 +467,7 @@ impl<'s> Plan<'s> {
 
     fn static_target_nullish(&mut self, target: &SimpleAssignmentTarget<'_>) {
         if let SimpleAssignmentTarget::StaticMemberExpression(member) = target {
-            if definitely_nullish(&member.object) {
+            if value_facts(&member.object, 0).nullish {
                 self.mark(
                     member.object.span(),
                     "ToObject base",
@@ -558,7 +588,7 @@ impl<'s> Plan<'s> {
             Self::receiver_kind(&call.callee, !call.optional),
         );
         self.arguments(&call.arguments);
-        if !call.optional && definitely_not_callable(&call.callee) {
+        if !call.optional && value_facts(&call.callee, 0).non_callable {
             self.mark(
                 call.callee.span(),
                 "IsCallable",
@@ -617,7 +647,7 @@ impl<'s> Plan<'s> {
         }
         if let MemberExpression::ComputedMemberExpression(computed) = member {
             self.key_coercion(Some(ComputedKey::new(computed)));
-        } else if definitely_nullish(member.object()) {
+        } else if value_facts(member.object(), 0).nullish {
             self.mark(
                 member.object().span(),
                 "ToObject base",
@@ -657,20 +687,28 @@ impl<'s> Plan<'s> {
 
     /// Append a guard for the rest of THIS chain, rather than just the
     /// optional link. A nested `ChainExpression` has its own guard lifetime.
-    fn optional_guard(&mut self, value: Span, link: Span, access: Access) {
+    fn optional_guard(&mut self, value: &Expression<'_>, link: Span, access: Access) {
         let site = format!("optional link {}–{}", link.start, link.end);
         self.mark(
-            value,
+            value.span(),
             "nullish check",
             format!("{site}: test evaluated value for null or undefined"),
         );
         let incoming = self.normal.clone();
-        self.normal = incoming.assumed(
-            link,
-            true,
-            &format!("{site} nullish"),
-            &format!("{site} non-nullish"),
-        );
+        let facts = value_facts(value, 0);
+        let short = if facts.non_nullish {
+            NormalPaths::default()
+        } else if facts.nullish {
+            incoming.clone()
+        } else {
+            incoming.assumed(
+                link,
+                true,
+                &format!("{site} nullish"),
+                &format!("{site} non-nullish"),
+            )
+        };
+        self.normal = short;
         self.mark(
             link,
             "short circuit chain",
@@ -682,12 +720,18 @@ impl<'s> Plan<'s> {
         if let Some(shortcuts) = self.chain_shortcuts.last_mut() {
             shortcuts.merge(self.normal.clone());
         }
-        self.normal = incoming.assumed(
-            link,
-            false,
-            &format!("{site} nullish"),
-            &format!("{site} non-nullish"),
-        );
+        self.normal = if facts.nullish {
+            NormalPaths::default()
+        } else if facts.non_nullish {
+            incoming
+        } else {
+            incoming.assumed(
+                link,
+                false,
+                &format!("{site} nullish"),
+                &format!("{site} non-nullish"),
+            )
+        };
     }
 
     /// Descend only through the unparenthesized member/call spine. Other
@@ -714,7 +758,7 @@ impl<'s> Plan<'s> {
         }
         self.chain_operand(member.object(), chain_access);
         if member.optional() {
-            self.optional_guard(member.object().span(), member.span(), chain_access);
+            self.optional_guard(member.object(), member.span(), chain_access);
         }
         self.member_after_base(member, member_access);
     }
@@ -726,7 +770,7 @@ impl<'s> Plan<'s> {
         }
         self.chain_operand(&call.callee, access);
         if call.optional {
-            self.optional_guard(call.callee.span(), call.span, access);
+            self.optional_guard(&call.callee, call.span, access);
         }
         self.call_after_callee(call);
     }
@@ -785,7 +829,7 @@ impl<'s> Plan<'s> {
             "IsConstructor",
             "check after argument evaluation; non-constructible values throw TypeError here",
         );
-        if definitely_not_constructor(&construct.callee) {
+        if value_facts(&construct.callee, 0).non_constructor {
             self.throw(
                 construct.span,
                 "Construct with a guaranteed non-constructor throws TypeError after arguments",
@@ -1165,7 +1209,7 @@ impl<'s> Plan<'s> {
                     _ => ("logical branch", "logical skip"),
                 };
                 self.branch(logical.span, guard, inverse, |p| {
-                    p.expression(&logical.right)
+                    p.expression(&logical.right);
                 });
             }
             Expression::BinaryExpression(binary) => {
@@ -1445,6 +1489,79 @@ mod tests {
     }
 
     #[test]
+    fn static_optional_nullish_and_nonnullish_facts_prune_impossible_links() {
+        for (base, must_throw) in [
+            ("null", false),
+            ("(void side.effect())", false),
+            ("({})", true),
+            ("false", true),
+            ("(true ? {} : [])", true),
+        ] {
+            let source = format!(
+                "class A{{}}class B extends A{{run(side){{root=({base}?.[delete super.x],side.after=1,{});}}}}",
+                long_effects()
+            );
+            let phases = plan(&source);
+            assert_eq!(
+                phases.contains("| super delete ReferenceError |"),
+                must_throw,
+                "{phases}"
+            );
+            assert_eq!(
+                phases.contains("side.after = (setter may run)"),
+                !must_throw,
+                "{phases}"
+            );
+            if must_throw {
+                assert!(!phases.contains("| short circuit chain |"), "{phases}");
+            } else {
+                assert!(phases.contains("| short circuit chain |"), "{phases}");
+                assert!(
+                    phase_row(&phases, "side.after = (setter may run)").contains("| unguarded |")
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires installed Node; static optional nullish/non-nullish oracle"]
+    fn node_confirms_optional_literal_value_classification() -> anyhow::Result<()> {
+        use std::process::Command;
+        let source = r"
+const events=[];
+class A{}
+class B extends A {
+ run(){
+   events.push('before');
+   null?.[delete super.x];
+   (void events.push('void-effect'))?.[delete super.x];
+   events.push('after-null');
+   try{({})?.[delete super.x];events.push('impossible');}
+   catch(e){events.push(e.name);}
+   try{false?.[delete super.x];events.push('impossible');}
+   catch(e){events.push(e.name);}
+ }
+}
+new B().run();
+console.log(JSON.stringify(events));
+";
+        let result = Command::new("node").arg("-e").arg(source).output()?;
+        assert!(result.status.success(), "{result:?}");
+        let actual: serde_json::Value = serde_json::from_slice(&result.stdout)?;
+        assert_eq!(
+            actual,
+            serde_json::json!([
+                "before",
+                "void-effect",
+                "after-null",
+                "ReferenceError",
+                "ReferenceError"
+            ])
+        );
+        Ok(())
+    }
+
+    #[test]
     fn guaranteed_nullish_base_throws_after_key_expression_before_conversion() {
         for offending in ["null[key()]", "(void effect())[key()]"] {
             let source = format!(
@@ -1517,7 +1634,7 @@ mod tests {
         let site = Span::new(1, 2);
         let mut a = start.assumed(site, true, "yes", "no");
         a.merge(start.assumed(site, false, "yes", "no"));
-        assert!(a.labels().is_empty());
+        assert_eq!(a.labels(), Vec::<String>::new());
 
         let mut options = NormalPaths::default();
         for n in 0..40 {
