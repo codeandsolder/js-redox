@@ -740,11 +740,17 @@ impl Collector<'_, '_> {
     }
 
     fn lower_if_test_statements(&mut self, statements: &[Statement<'_>]) {
-        if !self.allow_effect_statements || self.function_context.depth == 0 {
+        if !self.allow_effect_statements {
             return;
         }
         for statement in statements {
             if let Statement::IfStatement(branch) = statement {
+                // Lifting the leading test operand into a sibling statement
+                // introduces another Completion Record. It is only safe if
+                // the enclosing if's completion value is not demanded.
+                if self.completion.needs_value(branch.span) {
+                    continue;
+                }
                 if let Some(code) = effect_statements::lower_if_test(branch, self.source) {
                     self.push(branch.span, code, "if_test_sequence_lowering");
                 } else if let Some(code) =
@@ -765,11 +771,16 @@ impl Collector<'_, '_> {
     }
 
     fn lower_sibling_expression_statements(&mut self, statements: &[Statement<'_>]) {
-        if !self.allow_effect_statements || self.function_context.depth == 0 {
+        if !self.allow_effect_statements {
             return;
         }
         for statement in statements {
             if let Statement::ExpressionStatement(expression) = statement {
+                // Replacing an assignment expression with if/else statements
+                // preserves its side effects, but not its expression result.
+                if self.completion.needs_value(expression.span) {
+                    continue;
+                }
                 if let Some(code) = effect_statements::lower_conditional_assignment(
                     expression,
                     self.source,
@@ -1395,6 +1406,16 @@ impl Collector<'_, '_> {
 }
 
 impl<'a> Visit<'a> for Collector<'_, '_> {
+    fn visit_program(&mut self, program: &oxc_ast::ast::Program<'a>) {
+        // The program body is a sibling statement list too. Earlier script
+        // and direct-eval statements may have dead completion values, just
+        // like function/block statements; inspect them under the same demand
+        // proof instead of excluding the entire top level.
+        self.lower_if_test_statements(&program.body);
+        self.lower_sibling_expression_statements(&program.body);
+        walk::walk_program(self, program);
+    }
+
     fn visit_function(&mut self, it: &oxc_ast::ast::Function<'a>, flags: ScopeFlags) {
         self.within_function(it.span, it.scope_id.get(), |visitor| {
             walk::walk_function(visitor, it, flags);

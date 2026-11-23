@@ -611,7 +611,7 @@ mod tests {
         Ok(())
     }
 
-    /// Compare the actual ScriptEvaluation Completion Record, not only
+    /// Compare the actual `ScriptEvaluation` Completion Record, not only
     /// emitted effects. In particular Empty is distinct from an explicit
     /// undefined completion, and an abrupt path may bypass a trailing arm.
     #[test]
@@ -621,7 +621,7 @@ mod tests {
         use std::process::Command;
 
         fn observe(source: &str) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-            let harness = r#"
+            let harness = r"
 const vm=require('node:vm');
 const events=[];
 const context={
@@ -629,7 +629,8 @@ const context={
   tick(label) {events.push('tick:'+label); return undefined;}
 };
 try {
-  const value=vm.runInNewContext(process.argv[1],context,{timeout:2000});
+  const options={};options.timeout=2000;
+  const value=vm.runInNewContext(process.argv[1],context,options);
   console.log(JSON.stringify({
     kind:value===undefined?'undefined':typeof value,
     value:value===undefined?null:value,
@@ -638,7 +639,7 @@ try {
 } catch(error) {
   console.log(JSON.stringify({kind:'throw',name:error.name,events}));
 }
-"#;
+";
             let result = Command::new("node")
                 .arg("-e")
                 .arg(harness)

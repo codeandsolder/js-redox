@@ -274,12 +274,13 @@ mod tests {
             "function f(){}",
             "class C{}",
         ];
-        let harness = r#"
+        let harness = r"
 const vm=require('node:vm');
 const suffixes=JSON.parse(process.argv[1]);
 function observe(source) {
  try {
-   const v=vm.runInNewContext(source,Object.create(null),{timeout:500});
+   const options={}; options.timeout=500;
+   const v=vm.runInNewContext(source,Object.create(null),options);
    return v===undefined?['undefined']:['value',typeof v,String(v)];
  } catch(e) {
    return ['throw',e.name];
@@ -290,7 +291,7 @@ console.log(JSON.stringify(suffixes.map(suffix=>{
  const empty=observe(';'+suffix);
  return JSON.stringify(value)!==JSON.stringify(empty);
 })));
-"#;
+";
         let output = Command::new("node")
             .arg("-e")
             .arg(harness)

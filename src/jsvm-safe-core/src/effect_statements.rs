@@ -766,6 +766,72 @@ mod tests {
     }
 
     #[test]
+    fn program_sibling_structuring_uses_the_same_completion_demand() -> Result<(), BudgetExceeded> {
+        let dead_if = "var flag=choice; if ((emit('P'),flag)) emit('Y'); else emit('N'); 42;";
+        let result = deobfuscate(
+            dead_if,
+            16,
+            &WorkBudget::unlimited("program-if-completion-dead"),
+        )?
+        .unwrap_or_else(|| unreachable!());
+        assert!(
+            result
+                .transforms
+                .get("if_test_sequence_lowering")
+                .is_some_and(|count| *count > 0),
+            "{:?}: {}",
+            result.transforms,
+            result.source
+        );
+        let live_if = "var flag=choice; if ((emit('P'),flag)) emit('Y'); else emit('N');";
+        let result = deobfuscate(
+            live_if,
+            16,
+            &WorkBudget::unlimited("program-if-completion-live"),
+        )?
+        .unwrap_or_else(|| unreachable!());
+        assert!(
+            !result.transforms.contains_key("if_test_sequence_lowering"),
+            "{:?}: {}",
+            result.transforms,
+            result.source
+        );
+
+        let dead_assign = "let state; state=choice ? (emit('Y'),2) : (emit('N'),4); 42;";
+        let result = deobfuscate(
+            dead_assign,
+            16,
+            &WorkBudget::unlimited("program-assignment-completion-dead"),
+        )?
+        .unwrap_or_else(|| unreachable!());
+        assert!(
+            result
+                .transforms
+                .get("assignment_conditional_lowering")
+                .is_some_and(|count| *count > 0),
+            "{:?}: {}",
+            result.transforms,
+            result.source
+        );
+        let live_assign = "let state; state=choice ? (emit('Y'),2) : (emit('N'),4);";
+        let result = deobfuscate(
+            live_assign,
+            16,
+            &WorkBudget::unlimited("program-assignment-completion-live"),
+        )?
+        .unwrap_or_else(|| unreachable!());
+        assert!(
+            !result
+                .transforms
+                .contains_key("assignment_conditional_lowering"),
+            "{:?}: {}",
+            result.transforms,
+            result.source
+        );
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "requires Node; compare script and direct-eval completion before/after source lowering"]
     fn script_and_eval_completion_match_after_demand_gated_lowering(
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -776,7 +842,7 @@ mod tests {
             choice: bool,
             mode: &str,
         ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-            let harness = r#"
+            let harness = r"
 const vm = require('node:vm');
 const events = [];
 const context = {
@@ -787,7 +853,8 @@ const source=process.argv[1];
 const code=process.argv[3]==='eval'?
   'eval('+JSON.stringify(source)+')':source;
 try {
-  const result=vm.runInNewContext(code,context,{timeout:2000});
+  const options={};options.timeout=2000;
+  const result=vm.runInNewContext(code,context,options);
   console.log(JSON.stringify({
     type:result===undefined?'undefined':typeof result,
     value:result===undefined?null:result,
@@ -796,7 +863,7 @@ try {
 } catch(e) {
   console.log(JSON.stringify({type:'throw',name:e.name,events}));
 }
-"#;
+";
             let result = Command::new("node")
                 .arg("-e")
                 .arg(harness)
@@ -814,6 +881,11 @@ try {
             "var flag=choice; try {(flag && (emit('A'),emit('B')),emit('C'));}finally{emit('F');} 42;",
             "var flag=choice; if(flag) {(emit('A'),emit('B'));}else{emit('N');} 42;",
             "var flag=choice; (flag && (emit('A'),emit('B')),eval(\"emit('E')\")); 42;",
+            "var flag=choice; if ((emit('P'),flag)) emit('Y'); else emit('N'); 42;",
+            "var flag=choice; if ((emit('P'),flag)) emit('Y'); else emit('N');",
+            "let state; state=choice ? (emit('Y'),2) : (emit('N'),4); 42;",
+            "let state; state=choice ? (emit('Y'),2) : (emit('N'),4);",
+            "var obj={}; ((emit('P'),obj).value=emit('V')); 42;",
         ];
         let mut lowered = 0;
         for source in fixtures {
