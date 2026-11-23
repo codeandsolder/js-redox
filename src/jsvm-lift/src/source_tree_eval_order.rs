@@ -3,11 +3,12 @@
 use oxc_ast::ast::{
     Argument, ArrayExpression, ArrayExpressionElement, AssignmentExpression, AssignmentTarget,
     CallExpression, ComputedMemberExpression, Expression, NewExpression, ObjectExpression,
-    ObjectPropertyKind, Program, SimpleAssignmentTarget,
+    ObjectPropertyKind, Program, SimpleAssignmentTarget, TaggedTemplateExpression, TemplateLiteral,
+    UnaryExpression,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_span::{GetSpan, Span};
-use oxc_syntax::operator::AssignmentOperator;
+use oxc_syntax::operator::{AssignmentOperator, UnaryOperator};
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
@@ -142,9 +143,11 @@ impl<'s> Plan<'s> {
     /// callee retains its base as the call receiver; a sequence (0, obj.f)
     /// produces a value rather than a property reference. Parentheses alone
     /// preserve a reference. Do not descend into optional call chains.
-    fn receiver_kind(callee: &Expression<'_>) -> &'static str {
+    fn receiver_kind(callee: &Expression<'_>, direct_eval_possible: bool) -> &'static str {
         match callee {
-            Expression::ParenthesizedExpression(paren) => Self::receiver_kind(&paren.expression),
+            Expression::ParenthesizedExpression(paren) => {
+                Self::receiver_kind(&paren.expression, direct_eval_possible)
+            }
             Expression::StaticMemberExpression(member) if !member.optional => {
                 "member receiver from evaluated reference"
             }
@@ -154,7 +157,7 @@ impl<'s> Plan<'s> {
             Expression::PrivateFieldExpression(member) if !member.optional => {
                 "private member receiver from evaluated reference"
             }
-            Expression::Identifier(id) if id.name == "eval" => {
+            Expression::Identifier(id) if direct_eval_possible && id.name == "eval" => {
                 "direct eval candidate: lexical environment remains observable"
             }
             Expression::SequenceExpression(_) => "sequence value; member receiver discarded",
@@ -171,7 +174,7 @@ impl<'s> Plan<'s> {
         self.mark(
             call.callee.span(),
             "callee ready",
-            Self::receiver_kind(&call.callee),
+            Self::receiver_kind(&call.callee, true),
         );
         self.arguments(&call.arguments);
         self.mark(
@@ -400,6 +403,81 @@ impl<'s> Plan<'s> {
         }
     }
 
+    fn template(&mut self, template: &TemplateLiteral<'_>) {
+        for substitution in &template.expressions {
+            self.expression(substitution);
+            self.mark(substitution.span(), "ToString substitution",
+                "convert before evaluating the next substitution; object coercion may invoke user code; Symbol throws");
+        }
+        self.mark(
+            template.span,
+            "template value",
+            "combine cooked segments and converted substitutions",
+        );
+    }
+
+    fn tagged_template(&mut self, tagged: &TaggedTemplateExpression<'_>) {
+        self.expression(&tagged.tag);
+        self.mark(
+            tagged.tag.span(),
+            "tag ready",
+            Self::receiver_kind(&tagged.tag, false),
+        );
+        self.mark(
+            tagged.quasi.span,
+            "GetTemplateObject",
+            "site-specific cached frozen template object; raw segments preserved, invalid cooked escapes yield undefined",
+        );
+        for substitution in &tagged.quasi.expressions {
+            self.expression(substitution);
+        }
+        self.mark(tagged.span, "Call tag",
+            "check callability after substitutions and invoke with original receiver, template object and uncoerced values; effects opaque");
+    }
+
+    fn unary(&mut self, unary: &UnaryExpression<'_>) {
+        if unary.operator == UnaryOperator::Delete {
+            self.opaque(unary.span, "delete reference semantics");
+            return;
+        }
+        if let (UnaryOperator::Typeof, Expression::Identifier(id)) =
+            (unary.operator, unary.argument.without_parentheses())
+        {
+            self.mark(id.span, "typeof identifier",
+                format!("{}; unresolvable reference yields undefined string, but TDZ and binding access can throw", id.name));
+            return;
+        }
+        self.expression(&unary.argument);
+        let (kind, detail) = match unary.operator {
+            UnaryOperator::Void => (
+                "discard value",
+                "void produces undefined only if its operand completes",
+            ),
+            UnaryOperator::Typeof => (
+                "typeof value",
+                "classify value without numeric or string coercion",
+            ),
+            UnaryOperator::LogicalNot => (
+                "ToBoolean",
+                "negate truthiness without invoking user coercion",
+            ),
+            UnaryOperator::UnaryPlus => (
+                "ToNumber",
+                "unary +; object coercion can run user code; BigInt and Symbol throw",
+            ),
+            UnaryOperator::UnaryNegation => (
+                "ToNumeric",
+                "unary -; numeric coercion then Number or BigInt negation",
+            ),
+            UnaryOperator::BitwiseNot => (
+                "ToNumeric",
+                "unary ~; numeric coercion then Number ToInt32 or BigInt complement",
+            ),
+            UnaryOperator::Delete => return,
+        };
+        self.mark(unary.span, kind, detail);
+    }
+
     fn expression(&mut self, expr: &Expression<'_>) {
         match expr {
             Expression::ParenthesizedExpression(paren) => self.expression(&paren.expression),
@@ -485,20 +563,11 @@ impl<'s> Plan<'s> {
                 // allocation/identity with a primitive constant or callback.
                 self.mark(expr.span(), "create regexp", "fresh RegExp literal value");
             }
-            Expression::UnaryExpression(unary) if unary.operator.is_void() => {
-                // void still evaluates GetValue of its operand, even if
-                // it contains assignments, calls or references that throw.
-                self.expression(&unary.argument);
-                self.mark(
-                    unary.span,
-                    "discard value",
-                    "void produces undefined only if its operand completes",
-                );
-            }
+            Expression::UnaryExpression(unary) => self.unary(unary),
+            Expression::TemplateLiteral(template) => self.template(template),
+            Expression::TaggedTemplateExpression(tagged) => self.tagged_template(tagged),
             Expression::UpdateExpression(update) => self.update(update),
-            // Delete/typeof and coercing unary operators, optional chains,
-            // templates and class initializers remain opaque rather than
-            // pretending we know their effect/exception order.
+            // Optional chains and class initializers remain opaque.
             _ => self.opaque(expr.span(), "unexpanded AST subtree"),
         }
     }
@@ -555,8 +624,10 @@ pub fn ordered_assignment_phases(
          Primitive literals are marked inert, while RegExp literals create \
          distinct objects. The void operator evaluates its operand (including \
          calls, binding reads and exceptions) before discarding its value; \
-         delete/typeof and coercing unary operators retain their own \
-         unexpanded semantics. New expressions evaluate the constructor \
+         typeof preserves its special unresolvable-reference behavior; numeric unary \
+         operators distinguish ToNumber from ToNumeric. Delete stays opaque. Untagged \
+         templates convert each substitution immediately; tags receive uncoerced values \
+         and a site-specific template object with the original receiver. New expressions evaluate the constructor \
          value and argument list (including spreads) before IsConstructor \
          validation and Construct; a member receiver is not forwarded. \
          Spans refer to the derived readable helper, not captured source.\n\n",
@@ -1095,7 +1166,7 @@ console.log(JSON.stringify(output));
     }
 
     #[test]
-    fn void_reads_effectful_operands_but_typeof_delete_and_coercions_stay_opaque() {
+    fn unary_operands_preserve_reference_and_coercion_distinctions() {
         let source = format!(
             "function f(obj,side){{root=(side.a=void missing,             side.b=typeof missing,side.c=delete obj.x,             side.d=+obj,side.e=void obj.value,{});}}",
             long_effects()
@@ -1105,17 +1176,170 @@ console.log(JSON.stringify(output));
         let first_discard = position(&phases, "| discard value |");
         assert!(missing < first_discard, "{phases}");
         assert!(
-            phases.contains("unexpanded AST subtree: typeof missing"),
+            phases.contains("| typeof identifier | missing; unresolvable reference"),
             "{phases}"
         );
         assert!(
-            phases.contains("unexpanded AST subtree: delete obj.x"),
+            phases.contains("delete reference semantics: delete obj.x"),
             "{phases}"
         );
-        assert!(phases.contains("unexpanded AST subtree: +obj"), "{phases}");
+        let read = position(&phases, "| GetValue identifier | obj |");
+        let coercion = position(&phases, "| ToNumber | unary +;");
+        assert!(read < coercion, "{phases}");
         let getter = position(&phases, "| GetValue member | property .value");
         let last_discard = phases.rfind("| discard value |").unwrap_or(usize::MAX);
         assert!(getter < last_discard, "{phases}");
+    }
+
+    #[test]
+    fn templates_distinguish_conversion_order_from_tag_invocation() {
+        let source = format!(
+            "function f(obj,side){{root=(side.a=`a${{first()}}b${{second()}}`,side.b=obj.tag`a${{third()}}b${{fourth()}}`,{});}}",
+            long_effects()
+        );
+        let phases = plan(&source);
+        let first = position(&phases, "| Call | first;");
+        let first_conversion = position(&phases, "| ToString substitution |");
+        let second = position(&phases, "| Call | second;");
+        let last_conversion = phases
+            .rfind("| ToString substitution |")
+            .unwrap_or(usize::MAX);
+        let getter = position(&phases, "| GetValue member | property .tag");
+        let tag = position(&phases, "| tag ready | member receiver");
+        let object = position(&phases, "| GetTemplateObject |");
+        let third = position(&phases, "| Call | third;");
+        let fourth = position(&phases, "| Call | fourth;");
+        let call = position(&phases, "| Call tag |");
+        let ordered = [
+            first,
+            first_conversion,
+            second,
+            last_conversion,
+            getter,
+            tag,
+            object,
+            third,
+            fourth,
+            call,
+        ];
+        assert!(ordered.windows(2).all(|pair| pair[0] < pair[1]), "{phases}");
+        assert_eq!(
+            phases.matches("| ToString substitution |").count(),
+            2,
+            "{phases}"
+        );
+    }
+
+    #[test]
+    fn tagged_eval_is_not_a_direct_eval_candidate() {
+        let source = format!(
+            "function f(side){{root=(side.a=eval('x'),side.b=eval`x`,side.c=(0,obj.tag)`x`,{});}}",
+            long_effects()
+        );
+        let phases = plan(&source);
+        assert_eq!(
+            phases.matches("direct eval candidate:").count(),
+            1,
+            "{phases}"
+        );
+        assert!(
+            phases.contains("| tag ready | sequence value; member receiver discarded"),
+            "{phases}"
+        );
+        assert_eq!(
+            phases.matches("| GetTemplateObject |").count(),
+            2,
+            "{phases}"
+        );
+    }
+
+    #[test]
+    fn unary_type_and_numeric_phases_follow_operand_evaluation() {
+        let source = format!(
+            "function f(obj,side){{root=(side.a=typeof (missing),side.b=typeof (0,other),side.c=!first(),side.d=-second(),side.e=~third(),{});}}",
+            long_effects()
+        );
+        let phases = plan(&source);
+        let ordered = [
+            position(&phases, "| typeof identifier | missing;"),
+            position(&phases, "| GetValue identifier | other |"),
+            position(&phases, "| typeof value |"),
+            position(&phases, "| Call | first;"),
+            position(&phases, "| ToBoolean |"),
+            position(&phases, "| Call | second;"),
+            position(&phases, "| ToNumeric | unary -;"),
+            position(&phases, "| Call | third;"),
+            position(
+                &phases,
+                &format!("| ToNumeric | {};", literal_text("unary ~")),
+            ),
+        ];
+        assert!(ordered.windows(2).all(|pair| pair[0] < pair[1]), "{phases}");
+        assert!(
+            !phases.contains("| GetValue identifier | missing |"),
+            "{phases}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires installed Node; template and unary order oracle"]
+    fn node_confirms_template_and_unary_conversion_order() -> anyhow::Result<()> {
+        use std::process::Command;
+        let source = r"
+const log = [];
+function value(label) {
+    log.push('eval:'+label);
+    return {[Symbol.toPrimitive](hint){log.push('convert:'+label+':'+hint); return 3}};
+}
+const obj = {get tag(){
+    log.push('get:tag');
+    return function(t,a,b){log.push('tag:'+(this===obj)+':'+t.raw[0]+':'+typeof a+':'+typeof b)};
+}};
+const out = `x${value('a')}y${value('b')}`;
+obj.tag`raw${value('c')}${value('d')}`;
+try {`${Symbol()}${value('unreachable')}`} catch(e) {log.push(e.name)}
+const plus = +value('plus');
+const neg = -value('neg');
+const bit = ~value('bit');
+const not = !value('not');
+log.push('typeof:'+typeof (noSuchBindingOfAnyKind));
+try {typeof tdz; let tdz} catch(e) {log.push(e.name)}
+console.log(JSON.stringify([out,plus,neg,bit,not,log]));
+";
+        let result = Command::new("node").arg("-e").arg(source).output()?;
+        assert!(result.status.success(), "{result:?}");
+        let values: serde_json::Value = serde_json::from_slice(&result.stdout)?;
+        assert_eq!(
+            values,
+            serde_json::json!([
+                "x3y3",
+                3,
+                -3,
+                -4,
+                false,
+                [
+                    "eval:a",
+                    "convert:a:string",
+                    "eval:b",
+                    "convert:b:string",
+                    "get:tag",
+                    "eval:c",
+                    "eval:d",
+                    "tag:true:raw:object:object",
+                    "TypeError",
+                    "eval:plus",
+                    "convert:plus:number",
+                    "eval:neg",
+                    "convert:neg:number",
+                    "eval:bit",
+                    "convert:bit:number",
+                    "eval:not",
+                    "typeof:undefined",
+                    "ReferenceError"
+                ]
+            ])
+        );
+        Ok(())
     }
 
     #[test]
