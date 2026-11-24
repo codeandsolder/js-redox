@@ -1423,25 +1423,48 @@ fn live_loop_state_is_lexically_stable(
     let Some(symbol) = symbol else {
         return false;
     };
-    // A classic-script root var is object-backed. A preexisting global
-    // accessor survives the declaration and can intercept both GetValue
-    // and PutValue. In contrast a root let/const is a lexical environment
-    // binding, and function-local vars have their own declarative record.
-    if scoping.symbol_scope_id(symbol) == scoping.root_scope_id()
-        && !scoping
+    numeric_state_binding_is_declarative(scoping, symbol)
+        && numeric_state_loop_references_proven(scoping, symbol, name, |proof| {
+            proof.visit_for_statement(it);
+        })
+}
+
+/// A classic-script root var is object-backed. A preexisting accessor may
+/// intercept GetValue and PutValue; a root lexical binding and local vars
+/// use declarative environments instead.
+fn numeric_state_binding_is_declarative(scoping: &Scoping, symbol: SymbolId) -> bool {
+    scoping.symbol_scope_id(symbol) != scoping.root_scope_id()
+        || scoping
             .symbol_flags(symbol)
             .contains(oxc_semantic::SymbolFlags::BlockScopedVariable)
-    {
-        return false;
-    }
+}
+
+fn numeric_state_loop_references_proven(
+    scoping: &Scoping,
+    symbol: SymbolId,
+    name: &str,
+    visit: impl FnOnce(&mut LiveNumericStateBinding<'_>),
+) -> bool {
     let mut proof = LiveNumericStateBinding {
         scoping,
         symbol,
         name,
         valid: true,
     };
-    proof.visit_for_statement(it);
+    visit(&mut proof);
     proof.valid
+}
+
+fn while_state_transitions_proven(
+    it: &WhileStatement<'_>,
+    scoping: &Scoping,
+    symbol: SymbolId,
+    name: &str,
+) -> bool {
+    numeric_state_binding_is_declarative(scoping, symbol)
+        && numeric_state_loop_references_proven(scoping, symbol, name, |proof| {
+            proof.visit_while_statement(it);
+        })
 }
 
 /// A loop completion certificate can be attached to the already-validated
@@ -1613,7 +1636,12 @@ pub fn reconstruct_while_with_known_state(
     state: &str,
     initial: u64,
     source: &str,
+    scoping: &Scoping,
 ) -> Option<String> {
+    let (symbol, actual_name) = while_state_binding(it, scoping)?;
+    if state != actual_name || !while_state_transitions_proven(it, scoping, symbol, state) {
+        return None;
+    }
     reconstruct_state_loop(state, initial, &it.test, &it.body, "", source)
         .map(|reconstructed| reconstructed.text)
 }
@@ -5107,6 +5135,7 @@ pub fn reconstruct_while_adjacent(
     init: &Statement<'_>,
     loop_stmt: &WhileStatement<'_>,
     source: &str,
+    scoping: &Scoping,
 ) -> Option<String> {
     let (state, initial) = match init {
         Statement::ExpressionStatement(stmt) => {
@@ -5130,6 +5159,33 @@ pub fn reconstruct_while_adjacent(
         }
         _ => return None,
     };
+    let (symbol, actual_name) = while_state_binding(loop_stmt, scoping)?;
+    if state != actual_name || !while_state_transitions_proven(loop_stmt, scoping, symbol, state) {
+        return None;
+    }
+    let init_symbol = match init {
+        Statement::ExpressionStatement(stmt) => {
+            let Expression::AssignmentExpression(assign) = &stmt.expression else {
+                return None;
+            };
+            let AssignmentTarget::AssignmentTargetIdentifier(id) = &assign.left else {
+                return None;
+            };
+            id.reference_id
+                .get()
+                .and_then(|reference| crate::statically_resolved_symbol(scoping, reference))
+        }
+        Statement::VariableDeclaration(decl) => {
+            let BindingPattern::BindingIdentifier(id) = &decl.declarations.first()?.id else {
+                return None;
+            };
+            id.symbol_id.get()
+        }
+        _ => None,
+    };
+    if init_symbol != Some(symbol) {
+        return None;
+    }
     let initial_text = fragment(source, init.span());
     reconstruct_state_loop(
         state,
@@ -5980,6 +6036,37 @@ try {
                 return log.join('|');
             }
             var entries=[]; run(entries);"#,
+            // Adjacent initializer and while loop must not assume an
+            // unresolved getter read preserves the modeled successor.
+            r#"function run(log) {
+                let s=1;
+                Object.defineProperty(globalThis, 'hook', {
+                    configurable: true,
+                    get() { s=5; log.push('getter'); return 3; }
+                });
+                while(s!=9)
+                    if(s==1) var x=(s=9,hook);
+                    else if(s==5) { log.push('case5'); s=9; }
+                    else if(s==9) s=9;
+                return log.join('|');
+            }
+            var entries=[]; run(entries);"#,
+            // Reaching-state while loop, with an intervening statement
+            // between initializer and loop.
+            r#"function run(log) {
+                let s=1;
+                Object.defineProperty(globalThis, 'hook', {
+                    configurable: true,
+                    get() { s=5; log.push('getter'); return 3; }
+                });
+                log.push('start');
+                while(s!=9)
+                    if(s==1) var x=(s=9,[hook]);
+                    else if(s==5) { log.push('case5'); s=9; }
+                    else if(s==9) s=9;
+                return log.join('|');
+            }
+            var entries=[]; run(entries);"#,
         ];
         let harness = r"
 const vm=require('node:vm');
@@ -6017,8 +6104,10 @@ try{
                     };
                 let original = observe(source)?;
                 let rewritten = observe(&recovered.source)?;
-                if i < 2 {
+                if i < 2 || i == 3 {
                     assert_eq!(original["value"], "getter|case5");
+                } else if i == 4 {
+                    assert_eq!(original["value"], "start|getter|case5");
                 }
                 assert_eq!(
                     original, rewritten,
