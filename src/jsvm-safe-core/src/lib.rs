@@ -823,9 +823,12 @@ impl Collector<'_, '_> {
                 if self.completion.needs_value(loop_stmt.span) {
                     continue;
                 }
-                if let Some(code) =
-                    if_ladder_structure::reconstruct_while_adjacent(initial, loop_stmt, self.source)
-                {
+                if let Some(code) = if_ladder_structure::reconstruct_while_adjacent(
+                    initial,
+                    loop_stmt,
+                    self.source,
+                    self.scoping,
+                ) {
                     self.push(
                         Span::new(initial.span().start, loop_stmt.span.end),
                         code,
@@ -941,6 +944,7 @@ impl Collector<'_, '_> {
                                             name,
                                             initial,
                                             self.source,
+                                            self.scoping,
                                         )
                                     {
                                         self.push(loop_stmt.span, code, "if_ladder_structured");
@@ -1622,7 +1626,7 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
             return;
         }
         if let Some(text) =
-            if_ladder_structure::reconstruct_for(it, self.source, live.then_some(self.scoping))
+            if_ladder_structure::reconstruct_for(it, self.source, Some(self.scoping), live)
         {
             self.push(it.span, text, "if_ladder_structured");
             return;
