@@ -5278,7 +5278,7 @@ enum LoopAccumulator {
 }
 
 impl LoopAccumulator {
-    fn certified(self) -> NumericForCompletion {
+    const fn certified(self) -> NumericForCompletion {
         match self {
             Self::Undefined => NumericForCompletion::Undefined,
             Self::Number(value) => NumericForCompletion::Number(value),
@@ -5287,7 +5287,7 @@ impl LoopAccumulator {
     }
 }
 
-/// ECMAScript ForBodyEvaluation maintains V, initially undefined. Each
+/// ECMAScript `ForBodyEvaluation` maintains V, initially undefined. Each
 /// ordinary body result with a non-Empty value *replaces* V; Empty preserves
 /// the prior value. A fixed-point over (state,V) models all normal paths,
 /// including cycles, rather than requiring a literal value on every exit
@@ -5501,6 +5501,97 @@ try {
     }
 
     #[test]
+    #[ignore = "requires Node; differential matrix over concrete dispatcher paths"]
+    fn node_confirms_composed_dispatcher_completion_matrix(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::process::Command;
+        let entry_cases = [
+            "s=9;",
+            "let x=(s=9,[]);",
+            "s=2;",
+            "s=flag?9:2;",
+            "s=-0;",
+            "s=0;",
+            "globalThis.events.push('A');s=2;",
+            "let x=(s=2,[]);",
+        ];
+        let second_cases = [
+            "s=9;",
+            "let y=(s=9,[]);",
+            "s=3;",
+            "globalThis.events.push('B');s=9;",
+        ];
+        let third_cases = ["s=9;", "let z=(s=9,[]);"];
+        let harness = r"
+const vm=require('node:vm');
+const source=process.argv[1],flag=process.argv[2]==='true';
+const mode=process.argv[3],context={flag};
+const code=mode==='eval'?'eval('+JSON.stringify(source)+')':source;
+try {
+ const value=vm.runInNewContext(code,context,{timeout:800});
+ console.log(JSON.stringify({
+  type:value===undefined?'undefined':typeof value,
+  value:value===undefined?null:value,
+  negativeZero:Object.is(value,-0),
+  events:context.events
+ }));
+} catch(error) {
+ console.log(JSON.stringify({type:'throw',name:error.name,events:context.events}));
+}
+";
+        let mut transformations = 0usize;
+        let mut comparisons = 0usize;
+        for (first_index, first) in entry_cases.iter().enumerate() {
+            for (second_index, second) in second_cases.iter().enumerate() {
+                for (third_index, third) in third_cases.iter().enumerate() {
+                    let source = format!(
+                        "let s;globalThis.events=[];for(s=1;s!=9;)                         if(s==1){{{first}}}                         else if(s==2){{{second}}}                         else if(s==3){{{third}}}                         else if(s==0){{globalThis.events.push(Object.is(s,-0));s=9;}}                         else if(s==9){{s=9;}}"
+                    );
+                    let recovered = deobfuscate(
+                        &source,
+                        12,
+                        &WorkBudget::unlimited("composed-dispatcher-completion-matrix"),
+                    )?
+                    .ok_or_else(|| std::io::Error::other("valid JS must recover"))?;
+                    transformations += recovered
+                        .transforms
+                        .get("if_ladder_structured")
+                        .copied()
+                        .unwrap_or(0);
+                    for flag in [false, true] {
+                        for mode in ["script", "eval"] {
+                            let observe = |code: &str| -> Result<
+                                serde_json::Value,
+                                Box<dyn std::error::Error>,
+                            > {
+                                let output = Command::new("node")
+                                    .arg("-e")
+                                    .arg(harness)
+                                    .arg(code)
+                                    .arg(flag.to_string())
+                                    .arg(mode)
+                                    .output()?;
+                                assert!(output.status.success(), "{output:?}");
+                                Ok(serde_json::from_slice(&output.stdout)?)
+                            };
+                            let before = observe(&source)?;
+                            let after = observe(&recovered.source)?;
+                            assert_eq!(
+                                before, after,
+                                "dispatcher ({first_index},{second_index},{third_index}),                                  flag={flag}, mode={mode}: {}", recovered.source
+                            );
+                            comparisons += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(comparisons, 256);
+        assert!(transformations >= 8, "{transformations} recovered loops");
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "requires Node; confirm exact signed-zero ScriptEvaluation Completion"]
     fn node_confirms_signed_zero_exit_completions_are_not_conflated(
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -5556,15 +5647,17 @@ try{
         Ok(())
     }
 
-    #[test]
-    fn loop_completion_fixed_point_propagates_empty_and_handles_cycles() {
-        let edge = |target, completion| Route {
+    fn fixed_point_edge(target: u64, completion: RouteCompletion) -> Route {
+        Route {
             effects: Vec::new(),
             next: Next::State(target),
             completion,
             transition_proven: true,
-        };
-        let fork = |yes, no| Route {
+        }
+    }
+
+    fn fixed_point_fork(yes: Route, no: Route) -> Route {
+        Route {
             effects: Vec::new(),
             next: Next::Choose {
                 condition: "flag".to_owned(),
@@ -5573,186 +5666,204 @@ try{
             },
             completion: RouteCompletion::Unproven,
             transition_proven: true,
-        };
-        let proof = |initial, routes: BTreeMap<u64, Route>| {
-            let reachable = routes.keys().copied().collect();
-            proven_normal_exit_completion(initial, 9, &routes, &reachable)
-        };
+        }
+    }
 
+    fn fixed_point_proof(
+        initial: u64,
+        routes: BTreeMap<u64, Route>,
+    ) -> Option<NumericForCompletion> {
+        let reachable = routes.keys().copied().collect();
+        proven_normal_exit_completion(initial, 9, &routes, &reachable)
+    }
+
+    #[test]
+    fn loop_completion_preserves_empty_and_handles_multiple_paths() {
         assert_eq!(
-            proof(9, BTreeMap::new()),
+            fixed_point_proof(9, BTreeMap::new()),
             Some(NumericForCompletion::Undefined)
         );
         assert_eq!(
-            proof(
+            fixed_point_proof(
                 1,
                 BTreeMap::from([
-                    (1, edge(3, RouteCompletion::Number(3))),
-                    (3, edge(9, RouteCompletion::Empty)),
+                    (1, fixed_point_edge(3, RouteCompletion::Number(3))),
+                    (3, fixed_point_edge(9, RouteCompletion::Empty)),
                 ])
             ),
             Some(NumericForCompletion::Number(3)),
         );
         assert_eq!(
-            proof(
+            fixed_point_proof(
                 1,
                 BTreeMap::from([
-                    (1, edge(3, RouteCompletion::Number(3))),
-                    (3, edge(9, RouteCompletion::Undefined)),
+                    (1, fixed_point_edge(3, RouteCompletion::Number(3))),
+                    (3, fixed_point_edge(9, RouteCompletion::Undefined)),
                 ])
             ),
             Some(NumericForCompletion::Undefined),
         );
         assert_eq!(
-            proof(
+            fixed_point_proof(
                 1,
                 BTreeMap::from([
                     (
                         1,
-                        fork(
-                            edge(9, RouteCompletion::Number(9)),
-                            edge(3, RouteCompletion::Number(9)),
+                        fixed_point_fork(
+                            fixed_point_edge(9, RouteCompletion::Number(9)),
+                            fixed_point_edge(3, RouteCompletion::Number(9)),
                         )
                     ),
-                    (3, edge(9, RouteCompletion::Empty)),
+                    (3, fixed_point_edge(9, RouteCompletion::Empty)),
                 ])
             ),
             Some(NumericForCompletion::Number(9)),
         );
         assert_eq!(
-            proof(
+            fixed_point_proof(
                 1,
                 BTreeMap::from([
                     (
                         1,
-                        fork(
-                            edge(9, RouteCompletion::Undefined),
-                            edge(3, RouteCompletion::Number(3)),
+                        fixed_point_fork(
+                            fixed_point_edge(9, RouteCompletion::Undefined),
+                            fixed_point_edge(3, RouteCompletion::Number(3)),
                         )
                     ),
-                    (3, edge(9, RouteCompletion::Empty)),
+                    (3, fixed_point_edge(9, RouteCompletion::Empty)),
                 ])
             ),
             None,
         );
         assert_eq!(
-            proof(
+            fixed_point_proof(
                 1,
                 BTreeMap::from([(
                     1,
-                    fork(
-                        edge(1, RouteCompletion::Empty),
-                        edge(9, RouteCompletion::Number(9)),
+                    fixed_point_fork(
+                        fixed_point_edge(1, RouteCompletion::Empty),
+                        fixed_point_edge(9, RouteCompletion::Number(9)),
                     )
                 )])
             ),
             Some(NumericForCompletion::Number(9)),
         );
+    }
+
+    #[test]
+    fn loop_completion_distinguishes_zero_signs_and_abrupt_paths() {
         assert_eq!(
-            proof(
+            fixed_point_proof(
                 1,
                 BTreeMap::from([(
                     1,
-                    fork(
-                        edge(1, RouteCompletion::Number(3)),
-                        edge(9, RouteCompletion::Empty),
+                    fixed_point_fork(
+                        fixed_point_edge(1, RouteCompletion::Number(3)),
+                        fixed_point_edge(9, RouteCompletion::Empty),
                     )
                 )])
             ),
             None,
         );
         assert_eq!(
-            proof(
+            fixed_point_proof(
                 1,
                 BTreeMap::from([(
                     1,
-                    fork(
-                        edge(9, RouteCompletion::Abrupt),
-                        edge(9, RouteCompletion::Number(9)),
+                    fixed_point_fork(
+                        fixed_point_edge(9, RouteCompletion::Abrupt),
+                        fixed_point_edge(9, RouteCompletion::Number(9)),
                     )
                 )])
             ),
             Some(NumericForCompletion::Number(9)),
         );
         assert_eq!(
-            proof(
+            fixed_point_proof(
                 1,
-                BTreeMap::from([(1, edge(9, RouteCompletion::Number(0)))])
+                BTreeMap::from([(1, fixed_point_edge(9, RouteCompletion::Number(0)))])
             ),
             Some(NumericForCompletion::Number(0)),
         );
         assert_eq!(
-            proof(
+            fixed_point_proof(
                 1,
-                BTreeMap::from([(1, edge(9, RouteCompletion::NegativeZero))])
+                BTreeMap::from([(1, fixed_point_edge(9, RouteCompletion::NegativeZero))])
             ),
             Some(NumericForCompletion::NegativeZero),
         );
         assert_eq!(
-            proof(
+            fixed_point_proof(
                 1,
                 BTreeMap::from([(
                     1,
-                    fork(
-                        edge(9, RouteCompletion::Number(0)),
-                        edge(9, RouteCompletion::NegativeZero),
+                    fixed_point_fork(
+                        fixed_point_edge(9, RouteCompletion::Number(0)),
+                        fixed_point_edge(9, RouteCompletion::NegativeZero),
                     ),
                 )])
             ),
             None,
         );
         assert_eq!(
-            proof(
+            fixed_point_proof(
                 1,
                 BTreeMap::from([
-                    (1, edge(0, RouteCompletion::Number(0))),
-                    (0, edge(9, RouteCompletion::Number(9))),
+                    (1, fixed_point_edge(0, RouteCompletion::Number(0))),
+                    (0, fixed_point_edge(9, RouteCompletion::Number(9))),
                 ])
             ),
             Some(NumericForCompletion::Number(9)),
         );
+    }
+
+    #[test]
+    fn loop_completion_handles_cycles_and_rejects_unproven_edges() {
         assert_eq!(
-            proof(
+            fixed_point_proof(
                 1,
                 BTreeMap::from([
-                    (1, edge(0, RouteCompletion::Number(0))),
-                    (0, edge(9, RouteCompletion::Empty)),
+                    (1, fixed_point_edge(0, RouteCompletion::Number(0))),
+                    (0, fixed_point_edge(9, RouteCompletion::Empty)),
                 ])
             ),
             Some(NumericForCompletion::Number(0)),
         );
         assert_eq!(
-            proof(
+            fixed_point_proof(
                 1,
                 BTreeMap::from([
-                    (1, edge(0, RouteCompletion::NegativeZero)),
-                    (0, edge(9, RouteCompletion::Empty)),
+                    (1, fixed_point_edge(0, RouteCompletion::NegativeZero)),
+                    (0, fixed_point_edge(9, RouteCompletion::Empty)),
                 ])
             ),
             Some(NumericForCompletion::NegativeZero),
         );
         assert_eq!(
-            proof(
+            fixed_point_proof(
                 1,
                 BTreeMap::from([
-                    (1, edge(0, RouteCompletion::NegativeZero)),
-                    (0, edge(9, RouteCompletion::Number(9))),
+                    (1, fixed_point_edge(0, RouteCompletion::NegativeZero)),
+                    (0, fixed_point_edge(9, RouteCompletion::Number(9))),
                 ])
             ),
             Some(NumericForCompletion::Number(9)),
         );
         assert_eq!(
-            proof(1, BTreeMap::from([(1, edge(1, RouteCompletion::Empty))])),
+            fixed_point_proof(
+                1,
+                BTreeMap::from([(1, fixed_point_edge(1, RouteCompletion::Empty))])
+            ),
             None,
         );
         assert_eq!(
-            proof(
+            fixed_point_proof(
                 1,
                 BTreeMap::from([(
                     1,
                     Route {
                         transition_proven: false,
-                        ..edge(9, RouteCompletion::Number(9))
+                        ..fixed_point_edge(9, RouteCompletion::Number(9))
                     }
                 )])
             ),
