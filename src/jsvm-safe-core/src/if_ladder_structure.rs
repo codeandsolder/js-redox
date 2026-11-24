@@ -6418,16 +6418,26 @@ function dispatch(input, log) {
             "function run(){let s=1;while(s!=9)s==1?(s=9):s==9&&(s=9);return s;}run();",
             "let s=1;while(s!=9)s==1?(s=9):s==9&&(s=9);s;",
             "function run(){var s=1;while(s!=9)s==1?(s=9):s==9&&(s=9);return s;}run();",
+            "function run(){let s=1;while(s!=9)s==1?(s=9):s==9&&(s=9);const read=()=>s;return read();}run();",
+            "function run(){let s=1;while(s!=9)s==1?(s=9):s==9&&(s=9);return eval('s');}run();",
         ];
         let harness = r"
 const vm=require('node:vm');
 const source=process.argv[1],mode=process.argv[2];
 const code=mode==='eval'?'eval('+JSON.stringify(source)+')':source;
+const context=Object.create(null),options=Object.create(null);
+options.timeout=1000;
 try {
- const result=vm.runInNewContext(code,{}, {timeout:1000});
- console.log(JSON.stringify({kind:typeof result, result}));
+ const value=vm.runInNewContext(code,context,options);
+ const observation=Object.create(null);
+ observation.kind=typeof value;
+ observation.result=value;
+ console.log(JSON.stringify(observation));
 } catch(error) {
- console.log(JSON.stringify({kind:'throw',name:error.name}));
+ const observation=Object.create(null);
+ observation.kind='throw';
+ observation.name=error.name;
+ console.log(JSON.stringify(observation));
 }
 ";
         for (index, source) in cases.iter().enumerate() {
@@ -6437,10 +6447,16 @@ try {
                 &WorkBudget::unlimited("adjacent-while-lexical-binding-lifetime"),
             )?
             .ok_or_else(|| std::io::Error::other("valid source must recover"))?;
-            eprintln!(
-                "CASE {index} transforms {:?} source {}",
-                recovered.transforms, recovered.source
-            );
+            if matches!(index, 0 | 2) {
+                assert!(
+                    recovered
+                        .transforms
+                        .get("if_ladder_structured")
+                        .is_some_and(|count| *count > 0),
+                    "supported adjacent while rewrite missing for case {index}: {}",
+                    recovered.source
+                );
+            }
             for mode in ["script", "eval"] {
                 let observe = |input: &str| -> Result<String, Box<dyn std::error::Error>> {
                     let out = Command::new("node")
@@ -6454,8 +6470,11 @@ try {
                 };
                 let before = observe(source)?;
                 let after = observe(&recovered.source)?;
-                eprintln!("CASE {index}, {mode}: {before} -> {after}");
-                assert_eq!(before, after, "case {index}: {}", recovered.source);
+                assert_eq!(
+                    before, after,
+                    "case {index} in {mode}: {}",
+                    recovered.source
+                );
             }
         }
         Ok(())
