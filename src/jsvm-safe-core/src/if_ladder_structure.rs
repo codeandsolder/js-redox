@@ -1464,7 +1464,7 @@ fn while_state_transitions_proven(
 /// numeric dispatch graph. It is separate from the graph's effect/order proof:
 /// the same graph may be safe inside a function but not as the final script
 /// statement, where its Completion value is observable.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum NumericForCompletion {
     Undefined,
     Number(u64),
