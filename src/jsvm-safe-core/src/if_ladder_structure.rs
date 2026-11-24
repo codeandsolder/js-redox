@@ -68,15 +68,6 @@ impl Route {
         }
     }
 
-    fn all_transitions_proven(&self) -> bool {
-        match &self.next {
-            Next::State(_) => self.transition_proven,
-            Next::Choose { yes, no, .. } => {
-                yes.all_transitions_proven() && no.all_transitions_proven()
-            }
-        }
-    }
-
     fn change_completion(&mut self, f: fn(RouteCompletion) -> RouteCompletion) {
         match &mut self.next {
             Next::State(_) => self.completion = f(self.completion),
@@ -98,16 +89,18 @@ impl Route {
         self.change_completion(|_| RouteCompletion::Unproven);
     }
 
-    fn exit_completion(&self, exit: u64, out: &mut Vec<RouteCompletion>) {
+    fn transitions(&self, out: &mut Vec<(u64, RouteCompletion, bool)>) {
         match &self.next {
-            Next::State(target) if *target == exit => out.push(self.completion),
-            Next::Choose { yes, no, .. } => {
-                yes.exit_completion(exit, out);
-                no.exit_completion(exit, out);
+            Next::State(target) => {
+                out.push((*target, self.completion, self.transition_proven));
             }
-            Next::State(_) => {}
+            Next::Choose { yes, no, .. } => {
+                yes.transitions(out);
+                no.transitions(out);
+            }
         }
     }
+
     fn targets(&self, out: &mut Vec<u64>) {
         match &self.next {
             Next::State(target) => out.push(*target),
@@ -1471,17 +1464,17 @@ fn while_state_transitions_proven(
 /// numeric dispatch graph. It is separate from the graph's effect/order proof:
 /// the same graph may be safe inside a function but not as the final script
 /// statement, where its Completion value is observable.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum NumericForCompletion {
     Undefined,
-    ExitNumber(u64),
+    Number(u64),
 }
 
 impl NumericForCompletion {
     fn expression(self) -> String {
         match self {
             Self::Undefined => "void 0".to_owned(),
-            Self::ExitNumber(value) => value.to_string(),
+            Self::Number(value) => value.to_string(),
         }
     }
 }
@@ -5252,6 +5245,33 @@ struct ReconstructedStateLoop {
     normal_completion: Option<NumericForCompletion>,
 }
 
+/// Unsigned graph labels cannot distinguish the two ECMAScript zero signs.
+/// Carry that uncertainty through Empty iterations. A later known Number or
+/// Undefined overwrites it; only an observable ambiguous zero is rejected.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum LoopAccumulator {
+    Undefined,
+    Number(u64),
+    UnknownZero,
+}
+
+impl LoopAccumulator {
+    fn certified(self) -> Option<NumericForCompletion> {
+        match self {
+            Self::Undefined => Some(NumericForCompletion::Undefined),
+            Self::Number(value) => Some(NumericForCompletion::Number(value)),
+            Self::UnknownZero => None,
+        }
+    }
+}
+
+/// ECMAScript ForBodyEvaluation maintains V, initially undefined. Each
+/// ordinary body result with a non-Empty value *replaces* V; Empty preserves
+/// the prior value. A fixed-point over (state,V) models all normal paths,
+/// including cycles, rather than requiring a literal value on every exit
+/// edge. It is bounded by the existing graph-size proof and an explicit
+/// state/value-product limit; excessive state explosions fail without a
+/// speculative completion result.
 fn proven_normal_exit_completion(
     initial: u64,
     exit: u64,
@@ -5259,36 +5279,56 @@ fn proven_normal_exit_completion(
     reachable: &BTreeSet<u64>,
 ) -> Option<NumericForCompletion> {
     if initial == exit {
-        // The loop condition fails before the first body evaluation; the
-        // specified ForBodyEvaluation accumulator V starts at undefined.
         return Some(NumericForCompletion::Undefined);
     }
-    let mut proven = None;
+
+    let mut transitions = BTreeMap::new();
     for &state in reachable {
-        let route = graph.get(&state)?;
-        if !route.all_transitions_proven() {
+        let mut routes = Vec::new();
+        graph.get(&state)?.transitions(&mut routes);
+        if routes.iter().any(|(_, _, proven)| !proven) {
             return None;
         }
-        let mut exits = Vec::new();
-        route.exit_completion(exit, &mut exits);
-        for exit_value in exits {
-            let candidate = match exit_value {
+        transitions.insert(state, routes);
+    }
+
+    let first = (initial, LoopAccumulator::Undefined);
+    let mut queue = VecDeque::from([first]);
+    let mut visited = BTreeSet::from([first]);
+    let mut exits = BTreeSet::new();
+    while let Some((state, previous)) = queue.pop_front() {
+        if state == exit {
+            exits.insert(previous);
+            continue;
+        }
+        for &(next, completion, _) in transitions.get(&state)? {
+            let value = match completion {
                 RouteCompletion::Abrupt => continue,
-                RouteCompletion::Number(value) if value == exit && exit != 0 => {
-                    NumericForCompletion::ExitNumber(exit)
-                }
-                RouteCompletion::Undefined => NumericForCompletion::Undefined,
-                RouteCompletion::Number(_) | RouteCompletion::Empty | RouteCompletion::Unproven => {
-                    return None;
-                }
+                RouteCompletion::Empty => previous,
+                RouteCompletion::Undefined => LoopAccumulator::Undefined,
+                RouteCompletion::Number(0) => LoopAccumulator::UnknownZero,
+                RouteCompletion::Number(value) => LoopAccumulator::Number(value),
+                RouteCompletion::Unproven => return None,
             };
-            if proven.is_some_and(|previous| previous != candidate) {
+            if next != exit && !reachable.contains(&next) {
                 return None;
             }
-            proven = Some(candidate);
+            if visited.insert((next, value)) {
+                // 2048 possible source states times their distinct last
+                // Completion values is finite, but may be very large.
+                // Bound the proof rather than allocating an unbounded matrix.
+                if visited.len() > 16_384 {
+                    return None;
+                }
+                queue.push_back((next, value));
+            }
         }
     }
-    proven
+    if exits.len() == 1 {
+        exits.into_iter().next()?.certified()
+    } else {
+        None
+    }
 }
 
 fn reconstruct_state_loop(
@@ -5364,8 +5404,8 @@ fn reconstruct_state_loop(
 #[cfg(test)]
 mod tests {
     use super::{
-        closed_exception_dag_region, ordered_natural_loop_side, reconstruct_for,
-        ExceptionEntryProof, Next, Route, RouteCompletion,
+        closed_exception_dag_region, ordered_natural_loop_side, proven_normal_exit_completion,
+        reconstruct_for, ExceptionEntryProof, Next, NumericForCompletion, Route, RouteCompletion,
     };
     use crate::deobfuscate;
     use oxc_allocator::Allocator;
@@ -5375,6 +5415,170 @@ mod tests {
     use rolldown_redox::ecmascript::parse_program;
     use std::collections::{BTreeMap, BTreeSet};
     use work_budget::WorkBudget;
+
+    #[test]
+    fn loop_completion_fixed_point_propagates_empty_and_handles_cycles() {
+        let edge = |target, completion| Route {
+            effects: Vec::new(),
+            next: Next::State(target),
+            completion,
+            transition_proven: true,
+        };
+        let fork = |yes, no| Route {
+            effects: Vec::new(),
+            next: Next::Choose {
+                condition: "flag".to_owned(),
+                yes: Box::new(yes),
+                no: Box::new(no),
+            },
+            completion: RouteCompletion::Unproven,
+            transition_proven: true,
+        };
+        let proof = |initial, routes: BTreeMap<u64, Route>| {
+            let reachable = routes.keys().copied().collect();
+            proven_normal_exit_completion(initial, 9, &routes, &reachable)
+        };
+
+        assert_eq!(
+            proof(9, BTreeMap::new()),
+            Some(NumericForCompletion::Undefined)
+        );
+        assert_eq!(
+            proof(
+                1,
+                BTreeMap::from([
+                    (1, edge(3, RouteCompletion::Number(3))),
+                    (3, edge(9, RouteCompletion::Empty)),
+                ])
+            ),
+            Some(NumericForCompletion::Number(3)),
+        );
+        assert_eq!(
+            proof(
+                1,
+                BTreeMap::from([
+                    (1, edge(3, RouteCompletion::Number(3))),
+                    (3, edge(9, RouteCompletion::Undefined)),
+                ])
+            ),
+            Some(NumericForCompletion::Undefined),
+        );
+        assert_eq!(
+            proof(
+                1,
+                BTreeMap::from([
+                    (
+                        1,
+                        fork(
+                            edge(9, RouteCompletion::Number(9)),
+                            edge(3, RouteCompletion::Number(9)),
+                        )
+                    ),
+                    (3, edge(9, RouteCompletion::Empty)),
+                ])
+            ),
+            Some(NumericForCompletion::Number(9)),
+        );
+        assert_eq!(
+            proof(
+                1,
+                BTreeMap::from([
+                    (
+                        1,
+                        fork(
+                            edge(9, RouteCompletion::Undefined),
+                            edge(3, RouteCompletion::Number(3)),
+                        )
+                    ),
+                    (3, edge(9, RouteCompletion::Empty)),
+                ])
+            ),
+            None,
+        );
+        assert_eq!(
+            proof(
+                1,
+                BTreeMap::from([(
+                    1,
+                    fork(
+                        edge(1, RouteCompletion::Empty),
+                        edge(9, RouteCompletion::Number(9)),
+                    )
+                )])
+            ),
+            Some(NumericForCompletion::Number(9)),
+        );
+        assert_eq!(
+            proof(
+                1,
+                BTreeMap::from([(
+                    1,
+                    fork(
+                        edge(1, RouteCompletion::Number(3)),
+                        edge(9, RouteCompletion::Empty),
+                    )
+                )])
+            ),
+            None,
+        );
+        assert_eq!(
+            proof(
+                1,
+                BTreeMap::from([(
+                    1,
+                    fork(
+                        edge(9, RouteCompletion::Abrupt),
+                        edge(9, RouteCompletion::Number(9)),
+                    )
+                )])
+            ),
+            Some(NumericForCompletion::Number(9)),
+        );
+        assert_eq!(
+            proof(
+                1,
+                BTreeMap::from([(1, edge(9, RouteCompletion::Number(0)))])
+            ),
+            None,
+        );
+        assert_eq!(
+            proof(
+                1,
+                BTreeMap::from([
+                    (1, edge(0, RouteCompletion::Number(0))),
+                    (0, edge(9, RouteCompletion::Number(9))),
+                ])
+            ),
+            Some(NumericForCompletion::Number(9)),
+        );
+        assert_eq!(
+            proof(
+                1,
+                BTreeMap::from([
+                    (1, edge(0, RouteCompletion::Number(0))),
+                    (0, edge(9, RouteCompletion::Empty)),
+                ])
+            ),
+            None,
+        );
+        assert_eq!(
+            proof(1, BTreeMap::from([(1, edge(1, RouteCompletion::Empty))])),
+            None,
+        );
+        assert_eq!(
+            proof(
+                1,
+                BTreeMap::from([(
+                    1,
+                    Route {
+                        transition_proven: false,
+                        ..edge(9, RouteCompletion::Number(9))
+                    }
+                )])
+            ),
+            None,
+        );
+    }
 
     #[test]
     fn duplicate_conditional_successors_count_as_one_incoming_edge() {
