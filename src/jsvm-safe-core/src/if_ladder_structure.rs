@@ -1260,7 +1260,7 @@ impl Emitter<'_> {
     }
 }
 
-/// Syntax establishes that the suffix performs only bare GetValue reads
+/// Syntax establishes that the suffix performs only bare `GetValue` reads
 /// (possibly in an array). Semantic symbol identity must additionally show
 /// that those reads cannot invoke global-object or with-environment getters.
 struct InertBindingReads<'s> {
@@ -1430,7 +1430,7 @@ fn live_loop_state_is_lexically_stable(
 }
 
 /// A classic-script root var is object-backed. A preexisting accessor may
-/// intercept GetValue and PutValue; a root lexical binding and local vars
+/// intercept `GetValue` and `PutValue`; a root lexical binding and local vars
 /// use declarative environments instead.
 fn numeric_state_binding_is_declarative(scoping: &Scoping, symbol: SymbolId) -> bool {
     scoping.symbol_scope_id(symbol) != scoping.root_scope_id()
@@ -5996,78 +5996,34 @@ try {
     fn global_accessor_after_state_write_keeps_real_successor(
     ) -> Result<(), Box<dyn std::error::Error>> {
         use std::process::Command;
+        // Different numeric-graph producers must agree on the binding-aware
+        // GetValue effect proof, including nonadjacent while.
         let cases = [
-            r#"function run(log) {
-                let s;
-                Object.defineProperty(globalThis, 'hook', {
-                    configurable: true,
-                    get() { s=5; log.push('getter'); return 3; }
-                });
-                for(s=1;s!=9;)
-                    if(s==1) var x=(s=9,hook);
-                    else if(s==5) { log.push('case5'); s=9; }
-                    else if(s==9) s=9;
-                return log.join('|');
-            }
-            var entries=[]; run(entries);"#,
-            r#"function run(log) {
-                let s;
-                Object.defineProperty(globalThis, 'hook', {
-                    configurable: true,
-                    get() { s=5; log.push('getter'); return 3; }
-                });
-                for(s=1;s!=9;)
-                    if(s==1) var x=(s=9,[hook]);
-                    else if(s==5) { log.push('case5'); s=9; }
-                    else if(s==9) s=9;
-                return log.join('|');
-            }
-            var entries=[]; run(entries);"#,
-            r#"function run(log) {
-                let s;
-                Object.defineProperty(globalThis, 'hook', {
-                    configurable: true,
-                    get() { s=5; log.push('getter'); return 3; }
-                });
-                for(s=1;s!=9;)
-                    if(s==1) var x=(s=9,hook);
-                    else if(s==5) s=9;
-                    else if(s==9) s=9;
-                return log.join('|');
-            }
-            var entries=[]; run(entries);"#,
-            // Adjacent initializer and while loop must not assume an
-            // unresolved getter read preserves the modeled successor.
-            r#"function run(log) {
-                let s=1;
-                Object.defineProperty(globalThis, 'hook', {
-                    configurable: true,
-                    get() { s=5; log.push('getter'); return 3; }
-                });
-                while(s!=9)
-                    if(s==1) var x=(s=9,hook);
-                    else if(s==5) { log.push('case5'); s=9; }
-                    else if(s==9) s=9;
-                return log.join('|');
-            }
-            var entries=[]; run(entries);"#,
-            // Reaching-state while loop, with an intervening statement
-            // between initializer and loop.
-            r#"function run(log) {
-                let s=1;
-                Object.defineProperty(globalThis, 'hook', {
-                    configurable: true,
-                    get() { s=5; log.push('getter'); return 3; }
-                });
-                log.push('start');
-                while(s!=9)
-                    if(s==1) var x=(s=9,[hook]);
-                    else if(s==5) { log.push('case5'); s=9; }
-                    else if(s==9) s=9;
-                return log.join('|');
-            }
-            var entries=[]; run(entries);"#,
+            ("let s;", "", "for(s=1;s!=9;)", "hook", true, "getter|case5"),
+            (
+                "let s;",
+                "",
+                "for(s=1;s!=9;)",
+                "[hook]",
+                true,
+                "getter|case5",
+            ),
+            ("let s;", "", "for(s=1;s!=9;)", "hook", false, "getter"),
+            ("let s=1;", "", "while(s!=9)", "hook", true, "getter|case5"),
+            (
+                "let s=1;",
+                "log.push('start');",
+                "while(s!=9)",
+                "[hook]",
+                true,
+                "start|getter|case5",
+            ),
         ];
+        let getter = r"
+Object.defineProperty(globalThis, 'hook', {
+    configurable: true,
+    get() { s=5;log.push('getter');return 3; }
+});";
         let harness = r"
 const vm=require('node:vm');
 const source=process.argv[1],mode=process.argv[2];
@@ -6083,9 +6039,33 @@ try{
  console.log(JSON.stringify({type:'throw',name:error.name}));
 }
 ";
-        for (i, source) in cases.iter().enumerate() {
+        for (i, &(init, before_loop, header, read, observe_case5, expected)) in
+            cases.iter().enumerate()
+        {
+            let case5 = if observe_case5 {
+                "{log.push('case5');s=9;}"
+            } else {
+                "s=9;"
+            };
+            let source = [
+                "function run(log) {",
+                getter,
+                init,
+                before_loop,
+                header,
+                "if(s==1)",
+                "var x=(s=9,",
+                read,
+                ");",
+                "else if(s==5)",
+                case5,
+                "else if(s==9) s=9;",
+                "return log.join('|');",
+                "} var entries=[]; run(entries);",
+            ]
+            .join("\n");
             let recovered = deobfuscate(
-                source,
+                &source,
                 12,
                 &WorkBudget::unlimited("global-getter-transition-differential"),
             )?
@@ -6102,13 +6082,9 @@ try{
                         assert!(output.status.success(), "{output:?}");
                         Ok(serde_json::from_slice(&output.stdout)?)
                     };
-                let original = observe(source)?;
+                let original = observe(&source)?;
                 let rewritten = observe(&recovered.source)?;
-                if i < 2 || i == 3 {
-                    assert_eq!(original["value"], "getter|case5");
-                } else if i == 4 {
-                    assert_eq!(original["value"], "start|getter|case5");
-                }
+                assert_eq!(original["value"], expected);
                 assert_eq!(
                     original, rewritten,
                     "case {i}, {mode}: pruned real successor; transforms {:?}, source {}",
