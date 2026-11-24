@@ -6042,7 +6042,7 @@ try{
         for (i, &(init, before_loop, header, read, observe_case5, expected)) in
             cases.iter().enumerate()
         {
-            let case5 = if observe_case5 {
+            let state_five_branch = if observe_case5 {
                 "{log.push('case5');s=9;}"
             } else {
                 "s=9;"
@@ -6058,7 +6058,7 @@ try{
                 read,
                 ");",
                 "else if(s==5)",
-                case5,
+                state_five_branch,
                 "else if(s==9) s=9;",
                 "return log.join('|');",
                 "} var entries=[]; run(entries);",
