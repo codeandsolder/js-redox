@@ -5525,10 +5525,13 @@ try {
         let harness = r"
 const vm=require('node:vm');
 const source=process.argv[1],flag=process.argv[2]==='true';
-const mode=process.argv[3],context={flag};
+const mode=process.argv[3],context={};
+context.flag=flag;
 const code=mode==='eval'?'eval('+JSON.stringify(source)+')':source;
+const options={};
+options.timeout=800;
 try {
- const value=vm.runInNewContext(code,context,{timeout:800});
+ const value=vm.runInNewContext(code,context,options);
  console.log(JSON.stringify({
   type:value===undefined?'undefined':typeof value,
   value:value===undefined?null:value,
@@ -5671,22 +5674,22 @@ try{
 
     fn fixed_point_proof(
         initial: u64,
-        routes: BTreeMap<u64, Route>,
+        routes: &BTreeMap<u64, Route>,
     ) -> Option<NumericForCompletion> {
         let reachable = routes.keys().copied().collect();
-        proven_normal_exit_completion(initial, 9, &routes, &reachable)
+        proven_normal_exit_completion(initial, 9, routes, &reachable)
     }
 
     #[test]
     fn loop_completion_preserves_empty_and_handles_multiple_paths() {
         assert_eq!(
-            fixed_point_proof(9, BTreeMap::new()),
+            fixed_point_proof(9, &BTreeMap::new()),
             Some(NumericForCompletion::Undefined)
         );
         assert_eq!(
             fixed_point_proof(
                 1,
-                BTreeMap::from([
+                &BTreeMap::from([
                     (1, fixed_point_edge(3, RouteCompletion::Number(3))),
                     (3, fixed_point_edge(9, RouteCompletion::Empty)),
                 ])
@@ -5696,7 +5699,7 @@ try{
         assert_eq!(
             fixed_point_proof(
                 1,
-                BTreeMap::from([
+                &BTreeMap::from([
                     (1, fixed_point_edge(3, RouteCompletion::Number(3))),
                     (3, fixed_point_edge(9, RouteCompletion::Undefined)),
                 ])
@@ -5706,7 +5709,7 @@ try{
         assert_eq!(
             fixed_point_proof(
                 1,
-                BTreeMap::from([
+                &BTreeMap::from([
                     (
                         1,
                         fixed_point_fork(
@@ -5722,7 +5725,7 @@ try{
         assert_eq!(
             fixed_point_proof(
                 1,
-                BTreeMap::from([
+                &BTreeMap::from([
                     (
                         1,
                         fixed_point_fork(
@@ -5738,7 +5741,7 @@ try{
         assert_eq!(
             fixed_point_proof(
                 1,
-                BTreeMap::from([(
+                &BTreeMap::from([(
                     1,
                     fixed_point_fork(
                         fixed_point_edge(1, RouteCompletion::Empty),
@@ -5755,7 +5758,7 @@ try{
         assert_eq!(
             fixed_point_proof(
                 1,
-                BTreeMap::from([(
+                &BTreeMap::from([(
                     1,
                     fixed_point_fork(
                         fixed_point_edge(1, RouteCompletion::Number(3)),
@@ -5768,7 +5771,7 @@ try{
         assert_eq!(
             fixed_point_proof(
                 1,
-                BTreeMap::from([(
+                &BTreeMap::from([(
                     1,
                     fixed_point_fork(
                         fixed_point_edge(9, RouteCompletion::Abrupt),
@@ -5781,21 +5784,21 @@ try{
         assert_eq!(
             fixed_point_proof(
                 1,
-                BTreeMap::from([(1, fixed_point_edge(9, RouteCompletion::Number(0)))])
+                &BTreeMap::from([(1, fixed_point_edge(9, RouteCompletion::Number(0)))])
             ),
             Some(NumericForCompletion::Number(0)),
         );
         assert_eq!(
             fixed_point_proof(
                 1,
-                BTreeMap::from([(1, fixed_point_edge(9, RouteCompletion::NegativeZero))])
+                &BTreeMap::from([(1, fixed_point_edge(9, RouteCompletion::NegativeZero))])
             ),
             Some(NumericForCompletion::NegativeZero),
         );
         assert_eq!(
             fixed_point_proof(
                 1,
-                BTreeMap::from([(
+                &BTreeMap::from([(
                     1,
                     fixed_point_fork(
                         fixed_point_edge(9, RouteCompletion::Number(0)),
@@ -5808,7 +5811,7 @@ try{
         assert_eq!(
             fixed_point_proof(
                 1,
-                BTreeMap::from([
+                &BTreeMap::from([
                     (1, fixed_point_edge(0, RouteCompletion::Number(0))),
                     (0, fixed_point_edge(9, RouteCompletion::Number(9))),
                 ])
@@ -5822,7 +5825,7 @@ try{
         assert_eq!(
             fixed_point_proof(
                 1,
-                BTreeMap::from([
+                &BTreeMap::from([
                     (1, fixed_point_edge(0, RouteCompletion::Number(0))),
                     (0, fixed_point_edge(9, RouteCompletion::Empty)),
                 ])
@@ -5832,7 +5835,7 @@ try{
         assert_eq!(
             fixed_point_proof(
                 1,
-                BTreeMap::from([
+                &BTreeMap::from([
                     (1, fixed_point_edge(0, RouteCompletion::NegativeZero)),
                     (0, fixed_point_edge(9, RouteCompletion::Empty)),
                 ])
@@ -5842,7 +5845,7 @@ try{
         assert_eq!(
             fixed_point_proof(
                 1,
-                BTreeMap::from([
+                &BTreeMap::from([
                     (1, fixed_point_edge(0, RouteCompletion::NegativeZero)),
                     (0, fixed_point_edge(9, RouteCompletion::Number(9))),
                 ])
@@ -5852,14 +5855,14 @@ try{
         assert_eq!(
             fixed_point_proof(
                 1,
-                BTreeMap::from([(1, fixed_point_edge(1, RouteCompletion::Empty))])
+                &BTreeMap::from([(1, fixed_point_edge(1, RouteCompletion::Empty))])
             ),
             None,
         );
         assert_eq!(
             fixed_point_proof(
                 1,
-                BTreeMap::from([(
+                &BTreeMap::from([(
                     1,
                     Route {
                         transition_proven: false,
