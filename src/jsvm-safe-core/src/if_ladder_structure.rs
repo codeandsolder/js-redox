@@ -59,9 +59,12 @@ struct Route {
 }
 
 impl Route {
-    fn jump(state: &str, target: u64) -> Self {
+    fn jump(state: &str, target: u64, expression: &str) -> Self {
         Self {
-            effects: vec![format!("{state} = {target};")],
+            // Preserve the original proven numeric expression, rather than
+            // rendering the unsigned graph label. In particular, -0 and +0
+            // follow the same graph edges but are observable with Object.is.
+            effects: vec![format!("{state} = {expression};")],
             next: Next::State(target),
             completion: RouteCompletion::Number(target),
             transition_proven: true,
@@ -196,7 +199,11 @@ fn parse_target(expr: &Expression<'_>, state: &str, source: &str) -> Option<Rout
             result.effects = effects;
             Some(result)
         }
-        expr => Some(Route::jump(state, number(expr)?)),
+        expr => Some(Route::jump(
+            state,
+            number(expr)?,
+            fragment(source, expr.span()),
+        )),
     }
 }
 
@@ -5417,6 +5424,68 @@ mod tests {
     use work_budget::WorkBudget;
 
     #[test]
+    #[ignore = "requires Node; verify observable signed-zero assignment and effect order"]
+    fn node_confirms_signed_zero_state_assignment_keeps_original_expression(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::process::Command;
+        let source = r"
+let s, seen=[];
+for(s=1;s!=9;)
+    s==1 ? (s=-0)
+    : s==0 ? (seen.push(Object.is(s,-0)),s=9)
+    : s==9 && (s=9);
+seen.join('|');";
+        let recovered = deobfuscate(
+            source,
+            12,
+            &WorkBudget::unlimited("signed-zero-state-original-expression"),
+        )?
+        .ok_or_else(|| std::io::Error::other("valid source did not recover"))?;
+        assert!(
+            recovered
+                .transforms
+                .get("if_ladder_structured")
+                .is_some_and(|count| *count > 0),
+            "{:?}: {}",
+            recovered.transforms,
+            recovered.source
+        );
+        let harness = r"
+const vm=require('node:vm');
+const src=process.argv[1],mode=process.argv[2];
+const code=mode==='eval'?'eval('+JSON.stringify(src)+')':src;
+const options={};options.timeout=1500;
+try {
+ const result=vm.runInNewContext(code,{},options);
+ console.log(JSON.stringify({type:typeof result, value:result}));
+} catch(error){
+ console.log(JSON.stringify({type:'throw',name:error.name}));
+}
+";
+        for mode in ["script", "eval"] {
+            let execute = |code: &str| -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+                let output = Command::new("node")
+                    .arg("-e")
+                    .arg(harness)
+                    .arg(code)
+                    .arg(mode)
+                    .output()?;
+                assert!(output.status.success(), "{output:?}");
+                Ok(serde_json::from_slice(&output.stdout)?)
+            };
+            let before = execute(source)?;
+            let after = execute(&recovered.source)?;
+            assert_eq!(before["value"], "true");
+            assert_eq!(
+                before, after,
+                "{mode}: signed zero changed: {}",
+                recovered.source
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn loop_completion_fixed_point_propagates_empty_and_handles_cycles() {
         let edge = |target, completion| Route {
             effects: Vec::new(),
@@ -5588,16 +5657,16 @@ mod tests {
             transition_proven: true,
             next: Next::Choose {
                 condition: "pick()".to_owned(),
-                yes: Box::new(Route::jump("state", yes)),
-                no: Box::new(Route::jump("state", no)),
+                yes: Box::new(Route::jump("state", yes, &yes.to_string())),
+                no: Box::new(Route::jump("state", no, &no.to_string())),
             },
         };
         let cases = BTreeMap::from([
             (1, Some(choose(2, 3))),
             (2, Some(choose(4, 4))),
-            (3, Some(Route::jump("state", 5))),
-            (4, Some(Route::jump("state", 5))),
-            (5, Some(Route::jump("state", 9))),
+            (3, Some(Route::jump("state", 5, "5"))),
+            (4, Some(Route::jump("state", 5, "5"))),
+            (5, Some(Route::jump("state", 9, "9"))),
         ]);
         let roots = BTreeSet::from([1]);
         let reachable = BTreeSet::from([1, 2, 3, 4, 5]);
@@ -5630,14 +5699,14 @@ mod tests {
             transition_proven: true,
             next: Next::Choose {
                 condition: "pick()".to_owned(),
-                yes: Box::new(Route::jump("state", yes)),
-                no: Box::new(Route::jump("state", no)),
+                yes: Box::new(Route::jump("state", yes, &yes.to_string())),
+                no: Box::new(Route::jump("state", no, &no.to_string())),
             },
         };
         let graph = BTreeMap::from([
             (1, choose(2, 99)),
             (2, choose(3, 3)),
-            (3, Route::jump("state", 1)),
+            (3, Route::jump("state", 1, "1")),
         ]);
         let incoming = BTreeMap::from([
             (1, BTreeSet::from([3])),
