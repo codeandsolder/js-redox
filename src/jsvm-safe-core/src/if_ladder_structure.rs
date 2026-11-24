@@ -37,10 +37,25 @@ enum Next {
     },
 }
 
+/// The value of a *normal* source statement Completion at a modeled route
+/// exit. Empty is distinct from an explicit undefined, and an abrupt terminal
+/// route is not a normal loop exit. CFG effect equivalence and observable
+/// Completion equivalence are independently proved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteCompletion {
+    Number(u64),
+    Empty,
+    Undefined,
+    Abrupt,
+    Unproven,
+}
+
 #[derive(Debug, Clone)]
 struct Route {
     effects: Vec<String>,
     next: Next,
+    completion: RouteCompletion,
+    transition_proven: bool,
 }
 
 impl Route {
@@ -48,6 +63,49 @@ impl Route {
         Self {
             effects: vec![format!("{state} = {target};")],
             next: Next::State(target),
+            completion: RouteCompletion::Number(target),
+            transition_proven: true,
+        }
+    }
+
+    fn all_transitions_proven(&self) -> bool {
+        match &self.next {
+            Next::State(_) => self.transition_proven,
+            Next::Choose { yes, no, .. } => {
+                yes.all_transitions_proven() && no.all_transitions_proven()
+            }
+        }
+    }
+
+    fn change_completion(&mut self, f: fn(RouteCompletion) -> RouteCompletion) {
+        match &mut self.next {
+            Next::State(_) => self.completion = f(self.completion),
+            Next::Choose { yes, no, .. } => {
+                yes.change_completion(f);
+                no.change_completion(f);
+            }
+        }
+    }
+
+    fn if_statement_completion(&mut self) {
+        self.change_completion(|completion| match completion {
+            RouteCompletion::Empty => RouteCompletion::Undefined,
+            other => other,
+        });
+    }
+
+    fn unproven_completion(&mut self) {
+        self.change_completion(|_| RouteCompletion::Unproven);
+    }
+
+    fn exit_completion(&self, exit: u64, out: &mut Vec<RouteCompletion>) {
+        match &self.next {
+            Next::State(target) if *target == exit => out.push(self.completion),
+            Next::Choose { yes, no, .. } => {
+                yes.exit_completion(exit, out);
+                no.exit_completion(exit, out);
+            }
+            Next::State(_) => {}
         }
     }
     fn targets(&self, out: &mut Vec<u64>) {
@@ -126,6 +184,8 @@ fn parse_target(expr: &Expression<'_>, state: &str, source: &str) -> Option<Rout
     match unparen(expr) {
         Expression::ConditionalExpression(branch) => Some(Route {
             effects: vec![],
+            completion: RouteCompletion::Unproven,
+            transition_proven: true,
             next: Next::Choose {
                 condition: fragment(source, branch.test.span()).to_owned(),
                 yes: Box::new(parse_target(&branch.consequent, state, source)?),
@@ -168,6 +228,8 @@ fn parse_route(expr: &Expression<'_>, state: &str, source: &str) -> Option<Route
         }
         Expression::ConditionalExpression(conditional) => Some(Route {
             effects: Vec::new(),
+            completion: RouteCompletion::Unproven,
+            transition_proven: true,
             next: Next::Choose {
                 condition: fragment(source, conditional.test.span()).to_owned(),
                 yes: Box::new(parse_route(&conditional.consequent, state, source)?),
@@ -214,6 +276,11 @@ fn collect_dispatch(
 /// evaluation of the array elements), so this only establishes the next edge.
 /// Expressions after the assignment must not be able to write the state.
 fn inert_after_state_write(expr: &Expression<'_>) -> bool {
+    // The shared literal facts cover object/array/template/primitive
+    // expressions beyond the legacy syntax whitelist, without any getters.
+    if inert_literal_value(expr) {
+        return true;
+    }
     match unparen(expr) {
         Expression::Identifier(_)
         | Expression::StringLiteral(_)
@@ -238,6 +305,30 @@ fn inert_after_state_write(expr: &Expression<'_>) -> bool {
         }),
         _ => false,
     }
+}
+
+/// A declaration's normal Completion is always Empty, but its modeled state
+/// successor is only trustworthy for a *live* loop when every evaluation
+/// following its last numeric state assignment is independently inert.
+/// Source-name-only analysis may accept local identifiers in dead contexts;
+/// here global getters must not be allowed to retarget later dispatch cases.
+fn declaration_has_proven_final_state(expr: &Expression<'_>, state: &str) -> bool {
+    let Expression::SequenceExpression(sequence) = unparen(expr) else {
+        return false;
+    };
+    let Some(last_write) = sequence.expressions.iter().rposition(|item| {
+        matches!(
+            unparen(item),
+            Expression::AssignmentExpression(assign)
+                if assign.operator.as_str() == "="
+                    && direct_assignment_name(&assign.left) == Some(state)
+        )
+    }) else {
+        return false;
+    };
+    sequence.expressions[last_write + 1..]
+        .iter()
+        .all(inert_literal_value)
 }
 
 fn assigned_state_in_initializer(expr: &Expression<'_>, state: &str) -> Option<u64> {
@@ -330,6 +421,11 @@ fn parse_statement_block_route(
             .collect::<Vec<_>>();
         effects.append(&mut route.effects);
         route.effects = effects;
+        // Follow-up guards are modeled for state transitions, but their
+        // additional if-statement Completion can replace the predecessor's
+        // value. Keep that proof obligation explicit until every guard's
+        // selected/unselected branch has a compositional certificate.
+        route.unproven_completion();
         return Some(route);
     }
     // Moving a block-local declaration outside its original block
@@ -354,6 +450,27 @@ fn parse_statement_block_route(
         .collect::<Vec<_>>();
     effects.append(&mut route.effects);
     route.effects = effects;
+    // A trailing Empty completion inherits an earlier nonempty statement's
+    // value; if such a prefix exists, the complete block value is unknown.
+    // Nonempty final completions overwrite any normally evaluated prefix.
+    if prefix.iter().any(|statement| {
+        !matches!(
+            statement,
+            Statement::EmptyStatement(_)
+                | Statement::ExpressionStatement(_)
+                | Statement::VariableDeclaration(_)
+        )
+    }) {
+        route.unproven_completion();
+    } else if prefix
+        .iter()
+        .any(|statement| matches!(statement, Statement::ExpressionStatement(_)))
+    {
+        route.change_completion(|completion| match completion {
+            RouteCompletion::Empty => RouteCompletion::Unproven,
+            other => other,
+        });
+    }
     Some(route)
 }
 
@@ -374,37 +491,50 @@ fn parse_statement_route(
             // the synthetic graph exit for reachability and branch joins.
             effects: vec![fragment(source, stmt.span()).to_owned()],
             next: Next::State(exit),
+            completion: RouteCompletion::Abrupt,
+            transition_proven: true,
         }),
-        Statement::VariableDeclaration(declaration)
-            if declaration.kind == VariableDeclarationKind::Var
-                && declaration.declarations.len() == 1 =>
-        {
+        Statement::VariableDeclaration(declaration) if declaration.declarations.len() == 1 => {
+            // Destructuring can execute property getters after the modeled
+            // state write; only a simple binding has a proven effect order.
+            let BindingPattern::BindingIdentifier(_) = &declaration.declarations[0].id else {
+                return None;
+            };
             let initializer = declaration.declarations[0].init.as_ref()?;
             let target = assigned_state_in_initializer(initializer, state)?;
+            let original = fragment(source, stmt.span());
+            let effect = if declaration.kind == VariableDeclarationKind::Var {
+                original.to_owned()
+            } else {
+                // The initializer must remain in its original lexical region.
+                // Hoisting a let/const into an outer branch changes TDZ and
+                // closure identity; preserve it inside a fresh nested block.
+                format!("{{\n{original}\n}}")
+            };
             Some(Route {
-                effects: vec![fragment(source, stmt.span()).to_owned()],
+                effects: vec![effect],
                 next: Next::State(target),
+                completion: RouteCompletion::Empty,
+                transition_proven: declaration_has_proven_final_state(initializer, state),
             })
         }
         Statement::BlockStatement(block) => parse_statement_block_route(block, state, exit, source),
-        Statement::IfStatement(branch) => Some(Route {
-            effects: Vec::new(),
-            next: Next::Choose {
-                condition: fragment(source, branch.test.span()).to_owned(),
-                yes: Box::new(parse_statement_route(
-                    &branch.consequent,
-                    state,
-                    exit,
-                    source,
-                )?),
-                no: Box::new(parse_statement_route(
-                    branch.alternate.as_ref()?,
-                    state,
-                    exit,
-                    source,
-                )?),
-            },
-        }),
+        Statement::IfStatement(branch) => {
+            let mut yes = parse_statement_route(&branch.consequent, state, exit, source)?;
+            let mut no = parse_statement_route(branch.alternate.as_ref()?, state, exit, source)?;
+            yes.if_statement_completion();
+            no.if_statement_completion();
+            Some(Route {
+                effects: Vec::new(),
+                completion: RouteCompletion::Unproven,
+                transition_proven: true,
+                next: Next::Choose {
+                    condition: fragment(source, branch.test.span()).to_owned(),
+                    yes: Box::new(yes),
+                    no: Box::new(no),
+                },
+            })
+        }
         _ => None,
     }
 }
@@ -431,7 +561,11 @@ fn collect_dispatch_statement(
     match stmt {
         Statement::IfStatement(branch) => {
             let value = state_test(&branch.test, state)?;
-            let route = parse_statement_route(&branch.consequent, state, exit, source);
+            let route =
+                parse_statement_route(&branch.consequent, state, exit, source).map(|mut route| {
+                    route.if_statement_completion();
+                    route
+                });
             if cases.insert(value, route).is_some() {
                 return None;
             }
@@ -457,7 +591,8 @@ fn collect_dispatch_statement(
                     return None;
                 }
                 let label = state_test(&branch.test, state)?;
-                let route = parse_statement_route(&branch.consequent, state, exit, source)?;
+                let mut route = parse_statement_route(&branch.consequent, state, exit, source)?;
+                route.if_statement_completion();
                 if cases.insert(label, Some(route)).is_some() {
                     return None;
                 }
@@ -491,8 +626,8 @@ enum LoopBody {
     Natural {
         condition: String,
         enters_on_true: bool,
-        entering: Route,
-        exiting: Route,
+        entering: Box<Route>,
+        exiting: Box<Route>,
         header_effects: Vec<String>,
         body_start: u64,
     },
@@ -638,8 +773,8 @@ fn build_loops(
                     body: LoopBody::Natural {
                         condition: condition.clone(),
                         enters_on_true,
-                        entering: entering.as_ref().clone(),
-                        exiting: exiting.as_ref().clone(),
+                        entering: Box::new(entering.as_ref().clone()),
+                        exiting: Box::new(exiting.as_ref().clone()),
                         header_effects: route.effects.clone(),
                         body_start: enter,
                     },
@@ -1125,9 +1260,147 @@ impl Emitter<'_> {
     }
 }
 
-/// Turn a reducible numeric-state for/ternary dispatcher into ordinary JavaScript
+/// An observable loop Completion can depend on only one lexical state
+/// binding. Dynamic resolution, eval or an unrelated shadow with the same
+/// spelling would invalidate a numeric-state proof by source-name matching.
+struct LiveNumericStateBinding<'s> {
+    scoping: &'s Scoping,
+    symbol: SymbolId,
+    name: &'s str,
+    valid: bool,
+}
+
+impl<'a> Visit<'a> for LiveNumericStateBinding<'_> {
+    fn visit_identifier_reference(&mut self, id: &IdentifierReference<'a>) {
+        if id.name == self.name
+            && id
+                .reference_id
+                .get()
+                .and_then(|reference| crate::statically_resolved_symbol(self.scoping, reference))
+                != Some(self.symbol)
+        {
+            self.valid = false;
+        }
+    }
+
+    fn visit_variable_declaration(&mut self, declaration: &oxc_ast::ast::VariableDeclaration<'a>) {
+        if declaration.kind == VariableDeclarationKind::Var
+            && declaration.declarations.iter().any(|item| {
+                let BindingPattern::BindingIdentifier(id) = &item.id else {
+                    return true;
+                };
+                let Some(symbol) = id.symbol_id.get() else {
+                    return true;
+                };
+                item.init.as_ref().is_some_and(|init| {
+                    assigned_state_in_initializer(init, self.name).is_some()
+                        && self.scoping.symbol_scope_id(symbol) == self.scoping.root_scope_id()
+                })
+            })
+        {
+            // A root-level var initializer assigns through an object
+            // environment record; its setter runs after the RHS state
+            // assignment and can retarget the apparent CFG successor.
+            self.valid = false;
+        }
+        walk::walk_variable_declaration(self, declaration);
+    }
+
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        if crate::is_potential_direct_eval(call) {
+            self.valid = false;
+        }
+        walk::walk_call_expression(self, call);
+    }
+
+    fn visit_with_statement(&mut self, _stmt: &WithStatement<'a>) {
+        self.valid = false;
+    }
+}
+
+fn live_loop_state_is_lexically_stable(
+    it: &ForStatement<'_>,
+    scoping: &Scoping,
+    name: &str,
+) -> bool {
+    let Some(initializer) = it.init.as_ref() else {
+        return false;
+    };
+    let symbol = match initializer {
+        ForStatementInit::AssignmentExpression(assign) => {
+            let AssignmentTarget::AssignmentTargetIdentifier(id) = &assign.left else {
+                return false;
+            };
+            id.reference_id
+                .get()
+                .and_then(|reference| crate::statically_resolved_symbol(scoping, reference))
+        }
+        ForStatementInit::VariableDeclaration(decl) if decl.declarations.len() == 1 => {
+            let BindingPattern::BindingIdentifier(id) = &decl.declarations[0].id else {
+                return false;
+            };
+            id.symbol_id.get()
+        }
+        _ => None,
+    };
+    let Some(symbol) = symbol else {
+        return false;
+    };
+    // A classic-script root var is object-backed. A preexisting global
+    // accessor survives the declaration and can intercept both GetValue
+    // and PutValue. In contrast a root let/const is a lexical environment
+    // binding, and function-local vars have their own declarative record.
+    if scoping.symbol_scope_id(symbol) == scoping.root_scope_id()
+        && !scoping
+            .symbol_flags(symbol)
+            .contains(oxc_semantic::SymbolFlags::BlockScopedVariable)
+    {
+        return false;
+    }
+    let mut proof = LiveNumericStateBinding {
+        scoping,
+        symbol,
+        name,
+        valid: true,
+    };
+    proof.visit_for_statement(it);
+    proof.valid
+}
+
+/// A loop completion certificate can be attached to the already-validated
+/// numeric dispatch graph. It is separate from the graph's effect/order proof:
+/// the same graph may be safe inside a function but not as the final script
+/// statement, where its Completion value is observable.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NumericForCompletion {
+    Undefined,
+    ExitNumber(u64),
+}
+
+impl NumericForCompletion {
+    fn expression(self) -> String {
+        match self {
+            Self::Undefined => "void 0".to_owned(),
+            Self::ExitNumber(value) => value.to_string(),
+        }
+    }
+}
+
+/// Turn a reducible numeric-state dispatcher into ordinary JavaScript
 /// statement sequencing and while/if control flow, retaining assignment effects.
-pub fn reconstruct_for(it: &ForStatement<'_>, source: &str) -> Option<String> {
+///
+/// For a demanded script/eval Completion, the source graph must separately
+/// prove the exact normal exit value. The graph records per-route Completion
+/// classes, including the explicit undefined produced by an `IfStatement`
+/// `UpdateEmpty` and the Empty produced by var declarations. Only one common
+/// value on all normally exiting routes authorizes a live rewrite.
+/// Zero-valued numeric exits are excluded because state labels collapse +0
+/// and -0, although those Number values remain observably different.
+pub fn reconstruct_for(
+    it: &ForStatement<'_>,
+    source: &str,
+    live_scoping: Option<&Scoping>,
+) -> Option<String> {
     if it.update.is_some() {
         return None;
     }
@@ -1148,15 +1421,37 @@ pub fn reconstruct_for(it: &ForStatement<'_>, source: &str) -> Option<String> {
         }
         _ => return None,
     };
+    if let Some(scoping) = live_scoping {
+        if !live_loop_state_is_lexically_stable(it, scoping, state) {
+            return None;
+        }
+    }
+
     let init_text = format!("{};", fragment(source, init.span()));
-    reconstruct_state_loop(
+    let mut reconstructed = reconstruct_state_loop(
         state,
         initial,
         it.test.as_ref()?,
         &it.body,
         &init_text,
         source,
-    )
+    )?;
+    if live_scoping.is_some() {
+        let completion = reconstructed.normal_completion?;
+        // Appending to the same emitted block preserves the environment
+        // structure and only affects normal completion. Abrupt returns and
+        // throws bypass this suffix.
+        if reconstructed.text.pop()? != '}' {
+            return None;
+        }
+        write!(
+            &mut reconstructed.text,
+            "\n{};\n}}",
+            completion.expression()
+        )
+        .ok()?;
+    }
+    Some(reconstructed.text)
 }
 
 /// Enumerate numeric initializers by exact lexical binding and *individual*
@@ -1239,6 +1534,7 @@ pub fn reconstruct_while_with_known_state(
     source: &str,
 ) -> Option<String> {
     reconstruct_state_loop(state, initial, &it.test, &it.body, "", source)
+        .map(|reconstructed| reconstructed.text)
 }
 
 /// Track every write to the dispatcher's original lexical state symbol,
@@ -2677,6 +2973,8 @@ fn exception_branching_dag_regions(
             *cases.get_mut(&start)?.as_mut()? = Route {
                 effects: vec![text.clone()],
                 next: join_route.next,
+                completion: RouteCompletion::Unproven,
+                transition_proven: false,
             };
             return Some((BTreeMap::from([(start, text)]), absorbed));
         }
@@ -4567,6 +4865,8 @@ fn exception_dispatch_setup<'a, 'ast>(
             Some(Route {
                 effects: Vec::new(),
                 next: Next::State(exit),
+                completion: RouteCompletion::Unproven,
+                transition_proven: false,
             }),
         );
     }
@@ -4758,6 +5058,7 @@ pub fn reconstruct_while_adjacent(
         initial_text,
         source,
     )
+    .map(|reconstructed| reconstructed.text)
 }
 
 /// A `var` declaration is function-scoped even inside a branch that the
@@ -4814,6 +5115,50 @@ impl<'a> Visit<'a> for HoistedVars {
     fn visit_class(&mut self, _: &oxc_ast::ast::Class<'a>) {}
 }
 
+struct ReconstructedStateLoop {
+    text: String,
+    normal_completion: Option<NumericForCompletion>,
+}
+
+fn proven_normal_exit_completion(
+    initial: u64,
+    exit: u64,
+    graph: &BTreeMap<u64, Route>,
+    reachable: &BTreeSet<u64>,
+) -> Option<NumericForCompletion> {
+    if initial == exit {
+        // The loop condition fails before the first body evaluation; the
+        // specified ForBodyEvaluation accumulator V starts at undefined.
+        return Some(NumericForCompletion::Undefined);
+    }
+    let mut proven = None;
+    for &state in reachable {
+        let route = graph.get(&state)?;
+        if !route.all_transitions_proven() {
+            return None;
+        }
+        let mut exits = Vec::new();
+        route.exit_completion(exit, &mut exits);
+        for exit_value in exits {
+            let candidate = match exit_value {
+                RouteCompletion::Abrupt => continue,
+                RouteCompletion::Number(value) if value == exit && exit != 0 => {
+                    NumericForCompletion::ExitNumber(exit)
+                }
+                RouteCompletion::Undefined => NumericForCompletion::Undefined,
+                RouteCompletion::Number(_) | RouteCompletion::Empty | RouteCompletion::Unproven => {
+                    return None;
+                }
+            };
+            if proven.is_some_and(|previous| previous != candidate) {
+                return None;
+            }
+            proven = Some(candidate);
+        }
+    }
+    proven
+}
+
 fn reconstruct_state_loop(
     state: &str,
     initial: u64,
@@ -4821,7 +5166,7 @@ fn reconstruct_state_loop(
     body: &Statement<'_>,
     initial_text: &str,
     source: &str,
-) -> Option<String> {
+) -> Option<ReconstructedStateLoop> {
     let exit = exit_state(test, state)?;
     let mut candidate_cases = BTreeMap::new();
     collect_dispatch_statement(body, state, exit, source, &mut candidate_cases)?;
@@ -4834,6 +5179,7 @@ fn reconstruct_state_loop(
         .filter_map(|(number, route)| route.map(|route| (number, route)))
         .collect::<BTreeMap<_, _>>();
     let nodes = reachable(initial, exit, &graph)?;
+    let normal_completion = proven_normal_exit_completion(initial, exit, &graph, &nodes);
     let mut loops = build_loops(&graph, &nodes, exit)?;
     extend_multi_exit_loops(&graph, &nodes, initial, exit, &mut loops);
     // Do not generate an infinite/repeated CFG expansion. Every loop must
@@ -4877,14 +5223,17 @@ fn reconstruct_state_loop(
             hoisted.names.into_iter().collect::<Vec<_>>().join(", ")
         )
     };
-    Some(format!("{{\n{initial_text}\n{declarations}{code}\n}}"))
+    Some(ReconstructedStateLoop {
+        text: format!("{{\n{initial_text}\n{declarations}{code}\n}}"),
+        normal_completion,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         closed_exception_dag_region, ordered_natural_loop_side, reconstruct_for,
-        ExceptionEntryProof, Next, Route,
+        ExceptionEntryProof, Next, Route, RouteCompletion,
     };
     use crate::deobfuscate;
     use oxc_allocator::Allocator;
@@ -4899,6 +5248,8 @@ mod tests {
     fn duplicate_conditional_successors_count_as_one_incoming_edge() {
         let choose = |yes, no| Route {
             effects: Vec::new(),
+            completion: RouteCompletion::Unproven,
+            transition_proven: true,
             next: Next::Choose {
                 condition: "pick()".to_owned(),
                 yes: Box::new(Route::jump("state", yes)),
@@ -4939,6 +5290,8 @@ mod tests {
     fn natural_loop_deduplicates_conditional_successor_indegrees() {
         let choose = |yes, no| Route {
             effects: Vec::new(),
+            completion: RouteCompletion::Unproven,
+            transition_proven: true,
             next: Next::Choose {
                 condition: "pick()".to_owned(),
                 yes: Box::new(Route::jump("state", yes)),
@@ -4981,7 +5334,7 @@ mod tests {
 
     impl<'a> Visit<'a> for FindFor<'_> {
         fn visit_for_statement(&mut self, it: &oxc_ast::ast::ForStatement<'a>) {
-            if let Some(recovered) = reconstruct_for(it, self.source) {
+            if let Some(recovered) = reconstruct_for(it, self.source, None) {
                 self.outputs.push(recovered);
             }
             walk::walk_for_statement(self, it);
@@ -5240,6 +5593,265 @@ mod tests {
                 "unexpected reconstruction for {source}"
             );
         }
+    }
+
+    #[test]
+    fn live_expression_state_loops_retain_the_numeric_exit_completion() {
+        let cases = [
+            "let s;for(s=1;s!=9;)s==1?(s=9):s==9&&(s=9);",
+            "let s;for(s=1;s!=9;)s==1?(s=3):s==3?(s=9):s==9&&(s=9);",
+            "let s;for(s=1;s!=9;)s==1?(push('A'),s=3):s==3?(push('B'),s=9):s==9&&(s=9);",
+            "let s;for(s=1;s!=9;)s==1?(s=flag?9:3):s==3?(push('B'),s=9):s==9&&(s=9);",
+            "let s;for(s=9;s!=9;)s==1?(push('NEVER'),s=9):s==9&&(s=9);",
+            "1;let s;for(s=9;s!=9;)s==1?(push('NEVER'),s=9):s==9&&(s=9);",
+            "let s;L:for(s=1;s!=9;)s==1?(push('A'),s=9):s==9&&(s=9);",
+        ];
+        for source in cases {
+            let result = deobfuscate(
+                source,
+                12,
+                &WorkBudget::unlimited("numeric-loop-script-completion"),
+            );
+            assert!(result.is_ok(), "{result:?}");
+            let Some(recovered) = result.ok().flatten() else {
+                unreachable!()
+            };
+            assert!(
+                recovered
+                    .transforms
+                    .get("if_ladder_structured")
+                    .is_some_and(|n| *n > 0),
+                "{source}: {:?}: {}",
+                recovered.transforms,
+                recovered.source
+            );
+            if source.contains("s=9;s!=9") {
+                assert!(recovered.source.contains("void 0"), "{}", recovered.source);
+            } else {
+                assert!(recovered.source.contains("9;"), "{}", recovered.source);
+            }
+        }
+    }
+
+    #[test]
+    fn live_statement_dispatchers_preserve_if_update_empty_values() {
+        for (source, suffix) in [
+            (
+                "let s;for(s=1;s!=9;)if(s==1){s=9;}else if(s==9){s=9;}",
+                "9",
+            ),
+            (
+                "let s;for(s=1;s!=9;)if(s==1){let x=(s=9,[]);}else if(s==9){s=9;}",
+                "void 0",
+            ),
+            (
+                "let s;for(s=1;s!=9;)if(s==1){let x=(s=3,[]);}else if(s==3){let y=(s=9,[]);}else if(s==9){s=9;}",
+                "void 0",
+            ),
+        ] {
+            let recovered = deobfuscate(
+                source, 12, &WorkBudget::unlimited("statement-loop-script-completion")
+            );
+            assert!(recovered.is_ok(), "{recovered:?}");
+            let Some(recovered) = recovered.ok().flatten() else { unreachable!() };
+            assert!(
+                recovered.transforms.get("if_ladder_structured").is_some_and(|n| *n > 0),
+                "{source}: {:?}: {}",recovered.transforms,recovered.source
+            );
+            assert!(recovered.source.contains(suffix), "{source} -> {}",recovered.source);
+        }
+    }
+
+    #[test]
+    fn mixed_exit_completion_classes_are_not_conflated() {
+        let cases = [
+            // One state path ends in the assigned Number, another in the
+            // undefined produced by IfStatement UpdateEmpty(Empty).
+            "let s;for(s=1;s!=9;)if(s==1){s=flag?9:3;}else if(s==3){let x=(s=9,[]);}else if(s==9){s=9;}",
+            // An Empty block after a valued state write inherits that earlier
+            // value; without a path certificate this requires proof.
+            "let s;for(s=1;s!=9;)if(s==1){s=9;var x;}else if(s==9){s=9;}",
+        ];
+        for source in cases {
+            let recovered = deobfuscate(
+                source,
+                12,
+                &WorkBudget::unlimited("ambiguous-loop-completion"),
+            );
+            assert!(recovered.is_ok(), "{recovered:?}");
+            let Some(recovered) = recovered.ok().flatten() else {
+                unreachable!()
+            };
+            assert!(
+                !recovered.transforms.contains_key("if_ladder_structured"),
+                "{source}: {:?}: {}",
+                recovered.transforms,
+                recovered.source
+            );
+        }
+    }
+
+    #[test]
+    fn declaration_state_successors_refuse_global_getters_after_write() {
+        let unsafe_source =
+            "var s;for(s=1;s!=9;)if(s==1){var x=(s=9,possiblyGetter);}else if(s==9){s=9;}";
+        let result = deobfuscate(
+            unsafe_source,
+            12,
+            &WorkBudget::unlimited("global-getter-state-write"),
+        );
+        assert!(result.is_ok(), "{result:?}");
+        if let Some(recovered) = result.ok().flatten() {
+            assert!(
+                !recovered.transforms.contains_key("if_ladder_structured"),
+                "{:?}: {}",
+                recovered.transforms,
+                recovered.source
+            );
+        }
+
+        // Inert literal families share the value_eval classifier, not a
+        // syntax-only whitelist. These cannot run a user getter/coercion.
+        for tail in ["[]", concat!("({", "a:1})"), "[1,2,3]", "42", "void 0"] {
+            let source =
+                format!("let s;for(s=1;s!=9;)if(s==1){{let x=(s=9,{tail});}}else if(s==9){{s=9;}}");
+            let result = deobfuscate(
+                &source,
+                12,
+                &WorkBudget::unlimited("inert-state-write-tail"),
+            );
+            assert!(result.is_ok(), "{result:?}");
+            let recovered = result.ok().flatten();
+            assert!(
+                recovered
+                    .as_ref()
+                    .is_some_and(|result| result.transforms.contains_key("if_ladder_structured")),
+                "{source}: {recovered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn live_loop_proof_refuses_unmodeled_statement_and_signed_zero_completions() {
+        for source in [
+            "let s;for(s=1;s!=0;)s==1?(s=0):s==0&&(s=0);",
+            "let s;for(s=1;s!=-0;)s==1?(s=-0):s==0&&(s=0);",
+            "var s;for(s=1;s!=9;)if(s==1){s=9;var x;}else if(s==9){s=9;}",
+            // An unresolved global may be an accessor with observable side
+            // effects, not the proved lexical state binding.
+            "for(s=1;s!=9;)s==1?(s=9):s==9&&(s=9);",
+            // The state lookup is dynamically intercepted by with.
+            concat!(
+                "let s;with({",
+                "s:1}){for(s=1;s!=9;)s==1?(s=9):s==9&&(s=9);}"
+            ),
+            // The same spelling refers to different actual symbols.
+            "let s;for(s=1;s!=9;)s==1?((function(){let s=2;return s})(),s=9):s==9&&(s=9);",
+            // A dynamically evaluated string can mutate the state binding.
+            "let s;for(s=1;s!=9;)s==1?(eval('0'),s=9):s==9&&(s=9);",
+            // Reading an unresolved name after setting the state can execute
+            // its global accessor and change the supposedly terminal state.
+            "let s;for(s=1;s!=9;)if(s==1){var x=(s=9,possiblyGetter);}else if(s==9){s=9;}",
+        ] {
+            let recovered = deobfuscate(
+                source,
+                12,
+                &WorkBudget::unlimited("unproven-live-loop-completion"),
+            );
+            assert!(recovered.is_ok(), "{recovered:?}");
+            if let Some(recovered) = recovered.ok().flatten() {
+                assert!(
+                    !recovered.transforms.contains_key("if_ladder_structured"),
+                    "{source}: {:?}: {}",
+                    recovered.transforms,
+                    recovered.source
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires Node; compare live script and direct-eval Completion Records"]
+    fn node_confirms_recovered_live_numeric_loops_and_zero_iterations(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::process::Command;
+        let source_cases = [
+            "let s;for(s=1;s!=9;)s==1?(s=9):s==9&&(s=9);",
+            "let s;for(s=1;s!=9;)s==1?(s=3):s==3?(s=9):s==9&&(s=9);",
+            "let s;for(s=1;s!=9;)s==1?(push('A'),s=3):s==3?(push('B'),s=9):s==9&&(s=9);",
+            "let s;for(s=1;s!=9;)s==1?(s=flag?9:3):s==3?(push('B'),s=9):s==9&&(s=9);",
+            "let s;for(s=9;s!=9;)s==1?(push('NEVER'),s=9):s==9&&(s=9);",
+            "1;let s;for(s=9;s!=9;)s==1?(push('NEVER'),s=9):s==9&&(s=9);",
+            "let s;L:for(s=1;s!=9;)s==1?(push('A'),s=9):s==9&&(s=9);",
+            "let s;for(s=1;s!=9;)s==1?(s=9):s==9&&(s=9);var unused;",
+            "let s;for(s=1;s!=9;)if(s==1){s=9;}else if(s==9){s=9;}",
+            "let s;for(s=1;s!=9;)if(s==1){let x=(s=9,[]);}else if(s==9){s=9;}",
+            "let s;for(s=1;s!=9;)if(s==1){let x=(s=3,[]);}else if(s==3){let y=(s=9,[]);}else if(s==9){s=9;}",
+        ];
+        let mut transformed = 0;
+        let mut tests = 0;
+        for source in source_cases {
+            let recovered = deobfuscate(
+                source,
+                12,
+                &WorkBudget::unlimited("live-loop-runtime-oracle"),
+            )?
+            .ok_or_else(|| std::io::Error::other("valid source not recovered"))?;
+            transformed += recovered
+                .transforms
+                .get("if_ladder_structured")
+                .copied()
+                .unwrap_or(0);
+            for flag in [false, true] {
+                for mode in ["script", "eval"] {
+                    let harness = r"
+const vm=require('node:vm');
+const source=process.argv[1], flag=process.argv[2]==='true';
+const mode=process.argv[3];
+const effects=[];
+const context={flag, push(v){effects.push(v);return v.length}};
+const script=mode==='eval'?'eval('+JSON.stringify(source)+')':source;
+const options={};options.timeout=1500;
+try {
+  const value=vm.runInNewContext(script,context,options);
+  console.log(JSON.stringify({
+    type:value===undefined?'undefined':typeof value,
+    value:value===undefined?null:value,
+    effects
+  }));
+} catch(error) {
+  console.log(JSON.stringify({type:'throw',name:error.name,effects}));
+}
+";
+                    let observe =
+                        |code: &str| -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+                            let result = Command::new("node")
+                                .arg("-e")
+                                .arg(harness)
+                                .arg(code)
+                                .arg(if flag { "true" } else { "false" })
+                                .arg(mode)
+                                .output()?;
+                            assert!(result.status.success(), "{result:?}");
+                            Ok(serde_json::from_slice(&result.stdout)?)
+                        };
+                    let before = observe(source)?;
+                    let after = observe(&recovered.source)?;
+                    assert_eq!(
+                        before, after,
+                        "{source} -> {} (flag={flag}, mode={mode})",
+                        recovered.source
+                    );
+                    tests += 1;
+                }
+            }
+        }
+        assert!(
+            transformed >= source_cases.len(),
+            "{transformed} transformations"
+        );
+        assert_eq!(tests, 44);
+        Ok(())
     }
 
     #[test]
@@ -5622,7 +6234,7 @@ mod tests {
             "fixture should parse as a for statement"
         );
         if let Some(stmt) = statement {
-            assert!(reconstruct_for(stmt, source).is_none());
+            assert!(reconstruct_for(stmt, source, None).is_none());
         }
     }
 
@@ -5645,7 +6257,7 @@ mod tests {
             "fixture should parse as a for statement"
         );
         if let Some(stmt) = statement {
-            assert!(reconstruct_for(stmt, source).is_none());
+            assert!(reconstruct_for(stmt, source, None).is_none());
         }
     }
 }
