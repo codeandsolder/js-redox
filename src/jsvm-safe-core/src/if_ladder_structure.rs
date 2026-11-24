@@ -5855,6 +5855,63 @@ try {
     }
 
     #[test]
+    fn investigate_post_assignment_global_accessor_state_retargeting() {
+        let cases = [
+            r#"function run(log) {
+                let s;
+                Object.defineProperty(globalThis, 'hook', {
+                    configurable: true,
+                    get() { s=5; log.push('getter'); return 3; }
+                });
+                for(s=1;s!=9;)
+                    if(s==1) var x=(s=9,hook);
+                    else if(s==5) { log.push('case5'); s=9; }
+                    else if(s==9) s=9;
+                return log.join('|');
+            }
+            var entries=[]; run(entries);"#,
+            r#"function run(log) {
+                let s;
+                Object.defineProperty(globalThis, 'hook', {
+                    configurable: true,
+                    get() { s=5; log.push('getter'); return 3; }
+                });
+                for(s=1;s!=9;)
+                    if(s==1) var x=(s=9,[hook]);
+                    else if(s==5) { log.push('case5'); s=9; }
+                    else if(s==9) s=9;
+                return log.join('|');
+            }
+            var entries=[]; run(entries);"#,
+            r#"function run(log) {
+                let s;
+                Object.defineProperty(globalThis, 'hook', {
+                    configurable: true,
+                    get() { s=5; log.push('getter'); return 3; }
+                });
+                for(s=1;s!=9;)
+                    if(s==1) var x=(s=9,hook);
+                    else if(s==5) s=9;
+                    else if(s==9) s=9;
+                return log.join('|');
+            }
+            var entries=[]; run(entries);"#,
+        ];
+        for (i, source) in cases.iter().enumerate() {
+            let result = deobfuscate(
+                source,
+                12,
+                &WorkBudget::unlimited("accessor-transition-investigation"),
+            );
+            assert!(result.is_ok(), "{result:?}");
+            let Some(result) = result.ok().flatten() else {
+                panic!("valid input did not produce result")
+            };
+            println!("CASE {i}: {:?} SOURCE {}", result.transforms, result.source);
+        }
+    }
+
+    #[test]
     fn dead_numeric_state_writes_removed_only_when_unobserved() {
         let source = "function f(n){var s,sum=0;for(s=3;s!=9;)s==3?(s=n?4:9):s==4?(sum++,s=3):s==9&&(s=9);return sum;}";
         let result = deobfuscate(source, 12, &WorkBudget::unlimited("dead-state"));
