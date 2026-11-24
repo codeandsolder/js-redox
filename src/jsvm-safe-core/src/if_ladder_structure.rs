@@ -1260,6 +1260,44 @@ impl Emitter<'_> {
     }
 }
 
+/// Syntax establishes that the suffix performs only bare GetValue reads
+/// (possibly in an array). Semantic symbol identity must additionally show
+/// that those reads cannot invoke global-object or with-environment getters.
+struct InertBindingReads<'s> {
+    scoping: &'s Scoping,
+    implicit_arguments_local: bool,
+    valid: bool,
+}
+
+impl<'a> Visit<'a> for InertBindingReads<'_> {
+    fn visit_identifier_reference(&mut self, id: &IdentifierReference<'a>) {
+        let symbol = id
+            .reference_id
+            .get()
+            .and_then(|reference| crate::statically_resolved_symbol(self.scoping, reference));
+        if let Some(symbol) = symbol {
+            let flags = self.scoping.symbol_flags(symbol);
+            let root = self.scoping.symbol_scope_id(symbol) == self.scoping.root_scope_id();
+            if root
+                && !flags.intersects(
+                    oxc_semantic::SymbolFlags::BlockScopedVariable
+                        | oxc_semantic::SymbolFlags::Import,
+                )
+            {
+                self.valid = false;
+            }
+        } else if id.name != "arguments" || !self.implicit_arguments_local {
+            self.valid = false;
+        }
+    }
+
+    fn visit_function(&mut self, _: &oxc_ast::ast::Function<'a>, _: oxc_syntax::scope::ScopeFlags) {
+        // Creating a function does not execute the nested body.
+    }
+
+    fn visit_arrow_function_expression(&mut self, _: &oxc_ast::ast::ArrowFunctionExpression<'a>) {}
+}
+
 /// An observable loop Completion can depend on only one lexical state
 /// binding. Dynamic resolution, eval or an unrelated shadow with the same
 /// spelling would invalidate a numeric-state proof by source-name matching.
@@ -1284,24 +1322,63 @@ impl<'a> Visit<'a> for LiveNumericStateBinding<'_> {
     }
 
     fn visit_variable_declaration(&mut self, declaration: &oxc_ast::ast::VariableDeclaration<'a>) {
-        if declaration.kind == VariableDeclarationKind::Var
-            && declaration.declarations.iter().any(|item| {
-                let BindingPattern::BindingIdentifier(id) = &item.id else {
-                    return true;
-                };
-                let Some(symbol) = id.symbol_id.get() else {
-                    return true;
-                };
-                item.init.as_ref().is_some_and(|init| {
-                    assigned_state_in_initializer(init, self.name).is_some()
-                        && self.scoping.symbol_scope_id(symbol) == self.scoping.root_scope_id()
-                })
-            })
-        {
-            // A root-level var initializer assigns through an object
-            // environment record; its setter runs after the RHS state
-            // assignment and can retarget the apparent CFG successor.
-            self.valid = false;
+        for item in &declaration.declarations {
+            let Some(init) = item.init.as_ref() else {
+                continue;
+            };
+            if assigned_state_in_initializer(init, self.name).is_none() {
+                continue;
+            }
+            let BindingPattern::BindingIdentifier(id) = &item.id else {
+                self.valid = false;
+                break;
+            };
+            let Some(symbol) = id.symbol_id.get() else {
+                self.valid = false;
+                break;
+            };
+            if declaration.kind == VariableDeclarationKind::Var
+                && self.scoping.symbol_scope_id(symbol) == self.scoping.root_scope_id()
+            {
+                // Assignment into an object-backed global var may invoke a
+                // setter after writing the state.
+                self.valid = false;
+                break;
+            }
+            let Expression::SequenceExpression(sequence) = unparen(init) else {
+                self.valid = false;
+                break;
+            };
+            let Some(last_write) = sequence.expressions.iter().rposition(|expr| {
+                matches!(
+                    unparen(expr),
+                    Expression::AssignmentExpression(assign)
+                        if assign.operator.as_str() == "="
+                            && direct_assignment_name(&assign.left) == Some(self.name)
+                )
+            }) else {
+                self.valid = false;
+                break;
+            };
+            let implicit_arguments_local = self
+                .scoping
+                .scope_ancestors(self.scoping.symbol_scope_id(self.symbol))
+                .any(|scope| {
+                    let flags = self.scoping.scope_flags(scope);
+                    flags.is_function() && !flags.is_arrow()
+                });
+            let mut reads = InertBindingReads {
+                scoping: self.scoping,
+                implicit_arguments_local,
+                valid: true,
+            };
+            for suffix in &sequence.expressions[last_write + 1..] {
+                reads.visit_expression(suffix);
+            }
+            if !reads.valid {
+                self.valid = false;
+                break;
+            }
         }
         walk::walk_variable_declaration(self, declaration);
     }
@@ -1399,7 +1476,8 @@ impl NumericForCompletion {
 pub fn reconstruct_for(
     it: &ForStatement<'_>,
     source: &str,
-    live_scoping: Option<&Scoping>,
+    scoping: Option<&Scoping>,
+    completion_live: bool,
 ) -> Option<String> {
     if it.update.is_some() {
         return None;
@@ -1421,10 +1499,13 @@ pub fn reconstruct_for(
         }
         _ => return None,
     };
-    if let Some(scoping) = live_scoping {
+    if let Some(scoping) = scoping {
         if !live_loop_state_is_lexically_stable(it, scoping, state) {
             return None;
         }
+    } else if completion_live {
+        // No semantic identities means no observable-completion proof.
+        return None;
     }
 
     let init_text = format!("{};", fragment(source, init.span()));
@@ -1436,7 +1517,7 @@ pub fn reconstruct_for(
         &init_text,
         source,
     )?;
-    if live_scoping.is_some() {
+    if completion_live {
         let completion = reconstructed.normal_completion?;
         // Appending to the same emitted block preserves the environment
         // structure and only affects normal completion. Abrupt returns and
@@ -5334,7 +5415,7 @@ mod tests {
 
     impl<'a> Visit<'a> for FindFor<'_> {
         fn visit_for_statement(&mut self, it: &oxc_ast::ast::ForStatement<'a>) {
-            if let Some(recovered) = reconstruct_for(it, self.source, None) {
+            if let Some(recovered) = reconstruct_for(it, self.source, None, false) {
                 self.outputs.push(recovered);
             }
             walk::walk_for_statement(self, it);
@@ -5855,7 +5936,10 @@ try {
     }
 
     #[test]
-    fn investigate_post_assignment_global_accessor_state_retargeting() {
+    #[ignore = "requires installed Node; compare real script and direct-eval results"]
+    fn global_accessor_after_state_write_keeps_real_successor(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::process::Command;
         let cases = [
             r#"function run(log) {
                 let s;
@@ -5897,18 +5981,96 @@ try {
             }
             var entries=[]; run(entries);"#,
         ];
+        let harness = r"
+const vm=require('node:vm');
+const source=process.argv[1],mode=process.argv[2];
+const code=mode==='eval'?'eval('+JSON.stringify(source)+')':source;
+const options={};options.timeout=1000;
+try{
+ const value=vm.runInNewContext(code,{},options);
+ console.log(JSON.stringify({
+    type:value===undefined?'undefined':typeof value,
+    value:value===undefined?null:value
+ }));
+}catch(error){
+ console.log(JSON.stringify({type:'throw',name:error.name}));
+}
+";
         for (i, source) in cases.iter().enumerate() {
-            let result = deobfuscate(
+            let recovered = deobfuscate(
                 source,
                 12,
-                &WorkBudget::unlimited("accessor-transition-investigation"),
-            );
-            assert!(result.is_ok(), "{result:?}");
-            let Some(result) = result.ok().flatten() else {
-                panic!("valid input did not produce result")
-            };
-            println!("CASE {i}: {:?} SOURCE {}", result.transforms, result.source);
+                &WorkBudget::unlimited("global-getter-transition-differential"),
+            )?
+            .ok_or_else(|| std::io::Error::other("valid source must recover"))?;
+            for mode in ["script", "eval"] {
+                let observe =
+                    |code: &str| -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+                        let output = Command::new("node")
+                            .arg("-e")
+                            .arg(harness)
+                            .arg(code)
+                            .arg(mode)
+                            .output()?;
+                        assert!(output.status.success(), "{output:?}");
+                        Ok(serde_json::from_slice(&output.stdout)?)
+                    };
+                let original = observe(source)?;
+                let rewritten = observe(&recovered.source)?;
+                if i < 2 {
+                    assert_eq!(original["value"], "getter|case5");
+                }
+                assert_eq!(
+                    original, rewritten,
+                    "case {i}, {mode}: pruned real successor; transforms {:?}, source {}",
+                    recovered.transforms, recovered.source
+                );
+            }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn semantic_local_binding_reads_still_allow_numeric_state_recovery(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let source = r"
+function dispatch(input, log) {
+    let value;
+    const run = function(mode) {
+        for (var state = 6; state != 2;)
+            if (state == 30) var captured = (state = 67, [input, log, arguments]);
+            else if (state == 81) state = mode == 1 ? 17 : 24;
+            else if (state == 6) state = input ? 85 : 2;
+            else if (state == 67) state = mode == 127 ? 14 : 81;
+            else if (state == 63) { log.push('end'); state = 2; }
+            else if (state == 14) { var result = log.push(captured.length); state = 73; }
+            else if (state == 24) { result = log.push(24); state = 73; }
+            else {
+                if (state == 73) return result;
+                if (state == 17) {var local = !input; state = (log.push(local), 73);}
+                else state == 85 && (state = input > 1 ? 30 : 63);
+            }
+    };
+    value = run(127);
+    return [value,log];
+}
+";
+        let result = deobfuscate(
+            source,
+            16,
+            &WorkBudget::unlimited("resolved-local-state-suffix"),
+        )?
+        .ok_or_else(|| std::io::Error::other("valid local source must recover"))?;
+        assert!(
+            result
+                .transforms
+                .get("if_ladder_structured")
+                .is_some_and(|count| *count > 0),
+            "{:?}: {}",
+            result.transforms,
+            result.source
+        );
+        Ok(())
     }
 
     #[test]
@@ -6291,7 +6453,7 @@ try {
             "fixture should parse as a for statement"
         );
         if let Some(stmt) = statement {
-            assert!(reconstruct_for(stmt, source, None).is_none());
+            assert!(reconstruct_for(stmt, source, None, false).is_none());
         }
     }
 
@@ -6314,7 +6476,7 @@ try {
             "fixture should parse as a for statement"
         );
         if let Some(stmt) = statement {
-            assert!(reconstruct_for(stmt, source, None).is_none());
+            assert!(reconstruct_for(stmt, source, None, false).is_none());
         }
     }
 }
