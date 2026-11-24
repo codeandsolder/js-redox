@@ -626,8 +626,8 @@ enum LoopBody {
     Natural {
         condition: String,
         enters_on_true: bool,
-        entering: Route,
-        exiting: Route,
+        entering: Box<Route>,
+        exiting: Box<Route>,
         header_effects: Vec<String>,
         body_start: u64,
     },
@@ -773,8 +773,8 @@ fn build_loops(
                     body: LoopBody::Natural {
                         condition: condition.clone(),
                         enters_on_true,
-                        entering: entering.as_ref().clone(),
-                        exiting: exiting.as_ref().clone(),
+                        entering: Box::new(entering.as_ref().clone()),
+                        exiting: Box::new(exiting.as_ref().clone()),
                         header_effects: route.effects.clone(),
                         body_start: enter,
                     },
@@ -1391,8 +1391,8 @@ impl NumericForCompletion {
 ///
 /// For a demanded script/eval Completion, the source graph must separately
 /// prove the exact normal exit value. The graph records per-route Completion
-/// classes, including the explicit undefined produced by IfStatement's
-/// UpdateEmpty and the Empty produced by var declarations. Only one common
+/// classes, including the explicit undefined produced by an `IfStatement`
+/// `UpdateEmpty` and the Empty produced by var declarations. Only one common
 /// value on all normally exiting routes authorizes a live rewrite.
 /// Zero-valued numeric exits are excluded because state labels collapse +0
 /// and -0, although those Number values remain observably different.
@@ -1444,9 +1444,12 @@ pub fn reconstruct_for(
         if reconstructed.text.pop()? != '}' {
             return None;
         }
-        reconstructed
-            .text
-            .push_str(&format!("\n{};\n}}", completion.expression()));
+        write!(
+            &mut reconstructed.text,
+            "\n{};\n}}",
+            completion.expression()
+        )
+        .ok()?;
     }
     Some(reconstructed.text)
 }
@@ -5709,7 +5712,7 @@ mod tests {
 
         // Inert literal families share the value_eval classifier, not a
         // syntax-only whitelist. These cannot run a user getter/coercion.
-        for tail in ["[]", "({a:1})", "[1,2,3]", "42", "void 0"] {
+        for tail in ["[]", concat!("({", "a:1})"), "[1,2,3]", "42", "void 0"] {
             let source =
                 format!("let s;for(s=1;s!=9;)if(s==1){{let x=(s=9,{tail});}}else if(s==9){{s=9;}}");
             let result = deobfuscate(
@@ -5738,7 +5741,10 @@ mod tests {
             // effects, not the proved lexical state binding.
             "for(s=1;s!=9;)s==1?(s=9):s==9&&(s=9);",
             // The state lookup is dynamically intercepted by with.
-            "let s;with({s:1}){for(s=1;s!=9;)s==1?(s=9):s==9&&(s=9);}",
+            concat!(
+                "let s;with({",
+                "s:1}){for(s=1;s!=9;)s==1?(s=9):s==9&&(s=9);}"
+            ),
             // The same spelling refers to different actual symbols.
             "let s;for(s=1;s!=9;)s==1?((function(){let s=2;return s})(),s=9):s==9&&(s=9);",
             // A dynamically evaluated string can mutate the state binding.
