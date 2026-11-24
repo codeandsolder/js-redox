@@ -44,6 +44,7 @@ enum Next {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RouteCompletion {
     Number(u64),
+    NegativeZero,
     Empty,
     Undefined,
     Abrupt,
@@ -59,14 +60,18 @@ struct Route {
 }
 
 impl Route {
-    fn jump(state: &str, target: u64, expression: &str) -> Self {
+    fn jump(state: &str, target: u64, expression: &str, negative_zero: bool) -> Self {
         Self {
             // Preserve the original proven numeric expression, rather than
             // rendering the unsigned graph label. In particular, -0 and +0
             // follow the same graph edges but are observable with Object.is.
             effects: vec![format!("{state} = {expression};")],
             next: Next::State(target),
-            completion: RouteCompletion::Number(target),
+            completion: if negative_zero {
+                RouteCompletion::NegativeZero
+            } else {
+                RouteCompletion::Number(target)
+            },
             transition_proven: true,
         }
     }
@@ -199,11 +204,18 @@ fn parse_target(expr: &Expression<'_>, state: &str, source: &str) -> Option<Rout
             result.effects = effects;
             Some(result)
         }
-        expr => Some(Route::jump(
-            state,
-            number(expr)?,
-            fragment(source, expr.span()),
-        )),
+        expr => {
+            let Value::Number(value) = eval(expr)? else {
+                return None;
+            };
+            let target = exact_u64(value)?;
+            Some(Route::jump(
+                state,
+                target,
+                fragment(source, expr.span()),
+                value == 0.0 && value.is_sign_negative(),
+            ))
+        }
     }
 }
 
@@ -1475,6 +1487,7 @@ fn while_state_transitions_proven(
 enum NumericForCompletion {
     Undefined,
     Number(u64),
+    NegativeZero,
 }
 
 impl NumericForCompletion {
@@ -1482,6 +1495,7 @@ impl NumericForCompletion {
         match self {
             Self::Undefined => "void 0".to_owned(),
             Self::Number(value) => value.to_string(),
+            Self::NegativeZero => "-0".to_owned(),
         }
     }
 }
@@ -1494,8 +1508,8 @@ impl NumericForCompletion {
 /// classes, including the explicit undefined produced by an `IfStatement`
 /// `UpdateEmpty` and the Empty produced by var declarations. Only one common
 /// value on all normally exiting routes authorizes a live rewrite.
-/// Zero-valued numeric exits are excluded because state labels collapse +0
-/// and -0, although those Number values remain observably different.
+/// Signed zero is carried as an exact Completion fact independently of
+/// the unsigned state label, which correctly treats both signs as one state.
 pub fn reconstruct_for(
     it: &ForStatement<'_>,
     source: &str,
@@ -5252,22 +5266,23 @@ struct ReconstructedStateLoop {
     normal_completion: Option<NumericForCompletion>,
 }
 
-/// Unsigned graph labels cannot distinguish the two ECMAScript zero signs.
-/// Carry that uncertainty through Empty iterations. A later known Number or
-/// Undefined overwrites it; only an observable ambiguous zero is rejected.
+/// The control-flow graph merges both zero signs for equality and routing,
+/// but a statement Completion carries the sign of the exact source numeric
+/// fact. This is observable in script/eval evaluation and must survive Empty
+/// iterations without conflating the two values.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum LoopAccumulator {
     Undefined,
     Number(u64),
-    UnknownZero,
+    NegativeZero,
 }
 
 impl LoopAccumulator {
-    fn certified(self) -> Option<NumericForCompletion> {
+    fn certified(self) -> NumericForCompletion {
         match self {
-            Self::Undefined => Some(NumericForCompletion::Undefined),
-            Self::Number(value) => Some(NumericForCompletion::Number(value)),
-            Self::UnknownZero => None,
+            Self::Undefined => NumericForCompletion::Undefined,
+            Self::Number(value) => NumericForCompletion::Number(value),
+            Self::NegativeZero => NumericForCompletion::NegativeZero,
         }
     }
 }
@@ -5313,8 +5328,8 @@ fn proven_normal_exit_completion(
                 RouteCompletion::Abrupt => continue,
                 RouteCompletion::Empty => previous,
                 RouteCompletion::Undefined => LoopAccumulator::Undefined,
-                RouteCompletion::Number(0) => LoopAccumulator::UnknownZero,
                 RouteCompletion::Number(value) => LoopAccumulator::Number(value),
+                RouteCompletion::NegativeZero => LoopAccumulator::NegativeZero,
                 RouteCompletion::Unproven => return None,
             };
             if next != exit && !reachable.contains(&next) {
@@ -5332,7 +5347,7 @@ fn proven_normal_exit_completion(
         }
     }
     if exits.len() == 1 {
-        exits.into_iter().next()?.certified()
+        Some(exits.into_iter().next()?.certified())
     } else {
         None
     }
@@ -5486,6 +5501,62 @@ try {
     }
 
     #[test]
+    #[ignore = "requires Node; confirm exact signed-zero ScriptEvaluation Completion"]
+    fn node_confirms_signed_zero_exit_completions_are_not_conflated(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::process::Command;
+        let sources = [
+            ("let s;for(s=1;s!=0;)s==1?(s=0):s==0&&(s=0);", false),
+            ("let s;for(s=1;s!=0;)s==1?(s=-0):s==0&&(s=0);", true),
+        ];
+        let harness = r"
+const vm=require('node:vm');
+const source=process.argv[1],mode=process.argv[2];
+const code=mode==='eval'?'eval('+JSON.stringify(source)+')':source;
+const options={};options.timeout=1200;
+try{
+ const value=vm.runInNewContext(code,{},options);
+ console.log(JSON.stringify({type:typeof value,
+   negativeZero:Object.is(value,-0),positiveZero:Object.is(value,0)}));
+}catch(error){
+ console.log(JSON.stringify({type:'throw',name:error.name}));
+}
+";
+        for (source, negative) in sources {
+            let recovered =
+                deobfuscate(source, 12, &WorkBudget::unlimited("signed-zero-loop-exit"))?
+                    .ok_or_else(|| std::io::Error::other("valid signed-zero loop must recover"))?;
+            assert!(
+                recovered
+                    .transforms
+                    .get("if_ladder_structured")
+                    .is_some_and(|count| *count > 0),
+                "{:?}: {}",
+                recovered.transforms,
+                recovered.source
+            );
+            for mode in ["script", "eval"] {
+                let observe =
+                    |input: &str| -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+                        let output = Command::new("node")
+                            .arg("-e")
+                            .arg(harness)
+                            .arg(input)
+                            .arg(mode)
+                            .output()?;
+                        assert!(output.status.success(), "{output:?}");
+                        Ok(serde_json::from_slice(&output.stdout)?)
+                    };
+                let before = observe(source)?;
+                let after = observe(&recovered.source)?;
+                assert_eq!(before["negativeZero"], negative);
+                assert_eq!(before, after, "{mode}: {}", recovered.source);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn loop_completion_fixed_point_propagates_empty_and_handles_cycles() {
         let edge = |target, completion| Route {
             effects: Vec::new(),
@@ -5608,6 +5679,26 @@ try {
                 1,
                 BTreeMap::from([(1, edge(9, RouteCompletion::Number(0)))])
             ),
+            Some(NumericForCompletion::Number(0)),
+        );
+        assert_eq!(
+            proof(
+                1,
+                BTreeMap::from([(1, edge(9, RouteCompletion::NegativeZero))])
+            ),
+            Some(NumericForCompletion::NegativeZero),
+        );
+        assert_eq!(
+            proof(
+                1,
+                BTreeMap::from([(
+                    1,
+                    fork(
+                        edge(9, RouteCompletion::Number(0)),
+                        edge(9, RouteCompletion::NegativeZero),
+                    ),
+                )])
+            ),
             None,
         );
         assert_eq!(
@@ -5628,7 +5719,27 @@ try {
                     (0, edge(9, RouteCompletion::Empty)),
                 ])
             ),
-            None,
+            Some(NumericForCompletion::Number(0)),
+        );
+        assert_eq!(
+            proof(
+                1,
+                BTreeMap::from([
+                    (1, edge(0, RouteCompletion::NegativeZero)),
+                    (0, edge(9, RouteCompletion::Empty)),
+                ])
+            ),
+            Some(NumericForCompletion::NegativeZero),
+        );
+        assert_eq!(
+            proof(
+                1,
+                BTreeMap::from([
+                    (1, edge(0, RouteCompletion::NegativeZero)),
+                    (0, edge(9, RouteCompletion::Number(9))),
+                ])
+            ),
+            Some(NumericForCompletion::Number(9)),
         );
         assert_eq!(
             proof(1, BTreeMap::from([(1, edge(1, RouteCompletion::Empty))])),
@@ -5657,16 +5768,16 @@ try {
             transition_proven: true,
             next: Next::Choose {
                 condition: "pick()".to_owned(),
-                yes: Box::new(Route::jump("state", yes, &yes.to_string())),
-                no: Box::new(Route::jump("state", no, &no.to_string())),
+                yes: Box::new(Route::jump("state", yes, &yes.to_string(), false)),
+                no: Box::new(Route::jump("state", no, &no.to_string(), false)),
             },
         };
         let cases = BTreeMap::from([
             (1, Some(choose(2, 3))),
             (2, Some(choose(4, 4))),
-            (3, Some(Route::jump("state", 5, "5"))),
-            (4, Some(Route::jump("state", 5, "5"))),
-            (5, Some(Route::jump("state", 9, "9"))),
+            (3, Some(Route::jump("state", 5, "5", false))),
+            (4, Some(Route::jump("state", 5, "5", false))),
+            (5, Some(Route::jump("state", 9, "9", false))),
         ]);
         let roots = BTreeSet::from([1]);
         let reachable = BTreeSet::from([1, 2, 3, 4, 5]);
@@ -5699,14 +5810,14 @@ try {
             transition_proven: true,
             next: Next::Choose {
                 condition: "pick()".to_owned(),
-                yes: Box::new(Route::jump("state", yes, &yes.to_string())),
-                no: Box::new(Route::jump("state", no, &no.to_string())),
+                yes: Box::new(Route::jump("state", yes, &yes.to_string(), false)),
+                no: Box::new(Route::jump("state", no, &no.to_string(), false)),
             },
         };
         let graph = BTreeMap::from([
             (1, choose(2, 99)),
             (2, choose(3, 3)),
-            (3, Route::jump("state", 1, "1")),
+            (3, Route::jump("state", 1, "1", false)),
         ]);
         let incoming = BTreeMap::from([
             (1, BTreeSet::from([3])),
@@ -6137,10 +6248,8 @@ try {
     }
 
     #[test]
-    fn live_loop_proof_refuses_unmodeled_statement_and_signed_zero_completions() {
+    fn live_loop_proof_refuses_unmodeled_statement_and_binding_completions() {
         for source in [
-            "let s;for(s=1;s!=0;)s==1?(s=0):s==0&&(s=0);",
-            "let s;for(s=1;s!=-0;)s==1?(s=-0):s==0&&(s=0);",
             "var s;for(s=1;s!=9;)if(s==1){s=9;var x;}else if(s==9){s=9;}",
             // An unresolved global may be an accessor with observable side
             // effects, not the proved lexical state binding.
