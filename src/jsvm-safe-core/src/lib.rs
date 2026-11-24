@@ -1622,7 +1622,7 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
             return;
         }
         if let Some(text) =
-            if_ladder_structure::reconstruct_for(it, self.source, live.then_some(self.scoping))
+            if_ladder_structure::reconstruct_for(it, self.source, Some(self.scoping), live)
         {
             self.push(it.span, text, "if_ladder_structured");
             return;
