@@ -1,7 +1,7 @@
 //! Proof-oriented control-flow recovery.
 //!
 //! This module owns arithmetic dispatcher state simulation. Reference-valued
-//! dispatches use the reaching allocation heap in fresh_data. The central
+//! dispatches use the reaching allocation heap in `fresh_data`. The central
 //! collector remains in `lib.rs`; these methods operate on it so replacement
 //! scheduling and source-protection policy stay centralized.
 

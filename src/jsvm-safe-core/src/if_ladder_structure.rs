@@ -5329,7 +5329,7 @@ impl<'a> Visit<'a> for HoistedVars {
 }
 
 /// Retain function-scoped bindings from unreachable source regions.
-pub(crate) fn hoisted_var_declarations(body: &Statement<'_>) -> Option<String> {
+pub fn hoisted_var_declarations(body: &Statement<'_>) -> Option<String> {
     let mut hoisted = HoistedVars::default();
     hoisted.visit_statement(body);
     if hoisted.unsupported || hoisted.function_declaration {
