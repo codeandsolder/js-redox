@@ -1035,12 +1035,7 @@ impl Analyzer<'_> {
         call: &CallExpression<'_>,
         environment: &mut Environment,
     ) -> Option<Evaluation> {
-        if call.optional
-            || call
-                .arguments
-                .iter()
-                .any(|argument| matches!(argument, Argument::SpreadElement(_)))
-        {
+        if call.optional || call.arguments.iter().any(Argument::is_spread) {
             return None;
         }
         let Expression::Identifier(identifier) = call.callee.without_parentheses() else {
@@ -1055,7 +1050,6 @@ impl Analyzer<'_> {
             .hoisted_callable_at(self.scoping, &call.callee, function.scope())?;
         let mut values = Vec::with_capacity(call.arguments.len());
         let mut inert = true;
-        let mut exact = true;
         for argument in &call.arguments {
             let Some(expression) = argument.as_expression() else {
                 self.unobserved(call.span);
@@ -1063,15 +1057,12 @@ impl Analyzer<'_> {
             };
             let value = self.expression(expression, environment);
             inert &= value.inert;
-            if let Some(Fact::Primitive(value)) = value.fact {
-                values.push(value);
-            } else {
-                exact = false;
-            }
+            values.push(match value.fact {
+                Some(Fact::Primitive(value)) => Some(value),
+                _ => None,
+            });
         }
-        let result = exact
-            .then(|| function.evaluate(values.iter().map(Some), self.budget))
-            .flatten();
+        let result = function.evaluate(values.iter().map(Option::as_ref), self.budget);
         if !self.checkpoint() {
             return Some(self.barrier(environment));
         }
@@ -1661,6 +1652,9 @@ mod tests {
             ("function outer(){function index(x){let y=x;return (x=9,y);}let a=[0,0];for(let i=0;i<2;i++){a[index(i)]=7;}return a[0]+a[1];}", vec![("a[0]", "7"), ("a[1]", "7")]),
             ("function outer(){function index(x,y){return x+y;}let a=[0,7];let i=0;index(i++,i++);return a[i-1];}", vec![("a[i-1]", "7")]),
             ("function outer(){function index(x){return x;}let a=[7];index(a[0]=9);return a[0];}", vec![("a[0]", "9")]),
+            ("function outer(){function index(x,y){return x;}let a=[7];index(0,a);return a[0];}", vec![("a[0]", "7")]),
+            ("function outer(){function index(x){return (x=0,x);}let a=[7];index(a);return a[0];}", vec![("a[0]", "7")]),
+            ("function outer(){function index(x){return x;}let a=[7];index(a[0]=9,a);return a[0];}", vec![("a[0]", "9")]),
             ("function outer(){function index(x){return x;}let a=[7];index(a);return a[0];}", vec![]),
             ("function index(x){return x;}let a=[7];index(0);a[0];", vec![]),
             ("function outer(flag){if(flag){function index(x){return x;}}let a=[7];index(0);return a[0];}", vec![]),

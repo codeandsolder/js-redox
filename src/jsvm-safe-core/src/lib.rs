@@ -1118,29 +1118,8 @@ impl Collector<'_, '_> {
             .get(dispatcher.selector_index)
             .and_then(argument_integer)?;
         let projection = dispatcher.returns.get(&selector)?;
-        let values = call
-            .arguments
-            .iter()
-            .map(eval_static_argument)
-            .collect::<Vec<_>>();
-        let value = projection.evaluate(values.iter().map(Option::as_ref), self.budget)?;
-        // Unknown arguments are still evaluated, left to right, even when
-        // the selected return does not need them. Known arguments already
-        // have inert value proofs. Keep effectful arguments in the caller,
-        // not in a newly created activation with altered capture semantics.
-        let mut parts = call
-            .arguments
-            .iter()
-            .zip(&values)
-            .filter(|(_, value)| value.is_none())
-            .map(|(argument, _)| format!("({})", fragment(self.source, argument.span())))
-            .collect::<Vec<_>>();
-        parts.push(value.render_expression()?);
-        self.push(
-            call.span,
-            format!("({})", parts.join(", ")),
-            "selector_dispatch_specialize",
-        );
+        let text = scalar_call_replacement(call, projection, self.source, self.budget)?;
+        self.push(call.span, text, "selector_dispatch_specialize");
         Some(CallRewriteTraversal::Stop)
     }
 
@@ -1277,16 +1256,9 @@ impl Collector<'_, '_> {
             &call.callee,
             function.scope(),
         )?;
-        let values = call
-            .arguments
-            .iter()
-            .map(eval_static_argument)
-            .collect::<Option<Vec<_>>>()?;
-        let text = function
-            .evaluate(values.iter().map(Some), self.budget)
-            .and_then(|value| value.render_expression())?;
+        let text = scalar_call_replacement(call, function, self.source, self.budget)?;
         self.push(call.span, text, "pure_function_eval");
-        Some(CallRewriteTraversal::WalkChildren)
+        Some(CallRewriteTraversal::Stop)
     }
 
     fn try_decoder_rewrite(&mut self, call: &CallExpression<'_>) -> Option<CallRewriteTraversal> {
@@ -1748,6 +1720,36 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
             }
         }
     }
+}
+
+/// Retain unknown argument evaluations in their original caller and order.
+/// An exact argument has an inert-value proof; an unknown argument may have
+/// effects even when the activation's scalar result is independent of it.
+fn scalar_call_replacement(
+    call: &CallExpression<'_>,
+    function: &PureFunction,
+    source: &str,
+    budget: &WorkBudget,
+) -> Option<String> {
+    let values = call
+        .arguments
+        .iter()
+        .map(eval_static_argument)
+        .collect::<Vec<_>>();
+    let value = function.evaluate(values.iter().map(Option::as_ref), budget)?;
+    let result = value.render_expression()?;
+    let mut parts = call
+        .arguments
+        .iter()
+        .zip(&values)
+        .filter(|(_, value)| value.is_none())
+        .map(|(argument, _)| format!("({})", fragment(source, argument.span())))
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return Some(result);
+    }
+    parts.push(result);
+    Some(format!("({})", parts.join(", ")))
 }
 
 fn eval_static_argument(arg: &Argument<'_>) -> Option<Value> {
