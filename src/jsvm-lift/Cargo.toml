@@ -41,4 +41,4 @@ work-budget.workspace = true
 
 # Atomic no-clobber publication for fully validated observed-source trees.
 [target.'cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))'.dependencies]
-rustix = { version = "1.1.6", features = ["fs"] }
+rustix = { workspace = true, features = ["fs"] }
