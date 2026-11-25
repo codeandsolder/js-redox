@@ -201,8 +201,9 @@ impl Flow {
 
     pub(super) const fn opaque(unproved: bool) -> Self {
         Self {
+            normal: Some(CompletionValue::opaque()),
+            abrupt: BTreeMap::new(),
             unproved,
-            ..Self::normal(CompletionValue::opaque())
         }
     }
 
