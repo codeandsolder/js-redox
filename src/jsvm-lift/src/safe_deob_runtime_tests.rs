@@ -12,7 +12,7 @@ use tempfile::TempDir;
 use work_budget::{run_command, BudgetLimits, WorkBudget};
 
 const FIXTURE_DIR: &str = "corpus/generated/reversible-obfuscation";
-const MAIN_FIXTURES: [&str; 42] = [
+const MAIN_FIXTURES: &[&str] = &[
     "obscura-split-strings.js",
     "obscura-number-expressions.js",
     "obscura-unicode-escape.js",
@@ -37,6 +37,8 @@ const MAIN_FIXTURES: [&str; 42] = [
     "ordered-switch-for.js",
     "ordered-switch-bounded.js",
     "arithmetic-state.js",
+    "arithmetic-state-lexical.js",
+    "arithmetic-state-iife-shadow-safety.js",
     "arithmetic-state-external.js",
     "arithmetic-state-registers.js",
     "arithmetic-state-register-key-safety.js",
@@ -222,7 +224,13 @@ fn assert_state_and_alias_contract(file: &str, outcome: &SafeDeobOutcome) {
             assert_eq!(count(report, "ordered_switch_unflatten"), 1);
             assert!(!outcome.source.contains("switch ("));
         }
-        "arithmetic-state.js"
+        "arithmetic-state.js" => assert_eq!(
+            count(report, "arithmetic_state_unflatten"),
+            0,
+            "ambient state may be accessor-backed"
+        ),
+        "arithmetic-state-lexical.js"
+        | "arithmetic-state-iife-shadow-safety.js"
         | "arithmetic-state-external.js"
         | "arithmetic-state-registers.js"
         | "arithmetic-state-register-key-safety.js"
@@ -1509,7 +1517,7 @@ console.log(JSON.stringify(run(false)));
 fn depythonify_safe_deob_generated_runtime_equivalence() -> Result<()> {
     let scratch = TempDir::new()?;
     let mut totals = BTreeMap::<String, usize>::new();
-    for file in MAIN_FIXTURES {
+    for &file in MAIN_FIXTURES {
         let ambient = deob_fixture(scratch.path(), file)?;
         // These fixtures exercise own-member transformations. The original
         // classic-script input is still checked for runtime equivalence.
@@ -1532,7 +1540,9 @@ fn depythonify_safe_deob_generated_runtime_equivalence() -> Result<()> {
         };
         let expected_changed = !matches!(
             file,
-            "static-alias-installer-calls.js" | "static-alias-live-forwarding.js"
+            "static-alias-installer-calls.js"
+                | "static-alias-live-forwarding.js"
+                | "arithmetic-state.js"
         );
         assert_eq!(outcome.report.changed, expected_changed, "{file}");
         assert_main_contract(file, &outcome);
@@ -1674,10 +1684,6 @@ fn depythonify_safe_deob_safety_runtime_equivalence() -> Result<()> {
         ),
         (
             "arithmetic-state-conditional-safety.js",
-            &["arithmetic_state_unflatten"][..],
-        ),
-        (
-            "arithmetic-state-iife-shadow-safety.js",
             &["arithmetic_state_unflatten"][..],
         ),
     ] {
