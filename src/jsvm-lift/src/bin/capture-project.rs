@@ -9,11 +9,11 @@ use jsvm_lift::{
     },
     analysis_budget::AnalysisBudgets,
     capture_pipeline::{
-        recover_capture_project, CapturePipelineOptions, CaptureStages, SourceRecovery,
+        recover_capture_project, CapturePipelineOptions, CaptureStages, HttpCaptureProvenance,
+        SourceRecovery,
     },
-    capture_project::{read_manifest, write_manifest, MANIFEST_NAME},
-    http_capture::{capture_url_to_har, HttpCaptureLimits, HttpCaptureSummary},
-    project_readme::refresh_project_readme,
+    capture_project::{read_manifest, MANIFEST_NAME},
+    http_capture::{capture_url_to_har, HttpCaptureLimits},
 };
 use serde_json::Value;
 use std::{
@@ -237,45 +237,6 @@ fn print_vm_summary(project: &Path) -> Result<()> {
     Ok(())
 }
 
-fn archive_http_capture(
-    capture: &Path,
-    output: &Path,
-    requested_url: &str,
-    summary: &HttpCaptureSummary,
-) -> Result<()> {
-    let analysis = output.join("analysis");
-    let archived = analysis.join("http-capture.har");
-    jsvm_lift::report_file::copy_snapshot(
-        capture,
-        &archived,
-        &AnalysisBudgets::standard("http-capture-archive").scope("snapshot"),
-    )?;
-    jsvm_lift::report_file::write_json(&analysis.join("http-static.json"), summary)?;
-    let manifest_path = output.join(MANIFEST_NAME);
-    let mut manifest = read_manifest(&manifest_path)?;
-    manifest.source.kind = "http_static".into();
-    requested_url.clone_into(&mut manifest.source.input);
-    manifest
-        .source
-        .extra
-        .insert("requested_url".into(), summary.requested_url.clone().into());
-    manifest
-        .source
-        .extra
-        .insert("final_url".into(), summary.final_url.clone().into());
-    manifest
-        .source
-        .extra
-        .insert("captured_har".into(), "analysis/http-capture.har".into());
-    manifest
-        .source
-        .extra
-        .insert("http_static".into(), serde_json::to_value(summary)?);
-    write_manifest(&manifest_path, &manifest)?;
-    refresh_project_readme(output, &AnalysisBudgets::standard("http-project-readme"))?;
-    Ok(())
-}
-
 fn main() -> Result<()> {
     let args = Args::parse();
     let caller_cwd = env::current_dir()?;
@@ -333,7 +294,11 @@ fn main() -> Result<()> {
     };
 
     recover_capture_project(&CapturePipelineOptions {
-        input: capture.clone(),
+        input: capture,
+        http_capture: http_summary.map(|summary| HttpCaptureProvenance {
+            requested_url: args.capture,
+            summary,
+        }),
         output: output.clone(),
         assets_dir,
         overwrite: args.overwrite,
@@ -341,10 +306,6 @@ fn main() -> Result<()> {
         stages,
         budgets: AnalysisBudgets::standard("capture-project"),
     })?;
-
-    if let Some(summary) = http_summary {
-        archive_http_capture(&capture, &output, &args.capture, &summary)?;
-    }
 
     print_summary(&output, stages)
 }

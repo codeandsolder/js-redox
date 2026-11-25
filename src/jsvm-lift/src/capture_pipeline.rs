@@ -1,8 +1,9 @@
 use crate::{
-    analysis_budget::AnalysisBudgets,
+    analysis_budget::{AnalysisBudgets, AnalysisOperation},
     bundle_materialize::{materialize_bundle_modules, BundleMaterializeSummary},
     capture_import::{prepare_capture_project, CaptureImportOptions, CaptureImportSummary},
-    capture_project::{read_manifest, MANIFEST_NAME},
+    capture_project::{read_manifest, write_manifest, MANIFEST_NAME},
+    http_capture::HttpCaptureSummary,
     invocation_views::materialize_invocation_views,
     observed_runtime::{materialize_observed_runtime_sources, ObservedSourceSummary},
     project_api_surface::analyze_project_api_surface,
@@ -18,7 +19,7 @@ use crate::{
     wasm_materialize::{materialize_wasm, WasmMaterializeSummary},
     wasm_resource_provenance::{correlate_wasm_resource_provenance, WasmResourceProvenanceSummary},
 };
-use anyhow::Result;
+use anyhow::{ensure, Result};
 use std::path::{Path, PathBuf};
 
 /// Source reconstruction stages form a dependency chain: bundle recovery
@@ -49,9 +50,17 @@ pub struct CaptureStages {
     pub vm_scan: bool,
 }
 
+/// Original HTTP acquisition provenance for a HAR prepared by the URL capture driver.
+#[derive(Debug, Clone)]
+pub struct HttpCaptureProvenance {
+    pub requested_url: String,
+    pub summary: HttpCaptureSummary,
+}
+
 #[derive(Debug, Clone)]
 pub struct CapturePipelineOptions {
     pub input: PathBuf,
+    pub http_capture: Option<HttpCaptureProvenance>,
     pub output: PathBuf,
     pub assets_dir: Option<PathBuf>,
     pub overwrite: bool,
@@ -97,10 +106,44 @@ pub fn recover_capture_project(options: &CapturePipelineOptions) -> Result<Captu
         },
         &options.budgets,
     )?;
+    if let Some(http) = &options.http_capture {
+        archive_http_capture(&options.input, staged.path(), http, &options.budgets)?;
+    }
     let summary = recover_prepared_project(staged.path(), import, options)?;
     options.budgets.root().checkpoint()?;
     staged.publish()?;
     Ok(summary)
+}
+
+fn archive_http_capture(
+    capture: &Path,
+    project: &Path,
+    http: &HttpCaptureProvenance,
+    budgets: &AnalysisBudgets,
+) -> Result<()> {
+    let manifest_path = project.join(MANIFEST_NAME);
+    let mut manifest = read_manifest(&manifest_path)?;
+    ensure!(
+        manifest.source.kind == "har",
+        "HTTP provenance requires a HAR capture"
+    );
+    let budget = budgets.operation(AnalysisOperation::CaptureImport, "HTTP archive");
+    let analysis = project.join("analysis");
+    crate::report_file::copy_snapshot(capture, &analysis.join("http-capture.har"), &budget)?;
+    crate::report_file::write_json(&analysis.join("http-static.json"), &http.summary)?;
+    manifest.source.kind = "http_static".into();
+    manifest.source.input.clone_from(&http.requested_url);
+    manifest.source.extra.extend([
+        (
+            "requested_url".into(),
+            http.summary.requested_url.clone().into(),
+        ),
+        ("final_url".into(), http.summary.final_url.clone().into()),
+        ("captured_har".into(), "analysis/http-capture.har".into()),
+        ("http_static".into(), serde_json::to_value(&http.summary)?),
+    ]);
+    budget.checkpoint()?;
+    write_manifest(&manifest_path, &manifest)
 }
 
 fn recover_prepared_project(
@@ -288,6 +331,7 @@ mod tests {
     fn vm_options(input: &Path, output: &Path) -> CapturePipelineOptions {
         CapturePipelineOptions {
             input: input.to_path_buf(),
+            http_capture: None,
             output: output.to_path_buf(),
             assets_dir: None,
             overwrite: false,
@@ -304,6 +348,7 @@ mod tests {
     fn static_options(input: &Path, output: &Path) -> CapturePipelineOptions {
         CapturePipelineOptions {
             input: input.to_path_buf(),
+            http_capture: None,
             output: output.to_path_buf(),
             assets_dir: None,
             overwrite: false,
@@ -897,6 +942,46 @@ mod tests {
             Path::new(&manifest.source.input).canonicalize()?,
             new_har.canonicalize()?
         );
+        assert_no_staging_directories(work.path())?;
+        Ok(())
+    }
+
+    #[test]
+    fn http_acquisition_provenance_is_part_of_the_published_project() -> Result<()> {
+        let work = TempDir::new()?;
+        let har = work.path().join("temporary-http.har");
+        let project = work.path().join("project");
+        write_single_script_har(&har, "http", "globalThis.http = true;")?;
+        let raw = fs::read(&har)?;
+        let mut options = static_options(&har, &project);
+        options.http_capture = Some(HttpCaptureProvenance {
+            requested_url: "https://fixture.invalid".into(),
+            summary: HttpCaptureSummary {
+                requested_url: "https://fixture.invalid/".into(),
+                final_url: "https://fixture.invalid/redirected".into(),
+                resources: 1,
+                failed_resources: 0,
+                bytes: 23,
+                pending_resources: 0,
+                warnings: Vec::new(),
+            },
+        });
+        recover_capture_project(&options)?;
+        fs::remove_file(&har)?;
+        let manifest = read_manifest(&project.join(MANIFEST_NAME))?;
+        assert_eq!(manifest.source.kind, "http_static");
+        assert_eq!(manifest.source.input, "https://fixture.invalid");
+        assert_eq!(
+            manifest.source.extra["final_url"],
+            "https://fixture.invalid/redirected"
+        );
+        let archived = manifest.source.extra["captured_har"]
+            .as_str()
+            .context("archived HAR reference missing")?;
+        assert_eq!(fs::read(project.join(archived))?, raw);
+        assert!(project.join("analysis/http-static.json").is_file());
+        assert!(fs::read_to_string(project.join("README.md"))?.contains("HTTP-only acquisition"));
+        assert_no_staging_references(&project)?;
         assert_no_staging_directories(work.path())?;
         Ok(())
     }

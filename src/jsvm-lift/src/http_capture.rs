@@ -44,7 +44,7 @@ impl Default for HttpCaptureLimits {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct HttpCaptureSummary {
     pub requested_url: String,
     pub final_url: String,
