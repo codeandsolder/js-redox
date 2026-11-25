@@ -67,18 +67,6 @@ fn read_json(path: &Path) -> Result<Value> {
     serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
 }
 
-fn read_jsonl_values(path: &Path) -> Result<Vec<Value>> {
-    let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    text.lines()
-        .enumerate()
-        .filter(|(_, line)| !line.trim().is_empty())
-        .map(|(index, line)| {
-            serde_json::from_str(line)
-                .with_context(|| format!("parsing {} line {}", path.display(), index + 1))
-        })
-        .collect()
-}
-
 fn integer(value: Option<&Value>, label: &str) -> Result<i64> {
     value
         .and_then(Value::as_i64)
@@ -86,7 +74,7 @@ fn integer(value: Option<&Value>, label: &str) -> Result<i64> {
 }
 
 fn width_consensus(path: &Path, top_score_slack: i64) -> Result<()> {
-    for report in read_jsonl_values(path)? {
+    for report in jsvm_lift::pipeline::read_json_records::<Value>(path)? {
         let mut votes = BTreeMap::<i64, usize>::new();
         let mut weighted = BTreeMap::<i64, i64>::new();
         let mut streams = 0_usize;

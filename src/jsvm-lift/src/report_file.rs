@@ -1,13 +1,84 @@
 //! Publish complete generated reports without truncating the previous snapshot.
 use crate::content_dedup::{digest_stream, FileDigest};
 use anyhow::{ensure, Context, Result};
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
     fs::{self, File},
     io::{BufWriter, ErrorKind, Read, Write},
     path::{Path, PathBuf},
 };
 use work_budget::WorkBudget;
+
+/// How a persisted source reference is resolved by report readers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportPathBase {
+    External,
+    Project,
+    Label,
+}
+
+pub(crate) fn project_relative_path(project: &Path, path: &Path) -> Result<String> {
+    let relative = path.strip_prefix(project).with_context(|| {
+        format!(
+            "{} is outside project {}",
+            path.display(),
+            project.display()
+        )
+    })?;
+    let text = relative
+        .to_str()
+        .context("project path is not UTF-8")?
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    crate::capture_project::validate_project_relative_path(&text, "report path")?;
+    Ok(text)
+}
+
+pub(crate) fn source_reference(
+    project: Option<&Path>,
+    path: &Path,
+) -> Result<(ReportPathBase, String)> {
+    project.map_or_else(
+        || {
+            let absolute = std::path::absolute(path)?;
+            let text = absolute.to_str().context("source path is not UTF-8")?;
+            Ok((ReportPathBase::External, text.to_owned()))
+        },
+        |root| Ok((ReportPathBase::Project, project_relative_path(root, path)?)),
+    )
+}
+
+/// Resolve a source reference against its declared base. Project-owned reports
+/// are relocatable: find the enclosing capture project, not the process cwd.
+///
+/// # Errors
+///
+/// Fails for invalid references, missing project roots, unavailable files, or
+/// project references resolving outside their enclosing project.
+pub fn resolve_report_source(report: &Path, source: &str, base: ReportPathBase) -> Result<PathBuf> {
+    ensure!(
+        base != ReportPathBase::Label,
+        "report identifies an in-memory source label, not a file"
+    );
+    if base == ReportPathBase::External {
+        let path = PathBuf::from(source);
+        ensure!(path.is_absolute(), "external report source is not absolute");
+        return Ok(path);
+    }
+    crate::capture_project::validate_project_relative_path(source, "report source")?;
+    let report = report.canonicalize()?;
+    let root = report
+        .ancestors()
+        .skip(1)
+        .find(|path| path.join(crate::capture_project::MANIFEST_NAME).is_file())
+        .context("project-relative report has no enclosing capture project")?;
+    let resolved = root.join(source).canonicalize()?;
+    ensure!(
+        resolved.starts_with(root),
+        "report source escapes its project"
+    );
+    Ok(resolved)
+}
 
 /// A completely encoded report whose final name is still untouched.
 /// Dropping it abandons the staging file, including on a later render failure.
@@ -242,6 +313,53 @@ pub fn write_text(path: &Path, value: &str) -> Result<()> {
 mod tests {
     use super::*;
     use serde::ser::{Error, SerializeSeq};
+
+    #[test]
+    fn source_references_resolve_after_project_relocation() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let old = workspace.path().join("before");
+        let report = old.join("analysis/jsvm/0000.json");
+        let source = old.join("src/input.js");
+        fs::create_dir_all(report.parent().context("report parent")?)?;
+        fs::create_dir_all(source.parent().context("source parent")?)?;
+        fs::write(old.join(crate::capture_project::MANIFEST_NAME), "{}")?;
+        fs::write(&report, "{}")?;
+        fs::write(&source, "const value = 1;")?;
+        let (base, reference) = source_reference(Some(&old), &source)?;
+        assert_eq!(base, ReportPathBase::Project);
+        assert_eq!(reference, "src/input.js");
+        let new = workspace.path().join("after");
+        fs::rename(old, &new)?;
+        let report = new.join("analysis/jsvm/0000.json");
+        let source = new.join("src/input.js");
+        assert_eq!(
+            resolve_report_source(&report, &reference, base)?,
+            source.canonicalize()?
+        );
+        assert!(resolve_report_source(&report, "../outside.js", base).is_err());
+        let (base, reference) = source_reference(None, &source)?;
+        assert_eq!(base, ReportPathBase::External);
+        assert_eq!(resolve_report_source(&report, &reference, base)?, source);
+        assert!(resolve_report_source(&report, "relative.js", base).is_err());
+        assert!(resolve_report_source(&report, "synthetic", ReportPathBase::Label).is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_source_reference_cannot_escape_through_symlink() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let project = workspace.path().join("project");
+        let outside = workspace.path().join("outside.js");
+        fs::create_dir(&project)?;
+        fs::write(&outside, "outside")?;
+        fs::write(project.join(crate::capture_project::MANIFEST_NAME), "{}")?;
+        let report = project.join("report.json");
+        fs::write(&report, "{}")?;
+        std::os::unix::fs::symlink(outside, project.join("alias.js"))?;
+        assert!(resolve_report_source(&report, "alias.js", ReportPathBase::Project).is_err());
+        Ok(())
+    }
 
     struct FailingReport;
 

@@ -10,6 +10,7 @@ pub(crate) fn publish_report<S: serde::de::DeserializeOwned, V: Serialize>(
     source_path: &std::path::Path,
     scan_path: &std::path::Path,
     output_path: &std::path::Path,
+    project: Option<&std::path::Path>,
     budget: &work_budget::WorkBudget,
     schema: &'static str,
     derive: impl FnOnce(&str, &S, &work_budget::WorkBudget) -> anyhow::Result<Vec<V>>,
@@ -19,6 +20,7 @@ pub(crate) fn publish_report<S: serde::de::DeserializeOwned, V: Serialize>(
     struct Report<V> {
         schema: &'static str,
         source: String,
+        path_base: crate::report_file::ReportPathBase,
         vms: Vec<V>,
     }
     budget.checkpoint()?;
@@ -26,9 +28,11 @@ pub(crate) fn publish_report<S: serde::de::DeserializeOwned, V: Serialize>(
         .with_context(|| format!("reading {}", source_path.display()))?;
     let scan = crate::report_file::read_json(scan_path, "scan report")?;
     budget.checkpoint()?;
+    let (path_base, source_reference) = crate::report_file::source_reference(project, source_path)?;
     let report = Report {
         schema,
-        source: source_path.display().to_string(),
+        source: source_reference,
+        path_base,
         vms: derive(&source, &scan, budget)?,
     };
     budget.checkpoint()?;

@@ -293,6 +293,8 @@ The directory contract is intentionally simple:
 
 This separation is important: presentation/deobfuscation passes never overwrite the original capture or make provenance ambiguous.
 
+Capture recovery builds the entire project in a private sibling staging directory. It publishes the completed tree only after the selected analysis stages and final budget checks succeed. A failed recovery leaves an existing project unchanged; the single-writer publication uses atomic directory exchange where available, otherwise rename with rollback. It does not promise crash durability. Project-owned scanner and semantic IR reports declare `path_base: "project"` and use project-relative paths, so the published project can be moved without breaking those references. Standalone file reports use absolute external paths; in-memory reports use source labels.
+
 ### Capture-to-project prototype
 
 Build the Rust tools, then use the one-command driver:

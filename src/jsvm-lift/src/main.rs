@@ -271,7 +271,7 @@ fn main() -> Result<()> {
             AnalysisOperation::StructuralScan,
             path.display().to_string(),
         );
-        let report = scan_file(path, args.dump_embedded.as_deref(), &budget)?;
+        let report = scan_file(path, args.dump_embedded.as_deref(), None, &budget)?;
         if args.json {
             println!("{}", serde_json::to_string(&report)?);
             continue;

@@ -22,7 +22,7 @@ fn main() -> Result<()> {
         AnalysisOperation::IrMaterialization,
         args.source.display().to_string(),
     );
-    materialize(&args.source, &args.scan, &args.output, &budget)?;
+    materialize(&args.source, &args.scan, &args.output, None, &budget)?;
     println!("wrote {}", args.output.display());
     Ok(())
 }

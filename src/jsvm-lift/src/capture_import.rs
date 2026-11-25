@@ -11,7 +11,7 @@ use crate::{
 };
 use anyhow::{bail, Context, Result};
 use runtime_scripts::analyze_recorder_runtime_scripts;
-use saved_page::{import_saved_page, SavedPageOptions};
+use saved_page::{prepare_saved_page, SavedPageOptions};
 use selective_trace::import_selective_trace;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -126,6 +126,16 @@ pub fn import_capture_project(
     options: &CaptureImportOptions,
     budgets: &AnalysisBudgets,
 ) -> Result<CaptureImportSummary> {
+    let (staged, summary) = prepare_capture_project(options, budgets)?;
+    staged.publish()?;
+    Ok(summary)
+}
+
+/// Prepare an imported project without replacing its destination.
+pub(crate) fn prepare_capture_project(
+    options: &CaptureImportOptions,
+    budgets: &AnalysisBudgets,
+) -> Result<(ProjectOutput, CaptureImportSummary)> {
     let budget = budgets.operation(
         AnalysisOperation::CaptureImport,
         options.input.display().to_string(),
@@ -138,7 +148,7 @@ pub fn import_capture_project(
     let kind = detect_capture_input(&input)?;
     match kind {
         CaptureInputKind::SavedPage => {
-            let summary = import_saved_page(
+            let (staged, summary) = prepare_saved_page(
                 &input,
                 &options.output,
                 &SavedPageOptions {
@@ -147,11 +157,14 @@ pub fn import_capture_project(
                 },
                 &budget,
             )?;
-            Ok(CaptureImportSummary {
-                kind,
-                resources: summary.resources,
-                script_records: summary.script_records,
-            })
+            Ok((
+                staged,
+                CaptureImportSummary {
+                    kind,
+                    resources: summary.resources,
+                    script_records: summary.script_records,
+                },
+            ))
         }
         CaptureInputKind::Har | CaptureInputKind::Recorder => {
             if options.assets_dir.is_some() {
@@ -189,12 +202,14 @@ pub fn import_capture_project(
                 import_selective_trace(&input, output, budgets)?;
             }
             budget.checkpoint()?;
-            staged.publish()?;
-            Ok(CaptureImportSummary {
-                kind,
-                resources: summary.resources,
-                script_records: summary.script_records,
-            })
+            Ok((
+                staged,
+                CaptureImportSummary {
+                    kind,
+                    resources: summary.resources,
+                    script_records: summary.script_records,
+                },
+            ))
         }
     }
 }

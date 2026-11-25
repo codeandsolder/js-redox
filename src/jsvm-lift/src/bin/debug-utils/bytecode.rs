@@ -12,24 +12,6 @@ use std::{
 };
 use work_budget::run_command;
 
-fn concatenated_json(path: &Path) -> Result<Vec<Value>> {
-    let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let mut out = Vec::new();
-    for item in serde_json::Deserializer::from_str(&text).into_iter::<Value>() {
-        match item {
-            Ok(value) => out.push(value),
-            Err(error) => {
-                eprintln!(
-                    "[warning] trailing/incomplete JSON ignored in {}: {error}",
-                    path.display()
-                );
-                break;
-            }
-        }
-    }
-    Ok(out)
-}
-
 fn usize_field(value: Option<&Value>, label: &str) -> Result<usize> {
     let raw = value
         .and_then(Value::as_u64)
@@ -293,7 +275,7 @@ pub fn dump_linked_bytecode(
     builder_start: Option<u64>,
     include_all: bool,
 ) -> Result<()> {
-    for report in concatenated_json(jsonl)? {
+    for report in jsvm_lift::pipeline::read_json_records::<Value>(jsonl)? {
         let mut builders = BTreeMap::<u64, &Value>::new();
         for builder in report
             .get("push_builders")
@@ -304,12 +286,15 @@ pub fn dump_linked_bytecode(
             builders.insert(u64_field(builder.get("start"), "builder start")?, builder);
         }
 
-        let source_path = report
+        let source_reference = report
             .get("file")
             .and_then(Value::as_str)
-            .map(PathBuf::from)
             .context("scan report missing file")?;
-        let source = fs::read_to_string(&source_path).unwrap_or_default();
+        let path_base = serde_json::from_value(report["path_base"].clone())?;
+        let source_path =
+            jsvm_lift::report_file::resolve_report_source(jsonl, source_reference, path_base)?;
+        let source = fs::read_to_string(&source_path)
+            .with_context(|| format!("reading {}", source_path.display()))?;
         let aliases = parse_int_aliases(&source);
         let name = source_path
             .file_name()
