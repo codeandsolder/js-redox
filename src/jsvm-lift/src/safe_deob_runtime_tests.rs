@@ -954,6 +954,45 @@ fn depythonify_safe_deob_callable_capture_runtime_equivalence() -> Result<()> {
 
 #[test]
 #[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_arguments_objects_runtime_equivalence() -> Result<()> {
+    let sources = [
+        "let f=function(a){arguments[0]=9;return [a]};let r=f(7);r[0];",
+        "let f=function(a){a=9;return arguments};let r=f(7);r[0];",
+        "let f=function(a,a){a=9;return arguments};let r=f(7,8);[r[0],r[1]];",
+        "let f=function(a,a){a=9;return arguments};let r=f(7);[r[0],r[1]];",
+        "let f=function(a){delete arguments[0];a=9;return [a,arguments[0]]};let r=f(7);[r[0],r[1]];",
+        "let f=function(a){delete arguments[0];Object.defineProperty(arguments,'0',{value:8,writable:true});a=9;return [a,arguments[0]]};let r=f(7);[r[0],r[1]];",
+        "let f=function(a){'use strict';arguments[0]=9;return [a,arguments[0]]};let r=f(7);[r[0],r[1]];",
+        "let f=function(a=1){a=9;return arguments};let r=f(7);r[0];",
+        "let f=function(a,...rest){a=9;return arguments};let r=f(7,8);[r[0],r[1],r.length];",
+        "let f=function(a){return [arguments,()=>[a]]};let p=f(7);p[0][0]=9;let r=p[1]();r[0];",
+        "let f=function(a){return [arguments,()=>[a]]};let p=f(7);for(let i=0;i<256;i++){let x=[i];}p[0][0]=9;let r=p[1]();r[0];",
+        "let f=function(a){let b={__proto__: arguments};b[0]=9;return [a,b[0]]};let r=f(7);[r[0],r[1]];",
+        "let f=function(a){a=9;return {__proto__:null,...arguments}};let r=f(7);[r[0],r.length,r.callee];",
+        "let f=function(a){let b={...arguments};a=9;return b};let r=f(7);r[0];",
+        "let f=function(a){let {0:x,...r}=arguments;return {__proto__:null,...r}};let r=f(7,8);[r[0],r[1],r.length];",
+        "let f=function(a){var arguments;return arguments};let r=f(7);r[0];",
+        "let f=function(a){let b=arguments;arguments=[9];b[0]=8;return [a,arguments[0]]};let r=f(7);[r[0],r[1]];",
+        "let f=function(a){return ()=>arguments};let g=f(7);let r=g();r[0];",
+        "let f=function(a,g=()=>arguments){var arguments=[9];return g};let g=f(7);let r=g();r[0];",
+        "let f=function(arguments){return arguments};let r=f([7]);r[0];",
+        "let f=function(a){return arguments.callee};let g=f(7);let r=[g===f];r[0];",
+        "let f=function(a){'use strict';return arguments.callee};try{f(7)}catch(e){events.push(e.name)}",
+        "let f=function(a){'use strict';return {__proto__:null,...arguments}};let r=f(7);[r[0],r.length,r.callee];",
+        "let f=function(a){function a(){return 9}return arguments};let r=f(7);r[0]();",
+        "let f=function(a){return [arguments,()=>[a]]};let p=f(7),q=f(8);let o=flag=>flag?p[0]:q[0];let g=flag=>{o(flag)[0]=9;return [p[1]()[0],q[1]()[0]]};g(true);g(false);",
+        "let f=function(a){return [arguments,()=>[a]]};let p=f(7);Object.defineProperty(p[0],'0',{value:8,writable:false});p[0][0]=9;let r=p[1]();r[0];",
+        "let f=function(a=arguments[0]){return [a,arguments.length]};let r=f(7);[r[0],r[1]];",
+        "let f=function(a){arguments.length=99;return arguments};let r=f(7);[r.length,r[0]];",
+        "let f=function(a){delete arguments.length;arguments.length=99;return {...arguments}};let r=f(7);[r.length,r[0]];",
+        "let outer=[7];let escaped=(function(){var arguments;return [arguments,outer[0]];})();outer[0]=9;escaped[0].callee()[1];",
+        "let outer=[7];let escaped=(function(){var arguments;return [arguments,outer[0]];})();outer[0]=9;let result=escaped[0].callee();result[1];",
+    ];
+    script_runtime_equivalence(&sources, "arguments-objects", false)
+}
+
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
 fn depythonify_safe_deob_parameter_environments_runtime_equivalence() -> Result<()> {
     let sources = [
         "let f=(a=7,b=a+2)=>[a,b];let r=f();[r[0],r[1]];",

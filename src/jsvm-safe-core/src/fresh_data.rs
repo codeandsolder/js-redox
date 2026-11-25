@@ -29,6 +29,7 @@ use std::collections::{HashMap, HashSet};
 use work_budget::{BudgetExceeded, WorkBudget};
 
 mod activation;
+mod arguments;
 mod cells;
 mod coverage;
 mod dispatch;
@@ -344,11 +345,7 @@ impl Analyzer<'_, '_> {
     fn lexical_reference(&self, identifier: &IdentifierReference<'_>) -> Option<SymbolId> {
         let reference = identifier.reference_id.get()?;
         let symbol = crate::statically_resolved_symbol(self.scoping, reference)?;
-        if !self.bindings.has_declarative_storage(self.scoping, symbol)
-            || self
-                .bindings
-                .is_mapped_arguments_exposed(self.scoping, symbol)
-        {
+        if !self.bindings.has_declarative_storage(self.scoping, symbol) {
             return None;
         }
         self.bindings
@@ -361,13 +358,29 @@ impl Analyzer<'_, '_> {
     }
 
     fn cell_id(&self, symbol: SymbolId) -> Option<CellId> {
-        let instance = self
-            .scope_instances
-            .get(self.scoping.symbol_scope_id(symbol), || {
-                self.bindings
-                    .parameter_binding_survives_body(self.scoping, symbol)
-            })?;
+        let owner = self.scoping.symbol_scope_id(symbol);
+        let instance = self.scope_instances.get(owner, || {
+            self.bindings
+                .parameter_binding_survives_body(self.scoping, symbol)
+        })?;
+        if self
+            .bindings
+            .implicit_arguments_symbol(self.scoping, symbol)
+            && self.scope_instances.get(owner, || true) == Some(instance)
+        {
+            return Some(CellId::arguments(instance));
+        }
         Some(CellId::symbol(instance, symbol))
+    }
+
+    fn implicit_arguments_cell(&self, identifier: &IdentifierReference<'_>) -> Option<CellId> {
+        if identifier.name != "arguments" {
+            return None;
+        }
+        let owner = self
+            .bindings
+            .implicit_arguments_owner(self.scoping, identifier.reference_id.get()?)?;
+        Some(CellId::arguments(self.scope_instances.get(owner, || true)?))
     }
 
     fn identifier(
@@ -375,20 +388,20 @@ impl Analyzer<'_, '_> {
         identifier: &IdentifierReference<'_>,
         environment: &mut Environment,
     ) -> Evaluation {
-        let Some(symbol) = self.lexical_reference(identifier) else {
-            return self.barrier(environment);
-        };
         let Some(reference) = identifier.reference_id.get() else {
             return self.barrier(environment);
         };
         let reference_flags = self.scoping.get_reference(reference);
-        // This is an AST value-position read, including the receiver of a
-        // property write. MemberWriteTarget marks the containing operation,
-        // not a write to the receiver binding itself.
+        // MemberWriteTarget marks the containing operation, not a write to
+        // the receiver binding itself.
         if !reference_flags.is_read() || reference_flags.is_write() {
             return self.barrier(environment);
         }
-        let Some(cell) = self.cell_id(symbol) else {
+        let symbol = self.lexical_reference(identifier);
+        let Some(cell) = symbol
+            .and_then(|symbol| self.cell_id(symbol))
+            .or_else(|| self.implicit_arguments_cell(identifier))
+        else {
             return self.barrier(environment);
         };
         let Some(fact) = self.heap_result(environment.read_binding(cell, self.budget)) else {
@@ -400,20 +413,19 @@ impl Analyzer<'_, '_> {
                 inert: true,
             };
         }
-        let scope = self.scoping.get_reference(reference).scope_id();
+        let scope = reference_flags.scope_id();
         Evaluation {
             fact: None,
-            inert: self.bindings.proves_value_initialized(
-                self.scoping,
-                symbol,
-                scope,
-                identifier.span,
-            ) || self.bindings.proves_initialized(
-                self.scoping,
-                symbol,
-                scope,
-                identifier.span,
-            ),
+            inert: symbol.is_some_and(|symbol| {
+                self.bindings
+                    .proves_value_initialized(self.scoping, symbol, scope, identifier.span)
+                    || self.bindings.proves_initialized(
+                        self.scoping,
+                        symbol,
+                        scope,
+                        identifier.span,
+                    )
+            }),
         }
     }
 
@@ -556,6 +568,9 @@ impl Analyzer<'_, '_> {
         environment: &mut Environment,
     ) -> Option<Reference> {
         if let SimpleAssignmentTarget::AssignmentTargetIdentifier(identifier) = target {
+            if let Some(cell) = self.implicit_arguments_cell(identifier) {
+                return Some(Reference::Binding(cell));
+            }
             let symbol = self.lexical_reference(identifier)?;
             let flags = self.scoping.symbol_flags(symbol);
             // Declaration bindings are mutable; a named function expression's
@@ -1213,11 +1228,7 @@ impl Analyzer<'_, '_> {
             }
             _ => return None,
         };
-        (!self
-            .bindings
-            .is_mapped_arguments_exposed(self.scoping, symbol))
-        .then(|| self.cell_id(symbol))
-        .flatten()
+        self.cell_id(symbol)
     }
 
     fn declaration(
@@ -1746,7 +1757,9 @@ mod tests {
             ("let a=[7];let old=a;a[(()=>{a=[9];return 0;})()]=11;old[0];a[0];", vec![("old[0]", "11"),("a[0]", "9")]),
             ("let a=[[7],(()=>{let b=[8];return b;})()];a[0][0];a[1][0];", vec![("a[0][0]", "7"),("a[1][0]", "8")]),
             ("let result=[0,0];for(let i=0;i<2;i++){result[i]=(x=>{let a=[x];return a[0];})(i);}result[0];result[1];", vec![("result[0]", "0"),("result[1]", "1")]),
+            // Do not erase the invocation in the receiver of a member read.
             ("let outer=[7];let escaped=(function(){var arguments;return [arguments,outer[0]];})();outer[0]=9;escaped[0].callee()[1];", vec![]),
+            ("let outer=[7];let escaped=(function(){var arguments;return [arguments,outer[0]];})();outer[0]=9;let result=escaped[0].callee();result[1];", vec![("result[1]", "9")]),
         ] {
             let expected = expected.into_iter().map(|(source, value)| (source.to_owned(), value.to_owned())).collect::<Vec<_>>();
             assert_eq!(reads(source)?, expected, "{source}");
@@ -1776,7 +1789,7 @@ mod tests {
             ("function outer(){function f(a,n){if(n)f(a,n-1);a[0]++;return a;}let a=[0];f(a,2);return a[0];}", vec![("a[0]", "3")]),
             ("function outer(){function build(){effect();return [7];}let a=build();return a[0];}", vec![("a[0]", "7")]),
             ("function outer(){function f(x,x){return [x];}let a=f(1,7);return a[0];}", vec![("a[0]", "7")]),
-            ("function outer(){function f(x){arguments[0]=9;return [x];}let a=f(7);return a[0];}", vec![]),
+            ("function outer(){function f(x){arguments[0]=9;return [x];}let a=f(7);return a[0];}", vec![("a[0]", "9")]),
             ("function outer(){function f(p){function p(){return 9}return [p];}let a=f(7);return a[0];}", vec![]),
             ("function outer(){function f(){let x=[7];using r={[Symbol.dispose](){x[0]=9;}};return x;}let a=f();return a[0];}", vec![]),
             ("function outer(){'use strict';{let a=build(7);function build(x){return [x];}return a[0];}}", vec![("a[0]", "7")]),
@@ -1914,6 +1927,36 @@ mod tests {
                 ("[f][0]===f".into(), "true".into()),
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn arguments_objects_retain_formal_cell_identity() -> Result<(), BudgetExceeded> {
+        for (source, expected) in [
+            ("let f=function(a){arguments[0]=9;return [a]};let r=f(7);r[0];", vec![("r[0]", "9")]),
+            ("let f=function(a){a=9;return [arguments[0]]};let r=f(7);r[0];", vec![("r[0]", "9")]),
+            ("let f=function(a,a){a=9;return arguments};let r=f(7,8);r[0];r[1];", vec![("r[0]", "7"),("r[1]", "9")]),
+            ("let f=function(a,a){a=9;return arguments};let r=f(7);r[0];", vec![("r[0]", "7")]),
+            ("let f=function(a){delete arguments[0];a=9;return [a]};let r=f(7);r[0];", vec![("r[0]", "9")]),
+            ("let f=function(a){'use strict';arguments[0]=9;return [a,arguments[0]]};let r=f(7);r[0];r[1];", vec![("r[0]", "7"),("r[1]", "9")]),
+            ("let f=function(a=1){a=9;return arguments};let r=f(7);r[0];", vec![("r[0]", "7")]),
+            ("let f=function(a,...rest){a=9;return arguments};let r=f(7,8);r[0];r[1];r.length;", vec![("r[0]", "7"),("r[1]", "8"),("r.length", "2")]),
+            ("let f=function(a){return [arguments,()=>[a]]};let p=f(7);p[0][0]=9;let r=p[1]();r[0];", vec![("r[0]", "9")]),
+            ("let f=function(a){return [arguments,()=>[a]]};let p=f(7);for(let i=0;i<256;i++){let x=[i];}p[0][0]=9;let r=p[1]();r[0];", vec![("r[0]", "9")]),
+            ("let f=function(a){let b={__proto__: arguments};b[0]=9;return [a,b[0]]};let r=f(7);r[0];r[1];", vec![("r[0]", "7"),("r[1]", "9")]),
+            ("let f=function(a){a=9;return {__proto__:null,...arguments}};let r=f(7);r[0];r.length;r.callee;", vec![("r[0]", "9"),("r.length", "void 0"),("r.callee", "void 0")]),
+            ("let f=function(a){let b={...arguments};a=9;return b};let r=f(7);r[0];", vec![("r[0]", "7")]),
+            ("let f=function(a){let {0:x,...r}=arguments;return {__proto__:null,...r}};let r=f(7,8);r[0];r[1];r.length;", vec![("r[0]", "void 0"),("r[1]", "8"),("r.length", "void 0")]),
+            ("let f=function(a){var arguments;return arguments};let r=f(7);r[0];", vec![("r[0]", "7")]),
+            ("let f=function(a){let b=arguments;arguments=[9];b[0]=8;return [a,arguments[0]]};let r=f(7);r[0];r[1];", vec![("r[0]", "8"),("r[1]", "9")]),
+            ("let f=function(a){return ()=>arguments};let g=f(7);let r=g();r[0];", vec![("r[0]", "7")]),
+            ("let f=function(a,g=()=>arguments){var arguments=[9];return g};let g=f(7);let r=g();r[0];", vec![("r[0]", "7")]),
+            ("let f=function(arguments){return arguments};let r=f([7]);r[0];", vec![("r[0]", "7")]),
+            ("let f=function(a){return arguments.callee};let g=f(7);let r=[g===f];r[0];", vec![("r[0]", "true")]),
+        ] {
+            let expected = expected.into_iter().map(|(source,value)| (source.to_owned(),value.to_owned())).collect::<Vec<_>>();
+            assert_eq!(reads(source)?, expected, "{source}");
+        }
         Ok(())
     }
 

@@ -1,7 +1,8 @@
 //! Local invocation proofs share the ordinary statement/heap interpreter.
 //! The call itself remains in the output; only reaching facts cross its exit.
 use super::{
-    cells::CellId, scope_instances::ClosureOrigin, Analyzer, Environment, Evaluation, Fact, Value,
+    arguments::ArgumentsSpec, cells::CellId, scope_instances::ClosureOrigin, Analyzer, Environment,
+    Evaluation, Fact, Value,
 };
 use oxc_ast::ast::{
     ArrowFunctionBody, ArrowFunctionExpression, CallExpression, Expression, FormalParameters,
@@ -380,6 +381,18 @@ impl<'ast> Analyzer<'_, 'ast> {
                 self.heap_result(environment.insert(cell, value, self.budget))?;
             }
         }
+        if !matches!(activation.this_mode, ThisMode::Lexical) {
+            self.initialize_arguments_object(
+                ArgumentsSpec {
+                    scope: activation.scope,
+                    params: activation.params,
+                    strict: matches!(activation.this_mode, ThisMode::Strict),
+                    callee: activation.capture.as_ref().map(|(_, fact)| fact),
+                },
+                &arguments,
+                environment,
+            )?;
+        }
         self.initialize_parameters(activation.params, arguments, environment)?;
         self.initialize_body_environment(activation.scope, activation.params, environment)?;
         self.initialize_hoisted_callables(activation.scope, environment)
@@ -422,6 +435,7 @@ impl<'ast> Analyzer<'_, 'ast> {
     fn direct_activation<'a>(
         &self,
         call: &'a CallExpression<'a>,
+        environment: &Environment,
     ) -> Option<(Activation<'a>, Option<SymbolId>)>
     where
         'ast: 'a,
@@ -439,7 +453,12 @@ impl<'ast> Analyzer<'_, 'ast> {
                 )?;
                 (CallableNode::Ordinary(function), Some(symbol), false)
             }
-            Expression::FunctionExpression(function) if function.id.is_none() => {
+            Expression::FunctionExpression(function)
+                if function.id.is_none()
+                    && !self
+                        .bindings
+                        .implicit_arguments_exposed(function.scope_id.get()?) =>
+            {
                 (CallableNode::Ordinary(function), None, true)
             }
             Expression::ArrowFunctionExpression(function) => {
@@ -447,7 +466,24 @@ impl<'ast> Analyzer<'_, 'ast> {
             }
             _ => return None,
         };
-        Some((Activation::from_node(node, self.scoping, publish)?, symbol))
+        let mut activation = Activation::from_node(node, self.scoping, publish)?;
+        // Preserve a declaration's actual identity when the current
+        // reaching cell establishes it; never invent it after a barrier.
+        if let Some(symbol) = symbol {
+            if let Some(Fact::Objects(locations)) =
+                self.cell_id(symbol).and_then(|cell| environment.get(cell))
+            {
+                if let [id] = locations.as_ref() {
+                    if let Some(origin) = environment.callable_origin(*id) {
+                        if origin.scope == activation.scope {
+                            activation.capture =
+                                Some((origin, Fact::Objects(Rc::clone(locations))));
+                        }
+                    }
+                }
+            }
+        }
+        Some((activation, symbol))
     }
 
     /// Resolve every possible call target before argument evaluation.
@@ -506,7 +542,7 @@ impl<'ast> Analyzer<'_, 'ast> {
         }
         let mut receiver = Some(Fact::Primitive(Value::Undefined));
         let resolved = self
-            .direct_activation(call)
+            .direct_activation(call, environment)
             .map(|(activation, named)| (CallTargets::Single(activation), named))
             .or_else(|| {
                 let (callee, this_arg) = self.evaluate_callee(&call.callee, environment);
