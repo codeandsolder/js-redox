@@ -67,7 +67,7 @@ fn dispatch_switch<'a>(
     let Statement::BlockStatement(block) = body else {
         return None;
     };
-    let [Statement::SwitchStatement(switch), Statement::BreakStatement(tail)] =
+    let [.., Statement::SwitchStatement(switch), Statement::BreakStatement(tail)] =
         block.body.as_slice()
     else {
         return None;
@@ -440,6 +440,12 @@ impl Collector<'_, '_> {
     /// table, when its own entries guarantee an exit. Out-of-bounds reads
     /// are deliberately not considered undefined: prototypes may supply one.
     pub(super) fn bounded_dispatch_replacement(&self, it: &ForStatement<'_>) -> Option<String> {
+        let Statement::BlockStatement(body) = &it.body else {
+            return None;
+        };
+        if body.body.len() != 2 {
+            return None;
+        }
         let switch = dispatch_switch(&it.body, self, it.span)?;
         let mut environment = self.private_dispatch_environment(it, switch)?;
         // Constant labels get an O(1) typed lookup. Otherwise evaluate only

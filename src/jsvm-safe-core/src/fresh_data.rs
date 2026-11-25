@@ -22,6 +22,7 @@ use oxc_syntax::{operator::AssignmentOperator, symbol::SymbolId};
 use std::collections::{HashMap, HashSet};
 use work_budget::{BudgetExceeded, WorkBudget};
 
+mod dispatch;
 mod heap;
 use heap::{
     value_weight, AllocationId, AllocationKind, Environment, Fact, Locations, Lookup, OwnData,
@@ -93,18 +94,30 @@ impl Evaluation {
 /// A source occurrence can execute more than once in a proven finite loop.
 /// A rewrite is valid only when every reaching evaluation has the same
 /// inert value, not merely when one of the iterations supplied a fact.
-enum Observation {
-    Exact(Value),
+enum Observation<T> {
+    Exact(T),
     Unknown,
 }
 
-#[derive(Default)]
-struct ReachingObservations {
-    values: HashMap<(u32, u32), Observation>,
+struct ReachingObservations<T> {
+    values: HashMap<(u32, u32), Observation<T>>,
 }
 
-impl ReachingObservations {
-    fn observe(&mut self, key: (u32, u32), observation: Observation) {
+impl<T> Default for ReachingObservations<T> {
+    fn default() -> Self {
+        Self {
+            values: HashMap::new(),
+        }
+    }
+}
+
+impl<T> ReachingObservations<T> {
+    fn observe(
+        &mut self,
+        key: (u32, u32),
+        observation: Observation<T>,
+        equivalent: impl Fn(&T, &T) -> bool,
+    ) {
         use std::collections::hash_map::Entry;
         match self.values.entry(key) {
             Entry::Vacant(entry) => {
@@ -113,7 +126,7 @@ impl ReachingObservations {
             Entry::Occupied(mut entry) => {
                 if !matches!((entry.get(), &observation),
                     (Observation::Exact(left), Observation::Exact(right))
-                    if identical_primitive_value(left, right))
+                    if equivalent(left, right))
                 {
                     entry.insert(Observation::Unknown);
                 }
@@ -121,24 +134,25 @@ impl ReachingObservations {
         }
     }
 
-    fn get(&self, span: Span) -> Option<&Value> {
+    fn get(&self, span: Span) -> Option<&T> {
         match self.values.get(&(span.start, span.end))? {
             Observation::Exact(value) => Some(value),
             Observation::Unknown => None,
         }
     }
 
-    fn merge(&mut self, other: Self) {
+    fn merge(&mut self, other: Self, equivalent: impl Fn(&T, &T) -> bool) {
         for (key, observation) in other.values {
-            self.observe(key, observation);
+            self.observe(key, observation, &equivalent);
         }
     }
 }
 
 #[derive(Default)]
 pub struct FreshDataReads {
-    members: ReachingObservations,
-    comparisons: ReachingObservations,
+    members: ReachingObservations<Value>,
+    comparisons: ReachingObservations<Value>,
+    dispatches: ReachingObservations<dispatch::DispatchTrace>,
 }
 
 impl FreshDataReads {
@@ -172,9 +186,20 @@ impl FreshDataReads {
         self.comparisons.get(span)
     }
 
+    pub(crate) fn dispatch_replacement(
+        &self,
+        statement: &ForStatement<'_>,
+        scoping: &Scoping,
+        source: &str,
+    ) -> Option<String> {
+        dispatch::render_reaching_dispatch(&self.dispatches, statement, scoping, source)
+    }
+
     fn merge(&mut self, other: Self) {
-        self.members.merge(other.members);
-        self.comparisons.merge(other.comparisons);
+        self.members.merge(other.members, identical_primitive_value);
+        self.comparisons
+            .merge(other.comparisons, identical_primitive_value);
+        self.dispatches.merge(other.dispatches, PartialEq::eq);
     }
 }
 
@@ -857,7 +882,11 @@ impl Analyzer<'_> {
                 &mut self.reads.comparisons
             };
             let span = expression.span();
-            observations.observe((span.start, span.end), observation);
+            observations.observe(
+                (span.start, span.end),
+                observation,
+                identical_primitive_value,
+            );
         }
         evaluation
     }
@@ -1030,6 +1059,30 @@ impl Analyzer<'_> {
         true
     }
 
+    fn for_initializer(
+        &mut self,
+        statement: &ForStatement<'_>,
+        environment: &mut Environment,
+    ) -> Option<()> {
+        if let Some(initializer) = &statement.init {
+            match initializer {
+                ForStatementInit::VariableDeclaration(declaration) => {
+                    self.declaration(declaration, environment);
+                }
+                expression => {
+                    self.expression(expression.as_expression()?, environment);
+                }
+            }
+        }
+        Some(())
+    }
+
+    fn consume_iteration(&mut self) -> Option<()> {
+        let fuel = self.loop_fuel.as_mut()?;
+        *fuel = fuel.checked_sub(1)?;
+        self.heap_result(self.budget.consume(1))
+    }
+
     fn simulate_for(
         &mut self,
         statement: &ForStatement<'_>,
@@ -1047,20 +1100,9 @@ impl Analyzer<'_> {
         {
             return None;
         }
-        if let Some(initializer) = &statement.init {
-            match initializer {
-                ForStatementInit::VariableDeclaration(declaration) => {
-                    self.declaration(declaration, environment);
-                }
-                expression => {
-                    self.expression(expression.as_expression()?, environment);
-                }
-            }
-        }
+        self.for_initializer(statement, environment)?;
         loop {
-            let fuel = self.loop_fuel.as_mut()?;
-            *fuel = fuel.checked_sub(1)?;
-            self.heap_result(self.budget.consume(1))?;
+            self.consume_iteration()?;
             let condition = self.expression(test, environment);
             if !condition.fact.as_ref()?.truthy() {
                 return self.retire_scope(scope, environment).then_some(());
@@ -1088,7 +1130,12 @@ impl Analyzer<'_> {
         let mut candidate = environment.clone();
         let previous_reads = std::mem::take(&mut self.reads);
         let previous_lists = std::mem::take(&mut self.visited_lists);
-        let proven = self.simulate_for(statement, &mut candidate).is_some() && !self.loop_failed;
+        let result = if self.has_dispatch_shape(statement) {
+            self.simulate_dispatch(statement, &mut candidate)
+        } else {
+            self.simulate_for(statement, &mut candidate)
+        };
+        let proven = result.is_some() && !self.loop_failed;
         let observations = std::mem::replace(&mut self.reads, previous_reads);
         let visited = std::mem::replace(&mut self.visited_lists, previous_lists);
         if outermost {

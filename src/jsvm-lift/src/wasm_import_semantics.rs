@@ -855,9 +855,7 @@ fn collect_proof_normalized_handler_semantics(
     source: &str,
     budget: &WorkBudget,
 ) -> Result<Vec<WasmImportHandlerShape>, BudgetExceeded> {
-    let Some(normalized) =
-        jsvm_safe_core::deobfuscate_with_standard_numeric_builtins(source, 16, budget)?
-    else {
+    let Some(normalized) = jsvm_safe_core::deobfuscate(source, 16, budget)? else {
         return Ok(Vec::new());
     };
     for source_type in [SourceType::unambiguous(), SourceType::cjs()] {

@@ -1067,9 +1067,7 @@ fn normalized_initializer_proof(
     budget: &WorkBudget,
 ) -> Result<Option<NormalizedInitializerProof>, BudgetExceeded> {
     budget.checkpoint()?;
-    let Some(normalized) =
-        jsvm_safe_core::deobfuscate_with_standard_numeric_builtins(source, 16, budget)?
-    else {
+    let Some(normalized) = jsvm_safe_core::deobfuscate(source, 16, budget)? else {
         return Ok(None);
     };
     budget.checkpoint()?;
