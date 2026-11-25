@@ -41,7 +41,7 @@ enum Next {
 /// exit. Empty is distinct from an explicit undefined, and an abrupt terminal
 /// route is not a normal loop exit. CFG effect equivalence and observable
 /// Completion equivalence are independently proved.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum RouteCompletion {
     Number(u64),
     NegativeZero,
@@ -1506,8 +1506,8 @@ impl NumericLoopCompletion {
 /// For a demanded script/eval Completion, the source graph must separately
 /// prove the exact normal exit value. The graph records per-route Completion
 /// classes, including the explicit undefined produced by an `IfStatement`
-/// `UpdateEmpty` and the Empty produced by var declarations. Only one common
-/// value on all normally exiting routes authorizes a live rewrite.
+/// `UpdateEmpty` and the Empty produced by declarations. A common exit value
+/// permits a shared suffix; different exit values require a route-local proof.
 /// Signed zero is carried as an exact Completion fact independently of
 /// the unsigned state label, which correctly treats both signs as one state.
 pub fn reconstruct_for(
@@ -1553,8 +1553,8 @@ pub fn reconstruct_for(
         &it.body,
         &init_text,
         source,
-    )?
-    .render(completion_live)
+        completion_live,
+    )
 }
 
 /// Enumerate numeric initializers by exact lexical binding and *individual*
@@ -1642,7 +1642,15 @@ pub fn reconstruct_while_with_known_state(
     if state != actual_name || !while_state_transitions_proven(it, scoping, symbol, state) {
         return None;
     }
-    reconstruct_state_loop(state, initial, &it.test, &it.body, "", source)?.render(completion_live)
+    reconstruct_state_loop(
+        state,
+        initial,
+        &it.test,
+        &it.body,
+        "",
+        source,
+        completion_live,
+    )
 }
 
 /// Track every write to the dispatcher's original lexical state symbol,
@@ -5209,65 +5217,83 @@ impl<'a> Visit<'a> for HoistedVars {
     fn visit_class(&mut self, _: &oxc_ast::ast::Class<'a>) {}
 }
 
-struct ReconstructedStateLoop {
-    text: String,
-    normal_completion: Option<NumericLoopCompletion>,
+/// Source loop Completion values, retained by the bounded (state, V) proof.
+/// Exit routes sharing a state and Completion class have the same output
+/// unless they carry Empty from distinct incoming accumulator values.
+#[derive(Default)]
+struct NormalExitProof {
+    values: BTreeSet<NumericLoopCompletion>,
+    routes: BTreeMap<(u64, RouteCompletion), BTreeSet<NumericLoopCompletion>>,
 }
 
-impl ReconstructedStateLoop {
-    fn render(mut self, completion_live: bool) -> Option<String> {
-        if completion_live {
-            let completion = self.normal_completion?;
-            // The common normal result restores the loop accumulator without
-            // moving the initializer or creating an observable binding.
-            // Abrupt completions bypass the suffix.
-            if self.text.pop()? != '}' {
-                return None;
+impl NormalExitProof {
+    fn common(&self) -> Option<NumericLoopCompletion> {
+        if self.values.len() == 1 {
+            self.values.first().copied()
+        } else {
+            None
+        }
+    }
+
+    fn instrument_route(&self, state: u64, route: &mut Route, exit: u64) -> Option<()> {
+        match &mut route.next {
+            Next::State(target)
+                if *target == exit && route.completion != RouteCompletion::Abrupt =>
+            {
+                let values = self.routes.get(&(state, route.completion))?;
+                if values.len() != 1 {
+                    return None;
+                }
+                // A normal edge to the global exit executes no subsequent
+                // graph effects. Its explicit nonempty value flows through
+                // the emitter's block/if/loop boundaries, including Empty
+                // break completions. No accumulator binding is introduced.
+                let value = values.first()?.expression();
+                route.effects.push(format!(";\n{value};"));
             }
-            write!(&mut self.text, "\n{};\n}}", completion.expression()).ok()?;
+            Next::State(_) => {}
+            Next::Choose { yes, no, .. } => {
+                self.instrument_route(state, yes, exit)?;
+                self.instrument_route(state, no, exit)?;
+            }
         }
-        Some(self.text)
+        Some(())
+    }
+
+    fn prepare_emission(
+        &self,
+        graph: &mut BTreeMap<u64, Route>,
+        reachable: &BTreeSet<u64>,
+        exit: u64,
+    ) -> Option<String> {
+        if let Some(value) = self.common() {
+            // A single common normal value can be emitted after the graph.
+            return Some(format!("\n;\n{};", value.expression()));
+        }
+        if !self.values.is_empty() {
+            // Different normal exit values are permitted only when each
+            // actual terminal edge has one certified value. An Empty edge
+            // with multiple incoming values cannot use a constant suffix.
+            for &state in reachable {
+                self.instrument_route(state, graph.get_mut(&state)?, exit)?;
+            }
+        }
+        // No normal exits (only abrupt completion or divergence) need no
+        // suffix either. The emitter independently proves effect/control flow.
+        Some(String::new())
     }
 }
 
-/// The control-flow graph merges both zero signs for equality and routing,
-/// but a statement Completion carries the sign of the exact source numeric
-/// fact. This is observable in script/eval evaluation and must survive Empty
-/// iterations without conflating the two values.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum LoopAccumulator {
-    Undefined,
-    Number(u64),
-    NegativeZero,
-}
-
-impl LoopAccumulator {
-    const fn certified(self) -> NumericLoopCompletion {
-        match self {
-            Self::Undefined => NumericLoopCompletion::Undefined,
-            Self::Number(value) => NumericLoopCompletion::Number(value),
-            Self::NegativeZero => NumericLoopCompletion::NegativeZero,
-        }
-    }
-}
-
-/// ECMAScript `ForBodyEvaluation` and `WhileLoopEvaluation` maintain V, initially undefined. Each
-/// ordinary body result with a non-Empty value *replaces* V; Empty preserves
-/// the prior value. A fixed-point over (state,V) models all normal paths,
-/// including cycles, rather than requiring a literal value on every exit
-/// edge. It is bounded by the existing graph-size proof and an explicit
-/// state/value-product limit; excessive state explosions fail without a
-/// speculative completion result.
-fn proven_normal_exit_completion(
+/// ECMAScript `ForBodyEvaluation` and `WhileLoopEvaluation` maintain V, initially
+/// undefined. A non-Empty body value replaces V; Empty retains it. Enumerate
+/// the bounded state/value product and record both global and edge-local
+/// normal exit facts, preserving signed zero independently of graph identity.
+fn prove_normal_exit_completions(
     initial: u64,
     exit: u64,
     graph: &BTreeMap<u64, Route>,
     reachable: &BTreeSet<u64>,
-) -> Option<NumericLoopCompletion> {
-    if initial == exit {
-        return Some(NumericLoopCompletion::Undefined);
-    }
-
+) -> Option<NormalExitProof> {
     let mut transitions = BTreeMap::new();
     for &state in reachable {
         let mut routes = Vec::new();
@@ -5278,31 +5304,36 @@ fn proven_normal_exit_completion(
         transitions.insert(state, routes);
     }
 
-    let first = (initial, LoopAccumulator::Undefined);
+    let first = (initial, NumericLoopCompletion::Undefined);
     let mut queue = VecDeque::from([first]);
     let mut visited = BTreeSet::from([first]);
-    let mut exits = BTreeSet::new();
+    let mut proof = NormalExitProof::default();
     while let Some((state, previous)) = queue.pop_front() {
         if state == exit {
-            exits.insert(previous);
+            proof.values.insert(previous);
             continue;
         }
         for &(next, completion, _) in transitions.get(&state)? {
             let value = match completion {
                 RouteCompletion::Abrupt => continue,
                 RouteCompletion::Empty => previous,
-                RouteCompletion::Undefined => LoopAccumulator::Undefined,
-                RouteCompletion::Number(value) => LoopAccumulator::Number(value),
-                RouteCompletion::NegativeZero => LoopAccumulator::NegativeZero,
+                RouteCompletion::Undefined => NumericLoopCompletion::Undefined,
+                RouteCompletion::Number(value) => NumericLoopCompletion::Number(value),
+                RouteCompletion::NegativeZero => NumericLoopCompletion::NegativeZero,
                 RouteCompletion::Unproven => return None,
             };
-            if next != exit && !reachable.contains(&next) {
+            if next == exit {
+                proof
+                    .routes
+                    .entry((state, completion))
+                    .or_default()
+                    .insert(value);
+            } else if !reachable.contains(&next) {
                 return None;
             }
             if visited.insert((next, value)) {
-                // 2048 possible source states times their distinct last
-                // Completion values is finite, but may be very large.
-                // Bound the proof rather than allocating an unbounded matrix.
+                // Bound the finite proof, rather than allocating an
+                // unbounded product of numeric states and Completion values.
                 if visited.len() > 16_384 {
                     return None;
                 }
@@ -5310,11 +5341,7 @@ fn proven_normal_exit_completion(
             }
         }
     }
-    if exits.len() == 1 {
-        Some(exits.into_iter().next()?.certified())
-    } else {
-        None
-    }
+    Some(proof)
 }
 
 fn reconstruct_state_loop(
@@ -5324,7 +5351,8 @@ fn reconstruct_state_loop(
     body: &Statement<'_>,
     initial_text: &str,
     source: &str,
-) -> Option<ReconstructedStateLoop> {
+    completion_live: bool,
+) -> Option<String> {
     let exit = exit_state(test, state)?;
     let mut candidate_cases = BTreeMap::new();
     collect_dispatch_statement(body, state, exit, source, &mut candidate_cases)?;
@@ -5332,12 +5360,17 @@ fn reconstruct_state_loop(
     // are known. Drop unmodelled cases *from the graph*, not from the original
     // source: reachable() will reject a missing route if execution can enter
     // that state, while genuinely unreachable branches are irrelevant.
-    let graph = candidate_cases
+    let mut graph = candidate_cases
         .into_iter()
         .filter_map(|(number, route)| route.map(|route| (number, route)))
         .collect::<BTreeMap<_, _>>();
     let nodes = reachable(initial, exit, &graph)?;
-    let normal_completion = proven_normal_exit_completion(initial, exit, &graph, &nodes);
+    let suffix = if completion_live {
+        prove_normal_exit_completions(initial, exit, &graph, &nodes)?
+            .prepare_emission(&mut graph, &nodes, exit)?
+    } else {
+        String::new()
+    };
     let mut loops = build_loops(&graph, &nodes, exit)?;
     extend_multi_exit_loops(&graph, &nodes, initial, exit, &mut loops);
     // Do not generate an infinite/repeated CFG expansion. Every loop must
@@ -5381,16 +5414,15 @@ fn reconstruct_state_loop(
             hoisted.names.into_iter().collect::<Vec<_>>().join(", ")
         )
     };
-    Some(ReconstructedStateLoop {
-        text: format!("{{\n{initial_text}\n{declarations}{code}\n}}"),
-        normal_completion,
-    })
+    Some(format!(
+        "{{\n{initial_text}\n{declarations}{code}{suffix}\n}}"
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        closed_exception_dag_region, ordered_natural_loop_side, proven_normal_exit_completion,
+        closed_exception_dag_region, ordered_natural_loop_side, prove_normal_exit_completions,
         reconstruct_for, ExceptionEntryProof, Next, NumericLoopCompletion, Route, RouteCompletion,
     };
     use crate::deobfuscate;
@@ -5641,7 +5673,55 @@ try{
         routes: &BTreeMap<u64, Route>,
     ) -> Option<NumericLoopCompletion> {
         let reachable = routes.keys().copied().collect();
-        proven_normal_exit_completion(initial, 9, routes, &reachable)
+        prove_normal_exit_completions(initial, 9, routes, &reachable)?.common()
+    }
+
+    #[test]
+    fn route_local_proof_distinguishes_separate_exits_from_ambiguous_empty_edge(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut graph = BTreeMap::from([
+            (
+                1,
+                fixed_point_fork(
+                    fixed_point_edge(9, RouteCompletion::Number(9)),
+                    fixed_point_edge(3, RouteCompletion::Number(3)),
+                ),
+            ),
+            (3, fixed_point_edge(9, RouteCompletion::Undefined)),
+        ]);
+        let reachable = graph.keys().copied().collect();
+        let proof =
+            prove_normal_exit_completions(1, 9, &graph, &reachable).ok_or("missing proof")?;
+        assert!(proof.common().is_none());
+        assert_eq!(
+            proof.prepare_emission(&mut graph, &reachable, 9),
+            Some(String::new())
+        );
+        let Next::Choose { yes, .. } = &graph[&1].next else {
+            return Err("missing fork".into());
+        };
+        assert!(yes.effects.iter().any(|effect| effect.contains("9;")));
+        assert!(graph[&3]
+            .effects
+            .iter()
+            .any(|effect| effect.contains("void 0;")));
+
+        let mut graph = BTreeMap::from([
+            (
+                1,
+                fixed_point_fork(
+                    fixed_point_edge(3, RouteCompletion::Number(3)),
+                    fixed_point_edge(3, RouteCompletion::NegativeZero),
+                ),
+            ),
+            (3, fixed_point_edge(9, RouteCompletion::Empty)),
+        ]);
+        let reachable = graph.keys().copied().collect();
+        let proof =
+            prove_normal_exit_completions(1, 9, &graph, &reachable).ok_or("missing proof")?;
+        assert!(proof.common().is_none());
+        assert!(proof.prepare_emission(&mut graph, &reachable, 9).is_none());
+        Ok(())
     }
 
     #[test]
@@ -6256,33 +6336,39 @@ try{
         }
     }
 
+    const ROUTE_LOCAL_CASES: &[(&str, bool)] = &[
+        // Direct numeric exit versus IfStatement's explicit undefined.
+        ("let s;for(s=1;s!=9;)if(s==1){s=flag?9:3;}else if(s==3){let x=(s=9,[]);}else if(s==9){s=9;}", true),
+        // Different zero signs must remain different even at the same target.
+        ("let s;for(s=1;s!=0;)s==1?(s=flag?-0:0):s==0&&(s=0);", true),
+        ("let s=1;while(s!=0)s==1?(s=flag?-0:0):s==0&&(s=0);", true),
+        // A natural loop followed by two distinct terminal routes.
+        ("let n=2,s;for(s=1;s!=9;)if(s==1){s=n--?2:3;}else if(s==2){push('loop');s=1;}else if(s==3){s=flag?9:4;}else if(s==4){let z=(s=9,[]);}else if(s==9){s=9;}", true),
+        // A cycle with early exits at different states; generated breaks
+        // must carry the explicit edge Completion through the new loop.
+        ("let n=2,s;for(s=1;s!=9;)if(s==1){s=n--?2:9;}else if(s==2){s=flag?1:3;}else if(s==3){let z=(s=9,[]);}else if(s==9){s=9;}", true),
+        // No normal exit is needed for an unconditional throw.
+        ("let s;for(s=1;s!=9;)if(s==1){throw new TypeError('x');}else if(s==9){s=9;}", true),
+        ("try{let s;for(s=1;s!=9;)if(s==1){if(flag){throw new TypeError('x');}else{s=9;}}else if(s==9){s=9;}}catch(e){push(e.name);4;}finally{push('finally');}", true),
+        // A trailing declaration after an expression is not yet modeled.
+        ("let s;for(s=1;s!=9;)if(s==1){s=9;var x;}else if(s==9){s=9;}", false),
+    ];
+
     #[test]
-    fn mixed_exit_completion_classes_are_not_conflated() {
-        let cases = [
-            // One state path ends in the assigned Number, another in the
-            // undefined produced by IfStatement UpdateEmpty(Empty).
-            "let s;for(s=1;s!=9;)if(s==1){s=flag?9:3;}else if(s==3){let x=(s=9,[]);}else if(s==9){s=9;}",
-            // An Empty block after a valued state write inherits that earlier
-            // value; without a path certificate this requires proof.
-            "let s;for(s=1;s!=9;)if(s==1){s=9;var x;}else if(s==9){s=9;}",
-        ];
-        for source in cases {
-            let recovered = deobfuscate(
-                source,
-                12,
-                &WorkBudget::unlimited("ambiguous-loop-completion"),
-            );
-            assert!(recovered.is_ok(), "{recovered:?}");
-            let Some(recovered) = recovered.ok().flatten() else {
-                unreachable!()
-            };
-            assert!(
-                !recovered.transforms.contains_key("if_ladder_structured"),
-                "{source}: {:?}: {}",
-                recovered.transforms,
-                recovered.source
-            );
+    fn mixed_exit_completion_classes_are_not_conflated() -> Result<(), Box<dyn std::error::Error>> {
+        for &(source, should_structure) in ROUTE_LOCAL_CASES {
+            recover_live_loop(source, should_structure)?;
         }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires Node; verify route-local completion across generated control flow"]
+    fn node_confirms_route_local_exit_completions() -> Result<(), Box<dyn std::error::Error>> {
+        for &(source, should_structure) in ROUTE_LOCAL_CASES {
+            compare_live_loop_runtime(source, should_structure)?;
+        }
+        Ok(())
     }
 
     #[test]
@@ -6377,8 +6463,8 @@ try{
         ("{let s=1;push('before');while(s!=9)s==1?(s=9):s==9&&(s=9);}", true),
         ("{let s=1;push('before');{while(s!=9)s==1?(s=9):s==9&&(s=9);}}", true),
         ("let other=push('before'),s=1;while(s!=9)s==1?(s=9):s==9&&(s=9);", true),
-        // Different normal exit values cannot share one constant suffix.
-        ("let s=1;while(s!=9)if(s==1){s=flag?9:3;}else if(s==3){let x=(s=9,[]);}else if(s==9){s=9;}", false),
+        // Different normal exit values use edge-local suffixes.
+        ("let s=1;while(s!=9)if(s==1){s=flag?9:3;}else if(s==3){let x=(s=9,[]);}else if(s==9){s=9;}", true),
         // A later initializer may change the state before the first test.
         ("let s=1,later=(()=>{s=3;return 0;})();while(s!=9)s==1?(push('wrong'),s=9):s==3?(push('right'),s=9):s==9&&(s=9);", false),
         // Classic-script var may be backed by an accessor.
@@ -6407,7 +6493,7 @@ try{
     }
 
     #[test]
-    fn live_while_dispatchers_require_a_common_completion_certificate(
+    fn live_while_dispatchers_require_a_completion_certificate(
     ) -> Result<(), Box<dyn std::error::Error>> {
         for &(source, should_structure) in LIVE_WHILE_CASES {
             recover_live_loop(source, should_structure)?;
