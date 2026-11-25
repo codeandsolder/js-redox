@@ -811,13 +811,30 @@ fn depythonify_safe_deob_declarative_var_runtime_equivalence() -> Result<()> {
         "function f(p){var p=[7];arguments[0]=[9];return p[0];}f([]);",
         "function f(p){p=[7];arguments[0]=[9];return p[0];}f([]);",
         "function f(p){var p=[7];var args=arguments;args[0]=[9];return p[0];}f([]);",
-        "function f(){var a=[7];with({a:[2]}){var a=[9];events.push(a[0]);}return a[0];}f();",
-        "function f(){var a=[7];with(new Proxy({},{has(t,k){if(k==='b')a[0]=9;return false;}})){var b=a[0];return b;}}f();",
         "function f(){var a=[9];try{throw [];}catch(a){var a=[7];events.push(a[0]);}return a[0];}f();",
         "function f(){var a=[7];function mutate(){a[0]=9;}mutate();return a[0];}f();",
         "function f(){var a=[7];eval('a=[9]');return a[0];}f();",
         "Object.defineProperty(globalThis,'a',{get(){return [9]},set(value){events.push(value[0])},configurable:true});var a=[7];a[0];",
     ];
+    // The public safe-deob entry point rejects dynamic with scopes.
+    // The lower-level heap tests separately verify target-resolution facts.
+    for source in [
+        "function f(){var a=[7];with({a:[2]}){var a=[9];events.push(a[0]);}return a[0];}f();",
+        "function f(){var a=[7];with(new Proxy({},{has(t,k){if(k==='b')a[0]=9;return false;}})){var b=a[0];return b;}}f();",
+    ] {
+        let result = deobfuscate_source(
+            source,
+            "declarative-var-with",
+            SourceMode::Auto,
+            16,
+            false,
+            &budget("declarative-var-with"),
+        );
+        let Err(error) = result else {
+            return Err(anyhow!("dynamic with scope was unexpectedly accepted"));
+        };
+        assert!(error.to_string().contains("dynamic-with-scope"), "{error}");
+    }
     script_runtime_equivalence(&sources, "declarative-var", false)
 }
 
