@@ -83,17 +83,24 @@ impl<'a> Visit<'a> for ReturnProbe {
 
 /// References to arena-owned declaration nodes, indexed by semantic
 /// identity rather than spelling. The binding proof is checked at each call.
-pub(super) struct NamedFunctions<'a> {
-    functions: HashMap<SymbolId, &'a Function<'a>>,
+#[derive(Clone, Copy)]
+enum CallableNode<'a> {
+    Ordinary(&'a Function<'a>),
+    Arrow(&'a ArrowFunctionExpression<'a>),
 }
 
-struct NamedCollector<'c, 'a> {
-    functions: NamedFunctions<'a>,
+pub(super) struct CallableIndex<'a> {
+    declarations: HashMap<SymbolId, &'a Function<'a>>,
+    nodes: HashMap<ScopeId, CallableNode<'a>>,
+}
+
+struct CallableCollector<'c, 'a> {
+    functions: CallableIndex<'a>,
     budget: &'c WorkBudget,
     failure: Option<BudgetExceeded>,
 }
 
-impl<'a> Visit<'a> for NamedCollector<'_, 'a> {
+impl<'a> Visit<'a> for CallableCollector<'_, 'a> {
     fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
         if self.failure.is_some() {
             return;
@@ -102,26 +109,47 @@ impl<'a> Visit<'a> for NamedCollector<'_, 'a> {
             self.failure = Some(error);
             return;
         }
+        let function = self.alloc(function);
+        if let Some(scope) = function.scope_id.get() {
+            self.functions
+                .nodes
+                .insert(scope, CallableNode::Ordinary(function));
+        }
         if function.r#type == FunctionType::FunctionDeclaration {
             if let Some(symbol) = function.id.as_ref().and_then(|id| id.symbol_id.get()) {
-                // Oxc's visitor alloc accessor is for arena-backed AST nodes;
-                // declarations visited here are allocated in the program arena.
-                let declaration = self.alloc(function);
-                self.functions.functions.insert(symbol, declaration);
+                self.functions.declarations.insert(symbol, function);
             }
         }
         walk::walk_function(self, function, flags);
     }
+
+    fn visit_arrow_function_expression(&mut self, function: &ArrowFunctionExpression<'a>) {
+        if self.failure.is_some() {
+            return;
+        }
+        if let Err(error) = self.budget.consume(1) {
+            self.failure = Some(error);
+            return;
+        }
+        let function = self.alloc(function);
+        if let Some(scope) = function.scope_id.get() {
+            self.functions
+                .nodes
+                .insert(scope, CallableNode::Arrow(function));
+        }
+        walk::walk_arrow_function_expression(self, function);
+    }
 }
 
-impl<'a> NamedFunctions<'a> {
+impl<'a> CallableIndex<'a> {
     pub(super) fn collect(
         program: &Program<'a>,
         budget: &WorkBudget,
     ) -> Result<Self, BudgetExceeded> {
-        let mut collector = NamedCollector {
+        let mut collector = CallableCollector {
             functions: Self {
-                functions: HashMap::new(),
+                declarations: HashMap::new(),
+                nodes: HashMap::new(),
             },
             budget,
             failure: None,
@@ -131,7 +159,7 @@ impl<'a> NamedFunctions<'a> {
     }
 
     fn get(&self, symbol: SymbolId) -> Option<&'a Function<'a>> {
-        self.functions.get(&symbol).copied()
+        self.declarations.get(&symbol).copied()
     }
 }
 
@@ -146,45 +174,26 @@ struct Activation<'a> {
     body: Body<'a>,
     reflective: bool,
     publish_context: bool,
+    self_binding: Option<SymbolId>,
 }
 
 impl<'a> Activation<'a> {
-    fn new(
-        call: &'a CallExpression<'a>,
-        scoping: &Scoping,
-        named: Option<&'a Function<'a>>,
-    ) -> Option<Self> {
-        if call.optional
-            || call
-                .arguments
-                .iter()
-                .any(|arg| arg.as_expression().is_none())
-        {
-            return None;
-        }
-        let activation = if let Some(function) = named {
-            Self::ordinary(function, scoping, false)?
-        } else {
-            match call.callee.without_parentheses() {
-                Expression::FunctionExpression(function) if function.id.is_none() => {
-                    Self::ordinary(function, scoping, true)?
-                }
-                Expression::ArrowFunctionExpression(function) if !function.r#async => Self {
-                    scope: function.scope_id.get()?,
-                    params: &function.params,
-                    body: match &function.body {
-                        ArrowFunctionBody::FunctionBody(body) => Body::Statements(body),
-                        expression => Body::Expression(expression.as_expression()?),
-                    },
-                    reflective: false,
-                    publish_context: true,
+    fn from_node(node: CallableNode<'a>, scoping: &Scoping, publish_context: bool) -> Option<Self> {
+        let activation = match node {
+            CallableNode::Ordinary(function) => Self::ordinary(function, scoping, publish_context)?,
+            CallableNode::Arrow(function) if !function.r#async => Self {
+                scope: function.scope_id.get()?,
+                params: &function.params,
+                body: match &function.body {
+                    ArrowFunctionBody::FunctionBody(body) => Body::Statements(body),
+                    expression => Body::Expression(expression.as_expression()?),
                 },
-                _ => return None,
-            }
+                reflective: false,
+                publish_context,
+                self_binding: None,
+            },
+            CallableNode::Arrow(_) => return None,
         };
-        // Parameter instantiation for a simple list uses one declarative
-        // environment. Defaults/rest/destructuring require an additional
-        // parameter-expression and iterator proof, not a value substitution.
         if activation.params.rest.is_some()
             || activation.params.items.iter().any(|parameter| {
                 parameter.initializer.is_some()
@@ -215,11 +224,14 @@ impl<'a> Activation<'a> {
             // discard an otherwise proved normal return summary.
             reflective: publish_context && !scoping.scope_flags(scope).is_strict_mode(),
             publish_context,
+            self_binding: (function.r#type == FunctionType::FunctionExpression)
+                .then(|| function.id.as_ref().and_then(|id| id.symbol_id.get()))
+                .flatten(),
         })
     }
 }
 
-impl Analyzer<'_, '_> {
+impl<'ast> Analyzer<'_, 'ast> {
     pub(super) fn record_return(&mut self, value: Option<Fact>, environment: &Environment) {
         let Some(frame) = &self.return_frame else {
             return;
@@ -279,6 +291,9 @@ impl Analyzer<'_, '_> {
                     self.budget,
                 ))?;
             }
+        }
+        if let Some(symbol) = activation.self_binding {
+            self.heap_result(environment.remove(symbol, self.budget))?;
         }
         let mut arguments = arguments.into_iter();
         for parameter in &activation.params.items {
@@ -346,43 +361,95 @@ impl Analyzer<'_, '_> {
         const MAX_ACTIVATION_DEPTH: usize = 64;
         self.activation_scopes.len() < MAX_ACTIVATION_DEPTH
             && !self
-                .lexical_scopes
-                .iter()
-                .flatten()
-                .chain(&self.activation_scopes)
-                .any(|&active| {
-                    active == scope || self.scoping.scope_is_descendant_of(active, scope)
-                })
+                .scope_instances
+                .scopes()
+                .any(|active| active == scope || self.scoping.scope_is_descendant_of(active, scope))
     }
 
-    /// Evaluate local direct calls with fresh activation cells. Named
-    /// declaration results flow back to this call site, but body observations
-    /// must not be specialized to one invocation: the same declaration can
-    /// execute elsewhere, including through an escaped alias.
+    fn direct_activation<'a>(
+        &self,
+        call: &'a CallExpression<'a>,
+    ) -> Option<(Activation<'a>, Option<SymbolId>)>
+    where
+        'ast: 'a,
+    {
+        let (node, symbol, publish) = match call.callee.without_parentheses() {
+            Expression::Identifier(identifier) => {
+                let symbol = self
+                    .bindings
+                    .resolved_symbol(self.scoping, identifier.reference_id.get()?)?;
+                let function = self.callables.get(symbol)?;
+                self.bindings.hoisted_callable_at(
+                    self.scoping,
+                    &call.callee,
+                    function.scope_id.get()?,
+                )?;
+                (CallableNode::Ordinary(function), Some(symbol), false)
+            }
+            Expression::FunctionExpression(function) if function.id.is_none() => {
+                (CallableNode::Ordinary(function), None, true)
+            }
+            Expression::ArrowFunctionExpression(function) => {
+                (CallableNode::Arrow(function), None, true)
+            }
+            _ => return None,
+        };
+        Some((Activation::from_node(node, self.scoping, publish)?, symbol))
+    }
+
+    /// Resolve an already evaluated callable value using its creation
+    /// environment, not its current storage location or source spelling.
+    fn captured_activation(
+        &mut self,
+        fact: &Fact,
+        environment: &Environment,
+    ) -> Option<Activation<'ast>> {
+        let origin = environment.callable_origin(fact)?;
+        if !self.heap_result(self.scope_instances.matches(&origin, self.budget))? {
+            return None;
+        }
+        let node = *self.callables.nodes.get(&origin.scope)?;
+        Activation::from_node(node, self.scoping, false)
+    }
+
+    /// Evaluate local calls with fresh activation cells. Resolve the callee
+    /// exactly once before evaluating the arguments, even when no summary
+    /// can be established.
     pub(super) fn local_call(
         &mut self,
         call: &CallExpression<'_>,
         environment: &mut Environment,
-    ) -> Option<Evaluation> {
-        let named = if let Expression::Identifier(identifier) = call.callee.without_parentheses() {
-            let symbol = self
-                .bindings
-                .resolved_symbol(self.scoping, identifier.reference_id.get()?)?;
-            let function = self.named_functions.get(symbol)?;
-            self.bindings.hoisted_callable_at(
-                self.scoping,
-                &call.callee,
-                function.scope_id.get()?,
-            )?;
-            Some((symbol, function))
-        } else {
-            None
+    ) -> Evaluation {
+        if call.optional {
+            self.unobserved(call.span);
+            return self.barrier(environment);
+        }
+        if call
+            .arguments
+            .iter()
+            .any(|argument| argument.as_expression().is_none())
+        {
+            self.expression(&call.callee, environment);
+            self.arguments(&call.arguments, environment);
+            return self.barrier(environment);
+        }
+        let resolved = self.direct_activation(call).or_else(|| {
+            let callee = self.expression(&call.callee, environment);
+            callee
+                .fact
+                .as_ref()
+                .and_then(|fact| self.captured_activation(fact, environment))
+                .map(|activation| (activation, None))
+        });
+        let Some((activation, named)) = resolved else {
+            self.arguments(&call.arguments, environment);
+            return self.barrier(environment);
         };
-        let activation = Activation::new(call, self.scoping, named.map(|(_, function)| function))?;
         if !self.can_enter(activation.scope)
             || (activation.reflective && self.bindings.implicit_arguments_exposed(activation.scope))
         {
-            return None;
+            self.arguments(&call.arguments, environment);
+            return self.barrier(environment);
         }
 
         // Resolve the callee first, then evaluate each argument exactly once.
@@ -390,22 +457,25 @@ impl Analyzer<'_, '_> {
         let mut arguments = Vec::with_capacity(call.arguments.len());
         let mut inert = true;
         for argument in &call.arguments {
-            let expression = argument.as_expression()?;
+            let Some(expression) = argument.as_expression() else {
+                self.unobserved(call.span);
+                return self.barrier(environment);
+            };
             let result = self.expression(expression, environment);
             inert &= result.inert;
             arguments.push(result.fact);
         }
-        if let Some((symbol, _)) = named {
+        if let Some(symbol) = named {
             if let Some(function) = self.pure_functions.get(&symbol) {
                 let values = arguments.iter().map(|fact| match fact {
                     Some(Fact::Primitive(value)) => Some(value),
                     _ => None,
                 });
                 if let Some(value) = function.evaluate(values, self.budget) {
-                    return Some(Evaluation::primitive(value, inert));
+                    return Evaluation::primitive(value, inert);
                 }
                 if !self.checkpoint() {
-                    return Some(self.barrier(environment));
+                    return self.barrier(environment);
                 }
             }
         }
@@ -419,7 +489,9 @@ impl Analyzer<'_, '_> {
             .replace(ReturnFrame::new(self.pending_disposals));
         let disposes = self.enter_resource_scope(Some(activation.scope));
         self.activation_scopes.push(activation.scope);
+        let ticket = self.scope_instances.enter(activation.scope);
         let summary = self.execute_activation(&activation, arguments, &mut candidate);
+        self.scope_instances.leave(&ticket);
         self.activation_scopes.pop();
         self.leave_resource_scope(disposes, &mut candidate);
         self.return_frame = previous_frame;
@@ -435,17 +507,17 @@ impl Analyzer<'_, '_> {
                 self.visited_lists.extend(visited);
             }
             // Do not erase the invocation, even when its result is known.
-            return Some(Evaluation {
+            return Evaluation {
                 fact: summary.value,
                 inert: false,
-            });
+            };
         }
         if self.loop_fuel.is_some() {
             // Earlier iterations may already have observed this same body.
             // A failed activation cannot be omitted from their agreement.
             self.loop_failed = true;
         }
-        Some(self.barrier(environment))
+        self.barrier(environment)
     }
 
     pub(super) fn merge_loop_returns(&mut self, frame: Option<ReturnFrame>) {

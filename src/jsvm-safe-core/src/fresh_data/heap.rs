@@ -1,7 +1,7 @@
 //! Abstract heap for flow-local ordinary allocations. References are sets of
 //! allocation identities, never snapshots of object contents. Consequently an
 //! effect or a write through an alias also affects previously captured refs.
-use super::origins::AllocationOrigins;
+use super::{origins::AllocationOrigins, scope_instances::ClosureOrigin};
 use crate::numeric::exact_u32;
 use crate::value_eval::{
     canonical_array_index_key, identical_primitive_value, strict_primitive_equal, Value,
@@ -374,6 +374,7 @@ enum Prototype {
 pub(super) enum AllocationKind {
     Ordinary,
     Array,
+    Callable,
 }
 
 #[derive(Clone)]
@@ -381,6 +382,7 @@ pub(super) struct OwnData {
     kind: AllocationKind,
     prototype: Prototype,
     properties: Properties,
+    closure: Option<ClosureOrigin>,
 }
 
 impl OwnData {
@@ -389,7 +391,17 @@ impl OwnData {
             kind,
             prototype: Prototype::Unknown,
             properties: Properties::default(),
+            closure: None,
         }
+    }
+
+    pub(super) fn callable(origin: Option<ClosureOrigin>) -> Self {
+        let mut data = Self::new(AllocationKind::Callable);
+        // Function-specific own descriptors (name, length, prototype,
+        // arguments and caller) are not ordinary writable literal slots.
+        data.properties.unlisted = Property::Opaque;
+        data.closure = origin;
+        data
     }
 
     pub(super) fn define_data(&mut self, key: String, value: Option<Fact>) {
@@ -456,6 +468,9 @@ impl OwnData {
     fn enumerable_data(&self, budget: &WorkBudget) -> Result<Option<Properties>, BudgetExceeded> {
         self.properties.charge_clone(budget)?;
         let mut properties = self.properties.clone();
+        if self.kind == AllocationKind::Callable {
+            return Ok(None);
+        }
         if self.kind == AllocationKind::Array {
             // All tracked ordinary literal properties are enumerable,
             // except the intrinsic own Array length descriptor.
@@ -748,6 +763,39 @@ impl Environment {
         clear_shared(&mut self.bindings);
         clear_shared(&mut self.allocations);
         self.collection_threshold = MIN_COLLECTION_SIZE;
+    }
+
+    /// An exact ordinary function object's internal call target cannot be
+    /// replaced by an own-property write. Unknown effects still erase
+    /// its descriptor proof along with other heap information.
+    pub(super) fn callable_origin(&self, fact: &Fact) -> Option<ClosureOrigin> {
+        let Fact::Objects(locations) = fact else {
+            return None;
+        };
+        let [id] = locations.as_ref() else {
+            return None;
+        };
+        self.allocations.get(id)?.closure.clone()
+    }
+
+    pub(super) fn reference_type(
+        &self,
+        locations: &Locations,
+        budget: &WorkBudget,
+    ) -> Result<Option<&'static str>, BudgetExceeded> {
+        charge(budget, locations.len())?;
+        let mut callable = None;
+        for id in locations.iter() {
+            let Some(data) = self.allocations.get(id) else {
+                return Ok(None);
+            };
+            let kind = data.kind == AllocationKind::Callable;
+            if callable.is_some_and(|previous| previous != kind) {
+                return Ok(None);
+            }
+            callable = Some(kind);
+        }
+        Ok(callable.map(|kind| if kind { "function" } else { "object" }))
     }
 
     pub(super) fn get(&self, symbol: SymbolId) -> Option<&Fact> {
@@ -1288,7 +1336,7 @@ impl Environment {
         if !locations.iter().all(|id| {
             self.allocations
                 .get(id)
-                .is_some_and(|data| !data.is_length(key))
+                .is_some_and(|data| data.kind != AllocationKind::Callable && !data.is_length(key))
         }) {
             return Ok(false);
         }

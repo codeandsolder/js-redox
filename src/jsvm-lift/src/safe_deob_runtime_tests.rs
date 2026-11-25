@@ -913,6 +913,46 @@ fn depythonify_safe_deob_declarative_var_runtime_equivalence() -> Result<()> {
 
 #[test]
 #[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_callable_capture_runtime_equivalence() -> Result<()> {
+    let sources = [
+        "let f=x=>[x];let a=f(7);a[0];",
+        "let f=function(x){return [x];};let alias=f;let a=alias(7);a[0];",
+        "let f=function inner(x){return [x];};let a=f(7);a[0];",
+        "let a=[7];let f=()=>{a[0]=9;return a;};let b=f();[a[0],b[0],a===b];",
+        "let a=[7];let f=()=>a;a=[9];let b=f();b[0];",
+        "let fs=[x=>[x]];let a=fs[0](7);a[0];",
+        "let f=x=>[x];let a=f((f=x=>[9],7));a[0];",
+        "let f=x=>[x];let a=f(7);let b=f(9);[a[0],b[0]];",
+        "let a=[7];let f=()=>[a[0]];let b=f();a[0]=9;let c=f();[b[0],c[0]];",
+        "let f;{let x=7;f=()=>[x];}let a=f();a[0];",
+        "let f;for(let i=0;i<2;i++){if(i===0)f=()=>[i];else{let a=f();events.push(a[0]);}}",
+        "let a;for(let i=0;i<2;i++){let f=()=>[i];a=f();}a[0];",
+        "let f;for(let i=0;i<2;i++)if(i===0)f=()=>[i];else{let a=f();events.push(a[0]);}",
+        "let a;for(let i=0,f=()=>[i];i<1;i++){a=f();}a[0];",
+        "let f;let a;for(let i=0;i<2;f=()=>[i],i++){if(i===1)a=f();}a[0];",
+        "let a;for(let i=0;i<2;i++){let x=i;let f=()=>[x];a=f();}a[0];",
+        "let f=(()=>{let x=7;return ()=>[x];})();let a=f();a[0];",
+        "let a=[7];let f=()=>{events.push('effect');return [9];};let b=f();[b[0],a[0]];",
+        "let f=()=>[7];let a=f;f=()=>[9];let b=a();b[0];",
+        "let f=()=>[7];let a=[typeof f,typeof {}];[a[0],a[1]];",
+        "let f=function(){};let a=[7];events.push(delete f.prototype);a[0];",
+        "let f=()=>[7];let a={...f,x:7};a.x;",
+        "let f=()=>[7];let a={f};let b=a.f();b[0];",
+        "let a=[7];let f=()=>[a[0]];let b=f((a[0]=9,0));b[0];",
+        "let f=()=>7;let g=f;let h=()=>7;[f===g,f===h,[f][0]===f];",
+        "let f=function(){return [this.x];};let o={x:9,f};let a=o.f();a[0];",
+        "let make=()=>{let a=[7];return ()=>a[0]++;};let f=make();let g=make();[f(),g(),f()];",
+        "let f=()=>[7];let a=f((events.push('arg'),f=()=>[9]));a[0];",
+        "let f=(x=>{return [x];});let a=f(7);let b=f(9);[a[0],b[0],a===b];",
+        "let f=function self(n){return n?self(n-1):[7];};let a=f(2);a[0];",
+        "let a=[7];let f=()=>[7];let o={get f(){a[0]=9;return f;}};let b=o.f();[a[0],b[0]];",
+        "let f=null;let a=[7];f?.(a[0]=9);a[0];",
+    ];
+    script_runtime_equivalence(&sources, "callable-capture", false)
+}
+
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
 fn depythonify_safe_deob_named_activation_runtime_equivalence() -> Result<()> {
     let sources = [
         "function outer(){function build(v){let a=[v];return a;}let r=build(7);return r[0];}outer();",
