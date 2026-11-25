@@ -34,11 +34,8 @@ pub use browser_legacy::{
     recover_browser_legacy_call_assignments, BrowserLegacyCallAssignmentRecovery,
     BrowserLegacyOpaqueSpan,
 };
-use control_flow::{
-    collect_reference_spans, detect_reference_identity_tables, reference_identity,
-    ReferenceIdentityTable,
-};
-use decoder::{analyze_decoders, decoder_call_rewrite, js_parse_int, static_decoder_pass, Decoder};
+use control_flow::collect_reference_spans;
+use decoder::{analyze_decoders, decoder_call_rewrite, static_decoder_pass, Decoder};
 pub use iteration_history::IterationCycle;
 use iteration_history::IterationHistory;
 pub use numeric::{exact_i64, exact_u32, exact_u64, exact_usize, js_number_equal};
@@ -416,74 +413,6 @@ fn collect_from_char_code_aliases(
     collector.candidates
 }
 
-fn direct_global_object_name<'a>(
-    scoping: &Scoping,
-    facts: &BindingFacts,
-    expression: &'a Expression<'a>,
-) -> Option<&'a str> {
-    let Expression::Identifier(identifier) = expression else {
-        return None;
-    };
-    if !matches!(identifier.name.as_str(), "window" | "globalThis" | "self") {
-        return None;
-    }
-    facts
-        .proves_global_reference(scoping, identifier.reference_id.get()?)
-        .then_some(identifier.name.as_str())
-}
-
-fn collect_global_object_aliases(
-    program: &oxc_ast::ast::Program<'_>,
-    scoping: &Scoping,
-    facts: &BindingFacts,
-) -> HashSet<SymbolId> {
-    struct AliasCollector<'c> {
-        scoping: &'c Scoping,
-        facts: &'c BindingFacts,
-        aliases: HashSet<SymbolId>,
-    }
-    impl<'a> Visit<'a> for AliasCollector<'_> {
-        fn visit_variable_declaration(
-            &mut self,
-            declaration: &oxc_ast::ast::VariableDeclaration<'a>,
-        ) {
-            for declarator in &declaration.declarations {
-                let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
-                    continue;
-                };
-                let Some(symbol) = identifier.symbol_id.get() else {
-                    continue;
-                };
-                let Some(initializer) = &declarator.init else {
-                    continue;
-                };
-                if direct_global_object_name(self.scoping, self.facts, initializer).is_none() {
-                    continue;
-                }
-                if self.facts.binding_has_stable_value(self.scoping, symbol)
-                    && self
-                        .scoping
-                        .get_resolved_reference_ids(symbol)
-                        .iter()
-                        .all(|&reference| {
-                            self.facts.resolved_symbol(self.scoping, reference) == Some(symbol)
-                        })
-                {
-                    self.aliases.insert(symbol);
-                }
-            }
-            walk::walk_variable_declaration(self, declaration);
-        }
-    }
-    let mut collector = AliasCollector {
-        scoping,
-        facts,
-        aliases: HashSet::new(),
-    };
-    collector.visit_program(program);
-    collector.aliases
-}
-
 #[derive(Clone, Copy)]
 enum CallRewriteTraversal {
     Stop,
@@ -597,9 +526,6 @@ struct Collector<'s, 'c> {
     proxies: &'c HashMap<SymbolId, ProxyObject>,
     pure_functions: &'c HashMap<SymbolId, PureFunction>,
     from_char_code_aliases: &'c HashMap<SymbolId, u32>,
-    global_object_aliases: &'c HashSet<SymbolId>,
-    standard_numeric_builtins: bool,
-    reference_identity_tables: &'c HashMap<SymbolId, ReferenceIdentityTable>,
     selector_dispatchers: &'c HashMap<SymbolId, SelectorDispatcher>,
     external_arithmetic_entries: HashMap<Span, (SymbolId, f64)>,
     reference_spans: &'c HashMap<ReferenceId, Span>,
@@ -1428,30 +1354,6 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
             self.push_primitive(it.span, value, "reaching_heap_compare");
             return;
         }
-        if matches!(it.operator.as_str(), "==" | "===" | "!=" | "!==") {
-            let left_reference =
-                reference_identity(&it.left, self.scoping, self.reference_identity_tables);
-            let right_reference =
-                reference_identity(&it.right, self.scoping, self.reference_identity_tables);
-            if let (Some((left_symbol, left_identity)), Some((right_symbol, right_identity))) =
-                (left_reference, right_reference)
-            {
-                if left_symbol == right_symbol {
-                    let equal = left_identity == right_identity;
-                    let value = if matches!(it.operator.as_str(), "==" | "===") {
-                        equal
-                    } else {
-                        !equal
-                    };
-                    self.push(
-                        it.span,
-                        if value { "true" } else { "false" }.to_string(),
-                        "reference_identity_compare",
-                    );
-                    return;
-                }
-            }
-        }
         if let Some(value) = eval_binary_expression(it) {
             self.push_primitive(it.span, &value, "constant_fold");
         }
@@ -1598,14 +1500,15 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
             self.push(it.span, text, "if_ladder_structured");
             return;
         }
-        if !live {
-            if let Some(text) = self.reference_state_replacement(it) {
-                self.push(it.span, text, "reference_state_unflatten");
-                return;
-            }
-        }
         if let Some((text, proof)) = self.arithmetic_state_replacement(it, live) {
             self.push_arithmetic(it.span, text, proof);
+            return;
+        }
+        if let Some(text) = self
+            .fresh_data
+            .dispatch_replacement(it, self.scoping, self.source)
+        {
+            self.push(it.span, text, "reaching_heap_dispatch");
             return;
         }
         if self.allow_effect_statements {
@@ -2096,7 +1999,6 @@ fn transform_once(
     counts: &mut Counts,
     arithmetic_state_proofs: &mut Vec<ArithmeticStateProof>,
     iteration: usize,
-    standard_numeric_builtins: bool,
     budget: &WorkBudget,
 ) -> Result<Option<String>, BudgetExceeded> {
     budget.checkpoint()?;
@@ -2132,7 +2034,7 @@ fn transform_once(
     )?;
     budget.checkpoint()?;
     let decoders = decoder_analysis.decoders;
-    let mut protected_spans = decoder_analysis.protected_spans;
+    let protected_spans = decoder_analysis.protected_spans;
     let mut initial_replacements = decoder_analysis.replacements;
     budget.checkpoint()?;
     let shorthand_spans = collect_shorthand_spans(&program);
@@ -2141,17 +2043,7 @@ fn transform_once(
     let pure_functions = collect_pure_functions(&program, scoping);
     let from_char_code_aliases =
         collect_from_char_code_aliases(&program, scoping, &constants.initialization);
-    let global_object_aliases =
-        collect_global_object_aliases(&program, scoping, &constants.initialization);
     budget.checkpoint()?;
-    let reference_identity_tables =
-        detect_reference_identity_tables(source, scoping, &reference_spans);
-    budget.checkpoint()?;
-    protected_spans.extend(
-        reference_identity_tables
-            .values()
-            .map(|table| (table.construction_start, table.construction_end)),
-    );
     let stable_var_numbers = collect_stable_var_numbers(&program, scoping);
     let selector_dispatchers = collect_selector_dispatchers(&program, scoping, &stable_var_numbers);
     budget.checkpoint()?;
@@ -2178,9 +2070,6 @@ fn transform_once(
         proxies: &proxies,
         pure_functions: &pure_functions,
         from_char_code_aliases: &from_char_code_aliases,
-        global_object_aliases: &global_object_aliases,
-        standard_numeric_builtins,
-        reference_identity_tables: &reference_identity_tables,
         selector_dispatchers: &selector_dispatchers,
         external_arithmetic_entries: HashMap::new(),
         reference_spans: &reference_spans,
@@ -2326,7 +2215,6 @@ pub struct SafeTransformResult {
 fn deobfuscate_with_mode(
     source: &str,
     max_iterations: usize,
-    standard_numeric_builtins: bool,
     source_mode: SafeSourceMode,
     budget: &WorkBudget,
 ) -> Result<Option<SafeTransformResult>, BudgetExceeded> {
@@ -2380,7 +2268,6 @@ fn deobfuscate_with_mode(
             &mut counts,
             &mut arithmetic_state_proofs,
             iteration,
-            standard_numeric_builtins,
             budget,
         )?
         else {
@@ -2436,7 +2323,7 @@ pub fn deobfuscate(
     max_iterations: usize,
     budget: &WorkBudget,
 ) -> Result<Option<SafeTransformResult>, BudgetExceeded> {
-    deobfuscate_with_mode(source, max_iterations, false, SafeSourceMode::Auto, budget)
+    deobfuscate_with_mode(source, max_iterations, SafeSourceMode::Auto, budget)
 }
 
 /// Proof-oriented deobfuscation with an explicit host-language source mode.
@@ -2449,22 +2336,7 @@ pub fn deobfuscate_with_source_mode(
     source_mode: SafeSourceMode,
     budget: &WorkBudget,
 ) -> Result<Option<SafeTransformResult>, BudgetExceeded> {
-    deobfuscate_with_mode(source, max_iterations, false, source_mode, budget)
-}
-
-/// Proof-oriented deobfuscation with explicitly supported numeric globals.
-///
-/// This may evaluate `Number`, `parseInt`, and `Math.floor` through a proven
-/// stable global-object alias. Derived claims must disclose that assumption;
-/// ordinary source rewriting uses [`deobfuscate`].
-/// # Errors
-/// Returns `BudgetExceeded` if the configured work budget is exhausted.
-pub fn deobfuscate_with_standard_numeric_builtins(
-    source: &str,
-    max_iterations: usize,
-    budget: &WorkBudget,
-) -> Result<Option<SafeTransformResult>, BudgetExceeded> {
-    deobfuscate_with_mode(source, max_iterations, true, SafeSourceMode::Auto, budget)
+    deobfuscate_with_mode(source, max_iterations, source_mode, budget)
 }
 
 #[cfg(test)]
@@ -2472,7 +2344,6 @@ mod tests {
     use super::{
         deobfuscate as deobfuscate_budgeted,
         deobfuscate_with_source_mode as deobfuscate_with_source_mode_budgeted,
-        deobfuscate_with_standard_numeric_builtins as deobfuscate_with_standard_numeric_builtins_budgeted,
         expose_static_strings as expose_static_strings_budgeted,
         recover_static_decoders as recover_static_decoders_budgeted, safe_source_rejection,
         ProvenConstantEnvironment, SafeSourceMode, SafeSourceRecovery, SafeSourceRejection,
@@ -2503,15 +2374,6 @@ mod tests {
         source_mode: SafeSourceMode,
     ) -> Option<SafeTransformResult> {
         deobfuscate_with_source_mode_budgeted(source, max_iterations, source_mode, &test_budget())
-            .ok()
-            .flatten()
-    }
-
-    fn deobfuscate_with_standard_numeric_builtins(
-        source: &str,
-        max_iterations: usize,
-    ) -> Option<SafeTransformResult> {
-        deobfuscate_with_standard_numeric_builtins_budgeted(source, max_iterations, &test_budget())
             .ok()
             .flatten()
     }
@@ -9516,7 +9378,7 @@ console.log(d(0x10,"k"),d(0x11,"k"));
     }
 
     #[test]
-    fn reference_state_standard_numeric_builtins_are_proof_only() {
+    fn numeric_builtins_do_not_prove_reference_graph_identity() {
         let source = r#"
             function identityIndex(A, B, Q, g, E, C, I, unused) {
                 return (B * C ^ Q * A ^ g * E) >>> 0 & I - 1;
@@ -9554,33 +9416,12 @@ console.log(d(0x10,"k"),d(0x11,"k"));
             }
         "#;
 
-        let normal = deobfuscate(source, 16);
-        assert!(normal.is_some(), "normal safe transform should succeed");
-        let Some(normal) = normal else {
-            return;
-        };
-        assert!(normal.source.contains("switch (state)"));
-
-        let observable = deobfuscate_with_standard_numeric_builtins(source, 16)
-            .unwrap_or_else(|| unreachable!());
-        assert!(observable.source.contains("switch (state)"));
-        // Preserve the same proof coverage with an explicit final result,
-        // rather than dropping the live loop completion in a classic script.
-        let discarded_completion = format!("{source}\nout;");
-        let proof = deobfuscate_with_standard_numeric_builtins(&discarded_completion, 16);
-        assert!(proof.is_some(), "proof transform should succeed");
-        let Some(proof) = proof else {
-            return;
-        };
-        assert!(!proof.source.contains("switch (state)"));
-        assert!(proof.source.contains("out.push(\"good\")"));
-        assert!(proof.source.contains("out.push(\"done\")"));
-        assert!(!proof.source.contains("out.push(\"bad\")"));
-        assert!(!proof.source.contains("out.push(\"wrong\")"));
-        assert!(proof
-            .transforms
-            .get("reference_state_unflatten")
-            .is_some_and(|count| *count >= 1));
+        let result = deobfuscate(source, 16).unwrap_or_else(|| unreachable!());
+        assert_eq!(result.transforms.get("reaching_heap_dispatch"), None);
+        assert!(result.source.contains("out.push(\"good\")"));
+        assert!(result.source.contains("out.push(\"bad\")"));
+        assert!(result.source.contains("out.push(\"done\")"));
+        assert!(result.source.contains("out.push(\"wrong\")"));
     }
 }
 
@@ -9691,22 +9532,43 @@ mod fixture_regressions {
     }
 
     #[test]
-    fn reference_identity_fixture_unflattens_proven_state_machine() {
+    fn reaching_heap_dispatch_preserves_actual_reference_paths() {
+        let positives = [
+            "let a=[[],[]];for(let state=a[0];true;){switch(state){case a[0]:state=a[1];continue;case a[1]:17;break;}break;}",
+            "let a=[[],[]],x=0;for(let state=a[0];true;){x++;switch(state){case a[0]:x+=2;case a[1]:x+=3;break;}break;}x;",
+            "let a=[[],[]],x=0;for(let state=[];true;){x++;switch(state){case a[0]:x=9;break;}break;}x;",
+            "let a=[[],[]],f=[null,null];for(let state=a[0],i=0;i<2;i++){switch(state){case a[0]:f[0]=()=>i;state=a[1];continue;case a[1]:f[1]=()=>i;continue;}break;}[f[0](),f[1]()];",
+        ];
+        for source in positives {
+            let result = checked(source);
+            assert_eq!(
+                result.transforms.get("reaching_heap_dispatch"),
+                Some(&1),
+                "{source} => {}",
+                result.source
+            );
+        }
+        for source in [
+            "let a=[[],[]];for(let state=a[0];true;){switch(state){case (effect(),a[0]):state=a[1];continue;case a[1]:break;}break;}",
+            "let a=[[],[]];for(let state=a[0];true;){switch(state){case a[0]:effect();state=a[1];continue;case a[1]:break;}break;}",
+        ] {
+            let result = checked(source);
+            assert_eq!(result.transforms.get("reaching_heap_dispatch"), None, "{source}");
+        }
+    }
+
+    #[test]
+    fn reference_identity_fixture_retains_unproved_selection_and_comparisons() {
         let source = include_str!(
             "../../../corpus/generated/reversible-obfuscation/reference-identity-table.js"
         );
         let result = checked(source);
-        assert!(!result.source.contains("S[0][0] === S[4][0]"));
-        assert!(!result.source.contains("S[0][0] !== S[0][1]"));
-        assert!(!result.source.contains("switch (state)"));
-        assert!(!result.source.contains("switch(state)"));
+        assert!(result.source.contains("S[0][0] === S[4][0]"));
+        assert!(result.source.contains("S[0][0] !== S[0][1]"));
+        assert_eq!(result.transforms.get("reaching_heap_dispatch"), None);
         assert!(result
             .transforms
-            .get("reference_identity_compare")
-            .is_some_and(|count| *count >= 4));
-        assert!(result
-            .transforms
-            .get("reference_state_unflatten")
+            .get("dispatch_switch_structured")
             .is_some_and(|count| *count >= 1));
     }
 }

@@ -19,3 +19,16 @@ The canonical development corpus lives outside Git. Generated/minimal synthetic 
 
 `*.raw.js`, `*.pretty.js`, and external deobfuscated/reference bodies described by the manifest are
 private corpus data. SHA-256, byte size, family, date, purpose, and acceptance thresholds remain public so a mounted corpus can be verified without publishing its contents.
+
+## Reference-dispatch regression baseline
+
+For the pinned DataDome Qwant capture, revision `6bc77e2` produced
+3,704 string decodes, 126 pure-function evaluations, 10 structured switches
+and 25 speculative reference-state unflattenings within the corpus evaluator's
+16-pass limit. The replacement in `c499893` produces the same 3,704 decodes
+and 126 pure-function evaluations, with 35 runtime-preserving structured
+switches and no speculative reference-identity rewrites. The manifest tracks
+that measured decoder baseline and the total recovered dispatch structures
+instead of rewarding erased reference comparisons or unproved identity paths.
+The older 4,000-decode floor was already unmet by the preceding revision.
+String and scanner expectations remain unchanged.

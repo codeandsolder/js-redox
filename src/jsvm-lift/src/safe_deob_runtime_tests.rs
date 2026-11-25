@@ -33,6 +33,7 @@ const MAIN_FIXTURES: &[&str] = &[
     "selector-trailing-params.js",
     "reference-identity-table.js",
     "reference-identity-table-sync.js",
+    "reference-identity-table-lexical.js",
     "ordered-switch.js",
     "ordered-switch-for.js",
     "ordered-switch-bounded.js",
@@ -213,8 +214,12 @@ fn assert_state_and_alias_contract(file: &str, outcome: &SafeDeobOutcome) {
     let report = &outcome.report;
     match file {
         "reference-identity-table.js" | "reference-identity-table-sync.js" => {
-            assert!(count(report, "reference_identity_compare") >= 2);
-            assert!(count(report, "reference_state_unflatten") >= 1);
+            assert!(count(report, "dispatch_switch_structured") >= 1);
+            assert_eq!(count(report, "reaching_heap_dispatch"), 0);
+        }
+        "reference-identity-table-lexical.js" => {
+            assert!(count(report, "reaching_heap_compare") >= 2);
+            assert!(count(report, "reaching_heap_dispatch") >= 1);
         }
         "ordered-switch.js" | "ordered-switch-for.js" => {
             assert!(count(report, "dispatch_switch_structured") >= 1);
@@ -745,6 +750,48 @@ const SCRIPT_COMPLETION_SOURCES: &[&str] = &[
         "let a=[7,8];let b={...a};[b[0],b[1],b.length];",
         "let a={__proto__:null,[Symbol('a')]:7};let b={...a};Reflect.ownKeys(b).length;",
 ];
+
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_reaching_heap_dispatch_runtime_equivalence() -> Result<()> {
+    let sources = [
+        "let a=[[],[]];for(let state=a[0];true;){switch(state){case a[0]:state=a[1];continue;case a[1]:-0;break;}break;}",
+        "let a=[[],[]],x=0;for(let state=a[0];true;){x++;switch(state){case a[0]:x+=2;case a[1]:x+=3;break;}break;}x;",
+        "let a=[[],[]];for(let state=[];true;){42;switch(state){case a[0]:9;break;}break;}",
+        "let a=[[],[]],f=[null,null];for(let state=a[0],i=0;i<2;i++){switch(state){case a[0]:f[0]=()=>i;state=a[1];continue;case a[1]:f[1]=()=>i;continue;}break;}[f[0](),f[1]()];",
+        "let a=[[],[]],f=[null,null,null];for(let state=a[0],i=0;i<2;f[i]=()=>i,i++){switch(state){case a[0]:state=a[1];continue;case a[1]:19;continue;}break;}[f[0](),f[1]()];",
+        "let a=[[],[]];for(let state=a[0];true;){switch(state){case a[1]:var hidden=42;break;case a[0]:7;break;}break;}typeof hidden;",
+        "let a=[[],[]];for(let state=a[1];true;){switch(state){default:23;case a[0]:31;break;case a[1]:44;break;}break;}",
+        "let a=[[],[]],f=[null];for(let state=a[0],i=0;i<1;f[0]=()=>i,i++){switch(state){case a[0]:-0;continue;}break;}f[0]();",
+    ];
+    script_runtime_equivalence(&sources, "reaching-heap-dispatch", false)
+}
+
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_observation_coverage_runtime_equivalence() -> Result<()> {
+    let sources = [
+        "function f(target){for(let i=0;i<2;){let a=i===0?[0]:target;let b=[i];i=i+(a[0]=b[0],1);}}let t=[0];f(t);t[0];",
+        "function f(target){for(let i=0;i<2;){let a=i===0?[0]:target;let b=[i];i=i+(a[0]+=b[0],1);}}let t=[7];f(t);t[0];",
+        "function f(target){for(let i=0;i<2;){let a=i===0?[0]:target;let b=[i];i=i+(a[0]=(()=>{let c=[i];return c[0];})(),1);}}let t=[0];f(t);t[0];",
+        "function f(target){for(let i=0;i<2;){let a=i===0?[0]:target;let b=[i];i=i+(a[0]=b[0],1);}}let t={set 0(v){events.push(v);}};f(t);events;",
+    ];
+    script_runtime_equivalence(&sources, "observation-coverage", false)
+}
+
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_reference_construction_runtime_equivalence() -> Result<()> {
+    let source = fixture("reference-identity-table-sync.js")?;
+    let (builder, _) = source
+        .split_once("var trace")
+        .context("reference fixture builder")?;
+    let preinit = format!(
+        "try{{console.log(S[0][0]===S[4][0]);}}catch(e){{console.log(e.name);}}\n{builder}"
+    );
+    let constructor = format!("var replacement=[];var Array=function(){{return replacement;}};\n{builder}\nconsole.log(S[0][0]===S[0][1]);");
+    script_runtime_equivalence(&[&preinit, &constructor], "reference-construction", false)
+}
 
 #[test]
 #[ignore = "requires Node; semantic CI invokes explicitly"]
@@ -1568,8 +1615,8 @@ fn depythonify_safe_deob_generated_runtime_equivalence() -> Result<()> {
         ("pure_function_eval", 1),
         ("remove_unused_proven_helper", 1),
         ("selector_dispatch_specialize", 2),
-        ("reference_identity_compare", 4),
-        ("reference_state_unflatten", 1),
+        ("reaching_heap_compare", 2),
+        ("reaching_heap_dispatch", 1),
         ("ordered_switch_unflatten", 1),
         ("dispatch_switch_structured", 2),
         ("arithmetic_state_unflatten", 1),

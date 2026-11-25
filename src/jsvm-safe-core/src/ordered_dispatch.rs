@@ -67,7 +67,7 @@ fn dispatch_switch<'a>(
     let Statement::BlockStatement(block) = body else {
         return None;
     };
-    let [Statement::SwitchStatement(switch), Statement::BreakStatement(tail)] =
+    let [.., Statement::SwitchStatement(switch), Statement::BreakStatement(tail)] =
         block.body.as_slice()
     else {
         return None;
@@ -313,6 +313,12 @@ impl Collector<'_, '_> {
         it: &ForStatement<'_>,
         switch: &SwitchStatement<'_>,
     ) -> Option<PrivateDispatchEnvironment<'_>> {
+        let Statement::BlockStatement(body) = &it.body else {
+            return None;
+        };
+        if body.body.len() != 2 {
+            return None;
+        }
         let Some(ForStatementInit::VariableDeclaration(init)) = &it.init else {
             return None;
         };

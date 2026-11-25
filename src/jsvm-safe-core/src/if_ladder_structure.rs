@@ -5328,6 +5328,23 @@ impl<'a> Visit<'a> for HoistedVars {
     fn visit_class(&mut self, _: &oxc_ast::ast::Class<'a>) {}
 }
 
+/// Retain function-scoped bindings from unreachable source regions.
+pub fn hoisted_var_declarations(body: &Statement<'_>) -> Option<String> {
+    let mut hoisted = HoistedVars::default();
+    hoisted.visit_statement(body);
+    if hoisted.unsupported || hoisted.function_declaration {
+        return None;
+    }
+    Some(if hoisted.names.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "var {};\n",
+            hoisted.names.into_iter().collect::<Vec<_>>().join(", ")
+        )
+    })
+}
+
 /// Source loop Completion values, retained by the bounded (state, V) proof.
 /// Exit routes sharing a state and Completion class have the same output
 /// unless they carry Empty from distinct incoming accumulator values.
@@ -5512,19 +5529,7 @@ fn reconstruct_state_loop(
         fuel: 4096,
     };
     let code = emitter.walk(initial, exit)?;
-    let mut hoisted = HoistedVars::default();
-    hoisted.visit_statement(body);
-    if hoisted.unsupported || hoisted.function_declaration {
-        return None;
-    }
-    let declarations = if hoisted.names.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "var {};\n",
-            hoisted.names.into_iter().collect::<Vec<_>>().join(", ")
-        )
-    };
+    let declarations = hoisted_var_declarations(body)?;
     Some(format!(
         "{{\n{initial_text}\n{declarations}{code}{suffix}\n}}"
     ))
