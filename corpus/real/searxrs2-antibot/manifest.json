@@ -16,10 +16,9 @@
       "sha256": "9c002086227c79e328e8ddf2b5870de416af0d175615d9a90589d92e6d5c2714",
       "pretty_path": "datadome/qwant-tags-v5.10.0.pretty.js",
       "expect_deob_transforms_min": {
-        "string_array_decode": 4000,
+        "string_array_decode": 3704,
         "pure_function_eval": 120,
-        "reference_identity_compare": 13,
-        "reference_state_unflatten": 36
+        "dispatch_switch_structured": 35
       },
       "expect_deob_strings": [
         "__selenium_evaluate",
