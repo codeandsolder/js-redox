@@ -71,8 +71,8 @@ mkdir -p "$canonical"
 # deleting its disposable scratch target. Prefer that durable mirror after Cargo
 # returns, while retaining the scratch path as a fallback for older wrappers.
 bins=(
-  jsvm-lift reduce signature roles normalize disasm ir table-signature table-ir
-  switch-ir deobfuscate-safe capture-import capture-project js-format js-refs bundle-unpack
+  jsvm-lift reduce signature roles normalize disasm ir table-signature vm-ir
+  deobfuscate-safe capture-import capture-project js-format js-refs bundle-unpack
   source-materialize source-graph trace-explain lazy-cell-explain source-surface static-entrypoints bundle-materialize vm-materialize wasm-materialize wasm-resource-provenance project-readme
   sourcemaps sus-scan wasm-redox fresh-eval wasm-import-semantics
   api-surface static-string-recover static-byte-artifacts

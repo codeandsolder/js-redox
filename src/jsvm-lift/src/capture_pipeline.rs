@@ -1,8 +1,9 @@
 use crate::{
-    analysis_budget::AnalysisBudgets,
+    analysis_budget::{AnalysisBudgets, AnalysisOperation},
     bundle_materialize::{materialize_bundle_modules, BundleMaterializeSummary},
-    capture_import::{import_capture_project, CaptureImportOptions, CaptureImportSummary},
-    capture_project::{read_manifest, MANIFEST_NAME},
+    capture_import::{prepare_capture_project, CaptureImportOptions, CaptureImportSummary},
+    capture_project::{read_manifest, write_manifest, MANIFEST_NAME},
+    http_capture::HttpCaptureSummary,
     invocation_views::materialize_invocation_views,
     observed_runtime::{materialize_observed_runtime_sources, ObservedSourceSummary},
     project_api_surface::analyze_project_api_surface,
@@ -18,8 +19,8 @@ use crate::{
     wasm_materialize::{materialize_wasm, WasmMaterializeSummary},
     wasm_resource_provenance::{correlate_wasm_resource_provenance, WasmResourceProvenanceSummary},
 };
-use anyhow::Result;
-use std::path::PathBuf;
+use anyhow::{ensure, Result};
+use std::path::{Path, PathBuf};
 
 /// Source reconstruction stages form a dependency chain: bundle recovery
 /// requires the safe deobfuscation output.
@@ -49,9 +50,17 @@ pub struct CaptureStages {
     pub vm_scan: bool,
 }
 
+/// Original HTTP acquisition provenance for a HAR prepared by the URL capture driver.
+#[derive(Debug, Clone)]
+pub struct HttpCaptureProvenance {
+    pub requested_url: String,
+    pub summary: HttpCaptureSummary,
+}
+
 #[derive(Debug, Clone)]
 pub struct CapturePipelineOptions {
     pub input: PathBuf,
+    pub http_capture: Option<HttpCaptureProvenance>,
     pub output: PathBuf,
     pub assets_dir: Option<PathBuf>,
     pub overwrite: bool,
@@ -88,7 +97,7 @@ pub struct CapturePipelineSummary {
 /// Propagates capture import, project artifact read/write, subordinate
 /// analysis and resource-budget failures.
 pub fn recover_capture_project(options: &CapturePipelineOptions) -> Result<CapturePipelineSummary> {
-    let import = import_capture_project(
+    let (staged, import) = prepare_capture_project(
         &CaptureImportOptions {
             input: options.input.clone(),
             output: options.output.clone(),
@@ -97,7 +106,51 @@ pub fn recover_capture_project(options: &CapturePipelineOptions) -> Result<Captu
         },
         &options.budgets,
     )?;
-    let project = &options.output;
+    if let Some(http) = &options.http_capture {
+        archive_http_capture(&options.input, staged.path(), http, &options.budgets)?;
+    }
+    let summary = recover_prepared_project(staged.path(), import, options)?;
+    options.budgets.root().checkpoint()?;
+    staged.publish()?;
+    Ok(summary)
+}
+
+fn archive_http_capture(
+    capture: &Path,
+    project: &Path,
+    http: &HttpCaptureProvenance,
+    budgets: &AnalysisBudgets,
+) -> Result<()> {
+    let manifest_path = project.join(MANIFEST_NAME);
+    let mut manifest = read_manifest(&manifest_path)?;
+    ensure!(
+        manifest.source.kind == "har",
+        "HTTP provenance requires a HAR capture"
+    );
+    let budget = budgets.operation(AnalysisOperation::CaptureImport, "HTTP archive");
+    let analysis = project.join("analysis");
+    crate::report_file::copy_snapshot(capture, &analysis.join("http-capture.har"), &budget)?;
+    crate::report_file::write_json(&analysis.join("http-static.json"), &http.summary)?;
+    manifest.source.kind = "http_static".into();
+    manifest.source.input.clone_from(&http.requested_url);
+    manifest.source.extra.extend([
+        (
+            "requested_url".into(),
+            http.summary.requested_url.clone().into(),
+        ),
+        ("final_url".into(), http.summary.final_url.clone().into()),
+        ("captured_har".into(), "analysis/http-capture.har".into()),
+        ("http_static".into(), serde_json::to_value(&http.summary)?),
+    ]);
+    budget.checkpoint()?;
+    write_manifest(&manifest_path, &manifest)
+}
+
+fn recover_prepared_project(
+    project: &Path,
+    import: CaptureImportSummary,
+    options: &CapturePipelineOptions,
+) -> Result<CapturePipelineSummary> {
     let manifest = read_manifest(&project.join(MANIFEST_NAME))?;
 
     let source = materialize_capture_source(project, options.jobs, &options.budgets)?;
@@ -197,13 +250,15 @@ mod tests {
             load_artifact, BUNDLES, GENERATED_RECOVERY, JSVM_INDEX, JS_REFERENCES, SOURCEMAPS,
             SOURCE_GRAPH,
         },
+        capture_import::import_capture_project,
         capture_project::read_manifest,
     };
     use anyhow::Context;
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use serde_json::{json, Value};
-    use std::{fs, path::Path};
+    use std::{collections::BTreeMap, fs, path::Path};
     use tempfile::TempDir;
+    use work_budget::{find_budget_exceeded, BudgetExceededKind, BudgetLimits};
 
     fn har_entry(url: &str, mime: &str, body: &[u8], binary: bool) -> Value {
         let content = if binary {
@@ -276,6 +331,7 @@ mod tests {
     fn vm_options(input: &Path, output: &Path) -> CapturePipelineOptions {
         CapturePipelineOptions {
             input: input.to_path_buf(),
+            http_capture: None,
             output: output.to_path_buf(),
             assets_dir: None,
             overwrite: false,
@@ -292,6 +348,7 @@ mod tests {
     fn static_options(input: &Path, output: &Path) -> CapturePipelineOptions {
         CapturePipelineOptions {
             input: input.to_path_buf(),
+            http_capture: None,
             output: output.to_path_buf(),
             assets_dir: None,
             overwrite: false,
@@ -357,6 +414,52 @@ mod tests {
         Ok(())
     }
 
+    fn verify_embedded_paths(report_path: &Path, rows: &Value) -> Result<()> {
+        use crate::report_file::{resolve_report_source, ReportPathBase};
+        for row in rows.as_array().context("embedded rows missing")? {
+            if let Some(path) = row["dump_path"].as_str() {
+                assert!(
+                    resolve_report_source(report_path, path, ReportPathBase::Project)?.is_file()
+                );
+            }
+            verify_embedded_paths(report_path, &row["embedded"])?;
+        }
+        Ok(())
+    }
+
+    fn verify_vm_report_paths(project: &Path, units: &[Value]) -> Result<()> {
+        use crate::report_file::{read_json, resolve_report_source, ReportPathBase};
+        for unit in units {
+            for (field, source_field) in [
+                ("report", "file"),
+                ("switch_ir", "source"),
+                ("table_ir", "source"),
+            ] {
+                let Some(path) = unit[field].as_str() else {
+                    continue;
+                };
+                let report_path = project.join(path);
+                let report: Value = read_json(&report_path, field)?;
+                let base: ReportPathBase = serde_json::from_value(report["path_base"].clone())?;
+                assert_eq!(base, ReportPathBase::Project);
+                let source = report[source_field]
+                    .as_str()
+                    .context("source reference missing")?;
+                let resolved = resolve_report_source(&report_path, source, base)?;
+                assert_eq!(
+                    crate::content_dedup::sha256_path(&resolved)?,
+                    unit["analysis_sha256"]
+                        .as_str()
+                        .context("source digest missing")?
+                );
+                if field == "report" {
+                    verify_embedded_paths(&report_path, &report["embedded"])?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn run_vm_fixture(
         name: &str,
         source: &str,
@@ -367,6 +470,9 @@ mod tests {
         let project = work.path().join("project");
         write_single_script_har(&har, name, source)?;
         let summary = recover_capture_project(&vm_options(&har, &project))?;
+        let relocated = work.path().join("relocated");
+        fs::rename(&project, &relocated)?;
+        let project = relocated;
         let scan = summary.vm_scan.context("VM scan summary missing")?;
         assert_eq!(scan.failures, 0, "{name}");
         let materialized = summary
@@ -399,6 +505,9 @@ mod tests {
         );
 
         let graph = artifact(&project, SOURCE_GRAPH)?;
+        assert_eq!(graph["project"], ".");
+        assert_no_staging_references(&project)?;
+        verify_vm_report_paths(&project, code_units)?;
         assertions(&project, &index, code_units, materialized, &graph)
     }
 
@@ -724,6 +833,177 @@ mod tests {
         let raw = serde_json::to_string(&fixture)?;
         fs::write(har, &raw)?;
         Ok(raw)
+    }
+
+    fn snapshot_tree(root: &Path) -> Result<BTreeMap<PathBuf, Option<Vec<u8>>>> {
+        let mut entries = BTreeMap::new();
+        let mut directories = vec![root.to_path_buf()];
+        while let Some(directory) = directories.pop() {
+            for entry in fs::read_dir(directory)? {
+                let entry = entry?;
+                let path = entry.path();
+                let relative = path.strip_prefix(root)?.to_path_buf();
+                if entry.file_type()?.is_dir() {
+                    entries.insert(relative, None);
+                    directories.push(path);
+                } else {
+                    assert!(entry.file_type()?.is_file());
+                    entries.insert(relative, Some(fs::read(path)?));
+                }
+            }
+        }
+        Ok(entries)
+    }
+
+    fn assert_no_staging_references(project: &Path) -> Result<()> {
+        for (path, contents) in snapshot_tree(project)? {
+            if let Some(contents) = contents {
+                assert!(
+                    !String::from_utf8_lossy(&contents).contains(".capture-project-"),
+                    "staging path leaked into {}",
+                    path.display()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn assert_no_staging_directories(root: &Path) -> Result<()> {
+        for entry in fs::read_dir(root)? {
+            assert!(!entry?
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".capture-project-"));
+        }
+        Ok(())
+    }
+
+    fn import_and_source_work(input: &Path, output: &Path) -> Result<u64> {
+        let budgets = AnalysisBudgets::new("calibration", BudgetLimits::work(u64::MAX));
+        let (staged, _) = prepare_capture_project(
+            &CaptureImportOptions {
+                input: input.to_path_buf(),
+                output: output.to_path_buf(),
+                assets_dir: None,
+                overwrite: false,
+            },
+            &budgets,
+        )?;
+        let summary = materialize_capture_source(staged.path(), Some(1), &budgets)?;
+        assert!(summary.javascript_units > 0);
+        let remaining = budgets
+            .root()
+            .remaining_work()
+            .context("work budget missing")?;
+        recover_project_sourcemaps(staged.path(), &budgets)?;
+        assert!(
+            budgets
+                .root()
+                .remaining_work()
+                .context("work budget missing")?
+                < remaining
+        );
+        Ok(u64::MAX - remaining)
+    }
+
+    #[test]
+    fn late_recovery_failure_preserves_previous_complete_project() -> Result<()> {
+        let work = TempDir::new()?;
+        let old_har = work.path().join("old.har");
+        let new_har = work.path().join("new.har");
+        let project = work.path().join("project");
+        write_single_script_har(&old_har, "old", "globalThis.old = true;")?;
+        recover_capture_project(&static_options(&old_har, &project))?;
+        let before = snapshot_tree(&project)?;
+
+        write_static_har_fixture(&new_har)?;
+        let allowance = import_and_source_work(&new_har, &work.path().join("calibration"))?;
+        let mut options = static_options(&new_har, &project);
+        options.overwrite = true;
+        options.jobs = Some(1);
+        options.budgets =
+            AnalysisBudgets::new("transaction failure", BudgetLimits::work(allowance));
+        let error = recover_capture_project(&options)
+            .err()
+            .context("sourcemap work must exhaust budget")?;
+        let exhausted =
+            find_budget_exceeded(error.as_ref()).context("expected budget exhaustion")?;
+        assert_eq!(exhausted.kind(), BudgetExceededKind::Work);
+        assert_eq!(exhausted.scope(), "transaction failure");
+        assert_eq!(snapshot_tree(&project)?, before);
+        assert_no_staging_directories(work.path())?;
+
+        options.budgets = AnalysisBudgets::standard("transaction retry");
+        recover_capture_project(&options)?;
+        assert_ne!(snapshot_tree(&project)?, before);
+        assert_no_staging_references(&project)?;
+        let manifest = read_manifest(&project.join(MANIFEST_NAME))?;
+        assert_eq!(
+            Path::new(&manifest.source.input).canonicalize()?,
+            new_har.canonicalize()?
+        );
+        assert_no_staging_directories(work.path())?;
+        Ok(())
+    }
+
+    #[test]
+    fn http_acquisition_provenance_is_part_of_the_published_project() -> Result<()> {
+        let work = TempDir::new()?;
+        let har = work.path().join("temporary-http.har");
+        let project = work.path().join("project");
+        write_single_script_har(&har, "http", "globalThis.http = true;")?;
+        let raw = fs::read(&har)?;
+        let mut options = static_options(&har, &project);
+        options.http_capture = Some(HttpCaptureProvenance {
+            requested_url: "https://fixture.invalid".into(),
+            summary: HttpCaptureSummary {
+                requested_url: "https://fixture.invalid/".into(),
+                final_url: "https://fixture.invalid/redirected".into(),
+                resources: 1,
+                failed_resources: 0,
+                bytes: 23,
+                pending_resources: 0,
+                warnings: Vec::new(),
+            },
+        });
+        recover_capture_project(&options)?;
+        fs::remove_file(&har)?;
+        let manifest = read_manifest(&project.join(MANIFEST_NAME))?;
+        assert_eq!(manifest.source.kind, "http_static");
+        assert_eq!(manifest.source.input, "https://fixture.invalid");
+        assert_eq!(
+            manifest.source.extra["final_url"],
+            "https://fixture.invalid/redirected"
+        );
+        let archived = manifest.source.extra["captured_har"]
+            .as_str()
+            .context("archived HAR reference missing")?;
+        assert_eq!(fs::read(project.join(archived))?, raw);
+        assert!(project.join("analysis/http-static.json").is_file());
+        assert!(fs::read_to_string(project.join("README.md"))?.contains("HTTP-only acquisition"));
+        assert_no_staging_references(&project)?;
+        assert_no_staging_directories(work.path())?;
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_rejects_overlap_with_inferred_saved_page_assets() -> Result<()> {
+        let work = TempDir::new()?;
+        let page = work.path().join("Page.html");
+        let assets = work.path().join("Page_files");
+        fs::create_dir(&assets)?;
+        fs::write(&page, "<script src=\"Page_files/asset.js\"></script>")?;
+        fs::write(assets.join("asset.js"), "globalThis.asset = true;")?;
+        let before = snapshot_tree(&assets)?;
+        let mut options = static_options(&page, &assets.join("project"));
+        options.overwrite = true;
+        let error = recover_capture_project(&options)
+            .err()
+            .context("inferred assets must be protected")?;
+        assert!(error.to_string().contains("overlaps capture input"));
+        assert_eq!(snapshot_tree(&assets)?, before);
+        assert_no_staging_directories(work.path())?;
+        Ok(())
     }
 
     #[test]

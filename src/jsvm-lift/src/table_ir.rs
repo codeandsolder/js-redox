@@ -718,12 +718,14 @@ pub fn materialize(
     source_path: &Path,
     scan_path: &Path,
     output_path: &Path,
+    project: Option<&Path>,
     budget: &WorkBudget,
 ) -> Result<()> {
     crate::semantic_ir::publish_report(
         source_path,
         scan_path,
         output_path,
+        project,
         budget,
         "jsvm-table-ir/v0",
         lift_table_vms,

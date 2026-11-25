@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser as ClapParser;
 use jsvm_lift::effect_shape::{analyze_effect, family_name, EffectShape};
-use jsvm_lift::pipeline::{read_jsonl, RoleAssignment, VmRoles};
+use jsvm_lift::pipeline::{read_json_records, RoleAssignment, VmRoles};
 use serde::Deserialize;
 
 use std::{
@@ -439,8 +439,8 @@ fn print_summary(output: &[VmRoles]) {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let vms: Vec<ReducedVm> = read_jsonl(&args.reduced)?;
-    let scans: Vec<ScanReport> = read_jsonl(&args.scan)?;
+    let vms: Vec<ReducedVm> = read_json_records(&args.reduced)?;
+    let scans: Vec<ScanReport> = read_json_records(&args.scan)?;
     let gt: GroundTruth = serde_json::from_str(
         &fs::read_to_string(&args.ground_truth)
             .with_context(|| format!("reading {}", args.ground_truth.display()))?,

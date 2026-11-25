@@ -50,19 +50,41 @@ pub struct NormalizedVm {
     pub opcodes: Vec<NormalizedOpcode>,
 }
 
-/// Read nonempty JSON Lines records as the requested deserializable type.
+/// Read a stream of JSON records (including a single pretty-printed report).
 ///
 /// # Errors
 ///
-/// Fails if the input cannot be read as UTF-8, or if a nonempty line cannot be decoded into `T`; the parse error includes the file and one-based line number.
-pub fn read_jsonl<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
+/// Fails if the input cannot be read as UTF-8 or a JSON record is malformed; the parse error includes the file and record number.
+pub fn read_json_records<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
     let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    text.lines()
+    serde_json::Deserializer::from_str(&text)
+        .into_iter::<T>()
         .enumerate()
-        .filter(|(_, line)| !line.trim().is_empty())
-        .map(|(index, line)| {
-            serde_json::from_str(line)
-                .with_context(|| format!("parsing {} line {}", path.display(), index + 1))
+        .map(|(index, result)| {
+            result.with_context(|| format!("parsing {} record {}", path.display(), index + 1))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn records_support_pretty_printed_and_compact_reports() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let path = workspace.path().join("reports.json");
+        fs::write(&path, "{\n  \"value\": 1\n}\n{\"value\":2}\n")?;
+        let values: Vec<serde_json::Value> = read_json_records(&path)?;
+        assert_eq!(
+            values,
+            vec![
+                serde_json::json!({"value": 1}),
+                serde_json::json!({"value": 2})
+            ]
+        );
+        fs::write(&path, "{\"value\":1}\n{")?;
+        assert!(read_json_records::<serde_json::Value>(&path).is_err());
+        Ok(())
+    }
 }

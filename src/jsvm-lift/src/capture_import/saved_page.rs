@@ -710,12 +710,12 @@ fn saved_page_manifest(
     Ok(manifest)
 }
 
-pub(super) fn import_saved_page(
+pub(super) fn prepare_saved_page(
     page: &Path,
     output: &Path,
     options: &SavedPageOptions,
     budget: &WorkBudget,
-) -> Result<SavedPageSummary> {
+) -> Result<(ProjectOutput, SavedPageSummary)> {
     budget.checkpoint()?;
     let page = page
         .canonicalize()
@@ -788,12 +788,13 @@ pub(super) fn import_saved_page(
     crate::capture_project::write_editor_settings(output)?;
 
     budget.checkpoint()?;
-    staged.publish()?;
-
-    Ok(SavedPageSummary {
-        resources: manifest.resources.len(),
-        script_records: manifest.inline_scripts.len(),
-    })
+    Ok((
+        staged,
+        SavedPageSummary {
+            resources: manifest.resources.len(),
+            script_records: manifest.inline_scripts.len(),
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -872,7 +873,7 @@ mod tests {
         fs::write(assets.join("script-001.js"), "const archived=1;")?;
         fs::write(&page, "<script>const inline=2;</script>")?;
         let output = root.path().join("project");
-        import_saved_page(
+        let (staged, _) = prepare_saved_page(
             &page,
             &output,
             &SavedPageOptions {
@@ -881,6 +882,7 @@ mod tests {
             },
             &WorkBudget::unlimited("archive collision fixture"),
         )?;
+        staged.publish()?;
         let manifest = crate::capture_project::load_manifest(&output)?;
         let asset = manifest.resources[1]["output_path"]
             .as_str()
@@ -944,11 +946,10 @@ mod tests {
         }
 
         let project = root.join("capture");
-        let budget = WorkBudget::new(
-            "saved-page-classification",
-            work_budget::BudgetLimits::unlimited(),
-        );
-        import_saved_page(&page, &project, &SavedPageOptions::default(), &budget)?;
+        let budget = WorkBudget::unlimited("saved-page-classification");
+        let (staged, _) =
+            prepare_saved_page(&page, &project, &SavedPageOptions::default(), &budget)?;
+        staged.publish()?;
         let manifest = crate::capture_project::load_manifest(&project)?;
         let resource = |name: &str| {
             manifest

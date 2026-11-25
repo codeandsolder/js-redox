@@ -125,31 +125,26 @@ fn run_string_recovery(
     }
     let budget = AnalysisOperation::StaticStringRecovery
         .under(parent_budget, canonical.source.display().to_string());
-    let outcome = match recover_static_strings(
-        &original,
-        canonical.source.display().to_string(),
-        *mode,
-        8,
-        &budget,
-    ) {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            let error = recoverable_unit_error(anyhow::Error::new(error))?;
-            return Ok(StringResult {
-                mode: *mode,
-                canonical_ordinal: canonical.ordinal,
-                canonical_raw_path: canonical.raw_path.clone(),
-                report_path: None,
-                exit: 1,
-                changed: false,
-                replacements: 0,
-                decoders: json!([]),
-                selected_path: canonical.source.clone(),
-                selected_sha: raw_sha.clone(),
-                error: Some(error.to_string()),
-            });
-        }
-    };
+    let outcome =
+        match recover_static_strings(&original, canonical.raw_path.clone(), *mode, 8, &budget) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let error = recoverable_unit_error(anyhow::Error::new(error))?;
+                return Ok(StringResult {
+                    mode: *mode,
+                    canonical_ordinal: canonical.ordinal,
+                    canonical_raw_path: canonical.raw_path.clone(),
+                    report_path: None,
+                    exit: 1,
+                    changed: false,
+                    replacements: 0,
+                    decoders: json!([]),
+                    selected_path: canonical.source.clone(),
+                    selected_sha: raw_sha.clone(),
+                    error: Some(error.to_string()),
+                });
+            }
+        };
     crate::report_file::write_text(&recovered, &outcome.source)
         .with_context(|| format!("writing {}", recovered.display()))?;
     write_json(&report, &outcome.report)?;

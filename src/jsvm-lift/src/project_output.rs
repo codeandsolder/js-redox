@@ -169,7 +169,7 @@ impl ProjectOutput {
         &self.staged
     }
 
-    /// Publish the validated import. Prefer an atomic exchange where the
+    /// Publish the validated project. Prefer an atomic exchange where the
     /// filesystem supports it; neither path promises crash durability.
     pub(crate) fn publish(self) -> Result<()> {
         validate_staged_directory(&self.staged).context("validating staged capture project")?;

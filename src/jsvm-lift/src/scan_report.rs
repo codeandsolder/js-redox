@@ -4,6 +4,7 @@ use crate::{
     dispatch::{DirectSwitchMapCandidate, HandlerTableCandidate},
     embedded::EmbeddedCodeCandidate,
     function_analysis::FunctionMetrics,
+    report_file::{project_relative_path, source_reference, ReportPathBase},
     safe_deob::SourceMode,
     scanner::scan_source_core,
     state_flatten::{IfLadderStateMachineCandidate, OpcodeMapCandidate, StateMachineCandidate},
@@ -42,6 +43,7 @@ pub struct EmbeddedScanReport {
 #[derive(Debug, Clone, Serialize)]
 pub struct ScanReport {
     pub file: String,
+    pub path_base: ReportPathBase,
     pub bytes: usize,
     pub diagnostics: usize,
     pub fatal_error: bool,
@@ -141,6 +143,7 @@ pub fn scan_source(
 
     Ok(ScanReport {
         file: input_label.into(),
+        path_base: ReportPathBase::Label,
         bytes: source.len(),
         diagnostics: core.diagnostics,
         fatal_error: core.fatal_error,
@@ -166,15 +169,32 @@ pub fn scan_source(
 /// # Errors
 ///
 /// Fails if the file cannot be read as UTF-8, or propagates budget exhaustion from the core scanner or recursive embedded analyses.
-pub fn scan_file(path: &Path, dump_dir: Option<&Path>, budget: &WorkBudget) -> Result<ScanReport> {
+pub fn scan_file(
+    path: &Path,
+    dump_dir: Option<&Path>,
+    project: Option<&Path>,
+    budget: &WorkBudget,
+) -> Result<ScanReport> {
     let source = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    scan_source(
-        &source,
-        path.display().to_string(),
-        dump_dir,
-        SourceMode::for_path(path),
-        budget,
-    )
+    let (path_base, label) = source_reference(project, path)?;
+    let mut report = scan_source(&source, label, dump_dir, SourceMode::for_path(path), budget)?;
+    report.path_base = path_base;
+    rebase_embedded_paths(&mut report.embedded, project)?;
+    Ok(report)
+}
+
+fn rebase_embedded_paths(rows: &mut [EmbeddedScanReport], project: Option<&Path>) -> Result<()> {
+    for row in rows {
+        if let Some(path) = row.dump_path.as_mut() {
+            *path = if let Some(project) = project {
+                project_relative_path(project, Path::new(path))?
+            } else {
+                source_reference(None, Path::new(path))?.1
+            };
+        }
+        rebase_embedded_paths(&mut row.embedded, project)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
