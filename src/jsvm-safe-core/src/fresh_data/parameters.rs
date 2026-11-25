@@ -5,10 +5,9 @@
 //! patterns use the ordinary heap lookup and enumerable-copy machinery.
 //! Array patterns require iterator proofs, not assumptions about intrinsics.
 use super::{
-    cells::CellId, heap::charge, AllocationKind, Analyzer, Environment, Evaluation, Fact, OwnData,
-    Value,
+    cells::CellId, heap::charge, patterns::ObjectPatternSource, AllocationKind, Analyzer,
+    Environment, Fact, OwnData, Value,
 };
-use crate::value_eval::literal_property_key;
 use oxc_ast::ast::{
     BindingPattern, Expression, FormalParameters, ObjectPattern, VariableDeclarationKind,
     VariableDeclarator,
@@ -18,7 +17,6 @@ use oxc_syntax::{
     scope::ScopeId,
     symbol::{SymbolFlags, SymbolId},
 };
-use std::collections::HashSet;
 
 fn pattern_has_expression(pattern: &BindingPattern<'_>) -> bool {
     match pattern {
@@ -74,7 +72,7 @@ impl Analyzer<'_, '_> {
 
     /// Unknown input may be undefined. Evaluate the initializer only on
     /// that alternative, then join its effects with the supplied-value path.
-    fn apply_default(
+    pub(super) fn apply_default(
         &mut self,
         value: Option<Fact>,
         initializer: &Expression<'_>,
@@ -132,58 +130,16 @@ impl Analyzer<'_, '_> {
         source: Option<&Fact>,
         environment: &mut Environment,
     ) -> Option<()> {
-        let mut excluded = HashSet::new();
-        let mut known_exclusions = true;
+        let mut source = ObjectPatternSource::new(source, pattern.rest.is_some());
         for property in &pattern.properties {
-            let key = if property.computed {
-                property
-                    .key
-                    .as_expression()
-                    .map_or_default(|key| self.key(key, environment))
-            } else {
-                literal_property_key(&property.key)
-                    .map_or_default(|key| Evaluation::primitive(Value::String(key), true))
-            };
-            if pattern.rest.is_some() {
-                if let Some(key) = key.primitive_value().map(Value::js_string) {
-                    self.heap_result(charge(self.budget, key.len()))?;
-                    excluded.insert(key);
-                } else {
-                    known_exclusions = false;
-                }
-            }
-            let receiver = source.map(|value| value.copy(self.budget)).transpose();
-            let receiver = self.heap_result(receiver)?;
-            let value = self
-                .member(
-                    Evaluation {
-                        fact: receiver,
-                        inert: true,
-                    },
-                    &key,
-                    environment,
-                )
-                .fact;
+            let key = self.pattern_key(&property.key, property.computed, environment);
+            source.record_key(self, &key)?;
+            let value = source.read(self, &key, environment)?.fact;
             self.bind_pattern(&property.value, value, environment)?;
         }
         if let Some(rest) = &pattern.rest {
-            let mut data = OwnData::new(AllocationKind::Ordinary);
-            let copied = if let Some(source) = source.filter(|_| known_exclusions) {
-                self.heap_result(data.spread_excluding(
-                    environment,
-                    source,
-                    &excluded,
-                    self.budget,
-                ))?
-            } else {
-                false
-            };
-            if !copied {
-                self.invalidate(environment);
-                self.heap_result(data.define_unknown_key(true, None, self.budget))?;
-            }
-            let rest_value = self.allocate(environment, data, copied).fact;
-            self.bind_pattern(&rest.argument, rest_value, environment)?;
+            let value = source.rest(self, environment)?.fact;
+            self.bind_pattern(&rest.argument, value, environment)?;
         }
         Some(())
     }
