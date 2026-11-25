@@ -7,8 +7,8 @@
 
 use crate::value_eval::{
     canonical_array_index, eval, eval_binary, eval_logical_left, eval_unary_value,
-    eval_with_resolver, identical_primitive_value, inert_literal_value,
-    strict_primitive_equal, string_literal_value, template_element_value, LogicalStep, Value,
+    eval_with_resolver, identical_primitive_value, inert_literal_value, strict_primitive_equal,
+    string_literal_value, template_element_value, LogicalStep, Value,
 };
 use crate::{
     binding_facts::BindingFacts, direct_identifier_name, fragment, ArithmeticStateProof, Collector,
