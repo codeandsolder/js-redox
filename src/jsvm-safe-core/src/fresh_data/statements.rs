@@ -71,7 +71,7 @@ impl Analyzer<'_, '_> {
             if flow.normal.is_some() {
                 self.invalidate(environment);
             }
-            for path in flow.abrupt.values_mut() {
+            for path in flow.abrupt.values_mut().flatten() {
                 self.invalidate(&mut path.environment);
             }
         }

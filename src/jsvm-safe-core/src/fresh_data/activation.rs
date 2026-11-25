@@ -334,12 +334,13 @@ impl<'ast> Analyzer<'_, 'ast> {
         &mut self,
         mut flow: super::flow::Flow,
         environment: &Environment,
+        entry: usize,
     ) -> Option<ReturnSummary> {
         use super::flow::{CompletionValue, Transfer};
         if flow.unproved {
             return None;
         }
-        let mut returned = flow.abrupt.remove(&Transfer::Return);
+        let mut returned = flow.abrupt.remove(&Transfer::Return).unwrap_or_default();
         // A function with no explicit return returns undefined regardless
         // of the last normal statement's completion value.
         if flow.normal.is_some() {
@@ -347,19 +348,19 @@ impl<'ast> Analyzer<'_, 'ast> {
                 value: CompletionValue::undefined(),
                 environment: environment.clone(),
             };
-            self.heap_result(super::flow::Path::accumulate(
-                &mut returned,
-                path,
-                self.budget,
-            ))?;
+            returned.push(path);
         }
         if flow.abrupt.keys().any(|kind| *kind != Transfer::Throw) {
             return None;
         }
-        let returned = returned?;
+        let mut returned = returned.into_iter();
+        let mut summary = returned.next()?;
+        for path in returned {
+            self.heap_result(summary.join_at_activation_exit(&path, entry, self.budget))?;
+        }
         Some(ReturnSummary {
-            value: self.heap_result(returned.value.into_fact(self.budget))?,
-            environment: returned.environment,
+            value: self.heap_result(summary.value.into_fact(self.budget))?,
+            environment: summary.environment,
         })
     }
 
@@ -637,8 +638,9 @@ impl<'ast> Analyzer<'_, 'ast> {
         }
         self.activation_fuel -= 1;
         let before_effect = self.opaque_generation;
+        let entry = self.next_identity;
         let mut candidate = environment.clone();
-        candidate.enter_activation(self.next_identity);
+        candidate.enter_activation(entry);
         let selected = activation.capture.as_ref().map_or_else(
             || Ok(Vec::new()),
             |(origin, _)| self.scope_instances.select(origin, self.budget),
@@ -658,7 +660,7 @@ impl<'ast> Analyzer<'_, 'ast> {
         };
         let summary = flow.and_then(|mut flow| {
             self.dispose_paths(disposes, &mut flow, &mut candidate);
-            self.summarize_activation(flow, &candidate)
+            self.summarize_activation(flow, &candidate, entry)
         });
         self.leave_instance(ticket, &mut candidate);
         self.activation_depth -= 1;

@@ -930,6 +930,12 @@ struct Reachability<'b> {
     budget: &'b WorkBudget,
 }
 
+struct ExitProjection<'a, 'b> {
+    entry: AllocationId,
+    left: &'a Reachability<'b>,
+    right: &'a Reachability<'b>,
+}
+
 impl<'b> Reachability<'b> {
     fn new(budget: &'b WorkBudget) -> Self {
         Self {
@@ -1195,29 +1201,42 @@ impl Environment {
         roots: impl Iterator<Item = InstanceId>,
         budget: &WorkBudget,
     ) -> Result<(), BudgetExceeded> {
+        let trace = self.trace_reachable(roots, self.collection_floor, None, budget)?;
+        self.retain_reachable(&trace, budget)
+    }
+
+    fn trace_reachable<'b>(
+        &self,
+        roots: impl Iterator<Item = InstanceId>,
+        floor: AllocationId,
+        value: Option<&Fact>,
+        budget: &'b WorkBudget,
+    ) -> Result<Reachability<'b>, BudgetExceeded> {
         let mut trace = Reachability::new(budget);
+        if let Some(value) = value {
+            trace.fact(value)?;
+        }
         for instance in roots {
             trace.charge(1)?;
             trace.mark_instance(instance);
         }
-        if self.collection_floor != 0 {
+        if floor != 0 {
             trace.charge(
                 self.allocations
                     .capacity()
                     .saturating_add(self.bindings.capacity()),
             )?;
             for &id in self.allocations.keys() {
-                if id < self.collection_floor {
+                if id < floor {
                     trace.mark(id);
                 }
             }
             for id in self.bindings.ids() {
-                if id < self.collection_floor {
+                if id < floor {
                     trace.mark_instance(id);
                 }
             }
         }
-        let mut live_allocations = 0usize;
         loop {
             if let Some(instance) = trace.pending_instances.pop() {
                 if let Some(cells) = self.bindings.instance(instance) {
@@ -1228,16 +1247,23 @@ impl Environment {
                 }
             } else if let Some(id) = trace.pending.pop() {
                 if let Some(data) = self.allocations.get(&id) {
-                    live_allocations += 1;
                     trace.object(data)?;
                 }
             } else {
                 break;
             }
         }
+        Ok(trace)
+    }
+
+    fn retain_reachable(
+        &mut self,
+        trace: &Reachability<'_>,
+        budget: &WorkBudget,
+    ) -> Result<(), BudgetExceeded> {
         self.bindings.retain(&trace.marked_instances, budget)?;
         charge(budget, self.allocations.capacity())?;
-        if live_allocations != self.allocations.len() {
+        if self.allocations.keys().any(|id| !trace.marked.contains(id)) {
             self.charge_allocation_copy(budget)?;
             Rc::make_mut(&mut self.allocations).retain(|id, _| trace.marked.contains(id));
         }
@@ -1268,7 +1294,7 @@ impl Environment {
         first_new: AllocationId,
         budget: &WorkBudget,
     ) -> Result<(), BudgetExceeded> {
-        self.join_paths(other, Some(first_new), budget)
+        self.join_paths(other, Some(first_new), None, budget)
     }
 
     /// Return paths may diverge at different points in a function or loop.
@@ -1279,25 +1305,65 @@ impl Environment {
         other: &Self,
         budget: &WorkBudget,
     ) -> Result<(), BudgetExceeded> {
-        self.join_paths(other, None, budget)
+        self.join_paths(other, None, None, budget)
+    }
+
+    /// Project each completed invocation onto every caller-held identity
+    /// and the returned value before joining. A local identity inaccessible
+    /// through all tracked roots on one path cannot contribute contents to
+    /// a read through a known reference on that path. Unknown edges remain
+    /// unknown (and effects through them still invalidate the heap).
+    ///
+    /// Keep all pre-call identities, including caller temporaries, and mark
+    /// referenced identities even when their descriptors were invalidated.
+    /// This distinguishes an inaccessible local allocation from a live
+    /// reference whose contents are unknown. Do not change birth history.
+    pub(super) fn join_activation_exits(
+        &mut self,
+        other: &Self,
+        left_value: Option<&Fact>,
+        right_value: Option<&Fact>,
+        entry: AllocationId,
+        budget: &WorkBudget,
+    ) -> Result<(), BudgetExceeded> {
+        let left = self.trace_reachable(std::iter::empty(), entry, left_value, budget)?;
+        let right = other.trace_reachable(std::iter::empty(), entry, right_value, budget)?;
+        self.retain_reachable(&left, budget)?;
+        let mut other = other.clone();
+        other.retain_reachable(&right, budget)?;
+        let projection = ExitProjection {
+            entry,
+            left: &left,
+            right: &right,
+        };
+        self.join_paths(&other, None, Some(projection), budget)
     }
 
     fn join_paths(
         &mut self,
         other: &Self,
         first_new: Option<AllocationId>,
+        projection: Option<ExitProjection<'_, '_>>,
         budget: &WorkBudget,
     ) -> Result<(), BudgetExceeded> {
         // A failed join is not a usable abstract state: its caller aborts
         // the analysis. Stop merging immediately at the first budget error.
         let left_origins = self.origins.as_ref();
         let right_origins = other.origins.as_ref();
-        let absent = |id, origins: Option<&IdentityOrigins>| {
-            first_new.map_or_else(
+        let absent = |id, origins: Option<&IdentityOrigins>, trace: Option<&Reachability<'_>>| {
+            trace.is_some_and(|trace| {
+                projection
+                    .as_ref()
+                    .is_some_and(|projection| id >= projection.entry)
+                    && !trace.marked.contains(&id)
+                    && !trace.marked_instances.contains(&id)
+            }) || first_new.map_or_else(
                 || origins.is_some_and(|history| !history.may_exist(id)),
                 |floor| id >= floor,
             )
         };
+        let absent_left = |id| absent(id, left_origins, projection.as_ref().map(|p| p.left));
+        let absent_right = |id| absent(id, right_origins, projection.as_ref().map(|p| p.right));
         if first_new.is_none() {
             charge(
                 budget,
@@ -1314,12 +1380,8 @@ impl Environment {
                     ),
             )?;
         }
-        self.bindings.join(
-            &other.bindings,
-            |id| absent(id, left_origins),
-            |id| absent(id, right_origins),
-            budget,
-        )?;
+        self.bindings
+            .join(&other.bindings, absent_left, absent_right, budget)?;
         if !Rc::ptr_eq(&self.allocations, &other.allocations) {
             self.charge_allocation_copy(budget)?;
             charge(
@@ -1335,7 +1397,7 @@ impl Environment {
                     return true;
                 }
                 let Some(right) = other.allocations.get(id) else {
-                    return absent(*id, right_origins);
+                    return absent_right(*id);
                 };
                 if !Rc::ptr_eq(data, right) {
                     failure = (|| {
@@ -1349,7 +1411,7 @@ impl Environment {
             });
             failure?;
             for (&id, data) in other.allocations.iter() {
-                if absent(id, left_origins) {
+                if absent_left(id) {
                     allocations.entry(id).or_insert_with(|| Rc::clone(data));
                 }
             }
@@ -1712,6 +1774,51 @@ mod tests {
             cleared.read(&Rc::from([5]), "x", &budget)?,
             Ok(Some(Fact::Primitive(Value::Number(7.0))))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn activation_exit_projection_distinguishes_unreachable_from_unknown(
+    ) -> Result<(), BudgetExceeded> {
+        let budget = WorkBudget::unlimited("activation-exit-projection");
+        let mut data = OwnData::new(AllocationKind::Ordinary);
+        data.define_data("x".into(), Some(Fact::Primitive(Value::Number(0.0))));
+        let mut base = Environment::new();
+        base.enter_activation(1);
+        let local = base.allocate(1, data.clone(), &budget)?;
+        let mut left = base.clone();
+        let mut right = base;
+        data.define_data("x".into(), Some(Fact::Primitive(Value::Number(7.0))));
+        let alternative = left.allocate(2, data, &budget)?;
+        assert!(right.write(
+            &Rc::from([1]),
+            "x",
+            Some(&Fact::Primitive(Value::Number(7.0))),
+            &budget
+        )?);
+
+        let mut projected = left.clone();
+        projected.join_activation_exits(&right, Some(&alternative), Some(&local), 1, &budget)?;
+        assert!(matches!(
+            projected.read(&Rc::from([1, 2]), "x", &budget)?,
+            Ok(Some(Fact::Primitive(Value::Number(7.0))))
+        ));
+
+        // A caller-held cell keeps the otherwise local object observable.
+        left.insert(cell(0), local.clone(), &budget)?;
+        right.insert(cell(0), local.clone(), &budget)?;
+        let mut escaped = left.clone();
+        escaped.join_activation_exits(&right, Some(&alternative), Some(&local), 1, &budget)?;
+        assert!(matches!(
+            escaped.read(&Rc::from([1]), "x", &budget)?,
+            Ok(None)
+        ));
+
+        // A known reference may outlive its invalidated descriptor.
+        // Projection must mark it even when no data entry remains.
+        left.clear();
+        left.join_activation_exits(&right, Some(&local), Some(&local), 1, &budget)?;
+        assert!(left.read(&Rc::from([1]), "x", &budget)?.is_err());
         Ok(())
     }
 

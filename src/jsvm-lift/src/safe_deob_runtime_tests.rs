@@ -994,6 +994,11 @@ fn depythonify_safe_deob_completion_paths_runtime_equivalence() -> Result<()> {
         "let f=()=>{let a=[0];while(true){a[0]=7;return a;}};let r=f();r[0];",
         "function outer(flag){function f(){let a=[0];for(let i=0;i<1;i++){if(flag)return [7];a[0]=7;}return a;}let r=f();return r[0];}[outer(true),outer(false)];",
         "function outer(flag){function f(){let a=[0];for(let i=0;i<1;i++){if(flag)return [9];a[0]=7;}return a;}let r=f();return r[0];}[outer(true),outer(false)];",
+        "function outer(flag){let escaped;let f=()=>{let a=[0];escaped=a;if(flag)return [7];a[0]=7;return a;};let r=f();return [r[0],escaped[0]];}[outer(true),outer(false)];",
+        "function outer(flag){let f=()=>{let a=[0];if(flag)return [7];a[0]=7;return a;};let r=f();return r[0];}[outer(true),outer(false)];",
+        "function outer(flag){let f=()=>{let a=[0],g=()=>a[0];if(flag)return ()=>7;a[0]=7;return g;};let g=f();let r=[g()];return r[0];}[outer(true),outer(false)];",
+        "function outer(flag){let a=[0];let f=()=>{if(flag)return [7];a[0]=7;return a;};let r=f();return [r[0],a[0]];}[outer(true),outer(false)];",
+
         "let g;for(let i=0;i<3;i++){if(i===1){g=()=>[i];continue;}}let r=g();r[0];",
         "let a=[7];while(true){try{break;}finally{a[0]=9;}}a[0];",
         "function f(flag){let a=[7];switch(flag){case 1:a[0]=9;}return a[0];}[f(1),f(2)];",

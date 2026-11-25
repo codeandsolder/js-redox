@@ -97,8 +97,10 @@ impl LoopRun {
             budget.consume(1)?;
             body.consume(label, environment, budget)?;
         }
-        if let Some(path) = body.abrupt.remove(&Transfer::Break(None)) {
-            Path::accumulate(&mut self.normal_exit, path, budget)?;
+        if let Some(paths) = body.abrupt.remove(&Transfer::Break(None)) {
+            for path in paths {
+                Path::accumulate(&mut self.normal_exit, path, budget)?;
+            }
         }
         self.flow.normal = body.normal.take();
         self.flow.merge_abrupt(body, budget)

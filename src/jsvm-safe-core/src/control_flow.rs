@@ -414,31 +414,30 @@ impl LoopControlDetector {
     }
 }
 
-impl<'a> Visit<'a> for LoopControlDetector {
-    fn visit_break_statement(&mut self, it: &oxc_ast::ast::BreakStatement<'a>) {
-        if let Some(label) = &it.label {
-            let jump = if self.labels.iter().any(|name| name == label.name.as_str()) {
+impl LoopControlDetector {
+    fn record_jump(&mut self, label: Option<&oxc_ast::ast::LabelIdentifier<'_>>, depth: usize) {
+        let jump = if let Some(label) = label {
+            if self.labels.iter().any(|name| name == label.name.as_str()) {
                 JumpSummary::InternalLabel
             } else {
                 JumpSummary::External
-            };
-            self.summary.jumps = std::mem::take(&mut self.summary.jumps).max(jump);
-        } else if self.break_depth == 0 {
-            self.summary.jumps = JumpSummary::External;
-        }
+            }
+        } else if depth == 0 {
+            JumpSummary::External
+        } else {
+            JumpSummary::None
+        };
+        self.summary.jumps = std::mem::take(&mut self.summary.jumps).max(jump);
+    }
+}
+
+impl<'a> Visit<'a> for LoopControlDetector {
+    fn visit_break_statement(&mut self, it: &oxc_ast::ast::BreakStatement<'a>) {
+        self.record_jump(it.label.as_ref(), self.break_depth);
     }
 
     fn visit_continue_statement(&mut self, it: &oxc_ast::ast::ContinueStatement<'a>) {
-        if let Some(label) = &it.label {
-            let jump = if self.labels.iter().any(|name| name == label.name.as_str()) {
-                JumpSummary::InternalLabel
-            } else {
-                JumpSummary::External
-            };
-            self.summary.jumps = std::mem::take(&mut self.summary.jumps).max(jump);
-        } else if self.continue_depth == 0 {
-            self.summary.jumps = JumpSummary::External;
-        }
+        self.record_jump(it.label.as_ref(), self.continue_depth);
     }
 
     fn visit_labeled_statement(&mut self, it: &oxc_ast::ast::LabeledStatement<'a>) {

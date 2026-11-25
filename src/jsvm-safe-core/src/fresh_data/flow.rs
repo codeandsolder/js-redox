@@ -5,7 +5,7 @@
 //! the caller; abrupt paths own their snapshots until their target consumes
 //! them. A value carried by a return is never reconstructed from the heap.
 use super::{Environment, Fact, Value};
-use std::{collections::HashMap, rc::Rc};
+use std::{collections::BTreeMap, rc::Rc};
 use work_budget::{BudgetExceeded, WorkBudget};
 
 #[derive(Clone)]
@@ -92,6 +92,15 @@ impl CompletionValue {
         }
     }
 
+    pub(super) fn known_fact(&self) -> Option<&Fact> {
+        match self {
+            Self::Value(NonEmpty::Known(fact)) | Self::MaybeEmpty(NonEmpty::Known(fact)) => {
+                Some(fact)
+            }
+            _ => None,
+        }
+    }
+
     pub(super) fn into_fact(self, budget: &WorkBudget) -> Result<Option<Fact>, BudgetExceeded> {
         match self {
             Self::Value(value) => value.into_fact(budget),
@@ -100,7 +109,7 @@ impl CompletionValue {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum Transfer {
     Break(Option<String>),
     Continue(Option<String>),
@@ -116,6 +125,24 @@ pub(super) struct Path {
 impl Path {
     pub(super) fn join(&mut self, other: &Self, budget: &WorkBudget) -> Result<(), BudgetExceeded> {
         self.environment.join_returns(&other.environment, budget)?;
+        self.value = std::mem::replace(&mut self.value, CompletionValue::Empty)
+            .join(&other.value, budget)?;
+        Ok(())
+    }
+
+    pub(super) fn join_at_activation_exit(
+        &mut self,
+        other: &Self,
+        entry: usize,
+        budget: &WorkBudget,
+    ) -> Result<(), BudgetExceeded> {
+        self.environment.join_activation_exits(
+            &other.environment,
+            self.value.known_fact(),
+            other.value.known_fact(),
+            entry,
+            budget,
+        )?;
         self.value = std::mem::replace(&mut self.value, CompletionValue::Empty)
             .join(&other.value, budget)?;
         Ok(())
@@ -137,7 +164,7 @@ impl Path {
 
 pub(super) struct Flow {
     pub(super) normal: Option<CompletionValue>,
-    pub(super) abrupt: HashMap<Transfer, Path>,
+    pub(super) abrupt: BTreeMap<Transfer, Vec<Path>>,
     pub(super) unproved: bool,
 }
 
@@ -145,7 +172,7 @@ impl Flow {
     pub(super) fn normal(value: CompletionValue) -> Self {
         Self {
             normal: Some(value),
-            abrupt: HashMap::new(),
+            abrupt: BTreeMap::new(),
             unproved: false,
         }
     }
@@ -161,12 +188,12 @@ impl Flow {
     ) -> Self {
         Self {
             normal: None,
-            abrupt: HashMap::from([(
+            abrupt: BTreeMap::from([(
                 kind,
-                Path {
+                vec![Path {
                     value,
                     environment: environment.clone(),
-                },
+                }],
             )]),
             unproved: false,
         }
@@ -185,15 +212,31 @@ impl Flow {
         budget: &WorkBudget,
     ) -> Result<(), BudgetExceeded> {
         self.unproved |= other.unproved;
-        for (kind, path) in other.abrupt {
-            budget.consume(1)?;
-            match self.abrupt.entry(kind) {
-                std::collections::hash_map::Entry::Occupied(mut entry) => {
-                    entry.get_mut().join(&path, budget)?;
+        for (kind, paths) in other.abrupt {
+            self.extend_abrupt(kind, paths, budget)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn extend_abrupt(
+        &mut self,
+        kind: Transfer,
+        mut incoming: Vec<Path>,
+        budget: &WorkBudget,
+    ) -> Result<(), BudgetExceeded> {
+        // Retain disjoint abrupt paths until their target consumes them.
+        // Bound snapshots per target, with an ordinary sound join on overflow.
+        const MAX_PATHS_PER_TARGET: usize = 64;
+        super::heap::charge(budget, incoming.len())?;
+        let paths = self.abrupt.entry(kind).or_default();
+        paths.append(&mut incoming);
+        if paths.len() > MAX_PATHS_PER_TARGET {
+            let mut pending = std::mem::take(paths).into_iter();
+            if let Some(mut joined) = pending.next() {
+                for path in pending {
+                    joined.join(&path, budget)?;
                 }
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    entry.insert(path);
-                }
+                paths.push(joined);
             }
         }
         Ok(())
@@ -209,7 +252,7 @@ impl Flow {
         if let Some(value) = self.normal.take() {
             self.normal = Some(value.update_empty(inherited, budget)?);
         }
-        for path in self.abrupt.values_mut() {
+        for path in self.abrupt.values_mut().flatten() {
             budget.consume(1)?;
             path.value = std::mem::replace(&mut path.value, CompletionValue::Empty)
                 .update_empty(inherited, budget)?;
@@ -218,7 +261,7 @@ impl Flow {
     }
 
     pub(super) fn restore_floor(&mut self, floor: usize) {
-        for path in self.abrupt.values_mut() {
+        for path in self.abrupt.values_mut().flatten() {
             path.environment.protect_before(floor);
         }
     }
@@ -231,10 +274,12 @@ impl Flow {
         environment: &mut Environment,
         budget: &WorkBudget,
     ) -> Result<(), BudgetExceeded> {
-        let Some(path) = self.abrupt.remove(kind) else {
-            return Ok(());
-        };
-        self.merge_normal(path, environment, budget)
+        if let Some(paths) = self.abrupt.remove(kind) {
+            for path in paths {
+                self.merge_normal(path, environment, budget)?;
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn merge_normal(
