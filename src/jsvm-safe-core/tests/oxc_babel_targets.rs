@@ -1,4 +1,4 @@
-//! Regression for oxc-project/oxc#29927; retain after removing the backport.
+//! Regression for oxc-project/oxc#29927; retain across Oxc fork upgrades.
 use oxc_compat::{BabelTargets, EngineTargets};
 use serde_json::json;
 
@@ -17,5 +17,8 @@ fn unsupported_babel_targets_are_not_silently_ignored() -> Result<(), serde_json
     }
     let supported: BabelTargets = serde_json::from_value(json!({"edge": "100"}))?;
     assert!(EngineTargets::try_from(supported).is_ok());
+    let disabled: BabelTargets =
+        serde_json::from_value(json!({"edge": "100", "esmodules": false}))?;
+    assert!(EngineTargets::try_from(disabled).is_ok());
     Ok(())
 }

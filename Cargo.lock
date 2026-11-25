@@ -569,7 +569,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e35d6e78f4cebb90e51d543db8fe41528851d6deeef6ef21ebd4bfdc1e784776"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1370,8 +1370,7 @@ dependencies = [
 [[package]]
 name = "oxc_allocator"
 version = "0.159.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aaf8c5fa53291fec5f52e179974cc58cd002e45eab0defdbdfb6b36a1809c9ef"
+source = "git+https://github.com/codeandsolder/oxc.git?rev=e06236d72ffefb736a9e68143c5a4807a576bef9#e06236d72ffefb736a9e68143c5a4807a576bef9"
 dependencies = [
  "allocator-api2",
  "hashbrown 0.17.1",
@@ -1382,8 +1381,7 @@ dependencies = [
 [[package]]
 name = "oxc_ast"
 version = "0.159.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc5ac049e885e553878688ca583184cc2b8de02177914328f59616e59ffc224f"
+source = "git+https://github.com/codeandsolder/oxc.git?rev=e06236d72ffefb736a9e68143c5a4807a576bef9#e06236d72ffefb736a9e68143c5a4807a576bef9"
 dependencies = [
  "bitflags",
  "oxc_allocator",
@@ -1400,8 +1398,7 @@ dependencies = [
 [[package]]
 name = "oxc_ast_macros"
 version = "0.159.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb36e1df5e540ebd898865ed79ffd8d8f9e06310521dc0d8e5b9cc4567fc6739"
+source = "git+https://github.com/codeandsolder/oxc.git?rev=e06236d72ffefb736a9e68143c5a4807a576bef9#e06236d72ffefb736a9e68143c5a4807a576bef9"
 dependencies = [
  "phf",
  "proc-macro2",
@@ -1412,8 +1409,7 @@ dependencies = [
 [[package]]
 name = "oxc_ast_visit"
 version = "0.159.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a019293646229f79954cf7c5d022a13324c84e1b874e8ce030c8e7c0a56e5b0f"
+source = "git+https://github.com/codeandsolder/oxc.git?rev=e06236d72ffefb736a9e68143c5a4807a576bef9#e06236d72ffefb736a9e68143c5a4807a576bef9"
 dependencies = [
  "oxc_allocator",
  "oxc_ast",
@@ -1424,8 +1420,7 @@ dependencies = [
 [[package]]
 name = "oxc_cfg"
 version = "0.159.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dca8f8a53fcab08fb93b87d349f6d4902cb8a6916cb147627aa299ecfc4614ab"
+source = "git+https://github.com/codeandsolder/oxc.git?rev=e06236d72ffefb736a9e68143c5a4807a576bef9#e06236d72ffefb736a9e68143c5a4807a576bef9"
 dependencies = [
  "bitflags",
  "itertools",
@@ -1438,8 +1433,7 @@ dependencies = [
 [[package]]
 name = "oxc_codegen"
 version = "0.159.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a56802bea7d890e3c36215a28efc7623390c67abb4011d0d7c0be4e63c4e7411"
+source = "git+https://github.com/codeandsolder/oxc.git?rev=e06236d72ffefb736a9e68143c5a4807a576bef9#e06236d72ffefb736a9e68143c5a4807a576bef9"
 dependencies = [
  "bitflags",
  "cow-utils",
@@ -1460,6 +1454,7 @@ dependencies = [
 [[package]]
 name = "oxc_compat"
 version = "0.159.0"
+source = "git+https://github.com/codeandsolder/oxc.git?rev=e06236d72ffefb736a9e68143c5a4807a576bef9#e06236d72ffefb736a9e68143c5a4807a576bef9"
 dependencies = [
  "cow-utils",
  "oxc-browserslist",
@@ -1471,14 +1466,12 @@ dependencies = [
 [[package]]
 name = "oxc_data_structures"
 version = "0.159.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8932e4c5ad3c6973548bf2f7750b778315012ecd7086617721d23f17b43e5a55"
+source = "git+https://github.com/codeandsolder/oxc.git?rev=e06236d72ffefb736a9e68143c5a4807a576bef9#e06236d72ffefb736a9e68143c5a4807a576bef9"
 
 [[package]]
 name = "oxc_diagnostics"
 version = "0.159.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "901588f26a8f1e7a0a8f7ebab60bf311bc9a1d22935e740a1b545c33b020f29f"
+source = "git+https://github.com/codeandsolder/oxc.git?rev=e06236d72ffefb736a9e68143c5a4807a576bef9#e06236d72ffefb736a9e68143c5a4807a576bef9"
 dependencies = [
  "bytecount",
  "cow-utils",
@@ -1495,8 +1488,7 @@ dependencies = [
 [[package]]
 name = "oxc_ecmascript"
 version = "0.159.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4127c1685ec3e85c34bcbe9b4055b1ce34bc0e2614c4bf5cf56c52a5424c7fc5"
+source = "git+https://github.com/codeandsolder/oxc.git?rev=e06236d72ffefb736a9e68143c5a4807a576bef9#e06236d72ffefb736a9e68143c5a4807a576bef9"
 dependencies = [
  "itoa",
  "memchr",
@@ -1516,8 +1508,7 @@ dependencies = [
 [[package]]
 name = "oxc_estree"
 version = "0.159.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "00c806bed591dc97e36678eeaaccb6e85ecc21766eaf6f8a77e7a261a4457a2c"
+source = "git+https://github.com/codeandsolder/oxc.git?rev=e06236d72ffefb736a9e68143c5a4807a576bef9#e06236d72ffefb736a9e68143c5a4807a576bef9"
 
 [[package]]
 name = "oxc_index"
@@ -1532,8 +1523,7 @@ dependencies = [
 [[package]]
 name = "oxc_parser"
 version = "0.159.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fd93cb9811da8634acfd28a864889d1bf68bce2c546a52372205afabd4a63e7"
+source = "git+https://github.com/codeandsolder/oxc.git?rev=e06236d72ffefb736a9e68143c5a4807a576bef9#e06236d72ffefb736a9e68143c5a4807a576bef9"
 dependencies = [
  "bitflags",
  "cow-utils",
@@ -1556,8 +1546,7 @@ dependencies = [
 [[package]]
 name = "oxc_regular_expression"
 version = "0.159.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c85fe16e0f852ba1b1085f08efec7b9d611ecaba1851ca6fecb7f91b09631714"
+source = "git+https://github.com/codeandsolder/oxc.git?rev=e06236d72ffefb736a9e68143c5a4807a576bef9#e06236d72ffefb736a9e68143c5a4807a576bef9"
 dependencies = [
  "bitflags",
  "oxc_allocator",
@@ -1574,6 +1563,7 @@ dependencies = [
 [[package]]
 name = "oxc_semantic"
 version = "0.159.0"
+source = "git+https://github.com/codeandsolder/oxc.git?rev=e06236d72ffefb736a9e68143c5a4807a576bef9#e06236d72ffefb736a9e68143c5a4807a576bef9"
 dependencies = [
  "itertools",
  "memchr",
@@ -1609,8 +1599,7 @@ dependencies = [
 [[package]]
 name = "oxc_span"
 version = "0.159.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a0bb9aed024358d262b9daab20b7aa7ae89b42946e549b52ff92ddfef033d0e1"
+source = "git+https://github.com/codeandsolder/oxc.git?rev=e06236d72ffefb736a9e68143c5a4807a576bef9#e06236d72ffefb736a9e68143c5a4807a576bef9"
 dependencies = [
  "oxc_allocator",
  "oxc_ast_macros",
@@ -1620,8 +1609,7 @@ dependencies = [
 [[package]]
 name = "oxc_str"
 version = "0.159.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b51303dd938569998ad07110fff48d76da59cfe47748a39833c4652424babb4"
+source = "git+https://github.com/codeandsolder/oxc.git?rev=e06236d72ffefb736a9e68143c5a4807a576bef9#e06236d72ffefb736a9e68143c5a4807a576bef9"
 dependencies = [
  "compact_str",
  "hashbrown 0.17.1",
@@ -1634,8 +1622,7 @@ dependencies = [
 [[package]]
 name = "oxc_syntax"
 version = "0.159.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6f832591474dac1e451b6619d9e9d6187f08445d9d73c47b331dedc34439eb81"
+source = "git+https://github.com/codeandsolder/oxc.git?rev=e06236d72ffefb736a9e68143c5a4807a576bef9#e06236d72ffefb736a9e68143c5a4807a576bef9"
 dependencies = [
  "bitflags",
  "cow-utils",
@@ -1832,7 +1819,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2018,7 +2005,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2075,7 +2062,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2381,7 +2368,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2889,7 +2876,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
