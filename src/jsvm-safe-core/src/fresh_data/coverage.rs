@@ -33,7 +33,7 @@ impl CoverageGaps {
         }
         // Account for the sort and subsequent binary searches before
         // constructing the interval index.
-        let width = usize::try_from(usize::BITS - count.leading_zeros()).unwrap_or(usize::MAX);
+        let width = usize::try_from(count.bit_width()).unwrap_or(usize::MAX);
         let units = count
             .saturating_add(observations)
             .saturating_mul(width.saturating_add(1));

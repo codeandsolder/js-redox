@@ -1384,8 +1384,13 @@ mod tests {
 
     #[test]
     fn unobserved_executions_invalidate_only_covered_facts() -> Result<(), BudgetExceeded> {
-        let source = "function f(target){for(let i=0;i<2;){let a=i===0?[0]:target;let b=[i];let c=[7];c[0];i=i+(a[0]=b[0],1);}}";
-        assert_eq!(reads(source)?, vec![("c[0]".into(), "7".into())]);
+        let source = "function f(target){let last;for(let i=0;i<2;){let a=i===0?[0]:target;let b=[i];let c=[7];c[0];i=i+(a[0]=b[0],1);last=[i];}return last[0];}";
+        // The post-loop read witnesses successful normal-exit simulation;
+        // rejecting the entire transaction would also lose this proof.
+        assert_eq!(
+            reads(source)?,
+            vec![("c[0]".into(), "7".into()), ("last[0]".into(), "2".into())]
+        );
 
         // An unknown compound GetValue can similarly hide the RHS.
         let compound = "function f(target){for(let i=0;i<2;){let a=i===0?[0]:{get x(){return target;}};let b=[i];i=i+(a[i===0?'0':'x']+=b[0],1);}}";
