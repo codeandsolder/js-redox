@@ -6443,6 +6443,7 @@ try{
     ];
 
     const STATEMENT_COMPOSITION_CASES: &[(&str, bool)] = &[
+        ("function f(value){let state=0;while(true)try{if(state==0){let value='inner';push(value);state=1;}else if(state==1)return value;}catch(error){throw error;}}f('outer');", false),
         // The numeric exit label is not an abrupt completion. Its guard
         // can execute effects and retarget the next iteration.
         ("let s;for(s=1;s!=9;)if(s==1){s=9;if(s==9){push('retarget');s=3;}}else if(s==3){push('third');s=9;}else if(s==9){s=9;}", true),

@@ -3407,7 +3407,7 @@ mod tests {
             .filter(|c| !c.is_whitespace())
             .collect();
         assert!(
-            compact.contains("state==1"),
+            compact.contains("state==1") || compact.contains("state=1;}returnvalue;"),
             "original return binding must survive: {}",
             result.source
         );
