@@ -13,13 +13,35 @@ use work_budget::{BudgetExceeded, WorkBudget};
 
 pub(super) type InstanceId = usize;
 
-#[derive(Clone, Copy)]
-pub(super) struct CellId {
-    pub(super) instance: InstanceId,
-    pub(super) symbol: SymbolId,
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum Binding {
+    Symbol(SymbolId),
+    This,
 }
 
-type InstanceCells = HashMap<SymbolId, Fact>;
+#[derive(Clone, Copy)]
+pub(super) struct CellId {
+    instance: InstanceId,
+    binding: Binding,
+}
+
+impl CellId {
+    pub(super) const fn symbol(instance: InstanceId, symbol: SymbolId) -> Self {
+        Self {
+            instance,
+            binding: Binding::Symbol(symbol),
+        }
+    }
+
+    pub(super) const fn receiver(instance: InstanceId) -> Self {
+        Self {
+            instance,
+            binding: Binding::This,
+        }
+    }
+}
+
+type InstanceCells = HashMap<Binding, Fact>;
 
 #[derive(Clone, Default)]
 pub(super) struct CellStore {
@@ -56,7 +78,7 @@ impl CellStore {
     }
 
     pub(super) fn get(&self, id: CellId) -> Option<&Fact> {
-        self.instances.get(&id.instance)?.get(&id.symbol)
+        self.instances.get(&id.instance)?.get(&id.binding)
     }
 
     pub(super) fn insert(
@@ -66,14 +88,14 @@ impl CellStore {
         budget: &WorkBudget,
     ) -> Result<(), BudgetExceeded> {
         self.mutable_instance(id.instance, budget)?
-            .insert(id.symbol, value);
+            .insert(id.binding, value);
         Ok(())
     }
 
     pub(super) fn remove(&mut self, id: CellId, budget: &WorkBudget) -> Result<(), BudgetExceeded> {
         if self.get(id).is_some() {
             self.mutable_instance(id.instance, budget)?
-                .remove(&id.symbol);
+                .remove(&id.binding);
         }
         Ok(())
     }

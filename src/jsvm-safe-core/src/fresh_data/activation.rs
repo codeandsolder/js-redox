@@ -1,9 +1,11 @@
 //! Local invocation proofs share the ordinary statement/heap interpreter.
 //! The call itself remains in the output; only reaching facts cross its exit.
-use super::{scope_instances::ClosureOrigin, Analyzer, Environment, Evaluation, Fact, Value};
+use super::{
+    cells::CellId, scope_instances::ClosureOrigin, Analyzer, Environment, Evaluation, Fact, Value,
+};
 use oxc_ast::ast::{
     ArrowFunctionBody, ArrowFunctionExpression, BindingPattern, CallExpression, Expression,
-    FormalParameters, Function, FunctionBody, FunctionType, Program, Statement,
+    FormalParameters, Function, FunctionBody, FunctionType, Program, Statement, ThisExpression,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::Scoping;
@@ -92,10 +94,12 @@ enum CallableNode<'a> {
 pub(super) struct CallableIndex<'a> {
     declarations: HashMap<SymbolId, &'a Function<'a>>,
     nodes: HashMap<ScopeId, CallableNode<'a>>,
+    this_owners: HashMap<u32, ScopeId>,
 }
 
 struct CallableCollector<'c, 'a> {
     functions: CallableIndex<'a>,
+    this_owner: Option<ScopeId>,
     budget: &'c WorkBudget,
     failure: Option<BudgetExceeded>,
 }
@@ -120,7 +124,33 @@ impl<'a> Visit<'a> for CallableCollector<'_, 'a> {
                 self.functions.declarations.insert(symbol, function);
             }
         }
+        let previous = std::mem::replace(&mut self.this_owner, function.scope_id.get());
         walk::walk_function(self, function, flags);
+        self.this_owner = previous;
+    }
+
+    fn visit_this_expression(&mut self, expression: &ThisExpression) {
+        if self.failure.is_some() {
+            return;
+        }
+        if let Err(error) = self.budget.consume(1) {
+            self.failure = Some(error);
+            return;
+        }
+        if let Some(owner) = self.this_owner {
+            self.functions
+                .this_owners
+                .insert(expression.span.start, owner);
+        }
+    }
+
+    fn visit_class(&mut self, class: &oxc_ast::ast::Class<'a>) {
+        // Field initializers and static blocks have their own this binding.
+        // A nested ordinary method establishes its own owner normally.
+        // Class evaluation itself is outside the current heap interpreter.
+        let previous = self.this_owner.take();
+        walk::walk_class(self, class);
+        self.this_owner = previous;
     }
 
     fn visit_arrow_function_expression(&mut self, function: &ArrowFunctionExpression<'a>) {
@@ -150,12 +180,18 @@ impl<'a> CallableIndex<'a> {
             functions: Self {
                 declarations: HashMap::new(),
                 nodes: HashMap::new(),
+                this_owners: HashMap::new(),
             },
+            this_owner: None,
             budget,
             failure: None,
         };
         collector.visit_program(program);
         collector.failure.map_or(Ok(collector.functions), Err)
+    }
+
+    pub(super) fn this_owner(&self, expression: &ThisExpression) -> Option<ScopeId> {
+        self.this_owners.get(&expression.span.start).copied()
     }
 
     fn get(&self, symbol: SymbolId) -> Option<&'a Function<'a>> {
@@ -168,6 +204,25 @@ enum Body<'a> {
     Expression(&'a Expression<'a>),
 }
 
+#[derive(Clone, Copy)]
+enum ThisMode {
+    Lexical,
+    Strict,
+    Sloppy,
+}
+
+impl ThisMode {
+    fn binding(self, receiver: Option<Fact>) -> Option<Fact> {
+        match self {
+            Self::Lexical => None,
+            Self::Strict => receiver,
+            // Non-null objects are passed unchanged. Boxing primitive
+            // receivers and the realm's global object remain unproved.
+            Self::Sloppy => receiver.filter(|fact| matches!(fact, Fact::Objects(_))),
+        }
+    }
+}
+
 struct Activation<'a> {
     scope: ScopeId,
     params: &'a FormalParameters<'a>,
@@ -175,6 +230,7 @@ struct Activation<'a> {
     reflective: bool,
     publish_context: bool,
     self_binding: Option<SymbolId>,
+    this_mode: ThisMode,
     capture: Option<(ClosureOrigin, Fact)>,
 }
 
@@ -192,6 +248,7 @@ impl<'a> Activation<'a> {
                 reflective: false,
                 publish_context,
                 self_binding: None,
+                this_mode: ThisMode::Lexical,
                 capture: None,
             },
             CallableNode::Arrow(_) => return None,
@@ -225,6 +282,11 @@ impl<'a> Activation<'a> {
             // reflection is an ordinary effect barrier, not a reason to
             // discard an otherwise proved normal return summary.
             reflective: publish_context && !scoping.scope_flags(scope).is_strict_mode(),
+            this_mode: if scoping.scope_flags(scope).is_strict_mode() {
+                ThisMode::Strict
+            } else {
+                ThisMode::Sloppy
+            },
             publish_context,
             self_binding: (function.r#type == FunctionType::FunctionExpression)
                 .then(|| function.id.as_ref().and_then(|id| id.symbol_id.get()))
@@ -294,8 +356,17 @@ impl<'ast> Analyzer<'_, 'ast> {
         &mut self,
         activation: &Activation<'_>,
         arguments: Vec<Option<Fact>>,
+        receiver: Option<Fact>,
         environment: &mut Environment,
     ) -> Option<()> {
+        if let Some(receiver) = activation.this_mode.binding(receiver) {
+            let instance = self.scope_instances.get(activation.scope)?;
+            self.heap_result(environment.insert(
+                CellId::receiver(instance),
+                receiver,
+                self.budget,
+            ))?;
+        }
         let cells = self.scoping.get_bindings(activation.scope).len();
         self.heap_result(
             self.budget
@@ -358,9 +429,10 @@ impl<'ast> Analyzer<'_, 'ast> {
         &mut self,
         activation: &Activation<'_>,
         arguments: Vec<Option<Fact>>,
+        receiver: Option<Fact>,
         environment: &mut Environment,
     ) -> Option<ReturnSummary> {
-        self.initialize_activation(activation, arguments, environment)?;
+        self.initialize_activation(activation, arguments, receiver, environment)?;
         match activation.body {
             Body::Expression(expression) => {
                 let result = self.expression(expression, environment);
@@ -453,8 +525,10 @@ impl<'ast> Analyzer<'_, 'ast> {
             self.arguments(&call.arguments, environment);
             return self.barrier(environment);
         }
+        let mut receiver = Some(Fact::Primitive(Value::Undefined));
         let resolved = self.direct_activation(call).or_else(|| {
-            let callee = self.expression(&call.callee, environment);
+            let (callee, this_arg) = self.evaluate_callee(&call.callee, environment);
+            receiver = this_arg;
             callee
                 .fact
                 .as_ref()
@@ -499,13 +573,14 @@ impl<'ast> Analyzer<'_, 'ast> {
                 }
             }
         }
-        self.run_activation(&activation, arguments, environment)
+        self.run_activation(&activation, arguments, receiver, environment)
     }
 
     fn run_activation(
         &mut self,
         activation: &Activation<'_>,
         arguments: Vec<Option<Fact>>,
+        receiver: Option<Fact>,
         environment: &mut Environment,
     ) -> Evaluation {
         const MAX_ACTIVATIONS: usize = 256;
@@ -535,7 +610,7 @@ impl<'ast> Analyzer<'_, 'ast> {
         self.activation_depth += 1;
         let ticket = self.enter_instance(Some(activation.scope), &mut candidate);
         let summary = if ticket.is_some() {
-            self.execute_activation(activation, arguments, &mut candidate)
+            self.execute_activation(activation, arguments, receiver, &mut candidate)
         } else {
             None
         };

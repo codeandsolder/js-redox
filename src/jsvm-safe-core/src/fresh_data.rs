@@ -363,7 +363,7 @@ impl Analyzer<'_, '_> {
         let instance = self
             .scope_instances
             .get(self.scoping.symbol_scope_id(symbol))?;
-        Some(CellId { instance, symbol })
+        Some(CellId::symbol(instance, symbol))
     }
 
     fn identifier(
@@ -998,6 +998,15 @@ impl Analyzer<'_, '_> {
         environment: &mut Environment,
     ) -> Evaluation {
         let evaluation = self.evaluate_expression(expression, environment);
+        self.observe_expression(expression, evaluation, environment)
+    }
+
+    fn observe_expression(
+        &mut self,
+        expression: &Expression<'_>,
+        evaluation: Evaluation,
+        environment: &mut Environment,
+    ) -> Evaluation {
         let member = expression.is_member_expression();
         let comparison = matches!(expression, Expression::BinaryExpression(binary)
             if matches!(binary.operator.as_str(), "==" | "!=" | "===" | "!=="));
@@ -1029,6 +1038,59 @@ impl Analyzer<'_, '_> {
         evaluation
     }
 
+    /// `GetValue` on a callee retains its reference receiver until after
+    /// argument evaluation. Parentheses preserve a reference; sequences,
+    /// assignments and conditional expressions produce ordinary values.
+    fn evaluate_callee(
+        &mut self,
+        callee: &Expression<'_>,
+        environment: &mut Environment,
+    ) -> (Evaluation, Option<Fact>) {
+        let callee = callee.without_parentheses();
+        let Some(member) = callee.as_member_expression() else {
+            return (
+                self.expression(callee, environment),
+                Some(Fact::Primitive(Value::Undefined)),
+            );
+        };
+        let Some((object, key)) = self.member_components(member, environment) else {
+            self.unobserved(callee.span());
+            return (self.barrier(environment), None);
+        };
+        let receiver = object
+            .fact
+            .as_ref()
+            .and_then(|fact| self.heap_result(fact.copy(self.budget)));
+        let evaluation = self.member(object, &key, environment);
+        (
+            self.observe_expression(callee, evaluation, environment),
+            receiver,
+        )
+    }
+
+    fn this_expression(
+        &mut self,
+        expression: &oxc_ast::ast::ThisExpression,
+        environment: &mut Environment,
+    ) -> Evaluation {
+        let Some(instance) = self
+            .callables
+            .this_owner(expression)
+            .and_then(|owner| self.scope_instances.get(owner))
+        else {
+            return self.barrier(environment);
+        };
+        let Some(Some(fact)) =
+            self.heap_result(environment.read_binding(CellId::receiver(instance), self.budget))
+        else {
+            return self.barrier(environment);
+        };
+        Evaluation {
+            fact: Some(fact),
+            inert: true,
+        }
+    }
+
     fn evaluate_expression(
         &mut self,
         expression: &Expression<'_>,
@@ -1039,6 +1101,7 @@ impl Analyzer<'_, '_> {
         }
         match expression {
             Expression::Identifier(identifier) => self.identifier(identifier, environment),
+            Expression::ThisExpression(expression) => self.this_expression(expression, environment),
             Expression::ParenthesizedExpression(paren) => {
                 self.expression(&paren.expression, environment)
             }
@@ -1830,6 +1893,46 @@ mod tests {
     }
 
     #[test]
+    fn receiver_bindings_follow_ordered_call_references() -> Result<(), BudgetExceeded> {
+        for (source, expected) in [
+            ("let o={x:7,f:function(){return [this.x]}};let a=o.f();a[0];", vec![("a[0]", "7")]),
+            ("let o={x:7,f(){return [this.x]}};let a=o.f();a[0];", vec![("a[0]", "7")]),
+            ("let o={x:7,f(){this.x++;return this;}};let a=o.f();a.x;o.x;", vec![("a.x", "8"),("o.x", "8")]),
+            ("let o={x:7,f(){return [this.x]}};let a=o.f((o={x: 9},0));a[0];", vec![("a[0]", "7")]),
+            ("let o={x:7,f(){return [this.x]}};let a=o[(o={x: 9},'f')]();a[0];", vec![("a[0]", "7")]),
+            ("let o={x:7,f(){return [this.x]}};let a=(o.f)();a[0];", vec![("a[0]", "7")]),
+            ("let f=function(){'use strict';return [this===void 0]};let a=f();a[0];", vec![("a[0]", "true")]),
+            ("let o={x:7,f(){'use strict';return [this===void 0]}};let a=(0,o.f)();a[0];", vec![("a[0]", "true")]),
+            ("let o={x:7,f(){return [this.x]}};let a=(0,o.f)();a[0];", vec![]),
+            ("let o={x:7,f(){return [this.x]}};let p={x:9,f:o.f};let a=o.f(),b=p.f();a[0];b[0];", vec![("a[0]", "7"),("b[0]", "9")]),
+            ("let o={x:7,f(){return [this.x]}};let a=o.f((o.x=9,0));a[0];", vec![("a[0]", "9")]),
+            ("let o={x:7,f(){return [this.x]}};let a=o.f(unknown());a[0];", vec![]),
+            ("let o={x:7,f(){'use strict';let g=function(){return [this===void 0]};return g();}};let a=o.f();a[0];", vec![("a[0]", "true")]),
+        ] {
+            let expected = expected.into_iter().map(|(source, value)| (source.to_owned(),value.to_owned())).collect::<Vec<_>>();
+            assert_eq!(reads(source)?, expected, "{source}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn escaped_arrows_keep_lexical_receivers_not_call_receivers() -> Result<(), BudgetExceeded> {
+        for (source, expected) in [
+            ("let o={x:7,f(){return ()=>[this.x]}};let g=o.f();o.x=9;let a=g();a[0];", vec![("a[0]", "9")]),
+            ("let o={x:7,f(){return {x:9,g:()=>[this.x]}}};let p=o.f();let a=p.g();a[0];", vec![("a[0]", "7")]),
+            ("let o={x:7,f(){return ()=>[this.x]}};let p={x:9,f:o.f};let g=o.f(),h=p.f();let a=g(),b=h();a[0];b[0];", vec![("a[0]", "7"),("b[0]", "9")]),
+            ("let o={x:7,f(){return ()=>[this.x]}};let g=o.f();o={x: 9};for(let i=0;i<256;i++){let a=[i];}let a=g();a[0];", vec![("a[0]", "7")]),
+            ("let o={x:7,f(){return [()=>this.x,()=>{this.x=9}]}};let p=o.f();p[1]();let a=[p[0]()];a[0];", vec![("a[0]", "9")]),
+            ("let o={x:7,f(){return ()=>[this.x]}};let g=o.f();unknown(g);let a=g();a[0];", vec![]),
+            ("let o={x:7,f:()=>[this.x]};let a=o.f();a[0];", vec![]),
+        ] {
+            let expected = expected.into_iter().map(|(source,value)| (source.to_owned(), value.to_owned())).collect::<Vec<_>>();
+            assert_eq!(reads(source)?, expected, "{source}");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn hoisted_callable_cells_follow_aliases_and_declaration_instances(
     ) -> Result<(), BudgetExceeded> {
         for (source, expected) in [
@@ -2088,7 +2191,7 @@ mod tests {
         );
         assert_eq!(reads(&source)?, vec![("holder.x".into(), "7".into())]);
         let temporaries = "({ x:1 }),".repeat(256);
-        let source = format!("let a={{x:7}};let b=a; b.x=({temporaries}a={{x:9}},8);b.x;a.x;");
+        let source = format!("let a={{x:7}};let b=a; b.x=({temporaries}a={{x: 9}},8);b.x;a.x;");
         assert_eq!(
             reads(&source)?,
             vec![("b.x".into(), "8".into()), ("a.x".into(), "9".into())]
@@ -2204,7 +2307,7 @@ mod tests {
             ("let a=[7,8,9];a.length='1';a[0];a.length;",vec![("a[0]","7"),("a.length","1")]),
             ("let a=[7,8,9];delete a[1];a[0];a[2];a.length;",vec![("a[0]","7"),("a[2]","9"),("a.length","3")]),
             ("let a={x:null};a.x=a;a.x.x.x===a;a.x.x.x.x.x.x.x.x;",vec![]),
-            ("let a={x:7};let b={x:9};let c=true?a:b;c.x=8;a.x;b.x;",vec![("a.x","8"),("b.x","9")]),
+            ("let a={x:7};let b={x: 9};let c=true?a:b;c.x=8;a.x;b.x;",vec![("a.x","8"),("b.x","9")]),
             ("function f(flag){let a={x:7};let b={x:8};let c=flag?a:b;c.x=9;a.x;b.x;}",vec![]),
             ("function f(flag){let a={x:7,y:8};let b={x:7,y:9};let c=flag?a:b;c.x=9;c.y;a.y;b.y;}",vec![("a.y","8"),("b.y","9")]),
             ("function f(flag){let a={x:7};if(flag)a.x=9;else a.x=9;return a.x;}",vec![("a.x","9")]),
@@ -2256,7 +2359,7 @@ mod tests {
             ("function f(flag){let p={x:7};let a={__proto__:p};if(flag)a.x=7;a.x;}",vec![("a.x","7")]),
             ("function f(flag){let p={x:7};let a={__proto__:p,x:7};if(flag)delete a.x;a.x;}",vec![("a.x","7")]),
             ("function f(flag){let p=flag?{x:7}:{x:7};let a={__proto__:p};a.x;}",vec![("a.x","7")]),
-            ("function f(flag){let p=flag?{x:7}:{x:9};let a={__proto__:p};a.x;}",vec![]),
+            ("function f(flag){let p=flag?{x:7}:{x: 9};let a={__proto__:p};a.x;}",vec![]),
             ("function f(flag){let a={__proto__:null};let b={__proto__:null};let c=flag?a:b;c.x=7;c.x=9;}",vec![]),
             ("function f(k){let a={x:7,[k]:9};a.x=8;a.x;}",vec![("a.x","8")]),
             ("function f(k){let a={__proto__:null,[k]:9};a.x=8;a.x;}",vec![("a.x","8")]),

@@ -1337,10 +1337,7 @@ mod tests {
 
     const ROOT: InstanceId = 0;
     fn cell(index: usize) -> CellId {
-        CellId {
-            instance: ROOT,
-            symbol: SymbolId::new(index),
-        }
+        CellId::symbol(ROOT, SymbolId::new(index))
     }
 
     fn descriptor_shape(property: &Property) -> (u8, Option<String>) {
@@ -1418,18 +1415,9 @@ mod tests {
     #[test]
     fn instance_joins_preserve_births_and_copy_on_write_isolation() -> Result<(), BudgetExceeded> {
         let budget = WorkBudget::unlimited("instance-cell-join");
-        let first = CellId {
-            instance: 1,
-            symbol: SymbolId::new(0),
-        };
-        let second = CellId {
-            instance: 2,
-            ..first
-        };
-        let third = CellId {
-            instance: 3,
-            ..first
-        };
+        let first = CellId::symbol(1, SymbolId::new(0));
+        let second = CellId::symbol(2, SymbolId::new(0));
+        let third = CellId::symbol(3, SymbolId::new(0));
         let mut base = Environment::new();
         base.enter_activation(1);
         base.record_birth(1, &budget)?;
