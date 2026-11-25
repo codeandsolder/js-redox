@@ -8,11 +8,9 @@
 use crate::value_eval::{
     canonical_array_index, eval, eval_binary, eval_logical_left, eval_unary_value,
     eval_with_resolver, identical_primitive_value, inert_literal_value, strict_primitive_equal,
-    string_literal_value, template_element_value, LogicalStep, Value,
+    LogicalStep, Value,
 };
-use crate::{
-    binding_facts::BindingFacts, direct_identifier_name, fragment, ArithmeticStateProof, Collector,
-};
+use crate::{binding_facts::BindingFacts, fragment, ArithmeticStateProof, Collector};
 use oxc_ast::ast::{
     ArrayExpressionElement, BindingPattern, Expression, IdentifierReference, Statement,
     VariableDeclarationKind,
@@ -375,12 +373,6 @@ impl<'a> Visit<'a> for NameUseCollector {
     fn visit_identifier_reference(&mut self, it: &oxc_ast::ast::IdentifierReference<'a>) {
         self.names.insert(it.name.to_string());
     }
-}
-
-fn expression_mentions(expr: &Expression<'_>, name: &str) -> bool {
-    let mut collector = NameUseCollector::default();
-    collector.visit_expression(expr);
-    collector.names.contains(name)
 }
 
 fn statement_mentions(stmt: &Statement<'_>, name: &str) -> bool {
