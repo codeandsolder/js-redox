@@ -992,7 +992,7 @@ fn depythonify_safe_deob_parameter_environments_runtime_equivalence() -> Result<
         "let {x,y:z=9}={x:7,y:void 0};let a=[x,z];[a[0],a[1]];",
         "const {x,...r}={x:7,y:9};r.y;",
         "function outer(){var {x,...r}={x:7,y:9};return r.y;}outer();",
-        "var {x}={x:7};let r=[x];r[0];",
+        "var {x}={x: 7};let r=[x];r[0];",
         "let a={x:7,y:9};let {x:v,...r}=a;let b=[v,r.y];[b[0],b[1]];",
         "function outer(){let g=f;function f(){return [7]}function f(){return [9]}let r=g();return r[0];}outer();",
         "let f=(a=b,b=7)=>[a];try{f()}catch(e){events.push(e.name)}f(9)[0];",

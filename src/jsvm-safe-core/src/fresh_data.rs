@@ -2046,7 +2046,7 @@ mod tests {
                 "function outer(){var {x,...r}={x:7,y:9};return r.y;}",
                 vec![("r.y", "9")],
             ),
-            ("var {x}={x:7};let r=[x];r[0];", vec![]),
+            ("var {x}={x: 7};let r=[x];r[0];", vec![]),
             (
                 "let a={x:7,y:9};let {x:v,...r}=a;let b=[v,r.y];b[0];b[1];",
                 vec![("r.y", "9"), ("b[0]", "7"), ("b[1]", "9")],
