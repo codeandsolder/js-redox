@@ -946,10 +946,7 @@ mod tests {
         }
 
         let project = root.join("capture");
-        let budget = WorkBudget::new(
-            "saved-page-classification",
-            work_budget::BudgetLimits::unlimited(),
-        );
+        let budget = WorkBudget::unlimited("saved-page-classification");
         let (staged, _) =
             prepare_saved_page(&page, &project, &SavedPageOptions::default(), &budget)?;
         staged.publish()?;
