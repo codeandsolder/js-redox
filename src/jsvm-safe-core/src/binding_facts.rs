@@ -264,7 +264,7 @@ impl BindingFacts {
         self.resolve_scope(scoping, scope, Some(symbol)) == ReferenceIdentity::Lexical(symbol)
     }
 
-    /// Declarative bindings have no accessor-backed ResolveBinding step.
+    /// Declarative bindings have no accessor-backed `ResolveBinding` step.
     /// A script's object-backed global variables are not such bindings.
     pub(crate) fn has_declarative_storage(&self, scoping: &Scoping, symbol: SymbolId) -> bool {
         !self.ambient_root
