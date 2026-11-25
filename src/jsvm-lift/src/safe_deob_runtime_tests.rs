@@ -801,6 +801,31 @@ fn depythonify_safe_deob_script_completion_runtime_equivalence() -> Result<()> {
 
 #[test]
 #[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_selector_projection_runtime_equivalence() -> Result<()> {
+    let sources = [
+        "function outer(){let x=7;function f(s){if(s===0)return x;return 0;}function inner(){let x=9;return f(0);}return inner();}outer();",
+        "function outer(){let n=0;function f(s){if(++n&&s===1)return 1;if(s===0)return 2;return 3;}return [f(0),n];}outer();",
+        "function outer(){function f(s,s){if(s===0)return 1;if(s===1)return 2;return 3;}return f(0,1);}outer();",
+        "function f(s){if(s===0)return 1;return 2;}globalThis.f=()=>9;f(0);",
+        "function outer(){var a=42;function f(s){if(s===a)return 1;if(s===0)return 2;return 3;}eval('a=0');return f(0);}outer();",
+        "function outer(){function f(s,x,y){if(s===0)return (arguments[2]=9,y);return 0;}return f(0,1,2);}outer();",
+        "function outer(){function f(s,x){if(s===0)return x+1;return 0;}let obj={valueOf(){events.push('coercion');return 7}};return f(0,obj);}outer();",
+        "function outer(){function f(s,x,y){if(s===0)return x+1;return 0;}return f(0,7,events.push('arg'));}outer();",
+        "function outer(){function f(s,x){if(s===0)return (x=7,x);return 0;}return f(0,events.push('arg'));}outer();",
+        "function outer(){function f(s){if(s===0)return 1;return 2;function s(){}}return f(0);}outer();",
+        "var a=42;function outer(){function f(s){if(s===a)return 1;if(s===0)return 2;return 3;}globalThis.a=0;return f(0);}outer();",
+        "function outer(){let n=0;function f(s){if(s===0||++n)return 1;return 2;}return [f(0),n];}outer();",
+        "function outer(){function f(s,x,y,z){if(s===0)return x;return 0;}return f(0,7,events.push(1),events.push(2));}outer();",
+        "function outer(){function f(s,x){if(s===0)return x;return 0;}return f(0);}outer();",
+        "function outer(){function f(s,x){if(s===0)return x;return 0;}return f(0,void events.push(1));}outer();",
+        "function outer(a){var a=42;function f(s){if(s===a)return 1;if(s===0)return 2;return 3;}arguments[0]=0;return f(0);}outer(9);",
+        "function outer(){function f(s,x){if(s===0)return x===0;return 0;}return f(0,(events.push('arg'),-0));}outer();",
+    ];
+    script_runtime_equivalence(&sources, "selector-projection", false)
+}
+
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
 fn depythonify_safe_deob_scalar_helper_cells_runtime_equivalence() -> Result<()> {
     let sources = [
         "function outer(){function f(x){var y=x+1;return (x=9)+y;}return f(2);}outer();",

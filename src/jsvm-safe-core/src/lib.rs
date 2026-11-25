@@ -282,19 +282,18 @@ fn array_element(el: &ArrayExpressionElement<'_>) -> Option<Value> {
     }
 }
 
-#[derive(Default)]
-struct StableVarNumberCollector {
+struct StableVarNumberCollector<'c> {
+    scoping: &'c Scoping,
+    facts: &'c binding_facts::BindingFacts,
     candidates: HashMap<SymbolId, i64>,
 }
 
-impl<'a> Visit<'a> for StableVarNumberCollector {
+impl<'a> Visit<'a> for StableVarNumberCollector<'_> {
     fn visit_variable_declaration(&mut self, it: &oxc_ast::ast::VariableDeclaration<'a>) {
         if it.kind == VariableDeclarationKind::Var {
             for declaration in &it.declarations {
-                let BindingPattern::BindingIdentifier(id) = &declaration.id else {
-                    continue;
-                };
-                let Some(symbol) = id.symbol_id.get() else {
+                let Some(symbol) = self.facts.stable_var_initializer(self.scoping, declaration)
+                else {
                     continue;
                 };
                 let Some(init) = &declaration.init else {
@@ -316,12 +315,14 @@ impl<'a> Visit<'a> for StableVarNumberCollector {
 fn collect_stable_var_numbers(
     program: &oxc_ast::ast::Program<'_>,
     scoping: &Scoping,
+    facts: &binding_facts::BindingFacts,
 ) -> HashMap<SymbolId, i64> {
-    let mut collector = StableVarNumberCollector::default();
+    let mut collector = StableVarNumberCollector {
+        scoping,
+        facts,
+        candidates: HashMap::new(),
+    };
     collector.visit_program(program);
-    collector
-        .candidates
-        .retain(|symbol, _| symbol_has_only_read_references(scoping, *symbol));
     collector.candidates
 }
 
@@ -1107,33 +1108,37 @@ impl Collector<'_, '_> {
             .initialization
             .stable_callable_symbol(self.scoping, &call.callee)?;
         let dispatcher = self.selector_dispatchers.get(&symbol)?;
-        let selector = call.arguments.first().and_then(argument_integer)?;
-        let return_span = *dispatcher.returns.get(&selector)?;
-        let used_param_count = dispatcher
-            .param_symbols
-            .iter()
-            .enumerate()
-            .filter_map(|(index, symbol)| {
-                self.scoping
-                    .get_resolved_reference_ids(*symbol)
-                    .iter()
-                    .filter_map(|reference_id| self.reference_spans.get(reference_id))
-                    .any(|span| return_span.start <= span.start && span.end <= return_span.end)
-                    .then_some(index + 1)
-            })
-            .max()
-            .unwrap_or(0);
-        let params = dispatcher.params[..used_param_count].join(", ");
-        let args = call
+        self.constants.initialization.hoisted_callable_at(
+            self.scoping,
+            &call.callee,
+            dispatcher.scope,
+        )?;
+        let selector = call
+            .arguments
+            .get(dispatcher.selector_index)
+            .and_then(argument_integer)?;
+        let projection = dispatcher.returns.get(&selector)?;
+        let values = call
             .arguments
             .iter()
-            .map(|argument| fragment(self.source, argument.span()))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let returned = fragment(self.source, return_span);
+            .map(eval_static_argument)
+            .collect::<Vec<_>>();
+        let value = projection.evaluate(values.iter().map(Option::as_ref), self.budget)?;
+        // Unknown arguments are still evaluated, left to right, even when
+        // the selected return does not need them. Known arguments already
+        // have inert value proofs. Keep effectful arguments in the caller,
+        // not in a newly created activation with altered capture semantics.
+        let mut parts = call
+            .arguments
+            .iter()
+            .zip(&values)
+            .filter(|(_, value)| value.is_none())
+            .map(|(argument, _)| format!("({})", fragment(self.source, argument.span())))
+            .collect::<Vec<_>>();
+        parts.push(value.render_expression()?);
         self.push(
             call.span,
-            format!("(function({params}){{return ({returned});}})({args})"),
+            format!("({})", parts.join(", ")),
             "selector_dispatch_specialize",
         );
         Some(CallRewriteTraversal::Stop)
@@ -1278,7 +1283,7 @@ impl Collector<'_, '_> {
             .map(eval_static_argument)
             .collect::<Option<Vec<_>>>()?;
         let text = function
-            .evaluate(&values, self.budget)
+            .evaluate(values.iter().map(Some), self.budget)
             .and_then(|value| value.render_expression())?;
         self.push(call.span, text, "pure_function_eval");
         Some(CallRewriteTraversal::WalkChildren)
@@ -2056,8 +2061,14 @@ fn transform_once(
     let from_char_code_aliases =
         collect_from_char_code_aliases(&program, scoping, &constants.initialization);
     budget.checkpoint()?;
-    let stable_var_numbers = collect_stable_var_numbers(&program, scoping);
-    let selector_dispatchers = collect_selector_dispatchers(&program, scoping, &stable_var_numbers);
+    let stable_var_numbers =
+        collect_stable_var_numbers(&program, scoping, &constants.initialization);
+    let selector_dispatchers = collect_selector_dispatchers(
+        &program,
+        scoping,
+        &constants.initialization,
+        &stable_var_numbers,
+    );
     budget.checkpoint()?;
     let numeric_state_risks = NumericStateAliasRisks::analyze(&program);
     initial_replacements.extend(remove_unused_proven_helpers(
@@ -9509,10 +9520,35 @@ mod fixture_regressions {
         let result = checked(source);
         assert_eq!(
             result.transforms.get("selector_dispatch_specialize"),
-            Some(&7)
+            Some(&6)
         );
         assert!(result.source.contains("dispatch(42, 9, 4)"));
         assert_eq!(result.source.matches("ambiguous(1, 4)").count(), 2);
+    }
+
+    #[test]
+    fn selector_projection_preserves_activation_and_argument_effects() {
+        for (source, expected) in [
+            ("function outer(){let x=7;function f(s){if(s===0)return x;return 0;}function inner(){let x=9;return f(0);}return inner();}outer();", 0),
+            ("function outer(){let n=0;function f(s){if(++n&&s===1)return 1;if(s===0)return 2;return 3;}return [f(0),n];}outer();", 0),
+            ("function outer(){function f(s,s){if(s===0)return 1;if(s===1)return 2;return 3;}return f(0,1);}outer();", 1),
+            ("function f(s){if(s===0)return 1;return 2;}globalThis.f=()=>9;f(0);", 0),
+            ("function outer(){var a=42;function f(s){if(s===a)return 1;if(s===0)return 2;return 3;}eval('a=0');return f(0);}outer();", 0),
+            ("function outer(){function f(s,x,y){if(s===0)return (arguments[2]=9,y);return 0;}return f(0,1,2);}outer();", 0),
+            ("function outer(){function f(s,x){if(s===0)return x+1;return 0;}return f(0,unknown());}outer();", 0),
+            ("function outer(){function f(s,x,y){if(s===0)return x+1;return 0;}return f(0,7,sideEffect());}outer();", 1),
+            ("function outer(){function f(s,x){if(s===0)return (x=7,x);return 0;}return f(0,sideEffect());}outer();", 1),
+            ("function outer(){function f(s){if(s===0)return 1;return 2;function s(){}}return f(0);}outer();", 0),
+            ("var a=42;function outer(){function f(s){if(s===a)return 1;if(s===0)return 2;return 3;}globalThis.a=0;return f(0);}outer();", 0),
+            ("function outer(){let n=0;function f(s){if(s===0||++n)return 1;return 2;}return f(0);}outer();", 1),
+        ] {
+            let result = checked(source);
+            assert_eq!(
+                result.transforms.get("selector_dispatch_specialize").copied().unwrap_or_default(),
+                expected,
+                "{source} -> {}", result.source,
+            );
+        }
     }
 
     #[test]

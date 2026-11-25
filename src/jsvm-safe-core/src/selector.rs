@@ -1,262 +1,165 @@
-//! Proof of selector-style dispatcher functions used by control-flow obfuscators.
-//!
-//! This is intentionally project-specific proof logic: it proves a narrow
-//! function/branch shape and records only selector values whose return path is
-//! statically unique. Generic JavaScript coercion/evaluation remains delegated
-//! to the shared value evaluator.
-
-use super::{
-    expression_integer, known_bool, symbol_has_only_read_references, symbol_of, walk,
-    BindingPattern, Expression, GetSpan, HashMap, HashSet, ScopeFlags, Scoping, Span, Statement,
-    SymbolId, Visit,
+//! Specialize selector calls only when the original activation's result is
+//! established. The selected return expression is evaluated in semantic
+//! parameter cells, never copied into a potentially shadowing caller scope.
+use crate::{
+    binding_facts::BindingFacts, expression_integer, known_bool, pure_function::PureFunction,
 };
+use oxc_ast::ast::{BindingPattern, Expression, Function, FunctionType, Statement};
+use oxc_ast_visit::{walk, Visit};
+use oxc_semantic::Scoping;
+use oxc_syntax::{
+    scope::{ScopeFlags, ScopeId},
+    symbol::SymbolId,
+};
+use std::collections::{HashMap, HashSet};
 
-fn selector_identifier_symbol(expr: &Expression<'_>, scoping: &Scoping) -> Option<SymbolId> {
-    match expr {
-        Expression::Identifier(_) => symbol_of(scoping, expr),
-        Expression::ParenthesizedExpression(parenthesized) => {
-            selector_identifier_symbol(&parenthesized.expression, scoping)
-        }
-        _ => None,
-    }
+struct SelectorProof<'c> {
+    scoping: &'c Scoping,
+    facts: &'c BindingFacts,
+    stable_var_numbers: &'c HashMap<SymbolId, i64>,
+    selector: SymbolId,
 }
 
-fn selector_test_value(
-    expr: &Expression<'_>,
-    selector_symbol: SymbolId,
-    selector_value: i64,
-    scoping: &Scoping,
-    stable_var_numbers: &HashMap<SymbolId, i64>,
-) -> Option<bool> {
-    match expr {
-        Expression::ParenthesizedExpression(parenthesized) => selector_test_value(
-            &parenthesized.expression,
-            selector_symbol,
-            selector_value,
-            scoping,
-            stable_var_numbers,
-        ),
-        Expression::UnaryExpression(unary) if unary.operator.as_str() == "!" => {
-            selector_test_value(
-                &unary.argument,
-                selector_symbol,
-                selector_value,
-                scoping,
-                stable_var_numbers,
-            )
-            .map(|value| !value)
-        }
-        Expression::LogicalExpression(logical) => {
-            let left = selector_test_value(
-                &logical.left,
-                selector_symbol,
-                selector_value,
-                scoping,
-                stable_var_numbers,
-            );
-            let right = selector_test_value(
-                &logical.right,
-                selector_symbol,
-                selector_value,
-                scoping,
-                stable_var_numbers,
-            );
-            match logical.operator.as_str() {
-                "&&" => match (left, right) {
-                    (Some(false), _) | (_, Some(false)) => Some(false),
-                    (Some(true), Some(true)) => Some(true),
-                    _ => None,
-                },
-                "||" => match (left, right) {
-                    (Some(true), _) | (_, Some(true)) => Some(true),
-                    (Some(false), Some(false)) => Some(false),
-                    _ => None,
-                },
-                _ => None,
-            }
-        }
-        Expression::BinaryExpression(binary)
-            if matches!(binary.operator.as_str(), "==" | "===" | "!=" | "!==") =>
-        {
-            let left_symbol = selector_identifier_symbol(&binary.left, scoping);
-            let right_symbol = selector_identifier_symbol(&binary.right, scoping);
-
-            let other = if left_symbol == Some(selector_symbol) {
-                Some(&binary.right)
-            } else if right_symbol == Some(selector_symbol) {
-                Some(&binary.left)
-            } else {
-                None
-            }?;
-
-            let equal = if let Some(number) = expression_integer(other) {
-                selector_value == number
-            } else {
-                let symbol = selector_identifier_symbol(other, scoping)?;
-                let initialized_value = *stable_var_numbers.get(&symbol)?;
-                if selector_value == initialized_value {
-                    // A var binding is undefined before its initializer executes
-                    // and has the proven number afterward. Equality to that exact
-                    // number therefore depends on runtime ordering.
-                    return None;
-                }
-                false
-            };
-
-            Some(if matches!(binary.operator.as_str(), "==" | "===") {
-                equal
-            } else {
-                !equal
-            })
-        }
-        _ => known_bool(expr),
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum SelectorFlow {
+enum Flow<'a, 'ast> {
     Continue,
-    Return(Span),
+    Return(&'a Expression<'ast>),
 }
 
-fn selector_return_expression(
-    expr: &Expression<'_>,
-    selector_symbol: SymbolId,
-    selector_value: i64,
-    scoping: &Scoping,
-    stable_var_numbers: &HashMap<SymbolId, i64>,
-) -> Option<Span> {
-    match expr {
-        Expression::ConditionalExpression(conditional) => {
-            let test = selector_test_value(
-                &conditional.test,
-                selector_symbol,
-                selector_value,
-                scoping,
-                stable_var_numbers,
-            )?;
-            selector_return_expression(
+impl SelectorProof<'_> {
+    fn symbol(&self, expression: &Expression<'_>) -> Option<SymbolId> {
+        let Expression::Identifier(identifier) = expression.without_parentheses() else {
+            return None;
+        };
+        self.facts
+            .resolved_symbol(self.scoping, identifier.reference_id.get()?)
+    }
+
+    fn comparison(&self, binary: &oxc_ast::ast::BinaryExpression<'_>, value: i64) -> Option<bool> {
+        let other = if self.symbol(&binary.left) == Some(self.selector) {
+            &binary.right
+        } else if self.symbol(&binary.right) == Some(self.selector) {
+            &binary.left
+        } else {
+            return None;
+        };
+        let equal = if let Some(number) = expression_integer(other) {
+            number == value
+        } else {
+            let number = *self.stable_var_numbers.get(&self.symbol(other)?)?;
+            // A stable declarative var may contain either undefined or its
+            // exact numeric initializer. Both compare unequal to a different
+            // number, but equality to the initializer requires ordering proof.
+            if number == value {
+                return None;
+            }
+            false
+        };
+        Some(if matches!(binary.operator.as_str(), "==" | "===") {
+            equal
+        } else {
+            !equal
+        })
+    }
+
+    fn test(&self, expression: &Expression<'_>, value: i64) -> Option<bool> {
+        match expression.without_parentheses() {
+            Expression::UnaryExpression(unary) if unary.operator.as_str() == "!" => {
+                self.test(&unary.argument, value).map(|result| !result)
+            }
+            Expression::LogicalExpression(logical) => {
+                // A later known operand must not justify discarding an
+                // unknown/effectful earlier operand.
+                let left = self.test(&logical.left, value)?;
+                match (logical.operator.as_str(), left) {
+                    ("&&", false) => Some(false),
+                    ("||", true) => Some(true),
+                    ("&&" | "||", _) => self.test(&logical.right, value),
+                    _ => None,
+                }
+            }
+            Expression::BinaryExpression(binary)
+                if matches!(binary.operator.as_str(), "==" | "===" | "!=" | "!==") =>
+            {
+                self.comparison(binary, value)
+                    .or_else(|| known_bool(expression))
+            }
+            _ => known_bool(expression),
+        }
+    }
+
+    fn returned<'a, 'ast>(
+        &self,
+        expression: &'a Expression<'ast>,
+        value: i64,
+    ) -> Option<&'a Expression<'ast>> {
+        if let Expression::ConditionalExpression(conditional) = expression.without_parentheses() {
+            let test = self.test(&conditional.test, value)?;
+            self.returned(
                 if test {
                     &conditional.consequent
                 } else {
                     &conditional.alternate
                 },
-                selector_symbol,
-                selector_value,
-                scoping,
-                stable_var_numbers,
+                value,
             )
+        } else {
+            Some(expression)
         }
-        _ => Some(expr.span()),
     }
-}
 
-fn selector_statement_flow(
-    statement: &Statement<'_>,
-    selector_symbol: SymbolId,
-    selector_value: i64,
-    scoping: &Scoping,
-    stable_var_numbers: &HashMap<SymbolId, i64>,
-) -> Option<SelectorFlow> {
-    match statement {
-        Statement::BlockStatement(block) => selector_statements_flow(
-            &block.body,
-            selector_symbol,
-            selector_value,
-            scoping,
-            stable_var_numbers,
-        ),
-        Statement::IfStatement(branch) => {
-            let test = selector_test_value(
-                &branch.test,
-                selector_symbol,
-                selector_value,
-                scoping,
-                stable_var_numbers,
-            )?;
-            if test {
-                selector_statement_flow(
-                    &branch.consequent,
-                    selector_symbol,
-                    selector_value,
-                    scoping,
-                    stable_var_numbers,
-                )
-            } else if let Some(alternate) = &branch.alternate {
-                selector_statement_flow(
-                    alternate,
-                    selector_symbol,
-                    selector_value,
-                    scoping,
-                    stable_var_numbers,
-                )
-            } else {
-                Some(SelectorFlow::Continue)
+    fn statement<'a, 'ast>(
+        &self,
+        statement: &'a Statement<'ast>,
+        value: i64,
+    ) -> Option<Flow<'a, 'ast>> {
+        match statement {
+            Statement::BlockStatement(block) => self.statements(&block.body, value),
+            Statement::IfStatement(branch) => {
+                if self.test(&branch.test, value)? {
+                    self.statement(&branch.consequent, value)
+                } else if let Some(alternate) = &branch.alternate {
+                    self.statement(alternate, value)
+                } else {
+                    Some(Flow::Continue)
+                }
+            }
+            Statement::ReturnStatement(ret) => {
+                Some(Flow::Return(self.returned(ret.argument.as_ref()?, value)?))
+            }
+            Statement::EmptyStatement(_) => Some(Flow::Continue),
+            _ => None,
+        }
+    }
+
+    fn statements<'a, 'ast>(
+        &self,
+        statements: &'a [Statement<'ast>],
+        value: i64,
+    ) -> Option<Flow<'a, 'ast>> {
+        for statement in statements {
+            match self.statement(statement, value)? {
+                Flow::Continue => {}
+                returned @ Flow::Return(_) => return Some(returned),
             }
         }
-        Statement::ReturnStatement(ret) => {
-            let expression = ret.argument.as_ref()?;
-            let span = selector_return_expression(
-                expression,
-                selector_symbol,
-                selector_value,
-                scoping,
-                stable_var_numbers,
-            )?;
-            Some(SelectorFlow::Return(span))
-        }
-        Statement::EmptyStatement(_) => Some(SelectorFlow::Continue),
-        _ => None,
+        Some(Flow::Continue)
     }
 }
 
-fn selector_statements_flow(
-    statements: &[Statement<'_>],
-    selector_symbol: SymbolId,
-    selector_value: i64,
-    scoping: &Scoping,
-    stable_var_numbers: &HashMap<SymbolId, i64>,
-) -> Option<SelectorFlow> {
-    for statement in statements {
-        match selector_statement_flow(
-            statement,
-            selector_symbol,
-            selector_value,
-            scoping,
-            stable_var_numbers,
-        )? {
-            SelectorFlow::Continue => {}
-            returned @ SelectorFlow::Return(_) => return Some(returned),
-        }
-    }
-    Some(SelectorFlow::Continue)
-}
-
-#[derive(Default)]
-struct SelectorLiteralCollector<'c> {
-    scoping: Option<&'c Scoping>,
-    selector_symbol: Option<SymbolId>,
+struct LiteralCollector<'c> {
+    proof: &'c SelectorProof<'c>,
     values: HashSet<i64>,
 }
 
-impl<'a> Visit<'a> for SelectorLiteralCollector<'_> {
-    fn visit_function(&mut self, _function: &oxc_ast::ast::Function<'a>, _flags: ScopeFlags) {
-        // Do not collect selector tests from nested functions.
-    }
+impl<'a> Visit<'a> for LiteralCollector<'_> {
+    fn visit_function(&mut self, _: &Function<'a>, _: ScopeFlags) {}
+    fn visit_arrow_function_expression(&mut self, _: &oxc_ast::ast::ArrowFunctionExpression<'a>) {}
 
     fn visit_binary_expression(&mut self, binary: &oxc_ast::ast::BinaryExpression<'a>) {
         if matches!(binary.operator.as_str(), "==" | "===" | "!=" | "!==") {
-            let Some(scoping) = self.scoping else {
-                return;
-            };
-            let Some(selector_symbol) = self.selector_symbol else {
-                return;
-            };
-            let left_symbol = selector_identifier_symbol(&binary.left, scoping);
-            let right_symbol = selector_identifier_symbol(&binary.right, scoping);
-            let literal = if left_symbol == Some(selector_symbol) {
+            let literal = if self.proof.symbol(&binary.left) == Some(self.proof.selector) {
                 expression_integer(&binary.right)
-            } else if right_symbol == Some(selector_symbol) {
+            } else if self.proof.symbol(&binary.right) == Some(self.proof.selector) {
                 expression_integer(&binary.left)
             } else {
                 None
@@ -269,92 +172,105 @@ impl<'a> Visit<'a> for SelectorLiteralCollector<'_> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SelectorDispatcher {
-    pub(super) params: Vec<String>,
-    pub(super) param_symbols: Vec<SymbolId>,
-    pub(super) returns: HashMap<i64, Span>,
+    pub(super) selector_index: usize,
+    pub(super) scope: ScopeId,
+    pub(super) returns: HashMap<i64, PureFunction>,
 }
 
-struct SelectorDispatcherCollector<'c> {
+struct DispatcherCollector<'c> {
     scoping: &'c Scoping,
+    facts: &'c BindingFacts,
     stable_var_numbers: &'c HashMap<SymbolId, i64>,
     dispatchers: HashMap<SymbolId, SelectorDispatcher>,
 }
 
-impl<'a> Visit<'a> for SelectorDispatcherCollector<'_> {
-    fn visit_function(&mut self, function: &oxc_ast::ast::Function<'a>, flags: ScopeFlags) {
-        if !function.r#async && !function.generator && function.params.rest.is_none() {
-            if let (Some(id), Some(body)) = (&function.id, &function.body) {
-                if let Some(function_symbol) = id.symbol_id.get() {
-                    let binding_is_stable =
-                        symbol_has_only_read_references(self.scoping, function_symbol);
-
-                    let params = function
-                        .params
-                        .items
-                        .iter()
-                        .map(|param| {
-                            if param.initializer.is_some() {
-                                return None;
-                            }
-                            match &param.pattern {
-                                BindingPattern::BindingIdentifier(id) => {
-                                    Some((id.name.to_string(), id.symbol_id.get()?))
-                                }
-                                _ => None,
-                            }
-                        })
-                        .collect::<Option<Vec<_>>>();
-
-                    if binding_is_stable && body.directives.is_empty() {
-                        if let Some(params) = params {
-                            if let Some((_, selector_symbol)) = params.first() {
-                                let mut literals = SelectorLiteralCollector {
-                                    scoping: Some(self.scoping),
-                                    selector_symbol: Some(*selector_symbol),
-                                    values: HashSet::new(),
-                                };
-                                for statement in &body.statements {
-                                    literals.visit_statement(statement);
-                                }
-
-                                let mut returns = HashMap::new();
-                                for value in literals.values {
-                                    if let Some(SelectorFlow::Return(span)) =
-                                        selector_statements_flow(
-                                            &body.statements,
-                                            *selector_symbol,
-                                            value,
-                                            self.scoping,
-                                            self.stable_var_numbers,
-                                        )
-                                    {
-                                        returns.insert(value, span);
-                                    }
-                                }
-
-                                if !returns.is_empty() {
-                                    self.dispatchers.insert(
-                                        function_symbol,
-                                        SelectorDispatcher {
-                                            params: params
-                                                .iter()
-                                                .map(|(name, _)| name.clone())
-                                                .collect(),
-                                            param_symbols: params
-                                                .into_iter()
-                                                .map(|(_, symbol)| symbol)
-                                                .collect(),
-                                            returns,
-                                        },
-                                    );
-                                }
-                            }
-                        }
-                    }
+impl DispatcherCollector<'_> {
+    fn prove(&self, function: &Function<'_>) -> Option<(SymbolId, SelectorDispatcher)> {
+        if function.r#type != FunctionType::FunctionDeclaration
+            || function.r#async
+            || function.generator
+            || function.params.rest.is_some()
+        {
+            return None;
+        }
+        let symbol = function.id.as_ref()?.symbol_id.get()?;
+        let scope = function.scope_id.get()?;
+        if !self
+            .facts
+            .hoisted_callable_declaration(self.scoping, symbol, scope)
+        {
+            return None;
+        }
+        let params = function
+            .params
+            .items
+            .iter()
+            .map(|parameter| {
+                if parameter.initializer.is_some() {
+                    return None;
                 }
-            }
+                let BindingPattern::BindingIdentifier(id) = &parameter.pattern else {
+                    return None;
+                };
+                let symbol = id.symbol_id.get()?;
+                // Duplicate formal declarations have ordinary parameter
+                // initialization semantics, but a body declaration can install
+                // a different value even before its textual statement executes.
+                self.scoping
+                    .symbol_redeclarations(symbol)
+                    .iter()
+                    .all(|decl| {
+                        function.params.span.start <= decl.span.start
+                            && decl.span.end <= function.params.span.end
+                    })
+                    .then_some(symbol)
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let selector = *params.first()?;
+        let selector_index = params.iter().rposition(|&param| param == selector)?;
+        let body = function.body.as_ref()?;
+        let proof = SelectorProof {
+            scoping: self.scoping,
+            facts: self.facts,
+            stable_var_numbers: self.stable_var_numbers,
+            selector,
+        };
+        let mut literals = LiteralCollector {
+            proof: &proof,
+            values: HashSet::new(),
+        };
+        for statement in &body.statements {
+            literals.visit_statement(statement);
+        }
+        let returns = literals
+            .values
+            .into_iter()
+            .filter_map(|value| {
+                let Flow::Return(expression) = proof.statements(&body.statements, value)? else {
+                    return None;
+                };
+                let projection =
+                    PureFunction::return_projection(function, expression, self.scoping)?;
+                Some((value, projection))
+            })
+            .collect::<HashMap<_, _>>();
+        (!returns.is_empty()).then_some((
+            symbol,
+            SelectorDispatcher {
+                selector_index,
+                scope,
+                returns,
+            },
+        ))
+    }
+}
+
+impl<'a> Visit<'a> for DispatcherCollector<'_> {
+    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        if let Some((symbol, dispatcher)) = self.prove(function) {
+            self.dispatchers.insert(symbol, dispatcher);
         }
         walk::walk_function(self, function, flags);
     }
@@ -363,10 +279,12 @@ impl<'a> Visit<'a> for SelectorDispatcherCollector<'_> {
 pub fn collect_selector_dispatchers(
     program: &oxc_ast::ast::Program<'_>,
     scoping: &Scoping,
+    facts: &BindingFacts,
     stable_var_numbers: &HashMap<SymbolId, i64>,
 ) -> HashMap<SymbolId, SelectorDispatcher> {
-    let mut collector = SelectorDispatcherCollector {
+    let mut collector = DispatcherCollector {
         scoping,
+        facts,
         stable_var_numbers,
         dispatchers: HashMap::new(),
     };

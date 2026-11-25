@@ -570,6 +570,24 @@ impl BindingFacts {
                 .all(|&reference| !scoping.get_reference(reference).is_write())
     }
 
+    /// A single literal var initializer can establish a two-value
+    /// domain (undefined before execution, the initializer afterward).
+    /// Parameters, implicit arguments, dynamic targets and function
+    /// redeclarations do not have that initialization semantics.
+    pub(crate) fn stable_var_initializer(
+        &self,
+        scoping: &Scoping,
+        declarator: &VariableDeclarator<'_>,
+    ) -> Option<SymbolId> {
+        let symbol = self.var_initializer_target(scoping, declarator)?;
+        (self.hoisted_vars.contains(&symbol)
+            && !self.parameters.contains(&symbol)
+            && scoping.symbol_name(symbol) != "arguments"
+            && !scoping.symbol_flags(symbol).is_function()
+            && self.binding_has_stable_value(scoping, symbol))
+        .then_some(symbol)
+    }
+
     /// A function declaration is installed when its actual lexical owner
     /// is instantiated. Annex B can instead create a var-like binding
     /// initialized only by executing the declaration's block or branch.

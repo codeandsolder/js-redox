@@ -1070,7 +1070,7 @@ impl Analyzer<'_> {
             }
         }
         let result = exact
-            .then(|| function.evaluate(&values, self.budget))
+            .then(|| function.evaluate(values.iter().map(Some), self.budget))
             .flatten();
         if !self.checkpoint() {
             return Some(self.barrier(environment));
