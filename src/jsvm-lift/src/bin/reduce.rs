@@ -1,6 +1,10 @@
 use anyhow::{anyhow, Context, Result};
 use clap::Parser as ClapParser;
-use jsvm_lift::numeric::{eval_js_bitwise_i64, exact_i64, js_int32_from_i64};
+use jsvm_lift::{
+    numeric::{eval_js_bitwise_i64, exact_i64, js_int32_from_i64},
+    pipeline::read_json_records,
+    report_file::{resolve_report_source, ReportPathBase},
+};
 use oxc_allocator::Allocator;
 use oxc_ast::{
     ast::{Argument, AssignmentExpression, AssignmentTarget, Expression, Statement, SwitchCase},
@@ -14,7 +18,7 @@ use serde_json::Value as JsonValue;
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 #[derive(ClapParser, Debug)]
@@ -28,6 +32,7 @@ struct Args {
 #[derive(Debug, Deserialize)]
 struct ScanReport {
     file: String,
+    path_base: ReportPathBase,
     functions: Vec<FunctionMetric>,
     state_machines: Vec<StateMachine>,
     decoder_candidates: Vec<DecoderCandidate>,
@@ -941,9 +946,14 @@ fn derived_env_json(env: &Env) -> BTreeMap<String, JsonValue> {
     out
 }
 
-fn reduce_report(report: &ScanReport, wanted: Option<&str>) -> Result<Vec<ReducedVm>> {
-    let source =
-        fs::read_to_string(&report.file).with_context(|| format!("reading {}", report.file))?;
+fn reduce_report(
+    report: &ScanReport,
+    scan_path: &Path,
+    wanted: Option<&str>,
+) -> Result<Vec<ReducedVm>> {
+    let source_path = resolve_report_source(scan_path, &report.file, report.path_base)?;
+    let source = fs::read_to_string(&source_path)
+        .with_context(|| format!("reading {}", source_path.display()))?;
     let mut out = Vec::new();
 
     for dec in &report.decoder_candidates {
@@ -1001,15 +1011,8 @@ fn reduce_report(report: &ScanReport, wanted: Option<&str>) -> Result<Vec<Reduce
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let text = fs::read_to_string(&args.jsonl)
-        .with_context(|| format!("reading {}", args.jsonl.display()))?;
-    for (line_no, line) in text.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let report: ScanReport =
-            serde_json::from_str(line).with_context(|| format!("parsing line {}", line_no + 1))?;
-        for reduced in reduce_report(&report, args.function_id.as_deref())? {
+    for report in read_json_records::<ScanReport>(&args.jsonl)? {
+        for reduced in reduce_report(&report, &args.jsonl, args.function_id.as_deref())? {
             println!("{}", serde_json::to_string(&reduced)?);
         }
     }

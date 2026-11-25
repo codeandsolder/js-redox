@@ -6,7 +6,7 @@ use crate::{
     analysis_budget::{recoverable_unit_error, AnalysisBudgets, AnalysisOperation},
     content_dedup::{link_or_copy, sha256_path},
     js_format::format_source,
-    report_file::write_json,
+    report_file::{project_relative_path as relative_string, write_json},
     safe_deob::{deobfuscate_source, SourceMode},
     scan_report::{scan_file, ScanReport},
     string_recovery::recover_static_strings,
@@ -62,20 +62,6 @@ fn value_usize(value: &Value, field: &str) -> usize {
         .and_then(Value::as_u64)
         .and_then(|value| usize::try_from(value).ok())
         .unwrap_or(0)
-}
-
-fn relative_string(project: &Path, path: &Path) -> Result<String> {
-    Ok(path
-        .strip_prefix(project)
-        .with_context(|| {
-            format!(
-                "{} is outside project {}",
-                path.display(),
-                project.display()
-            )
-        })?
-        .to_string_lossy()
-        .into_owned())
 }
 
 fn generated_output_path(root: &str, scan_id: usize, ordinal: usize) -> PathBuf {
@@ -263,7 +249,7 @@ impl<'a> GeneratedRecovery<'a> {
             .under(self.budget, self.raw.display().to_string());
         match recover_static_strings(
             &raw_source,
-            self.raw.display().to_string(),
+            self.raw_rel,
             SourceMode::Auto,
             8,
             &string_budget,
@@ -334,7 +320,7 @@ impl<'a> GeneratedRecovery<'a> {
             AnalysisOperation::SafeDeobfuscation.under(self.budget, selected.display().to_string());
         let deob = deobfuscate_source(
             &selected_source,
-            selected.display().to_string(),
+            self.raw_rel,
             SourceMode::Auto,
             16,
             false,
@@ -760,7 +746,12 @@ impl ProjectScanner<'_> {
         self.scanner_invocations += 1;
         let budget =
             AnalysisOperation::StructuralScan.under(self.budget, source.display().to_string());
-        let report = Rc::new(scan_file(source, Some(&dump_dir), &budget)?);
+        let report = Rc::new(scan_file(
+            source,
+            Some(&dump_dir),
+            Some(self.project),
+            &budget,
+        )?);
         if report.embedded.is_empty() {
             self.scanner_cache
                 .insert(source_sha, (scan_id, Rc::clone(&report)));
@@ -824,8 +815,8 @@ impl ProjectScanner<'_> {
             let Some(dumped) = node.dump_path.as_deref() else {
                 continue;
             };
-            let raw = PathBuf::from(dumped);
-            let raw_rel = relative_string(self.project, &raw)?;
+            let raw = self.project.join(dumped);
+            let raw_rel = dumped.to_owned();
             let depth = parent_depth + 1;
             let raw_sha = sha256_path(&raw)?;
             let recovery = if let Some(cached) = self.generated_cache.get(&raw_sha) {
@@ -921,13 +912,25 @@ impl ProjectScanner<'_> {
                 "switch_ir_exit",
                 "switch_ir",
                 "switch_ir_error",
-                crate::switch_ir::materialize(source, report_path, &output_path, &budget),
+                crate::switch_ir::materialize(
+                    source,
+                    report_path,
+                    &output_path,
+                    Some(self.project),
+                    &budget,
+                ),
             ),
             IrKind::Table => (
                 "table_ir_exit",
                 "table_ir",
                 "table_ir_error",
-                crate::table_ir::materialize(source, report_path, &output_path, &budget),
+                crate::table_ir::materialize(
+                    source,
+                    report_path,
+                    &output_path,
+                    Some(self.project),
+                    &budget,
+                ),
             ),
         };
         match result {

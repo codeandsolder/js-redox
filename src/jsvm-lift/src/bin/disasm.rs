@@ -2,7 +2,8 @@ use anyhow::{Context, Result};
 use clap::Parser as ClapParser;
 use jsvm_lift::{
     parse_int::{parse_int_aliases, resolve_literal_parse_int},
-    pipeline::{read_jsonl, BindingInfo, NormalizedPath, NormalizedVm},
+    pipeline::{read_json_records, BindingInfo, NormalizedPath, NormalizedVm},
+    report_file::{resolve_report_source, ReportPathBase},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -26,6 +27,7 @@ struct Args {
 #[derive(Debug, Deserialize)]
 struct ScanReport {
     file: String,
+    path_base: ReportPathBase,
     decoder_candidates: Vec<DecoderCandidate>,
     push_builders: Vec<PushBuilder>,
 }
@@ -251,12 +253,14 @@ fn render_disassembly(disasm: &Disassembly) -> String {
 
 fn disassemble_report(
     report: &ScanReport,
+    scan_path: &Path,
     normalized_by_decoder: &HashMap<String, NormalizedVm>,
     output_dir: &Path,
     wanted: Option<&str>,
 ) -> Result<Vec<Disassembly>> {
-    let source = fs::read_to_string(&report.file)
-        .with_context(|| format!("reading source {}", report.file))?;
+    let source_path = resolve_report_source(scan_path, &report.file, report.path_base)?;
+    let source = fs::read_to_string(&source_path)
+        .with_context(|| format!("reading source {}", source_path.display()))?;
     let aliases = parse_int_aliases(&source);
     let builders: HashMap<_, _> = report
         .push_builders
@@ -308,7 +312,7 @@ fn main() -> Result<()> {
     let args = Args::parse();
     fs::create_dir_all(&args.output_dir)
         .with_context(|| format!("creating {}", args.output_dir.display()))?;
-    let scans: Vec<ScanReport> = read_jsonl(&args.scan)?;
+    let scans: Vec<ScanReport> = read_json_records(&args.scan)?;
     let normalized: Vec<NormalizedVm> = serde_json::from_str(
         &fs::read_to_string(&args.normalized)
             .with_context(|| format!("reading {}", args.normalized.display()))?,
@@ -321,6 +325,7 @@ fn main() -> Result<()> {
     for report in &scans {
         all.extend(disassemble_report(
             report,
+            &args.scan,
             &normalized_by_decoder,
             &args.output_dir,
             args.decoder.as_deref(),

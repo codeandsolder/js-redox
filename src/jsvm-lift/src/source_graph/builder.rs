@@ -272,7 +272,7 @@ impl GraphBuilder {
         budget.checkpoint()?;
         let document = json!({
             "schema": SOURCE_GRAPH.schema,
-            "project": project.display().to_string(),
+            "project": ".",
             "capture_salvaged": manifest.source.salvaged,
             "nodes": self.nodes.into_values().map(NodeRecord::into_value).collect::<Vec<_>>(),
             "edges": edges,
