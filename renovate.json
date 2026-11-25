@@ -6,29 +6,20 @@
   "separateMultipleMajor": true,
   "packageRules": [
     {
-      "description": "Vendored upstream crate manifests are immutable backport baselines",
-      "matchManagers": [
-        "cargo"
-      ],
-      "matchFileNames": [
-        "vendor/oxc_compat/**",
-        "vendor/oxc_semantic/**"
-      ],
-      "enabled": false
-    },
-    {
-      "description": "Coordinate Oxc and both Rolldown Git pins as one type universe, reviewing local Oxc backports before upgrades",
+      "description": "Coordinate all Oxc crates and both Rolldown Git pins as one type universe",
       "matchManagers": [
         "cargo"
       ],
       "matchPackageNames": [
-        "/^oxc_/"
+        "/^oxc_/",
+        "https://github.com/codeandsolder/oxc.git",
+        "codeandsolder/oxc"
       ],
       "groupName": "Oxc and Rolldown",
       "automerge": false
     },
     {
-      "description": "Coordinate Oxc and both Rolldown Git pins as one type universe, reviewing local Oxc backports before upgrades",
+      "description": "Coordinate all Oxc crates and both Rolldown Git pins as one type universe",
       "matchManagers": [
         "cargo"
       ],

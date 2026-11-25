@@ -40,6 +40,7 @@ jobs:
           exit 1
         fi
         cargo fmt --all -- --check
+        bash scripts/check-oxc-source.sh
         cargo test --locked --workspace
         cargo clippy --locked --workspace --all-targets -- -D warnings
 
