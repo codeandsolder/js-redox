@@ -553,11 +553,40 @@ impl<'ast> Analyzer<'_, 'ast> {
                     .and_then(|fact| self.captured_activations(fact, environment))
                     .map(|activations| (activations, None))
             });
+        self.invoke_resolved_call(call, resolved, receiver, environment)
+    }
+
+    /// Used by optional chains once a preceding member/call evaluation
+    /// has established the actual callee and its reference receiver.
+    pub(super) fn invoke_captured_call(
+        &mut self,
+        call: &CallExpression<'_>,
+        callee: Option<&Fact>,
+        receiver: Option<Fact>,
+        environment: &mut Environment,
+    ) -> Evaluation {
+        let resolved = callee
+            .and_then(|fact| self.captured_activations(fact, environment))
+            .map(|activations| (activations, None));
+        self.invoke_resolved_call(call, resolved, receiver, environment)
+    }
+
+    fn invoke_resolved_call(
+        &mut self,
+        call: &CallExpression<'_>,
+        resolved: Option<(CallTargets<'_>, Option<SymbolId>)>,
+        receiver: Option<Fact>,
+        environment: &mut Environment,
+    ) -> Evaluation {
         let Some((activations, named)) = resolved else {
             self.arguments(&call.arguments, environment);
             return self.barrier(environment);
         };
-        if !self.can_enter()
+        if call
+            .arguments
+            .iter()
+            .any(|argument| argument.as_expression().is_none())
+            || !self.can_enter()
             || matches!(&activations, CallTargets::Single(activation) if activation.reflective && self.bindings.implicit_arguments_exposed(activation.scope))
         {
             self.arguments(&call.arguments, environment);

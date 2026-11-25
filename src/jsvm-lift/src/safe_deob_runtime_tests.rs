@@ -954,6 +954,40 @@ fn depythonify_safe_deob_callable_capture_runtime_equivalence() -> Result<()> {
 
 #[test]
 #[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_optional_chain_runtime_equivalence() -> Result<()> {
+    let sources = [
+        "let a=null,b=[7];let r=[a?.[b[0]=9].x];[r[0],b[0]];",
+        "let a={x: 7},b=[0];let r=[a?.[(b[0]=9,'x')]];[r[0],b[0]];",
+        "let a={x: null},b=[7];let r=[a?.x?.[b[0]=9].y];[r[0],b[0]];",
+        "let a={x: {y: 7}};let r=[a?.x.y];r[0];",
+        "let a={x: 7,f(){return [this.x]}};let r=a?.f();r[0];",
+        "let a={x: 7,f(){return [this.x]}};let r=a.f?.();r[0];",
+        "let a={x: 7,f(){return [this.x]}};let r=a?.f?.();r[0];",
+        "let a={x: 7,f(){return [this.x]}};let r=(a?.f)();r[0];",
+        "let a={x: 7,f(){return [this.x]}};let r=(a?.f)?.();r[0];",
+        "let a=null,b=[7];let r=[a?.f(b[0]=9).x];[r[0],b[0]];",
+        "let a={f: null},b=[7];let r=[a.f?.(b[0]=9).x];[r[0],b[0]];",
+        "let a={x: 7,f(){events.push('call');return null}},b=[7];let r=[a?.f()?.[b[0]=9]];[r[0],b[0]];",
+        "let f=(x)=>[x];let a=[7];let r=f?.(a[0]=9);[r[0],a[0]];",
+        "let a={x: 7,f(x){return [this.x,x]}};let old=a;let r=a?.f((a={x: 9},11));[r[0],r[1],old.x];",
+        "let a=null,b=[7];let r=[delete a?.[b[0]=9]];[r[0],b[0]];",
+        "let a={__proto__: null,x:7};let r=[delete a?.x];[r[0],a.x];",
+        "let a={__proto__: null,get x(){throw 1}};let r=[delete a?.x];[r[0],a.x];",
+        "let a={f(){events.push('call');return [7]}};let r=[delete a?.f()];r[0];",
+        "let a=[7];let f=x=>{x?.[a[0]=9]};f(null);a[0];",
+        "let a=[7];let f=x=>{x?.[a[0]=9]};f({});a[0];",
+        "let a=null,b=[7];try{(a?.x)[b[0]=9]}catch(e){events.push(e.name)}b[0];",
+        "let a=null,b=[7];try{(a?.f)(b[0]=9)}catch(e){events.push(e.name)}b[0];",
+        "let a={x: 7,f(){return [this.x]}};let g=(0,a?.f);try{g()}catch(e){events.push(e.name)}",
+        "let a=[7],o={get f(){a[0]=9;return null}};let r=[o.f?.(a[0]=11)];[r[0],a[0]];",
+        "let a=[7];for(let i=0;i<2;i++){let o=i===0?null:{x: 9};o?.[(a[0]=i,'x')]}a[0];",
+        "let a={x: 7,f(){return [this.x]}};let r=(a?.f)(...(events.push('spread'),[]));r[0];",
+    ];
+    script_runtime_equivalence(&sources, "optional-chains", false)
+}
+
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
 fn depythonify_safe_deob_destructuring_assignment_runtime_equivalence() -> Result<()> {
     let sources = [
         "let a,b;({x: a,y:b}={x: 7,y:9});let r=[a,b];[r[0],r[1]];",

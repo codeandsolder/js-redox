@@ -31,6 +31,7 @@ use work_budget::{BudgetExceeded, WorkBudget};
 mod activation;
 mod arguments;
 mod cells;
+mod chains;
 mod coverage;
 mod dispatch;
 mod heap;
@@ -538,16 +539,25 @@ impl Analyzer<'_, '_> {
             return None;
         }
         let object = self.expression(member.object(), environment);
-        let key = match member {
-            MemberExpression::StaticMemberExpression(member) => {
-                Evaluation::primitive(Value::String(member.property.name.to_string()), true)
-            }
-            MemberExpression::ComputedMemberExpression(member) => {
-                self.key(&member.expression, environment)
-            }
-            MemberExpression::PrivateFieldExpression(_) => return None,
-        };
+        let key = self.member_key(member, environment)?;
         Some((object, key))
+    }
+
+    fn member_key(
+        &mut self,
+        member: &MemberExpression<'_>,
+        environment: &mut Environment,
+    ) -> Option<Evaluation> {
+        match member {
+            MemberExpression::StaticMemberExpression(member) => Some(Evaluation::primitive(
+                Value::String(member.property.name.to_string()),
+                true,
+            )),
+            MemberExpression::ComputedMemberExpression(member) => {
+                Some(self.key(&member.expression, environment))
+            }
+            MemberExpression::PrivateFieldExpression(_) => None,
+        }
     }
 
     fn member_reference(
@@ -746,16 +756,28 @@ impl Analyzer<'_, '_> {
         argument: &Expression<'_>,
         environment: &mut Environment,
     ) -> Evaluation {
+        let argument = argument.without_parentheses();
+        if let Expression::ChainExpression(chain) = argument {
+            return self.delete_chain(chain, environment);
+        }
         let reference = argument
-            .without_parentheses()
             .as_member_expression()
             .and_then(|member| self.member_reference(member, environment));
         let Some(Reference::Member { locations, key }) = reference else {
             self.unobserved(argument.span());
             return self.barrier(environment);
         };
+        self.delete_reference(&locations, &key, environment)
+    }
+
+    fn delete_reference(
+        &mut self,
+        locations: &Locations,
+        key: &str,
+        environment: &mut Environment,
+    ) -> Evaluation {
         if self
-            .heap_result(environment.delete(&locations, &key, self.budget))
+            .heap_result(environment.delete(locations, key, self.budget))
             .unwrap_or(false)
         {
             Evaluation::primitive(Value::Bool(true), false)
@@ -1084,6 +1106,9 @@ impl Analyzer<'_, '_> {
         environment: &mut Environment,
     ) -> (Evaluation, Option<Fact>) {
         let callee = callee.without_parentheses();
+        if let Expression::ChainExpression(chain) = callee {
+            return self.chain_expression(chain, environment);
+        }
         let Some(member) = callee.as_member_expression() else {
             return (
                 self.expression(callee, environment),
@@ -1170,6 +1195,7 @@ impl Analyzer<'_, '_> {
             Expression::ArrayExpression(array) => self.array_expression(array, environment),
             Expression::ObjectExpression(object) => self.object_expression(object, environment),
             Expression::CallExpression(call) => self.local_call(call, environment),
+            Expression::ChainExpression(chain) => self.chain_expression(chain, environment).0,
             Expression::NewExpression(call) => {
                 self.expression(&call.callee, environment);
                 self.arguments(&call.arguments, environment);
@@ -1937,6 +1963,38 @@ mod tests {
                 ("[f][0]===f".into(), "true".into()),
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn optional_chains_preserve_short_circuit_and_reference_receivers() -> Result<(), BudgetExceeded>
+    {
+        for (source, expected) in [
+            ("let a=null,b=[7];let r=[a?.[b[0]=9].x];r[0];b[0];", vec![("r[0]", "void 0"),("b[0]", "7")]),
+            ("let a={x: 7},b=[0];let r=[a?.[(b[0]=9,'x')]];r[0];b[0];", vec![("r[0]", "7"),("b[0]", "9")]),
+            ("let a={x: null},b=[7];let r=[a?.x?.[b[0]=9].y];r[0];b[0];", vec![("r[0]", "void 0"),("b[0]", "7")]),
+            ("let a={x: {y:7}};let r=[a?.x.y];r[0];", vec![("r[0]", "7")]),
+            ("let a={x: 7,f(){return [this.x]}};let r=a?.f();r[0];", vec![("r[0]", "7")]),
+            ("let a={x: 7,f(){return [this.x]}};let r=a.f?.();r[0];", vec![("r[0]", "7")]),
+            ("let a={x: 7,f(){return [this.x]}};let r=a?.f?.();r[0];", vec![("r[0]", "7")]),
+            ("let a={x: 7,f(){return [this.x]}};let r=(a?.f)();r[0];", vec![("r[0]", "7")]),
+            ("let a={x: 7,f(){return [this.x]}};let r=(a?.f)?.();r[0];", vec![("r[0]", "7")]),
+            ("let a=null,b=[7];let r=[a?.f(b[0]=9).x];r[0];b[0];", vec![("r[0]", "void 0"),("b[0]", "7")]),
+            ("let a={f: null},b=[7];let r=[a.f?.(b[0]=9).x];r[0];b[0];", vec![("r[0]", "void 0"),("b[0]", "7")]),
+            ("let a={x: 7,f(){return null}},b=[7];let r=[a?.f()?.[b[0]=9]];r[0];b[0];", vec![("r[0]", "void 0"),("b[0]", "7")]),
+            ("let f=(x)=>[x];let a=[7];let r=f?.(a[0]=9);r[0];a[0];", vec![("r[0]", "9"),("a[0]", "9")]),
+            ("let a={x: 7,f(x){return [this.x,x]}};let old=a;let r=a?.f((a={x: 9},11));r[0];r[1];old.x;", vec![("r[0]", "7"),("r[1]", "11"),("old.x", "7")]),
+            ("let a=null,b=[7];let r=[delete a?.[b[0]=9]];r[0];b[0];", vec![("r[0]", "true"),("b[0]", "7")]),
+            ("let a={__proto__: null,x:7};let r=[delete a?.x];r[0];a.x;", vec![("r[0]", "true"),("a.x", "void 0")]),
+            ("let a={__proto__: null,get x(){throw 1}};let r=[delete a?.x];r[0];a.x;", vec![("r[0]", "true"),("a.x", "void 0")]),
+            ("let a={f(){return [7]}};let r=[delete a?.f()];r[0];", vec![("r[0]", "true")]),
+            ("let a=[7];let f=x=>{x?.[a[0]=9]};f(unknown);a[0];", vec![]),
+            ("let a=null,b=[7];(a?.x)[b[0]=9];b[0];", vec![]),
+            ("let a=null,b=[7];(a?.f)(b[0]=9);b[0];", vec![]),
+        ] {
+            let expected = expected.into_iter().map(|(source,value)| (source.to_owned(),value.to_owned())).collect::<Vec<_>>();
+            assert_eq!(reads(source)?, expected, "{source}");
+        }
         Ok(())
     }
 
