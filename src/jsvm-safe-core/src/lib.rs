@@ -1424,6 +1424,10 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
                 return;
             }
         }
+        if let Some(value) = self.fresh_data.comparison(it.span) {
+            self.push_primitive(it.span, value, "reaching_heap_compare");
+            return;
+        }
         if matches!(it.operator.as_str(), "==" | "===" | "!=" | "!==") {
             let left_reference =
                 reference_identity(&it.left, self.scoping, self.reference_identity_tables);
