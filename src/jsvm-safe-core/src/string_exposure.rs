@@ -196,7 +196,8 @@ pub fn static_string_exposure_pass(
 ) -> Result<Vec<Replacement>, BudgetExceeded> {
     let facts = BindingFacts::analyze(program, scoping);
     let arrays = static_readonly_arrays(program, scoping, &facts);
-    let fresh_data = FreshDataReads::analyze(program, scoping, &facts, budget)?;
+    let pure_functions = crate::collect_pure_functions(program, scoping, &facts);
+    let fresh_data = FreshDataReads::analyze(program, scoping, &facts, &pure_functions, budget)?;
     let mut collector = StaticStringExposureCollector {
         scoping,
         arrays: &arrays,

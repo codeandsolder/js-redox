@@ -51,6 +51,7 @@ pub struct BindingFacts {
     scope_entries: HashMap<ScopeId, u32>,
     hoisted_functions: HashSet<ScopeId>,
     hoisted_function_bindings: HashMap<ScopeId, SymbolId>,
+    statement_list_functions: HashMap<SymbolId, ScopeId>,
     direct_calls: HashMap<ReferenceId, Span>,
     scopes: Vec<Option<ScopeId>>,
     eval_sites: Vec<EvalSite>,
@@ -134,6 +135,7 @@ impl BindingFacts {
             scope_entries: HashMap::new(),
             hoisted_functions: HashSet::new(),
             hoisted_function_bindings: HashMap::new(),
+            statement_list_functions: HashMap::new(),
             direct_calls: HashMap::new(),
             scopes: Vec::new(),
             eval_sites: Vec::new(),
@@ -568,6 +570,43 @@ impl BindingFacts {
                 .all(|&reference| !scoping.get_reference(reference).is_write())
     }
 
+    /// A function declaration is installed when its actual lexical owner
+    /// is instantiated. Annex B can instead create a var-like binding
+    /// initialized only by executing the declaration's block or branch.
+    /// The latter is not a stable hoisted callable.
+    pub(crate) fn hoisted_callable_declaration(
+        &self,
+        scoping: &Scoping,
+        symbol: SymbolId,
+        function_scope: ScopeId,
+    ) -> bool {
+        self.statement_list_functions.get(&symbol) == Some(&function_scope)
+            && scoping.scope_parent_id(function_scope) == Some(scoping.symbol_scope_id(symbol))
+            && self.has_declarative_storage(scoping, symbol)
+            && self.binding_has_stable_value(scoping, symbol)
+    }
+
+    /// Resolve an invocation to the already instantiated lexical function.
+    /// A body's declaration does not exist in its owner's separate
+    /// parameter environment, including closures created in defaults.
+    pub(crate) fn hoisted_callable_at(
+        &self,
+        scoping: &Scoping,
+        expression: &Expression<'_>,
+        function_scope: ScopeId,
+    ) -> Option<SymbolId> {
+        let Expression::Identifier(identifier) = expression.without_parentheses() else {
+            return None;
+        };
+        let symbol = self.resolved_symbol(scoping, identifier.reference_id.get()?)?;
+        let owner = scoping.symbol_scope_id(symbol);
+        let in_parameters = self.parameter_regions.get(&owner).is_some_and(|region| {
+            region.start <= identifier.span.start && identifier.span.end <= region.end
+        });
+        (!in_parameters && self.hoisted_callable_declaration(scoping, symbol, function_scope))
+            .then_some(symbol)
+    }
+
     pub(crate) fn stable_callable_symbol(
         &self,
         scoping: &Scoping,
@@ -696,6 +735,31 @@ impl<'a> Visit<'a> for BindingFacts {
         };
         let end = last.span().end;
         for statement in statements {
+            // Only statement-list declarations participate in ordinary
+            // function declaration instantiation. Annex B single-statement
+            // branches are not declarations in this list.
+            let function = match statement {
+                Statement::FunctionDeclaration(function) => Some(function.as_ref()),
+                Statement::ExportDeclaration(export) => match &export.declaration {
+                    Declaration::FunctionDeclaration(function) => Some(function.as_ref()),
+                    _ => None,
+                },
+                Statement::ExportDefaultDeclaration(export) => match &export.declaration {
+                    ExportDefaultDeclarationKind::FunctionDeclaration(function) => {
+                        Some(function.as_ref())
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(function) = function {
+                if let (Some(symbol), Some(scope)) = (
+                    function.id.as_ref().and_then(|id| id.symbol_id.get()),
+                    function.scope_id.get(),
+                ) {
+                    self.statement_list_functions.insert(symbol, scope);
+                }
+            }
             // This is one actual statement list. A switch case's lexical
             // declaration does not dominate a separately selectable case.
             let declaration = match statement {

@@ -801,6 +801,48 @@ fn depythonify_safe_deob_script_completion_runtime_equivalence() -> Result<()> {
 
 #[test]
 #[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_scalar_helper_cells_runtime_equivalence() -> Result<()> {
+    let sources = [
+        "function outer(){function f(x){var y=x+1;return (x=9)+y;}return f(2);}outer();",
+        "function outer(){function f(x){var y=x;var x=9;return y+x;}return f(2);}outer();",
+        "function outer(){function f(x){var y;var y=x+1;y++;return y;}return f(2);}outer();",
+        "function outer(){function f(x){var y=x+1;var y;return y;}return f(2);}outer();",
+        "function outer(){function f(x){let y=x+1;const z=y;y+=4;return z+y;}return f(2);}outer();",
+        "function outer(){function f(x){let y=x;return (y+=3,y++ + y);}return f(2);}outer();",
+        "function outer(){function f(x){let y=0;y ||= x;y &&= 7;return y;}return f(2);}outer();",
+        "function outer(){function f(x,x){return x;}return [f(2),f(2,7)];}outer();",
+        "function outer(){function f(){return typeof y;var y=1;}return f();}outer();",
+        "function outer(){function f(x){return x;function x(){}}return typeof f(2);}outer();",
+        "function outer(){function f(){return y;let y=7;}return f();}try{outer()}catch(e){e.name;}",
+        "function outer(){function f(){const x=7;x=9;return x;}return f();}try{outer()}catch(e){e.name;}",
+        "function f(x){return x+1}globalThis.f=x=>x+9;f(2);",
+        "function outer(flag){if(flag){function f(x){return x+1}}try{return f(2)}catch(e){return e.name;}}[outer(false),outer(true)];",
+        "function outer(flag){if(flag)function f(x){return x+1}try{return f(2)}catch(e){return e.name;}}[outer(false),outer(true)];",
+        "function outer(){function f(x){return x+1}function f(x){return x+9}return f(2);}outer();",
+        "function outer(){'use strict';{function f(x){return x+1}return f(2)}}outer();",
+        "function outer(){let a;{function f(x){return x+1}a=f(2)}return a;}outer();",
+        "function f(x){return x+9}function outer(a=f(2)){function f(x){return x+1}return a;}outer();",
+        "function f(x){return x+9}function outer(a=()=>f(2)){function f(x){return x+1}return a();}outer();",
+        "function outer(){function f(x){var arguments;return x;}return f(2);}outer();",
+        "function outer(){function f(x){var arguments=7;return arguments;}return f(2);}outer();",
+        "function outer(){function f(x){var y=x+1;return (x=9)+y;}return [f(2),f(7)];}outer();",
+        "function outer(){function f(x){let y=x;return y &&= 7;}return [f(0),f(2)];}outer();",
+    ];
+    script_runtime_equivalence(&sources, "scalar-helper-cells", false)?;
+    let heap_sources = [
+        "function outer(){function index(x){let y=x;return (x=9,y);}let a=[0,0];for(let i=0;i<2;i++){a[index(i)]=7;}return a[0]+a[1];}outer();",
+        "function outer(){function index(x,y){return x+y;}let a=[0,7];let i=0;index(i++,i++);return a[i-1];}outer();",
+        "function outer(){function index(x){return x;}let a=[7];index(a[0]=9);return a[0];}outer();",
+        "function outer(){function index(x){return x;}let a=[7];index(a);return a[0];}outer();",
+        "function index(x){return x;}let a=[7];globalThis.index=()=>{a[0]=9;};index(0);a[0];",
+        "function outer(flag){if(flag){function index(x){return x;}}let a=[7];index(0);return a[0];}try{outer(false)}catch(e){e.name;}",
+        "function outer(){function index(x){return x%2;}let a=[[],[]];for(let i=0;i<2;i++){a[index(i)]=a[0];}return a[0]===a[1];}outer();",
+    ];
+    script_runtime_equivalence(&heap_sources, "scalar-helper-heap", false)
+}
+
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
 fn depythonify_safe_deob_declarative_var_runtime_equivalence() -> Result<()> {
     let sources = [
         "function f(){var a=[7];var b=a;b[0]=9;return a[0];}f();",

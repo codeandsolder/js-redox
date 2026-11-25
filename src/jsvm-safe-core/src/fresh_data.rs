@@ -6,15 +6,16 @@
 //! branch joins keep only facts common to the reaching normal paths. Deferred
 //! bodies and unsupported control regions are analyzed from an empty state.
 use crate::binding_facts::BindingFacts;
+use crate::pure_function::PureFunction;
 use crate::value_eval::{
     eval, eval_binary, eval_unary_value, identical_primitive_value, is_prototype_setter,
     literal_property_key, Value,
 };
 use oxc_ast::ast::{
-    Argument, ArrayExpressionElement, BindingPattern, Declaration, Expression, ForStatement,
-    ForStatementInit, IdentifierReference, MemberExpression, ObjectPropertyKind, Program,
-    PropertyKind, SimpleAssignmentTarget, Statement, VariableDeclaration, VariableDeclarationKind,
-    VariableDeclarator,
+    Argument, ArrayExpressionElement, BindingPattern, CallExpression, Declaration, Expression,
+    ForStatement, ForStatementInit, IdentifierReference, MemberExpression, ObjectPropertyKind,
+    Program, PropertyKind, SimpleAssignmentTarget, Statement, VariableDeclaration,
+    VariableDeclarationKind, VariableDeclarator,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::Scoping;
@@ -165,11 +166,13 @@ impl FreshDataReads {
         program: &Program<'_>,
         scoping: &Scoping,
         bindings: &BindingFacts,
+        pure_functions: &HashMap<SymbolId, PureFunction>,
         budget: &WorkBudget,
     ) -> Result<Self, BudgetExceeded> {
         let mut analyzer = Analyzer {
             scoping,
             bindings,
+            pure_functions,
             reads: Self::default(),
             visited_lists: HashSet::new(),
             budget,
@@ -244,6 +247,7 @@ impl FreshDataReads {
 struct Analyzer<'c> {
     scoping: &'c Scoping,
     bindings: &'c BindingFacts,
+    pure_functions: &'c HashMap<SymbolId, PureFunction>,
     reads: FreshDataReads,
     visited_lists: HashSet<(u32, u32)>,
     budget: &'c WorkBudget,
@@ -988,6 +992,9 @@ impl Analyzer<'_> {
             Expression::ArrayExpression(array) => self.array_expression(array, environment),
             Expression::ObjectExpression(object) => self.object_expression(object, environment),
             Expression::CallExpression(call) => {
+                if let Some(result) = self.scalar_call(call, environment) {
+                    return result;
+                }
                 // Callee lookup precedes argument evaluation. An unknown
                 // getter/global lookup can mutate anything visible to it.
                 if let Some(result) = self.immediate_call(call, environment) {
@@ -1017,6 +1024,61 @@ impl Analyzer<'_> {
                 |value| Evaluation::primitive(value, true),
             ),
         }
+    }
+
+    /// Use the same lexical scalar interpreter as call replacement. A
+    /// proven callable lookup itself is inert, but arguments need not be.
+    /// Once argument evaluation begins, never retry via the unknown-call
+    /// path: it would replay their effects in the abstract heap.
+    fn scalar_call(
+        &mut self,
+        call: &CallExpression<'_>,
+        environment: &mut Environment,
+    ) -> Option<Evaluation> {
+        if call.optional
+            || call
+                .arguments
+                .iter()
+                .any(|argument| matches!(argument, Argument::SpreadElement(_)))
+        {
+            return None;
+        }
+        let Expression::Identifier(identifier) = call.callee.without_parentheses() else {
+            return None;
+        };
+        let symbol = self
+            .bindings
+            .resolved_symbol(self.scoping, identifier.reference_id.get()?)?;
+        let functions = self.pure_functions;
+        let function = functions.get(&symbol)?;
+        self.bindings
+            .hoisted_callable_at(self.scoping, &call.callee, function.scope())?;
+        let mut values = Vec::with_capacity(call.arguments.len());
+        let mut inert = true;
+        let mut exact = true;
+        for argument in &call.arguments {
+            let Some(expression) = argument.as_expression() else {
+                self.unobserved(call.span);
+                return Some(self.barrier(environment));
+            };
+            let value = self.expression(expression, environment);
+            inert &= value.inert;
+            if let Some(Fact::Primitive(value)) = value.fact {
+                values.push(value);
+            } else {
+                exact = false;
+            }
+        }
+        let result = exact
+            .then(|| function.evaluate(&values, self.budget))
+            .flatten();
+        if !self.checkpoint() {
+            return Some(self.barrier(environment));
+        }
+        Some(result.map_or_else(
+            || self.barrier(environment),
+            |value| Evaluation::primitive(value, inert),
+        ))
     }
 
     fn arguments(&mut self, arguments: &[Argument<'_>], environment: &mut Environment) {
@@ -1412,10 +1474,12 @@ mod tests {
         assert!(semantic.diagnostics.is_empty(), "{source}");
         let scoping = semantic.semantic.scoping();
         let bindings = BindingFacts::analyze(&program, scoping);
+        let pure_functions = crate::collect_pure_functions(&program, scoping, &bindings);
         let analysis = FreshDataReads::analyze(
             &program,
             scoping,
             &bindings,
+            &pure_functions,
             &WorkBudget::unlimited("fresh-data-tests"),
         )?;
         let observations = if comparisons {
@@ -1592,6 +1656,27 @@ mod tests {
     }
 
     #[test]
+    fn scalar_helpers_preserve_heap_and_argument_order() -> Result<(), BudgetExceeded> {
+        for (source, expected) in [
+            ("function outer(){function index(x){let y=x;return (x=9,y);}let a=[0,0];for(let i=0;i<2;i++){a[index(i)]=7;}return a[0]+a[1];}", vec![("a[0]", "7"), ("a[1]", "7")]),
+            ("function outer(){function index(x,y){return x+y;}let a=[0,7];let i=0;index(i++,i++);return a[i-1];}", vec![("a[i-1]", "7")]),
+            ("function outer(){function index(x){return x;}let a=[7];index(a[0]=9);return a[0];}", vec![("a[0]", "9")]),
+            ("function outer(){function index(x){return x;}let a=[7];index(a);return a[0];}", vec![]),
+            ("function index(x){return x;}let a=[7];index(0);a[0];", vec![]),
+            ("function outer(flag){if(flag){function index(x){return x;}}let a=[7];index(0);return a[0];}", vec![]),
+        ] {
+            let expected = expected.into_iter().map(|(span, value)| (span.to_owned(), value.to_owned())).collect::<Vec<_>>();
+            assert_eq!(reads(source)?, expected, "{source}");
+        }
+        let source = "function outer(){function index(x){return x%2;}let a=[[],[]];for(let i=0;i<2;i++){a[index(i)]=a[0];}return a[0]===a[1];}";
+        assert_eq!(
+            observed(source, true)?,
+            vec![("a[0]===a[1]".into(), "true".into())]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn finite_heap_construction_proves_real_object_identity() -> Result<(), BudgetExceeded> {
         let source = "let a=[[],[]];for(let i=0;i<2;i++)a[i]=a[0];a[0]===a[1];a[0]!=a[1];";
         assert_eq!(
@@ -1635,7 +1720,11 @@ mod tests {
         let scoping = semantic.semantic.scoping();
         let bindings = BindingFacts::analyze(&program, scoping);
         let budget = WorkBudget::new("bounded-heap-analysis", work_budget::BudgetLimits::work(16));
-        assert!(FreshDataReads::analyze(&program, scoping, &bindings, &budget).is_err());
+        let pure_functions = crate::collect_pure_functions(&program, scoping, &bindings);
+        assert!(
+            FreshDataReads::analyze(&program, scoping, &bindings, &pure_functions, &budget)
+                .is_err()
+        );
         assert_eq!(
             reads(&source)?,
             vec![("p0.x".into(), "7".into()), ("p127.x".into(), "7".into())]

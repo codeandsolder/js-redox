@@ -1,21 +1,42 @@
-use crate::value_eval::{
-    eval_binary, eval_logical_left, eval_unary_value, string_literal_value, template_element_value,
-    LogicalStep, Value,
+//! Compile source-local scalar helpers to exact declarative binding cells.
+//!
+//! A local initializer captures a value at its execution point; it is not
+//! a macro for reevaluating its expression after a parameter has changed.
+use crate::{
+    binding_facts::BindingFacts,
+    value_eval::{
+        eval_binary, eval_logical_left, eval_unary_value, string_literal_value,
+        template_element_value, LogicalStep, Value,
+    },
 };
-use oxc_ast::ast::{BindingPattern, Expression, Statement, VariableDeclarationKind};
+use oxc_ast::ast::{
+    BindingPattern, Expression, Function, FunctionType, IdentifierReference,
+    SimpleAssignmentTarget, Statement, VariableDeclarationKind,
+};
 use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::Scoping;
 use oxc_span::Span;
-use oxc_syntax::{scope::ScopeFlags, symbol::SymbolId};
+use oxc_syntax::{
+    operator::{AssignmentOperator, UpdateOperator},
+    scope::{ScopeFlags, ScopeId},
+    symbol::SymbolId,
+};
 use std::collections::HashMap;
+use work_budget::WorkBudget;
 
 #[derive(Debug, Clone)]
 enum PureExpr {
     Value(Value),
-    Param(usize),
-    AssignParam {
+    Cell(usize),
+    Assign {
         index: usize,
+        operator: AssignmentOperator,
         value: Box<Self>,
+    },
+    Update {
+        index: usize,
+        operator: UpdateOperator,
+        prefix: bool,
     },
     Unary {
         operator: String,
@@ -36,278 +57,441 @@ enum PureExpr {
         consequent: Box<Self>,
         alternate: Box<Self>,
     },
+    Sequence(Vec<Self>),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CellKind {
+    Var,
+    Let,
+    Const,
+    /// A var redeclaration of the implicit arguments object is initialized
+    /// to that object, not undefined. A primitive initializer can replace it.
+    Arguments,
+}
+
+struct Cell {
+    value: Option<Value>,
+    mutable: bool,
+}
+
+fn charge_value(value: &Value, budget: &WorkBudget) -> Option<()> {
+    let units = match value {
+        Value::String(text) => text.len().saturating_add(1),
+        _ => 1,
+    };
+    budget
+        .consume(u64::try_from(units).unwrap_or(u64::MAX))
+        .ok()
+}
+
+impl CellKind {
+    const fn create(self) -> Cell {
+        Cell {
+            value: match self {
+                Self::Var => Some(Value::Undefined),
+                Self::Let | Self::Const | Self::Arguments => None,
+            },
+            mutable: !matches!(self, Self::Const),
+        }
+    }
+}
+
+impl Cell {
+    fn read(&self, budget: &WorkBudget) -> Option<Value> {
+        let value = self.value.as_ref()?;
+        charge_value(value, budget)?;
+        Some(value.clone())
+    }
+
+    fn write(&mut self, value: Value, budget: &WorkBudget) -> Option<Value> {
+        // Writes before lexical initialization and writes to immutable
+        // bindings throw. The entire pure call proof must then fail.
+        if !self.mutable || self.value.is_none() {
+            return None;
+        }
+        charge_value(&value, budget)?;
+        self.value = Some(value.clone());
+        Some(value)
+    }
 }
 
 impl PureExpr {
-    fn is_effect_free(&self) -> bool {
+    fn eval(&self, cells: &mut [Cell], budget: &WorkBudget) -> Option<Value> {
+        budget.consume(1).ok()?;
         match self {
-            Self::Value(_) | Self::Param(_) => true,
-            Self::AssignParam { .. } => false,
-            Self::Unary { argument, .. } => argument.is_effect_free(),
-            Self::Binary { left, right, .. } | Self::Logical { left, right, .. } => {
-                left.is_effect_free() && right.is_effect_free()
+            Self::Value(value) => {
+                charge_value(value, budget)?;
+                Some(value.clone())
             }
-            Self::Conditional {
-                test,
-                consequent,
-                alternate,
-            } => test.is_effect_free() && consequent.is_effect_free() && alternate.is_effect_free(),
-        }
-    }
-
-    fn eval(&self, params: &mut [Value]) -> Option<Value> {
-        match self {
-            Self::Value(value) => Some(value.clone()),
-            Self::Param(index) => params.get(*index).cloned(),
-            Self::AssignParam { index, value } => {
-                let value = value.eval(params)?;
-                *params.get_mut(*index)? = value.clone();
-                Some(value)
+            Self::Cell(index) => cells.get(*index)?.read(budget),
+            Self::Assign {
+                index,
+                operator,
+                value,
+            } => {
+                let value = if *operator == AssignmentOperator::Assign {
+                    value.eval(cells, budget)?
+                } else {
+                    let previous = cells.get(*index)?.read(budget)?;
+                    if let Some(logical) = operator.to_logical_operator() {
+                        match eval_logical_left(logical.as_str(), previous)? {
+                            LogicalStep::Value(value) => return Some(value),
+                            LogicalStep::EvaluateRight => value.eval(cells, budget)?,
+                        }
+                    } else {
+                        let right = value.eval(cells, budget)?;
+                        eval_binary(operator.to_binary_operator()?.as_str(), &previous, &right)?
+                    }
+                };
+                cells.get_mut(*index)?.write(value, budget)
+            }
+            Self::Update {
+                index,
+                operator,
+                prefix,
+            } => {
+                let cell = cells.get_mut(*index)?;
+                let previous = cell.read(budget)?.number();
+                let next = match operator {
+                    UpdateOperator::Increment => previous + 1.0,
+                    UpdateOperator::Decrement => previous - 1.0,
+                };
+                cell.write(Value::Number(next), budget)?;
+                Some(Value::Number(if *prefix { next } else { previous }))
             }
             Self::Unary { operator, argument } => {
-                eval_unary_value(operator, &argument.eval(params)?)
+                eval_unary_value(operator, &argument.eval(cells, budget)?)
             }
             Self::Binary {
                 operator,
                 left,
                 right,
             } => {
-                let left = left.eval(params)?;
-                let right = right.eval(params)?;
+                let left = left.eval(cells, budget)?;
+                let right = right.eval(cells, budget)?;
                 eval_binary(operator, &left, &right)
             }
             Self::Logical {
                 operator,
                 left,
                 right,
-            } => match eval_logical_left(operator, left.eval(params)?)? {
+            } => match eval_logical_left(operator, left.eval(cells, budget)?)? {
                 LogicalStep::Value(value) => Some(value),
-                LogicalStep::EvaluateRight => right.eval(params),
+                LogicalStep::EvaluateRight => right.eval(cells, budget),
             },
             Self::Conditional {
                 test,
                 consequent,
                 alternate,
             } => {
-                if test.eval(params)?.truthy() {
-                    consequent.eval(params)
+                if test.eval(cells, budget)?.truthy() {
+                    consequent.eval(cells, budget)
                 } else {
-                    alternate.eval(params)
+                    alternate.eval(cells, budget)
                 }
+            }
+            Self::Sequence(items) => {
+                let mut result = Value::Undefined;
+                for item in items {
+                    result = item.eval(cells, budget)?;
+                }
+                Some(result)
             }
         }
     }
 }
 
-fn compile_pure_expr(
-    expr: &Expression<'_>,
-    params: &HashMap<String, usize>,
-    locals: &HashMap<String, PureExpr>,
-) -> Option<PureExpr> {
-    match expr {
-        Expression::Identifier(id) => locals
-            .get(id.name.as_str())
-            .cloned()
-            .or_else(|| params.get(id.name.as_str()).copied().map(PureExpr::Param)),
-        Expression::StringLiteral(v) => {
-            string_literal_value(v).map(|value| PureExpr::Value(Value::String(value)))
-        }
-        Expression::NumericLiteral(v) => Some(PureExpr::Value(Value::Number(v.value))),
-        Expression::BooleanLiteral(v) => Some(PureExpr::Value(Value::Bool(v.value))),
-        Expression::NullLiteral(_) => Some(PureExpr::Value(Value::Null)),
-        Expression::TemplateLiteral(v) if v.expressions.is_empty() => v
-            .quasis
-            .first()
-            .and_then(template_element_value)
-            .map(|value| PureExpr::Value(Value::String(value))),
-        Expression::ParenthesizedExpression(v) => compile_pure_expr(&v.expression, params, locals),
-        Expression::AssignmentExpression(v) if v.operator.as_str() == "=" => {
-            let oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(target) = &v.left else {
-                return None;
-            };
-            Some(PureExpr::AssignParam {
-                index: *params.get(target.name.as_str())?,
-                value: Box::new(compile_pure_expr(&v.right, params, locals)?),
-            })
-        }
-        Expression::UnaryExpression(v)
-            if matches!(
-                v.operator.as_str(),
-                "!" | "+" | "-" | "~" | "void" | "typeof"
-            ) =>
-        {
-            Some(PureExpr::Unary {
+struct Compiler<'c> {
+    scoping: &'c Scoping,
+    indices: HashMap<SymbolId, usize>,
+    cells: Vec<CellKind>,
+}
+
+impl Compiler<'_> {
+    fn declare(&mut self, symbol: SymbolId, kind: CellKind) -> usize {
+        *self.indices.entry(symbol).or_insert_with(|| {
+            let index = self.cells.len();
+            self.cells.push(kind);
+            index
+        })
+    }
+
+    fn reference(&self, identifier: &IdentifierReference<'_>) -> Option<usize> {
+        let symbol = self
+            .scoping
+            .get_reference(identifier.reference_id.get()?)
+            .symbol_id()?;
+        self.indices.get(&symbol).copied()
+    }
+
+    fn compile(&self, expr: &Expression<'_>) -> Option<PureExpr> {
+        match expr {
+            Expression::Identifier(id) => self.reference(id).map(PureExpr::Cell),
+            Expression::StringLiteral(v) => {
+                string_literal_value(v).map(|value| PureExpr::Value(Value::String(value)))
+            }
+            Expression::NumericLiteral(v) => Some(PureExpr::Value(Value::Number(v.value))),
+            Expression::BooleanLiteral(v) => Some(PureExpr::Value(Value::Bool(v.value))),
+            Expression::NullLiteral(_) => Some(PureExpr::Value(Value::Null)),
+            Expression::TemplateLiteral(v) if v.expressions.is_empty() => v
+                .quasis
+                .first()
+                .and_then(template_element_value)
+                .map(|value| PureExpr::Value(Value::String(value))),
+            Expression::ParenthesizedExpression(v) => self.compile(&v.expression),
+            Expression::AssignmentExpression(v) => {
+                let SimpleAssignmentTarget::AssignmentTargetIdentifier(target) =
+                    v.left.as_simple_assignment_target()?
+                else {
+                    return None;
+                };
+                Some(PureExpr::Assign {
+                    index: self.reference(target)?,
+                    operator: v.operator,
+                    value: Box::new(self.compile(&v.right)?),
+                })
+            }
+            Expression::UpdateExpression(v) => {
+                let SimpleAssignmentTarget::AssignmentTargetIdentifier(target) = &v.argument else {
+                    return None;
+                };
+                Some(PureExpr::Update {
+                    index: self.reference(target)?,
+                    operator: v.operator,
+                    prefix: v.prefix,
+                })
+            }
+            Expression::UnaryExpression(v)
+                if matches!(
+                    v.operator.as_str(),
+                    "!" | "+" | "-" | "~" | "void" | "typeof"
+                ) =>
+            {
+                Some(PureExpr::Unary {
+                    operator: v.operator.as_str().to_string(),
+                    argument: Box::new(self.compile(&v.argument)?),
+                })
+            }
+            Expression::BinaryExpression(v) => Some(PureExpr::Binary {
                 operator: v.operator.as_str().to_string(),
-                argument: Box::new(compile_pure_expr(&v.argument, params, locals)?),
-            })
-        }
-        Expression::BinaryExpression(v)
-            if matches!(
-                v.operator.as_str(),
-                "+" | "-"
-                    | "*"
-                    | "/"
-                    | "%"
-                    | "**"
-                    | "<<"
-                    | ">>"
-                    | ">>>"
-                    | "|"
-                    | "^"
-                    | "&"
-                    | "==="
-                    | "!=="
-                    | "=="
-                    | "!="
-                    | "<"
-                    | "<="
-                    | ">"
-                    | ">="
-            ) =>
-        {
-            Some(PureExpr::Binary {
+                left: Box::new(self.compile(&v.left)?),
+                right: Box::new(self.compile(&v.right)?),
+            }),
+            Expression::LogicalExpression(v) => Some(PureExpr::Logical {
                 operator: v.operator.as_str().to_string(),
-                left: Box::new(compile_pure_expr(&v.left, params, locals)?),
-                right: Box::new(compile_pure_expr(&v.right, params, locals)?),
-            })
+                left: Box::new(self.compile(&v.left)?),
+                right: Box::new(self.compile(&v.right)?),
+            }),
+            Expression::ConditionalExpression(v) => Some(PureExpr::Conditional {
+                test: Box::new(self.compile(&v.test)?),
+                consequent: Box::new(self.compile(&v.consequent)?),
+                alternate: Box::new(self.compile(&v.alternate)?),
+            }),
+            Expression::SequenceExpression(v) => Some(PureExpr::Sequence(
+                v.expressions
+                    .iter()
+                    .map(|expr| self.compile(expr))
+                    .collect::<Option<_>>()?,
+            )),
+            _ => None,
         }
-        Expression::LogicalExpression(v) => Some(PureExpr::Logical {
-            operator: v.operator.as_str().to_string(),
-            left: Box::new(compile_pure_expr(&v.left, params, locals)?),
-            right: Box::new(compile_pure_expr(&v.right, params, locals)?),
-        }),
-        Expression::ConditionalExpression(v) => Some(PureExpr::Conditional {
-            test: Box::new(compile_pure_expr(&v.test, params, locals)?),
-            consequent: Box::new(compile_pure_expr(&v.consequent, params, locals)?),
-            alternate: Box::new(compile_pure_expr(&v.alternate, params, locals)?),
-        }),
-        _ => None,
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
+enum Step {
+    Initialize { index: usize, value: PureExpr },
+    Evaluate(PureExpr),
+}
+
+#[derive(Debug)]
 pub struct PureFunction {
-    param_count: usize,
+    parameters: Vec<usize>,
+    cells: Vec<CellKind>,
+    steps: Vec<Step>,
     expression: PureExpr,
-    declaration_span: Option<Span>,
+    declaration_span: Span,
+    scope: ScopeId,
 }
 
 impl PureFunction {
-    pub(super) fn evaluate(&self, args: &[Value]) -> Option<Value> {
-        let mut params = vec![Value::Undefined; self.param_count];
-        for (target, value) in params.iter_mut().zip(args.iter().cloned()) {
-            *target = value;
+    pub(super) fn evaluate(&self, args: &[Value], budget: &WorkBudget) -> Option<Value> {
+        budget
+            .consume(u64::try_from(self.cells.len()).unwrap_or(u64::MAX))
+            .ok()?;
+        let mut cells = self
+            .cells
+            .iter()
+            .map(|kind| kind.create())
+            .collect::<Vec<_>>();
+        for (position, &index) in self.parameters.iter().enumerate() {
+            let value = args.get(position).unwrap_or(&Value::Undefined);
+            charge_value(value, budget)?;
+            cells.get_mut(index)?.value = Some(value.clone());
         }
-        self.expression.eval(&mut params)
+        for step in &self.steps {
+            match step {
+                Step::Initialize { index, value } => {
+                    let value = value.eval(&mut cells, budget)?;
+                    cells.get_mut(*index)?.value = Some(value);
+                }
+                Step::Evaluate(expr) => {
+                    expr.eval(&mut cells, budget)?;
+                }
+            }
+        }
+        self.expression.eval(&mut cells, budget)
     }
 
-    pub(super) const fn declaration_span(&self) -> Option<Span> {
+    pub(super) const fn declaration_span(&self) -> Span {
         self.declaration_span
+    }
+
+    pub(super) const fn scope(&self) -> ScopeId {
+        self.scope
     }
 }
 
 struct PureFunctionCollector<'c> {
     scoping: &'c Scoping,
+    facts: &'c BindingFacts,
     functions: HashMap<SymbolId, PureFunction>,
 }
 
-/// Compile only simple positional bindings; unsupported parameters cannot
-/// be modeled by the pure evaluator without additional call-time semantics.
-fn pure_parameter_bindings(
-    function: &oxc_ast::ast::Function<'_>,
-) -> Option<HashMap<String, usize>> {
-    if function.r#async || function.generator || function.params.rest.is_some() {
-        return None;
-    }
-    let mut params = HashMap::new();
-    for (index, parameter) in function.params.items.iter().enumerate() {
-        let BindingPattern::BindingIdentifier(parameter_id) = &parameter.pattern else {
-            return None;
-        };
-        if parameter.initializer.is_some()
-            || params
-                .insert(parameter_id.name.to_string(), index)
-                .is_some()
-        {
-            return None;
-        }
-    }
-    Some(params)
+fn cell_kind(kind: VariableDeclarationKind, name: &str) -> Option<CellKind> {
+    Some(match kind {
+        VariableDeclarationKind::Var if name == "arguments" => CellKind::Arguments,
+        VariableDeclarationKind::Var => CellKind::Var,
+        VariableDeclarationKind::Let => CellKind::Let,
+        VariableDeclarationKind::Const => CellKind::Const,
+        _ => return None,
+    })
 }
 
-/// Evaluate local declarations in source order, admitting only effect-free
-/// initializers before a final return. A rejected statement rejects the whole
-/// candidate, not merely the affected local binding.
-fn pure_function_body(
+fn declare_cells(
+    function: &Function<'_>,
     statements: &[Statement<'_>],
-    params: &HashMap<String, usize>,
-) -> Option<PureExpr> {
-    let mut locals = HashMap::new();
-    let mut expression = None;
-    if statements.is_empty() {
-        return None;
+    compiler: &mut Compiler<'_>,
+) -> Option<Vec<usize>> {
+    let mut parameters = Vec::new();
+    for parameter in &function.params.items {
+        let BindingPattern::BindingIdentifier(id) = &parameter.pattern else {
+            return None;
+        };
+        if parameter.initializer.is_some() {
+            return None;
+        }
+        parameters.push(compiler.declare(id.symbol_id.get()?, CellKind::Var));
     }
-    for (index, statement) in statements.iter().enumerate() {
+    for statement in statements {
         match statement {
-            Statement::VariableDeclaration(declaration)
-                if declaration.kind == VariableDeclarationKind::Var
-                    && index + 1 < statements.len() =>
-            {
+            Statement::VariableDeclaration(declaration) => {
                 for declarator in &declaration.declarations {
-                    let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
+                    let BindingPattern::BindingIdentifier(id) = &declarator.id else {
                         return None;
                     };
-                    if params.contains_key(identifier.name.as_str())
-                        || locals.contains_key(identifier.name.as_str())
-                    {
-                        return None;
-                    }
-                    let compiled = compile_pure_expr(declarator.init.as_ref()?, params, &locals)?;
-                    if !compiled.is_effect_free() {
-                        return None;
-                    }
-                    locals.insert(identifier.name.to_string(), compiled);
+                    compiler.declare(
+                        id.symbol_id.get()?,
+                        cell_kind(declaration.kind, id.name.as_str())?,
+                    );
                 }
             }
-            Statement::ReturnStatement(ret) if index + 1 == statements.len() => {
-                expression = Some(compile_pure_expr(ret.argument.as_ref()?, params, &locals)?);
-            }
+            Statement::ExpressionStatement(_)
+            | Statement::ReturnStatement(_)
+            | Statement::EmptyStatement(_) => {}
+            // Hoisted declarations after a return may override parameter
+            // or var cells. Do not discard unmodeled instantiation effects.
             _ => return None,
         }
     }
-    expression
+    Some(parameters)
+}
+
+fn compile_body(
+    statements: &[Statement<'_>],
+    compiler: &Compiler<'_>,
+) -> Option<(Vec<Step>, PureExpr)> {
+    let mut steps = Vec::new();
+    for statement in statements {
+        match statement {
+            Statement::VariableDeclaration(declaration) => {
+                for declarator in &declaration.declarations {
+                    let BindingPattern::BindingIdentifier(id) = &declarator.id else {
+                        return None;
+                    };
+                    if declaration.kind == VariableDeclarationKind::Var && declarator.init.is_none()
+                    {
+                        continue;
+                    }
+                    let value = if let Some(init) = &declarator.init {
+                        compiler.compile(init)?
+                    } else {
+                        PureExpr::Value(Value::Undefined)
+                    };
+                    let index = *compiler.indices.get(&id.symbol_id.get()?)?;
+                    steps.push(Step::Initialize { index, value });
+                }
+            }
+            Statement::ExpressionStatement(statement) => {
+                steps.push(Step::Evaluate(compiler.compile(&statement.expression)?));
+            }
+            Statement::ReturnStatement(ret) => {
+                let result = if let Some(argument) = &ret.argument {
+                    compiler.compile(argument)?
+                } else {
+                    PureExpr::Value(Value::Undefined)
+                };
+                return Some((steps, result));
+            }
+            Statement::EmptyStatement(_) => {}
+            _ => return None,
+        }
+    }
+    Some((steps, PureExpr::Value(Value::Undefined)))
 }
 
 fn proven_pure_function(
-    function: &oxc_ast::ast::Function<'_>,
+    function: &Function<'_>,
     scoping: &Scoping,
+    facts: &BindingFacts,
 ) -> Option<(SymbolId, PureFunction)> {
-    let id = function.id.as_ref()?;
-    let body = function.body.as_ref()?;
-    let symbol = id.symbol_id.get()?;
-    if scoping
-        .get_resolved_reference_ids(symbol)
-        .iter()
-        .any(|reference_id| scoping.get_reference(*reference_id).is_write())
+    if function.r#type != FunctionType::FunctionDeclaration
+        || function.r#async
+        || function.generator
+        || function.params.rest.is_some()
     {
         return None;
     }
-    let params = pure_parameter_bindings(function)?;
-    let expression = pure_function_body(&body.statements, &params)?;
+    let symbol = function.id.as_ref()?.symbol_id.get()?;
+    let scope = function.scope_id.get()?;
+    if !facts.hoisted_callable_declaration(scoping, symbol, scope) {
+        return None;
+    }
+    let body = function.body.as_ref()?;
+    let mut compiler = Compiler {
+        scoping,
+        indices: HashMap::new(),
+        cells: Vec::new(),
+    };
+    let parameters = declare_cells(function, &body.statements, &mut compiler)?;
+    let (steps, expression) = compile_body(&body.statements, &compiler)?;
     Some((
         symbol,
         PureFunction {
-            param_count: function.params.items.len(),
+            parameters,
+            cells: compiler.cells,
+            steps,
             expression,
-            declaration_span: (function.r#type == oxc_ast::ast::FunctionType::FunctionDeclaration)
-                .then_some(function.span),
+            declaration_span: function.span,
+            scope,
         },
     ))
 }
 
 impl<'a> Visit<'a> for PureFunctionCollector<'_> {
-    fn visit_function(&mut self, function: &oxc_ast::ast::Function<'a>, flags: ScopeFlags) {
-        if let Some((symbol, pure)) = proven_pure_function(function, self.scoping) {
+    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        if let Some((symbol, pure)) = proven_pure_function(function, self.scoping, self.facts) {
             self.functions.insert(symbol, pure);
         }
         walk::walk_function(self, function, flags);
@@ -317,9 +501,11 @@ impl<'a> Visit<'a> for PureFunctionCollector<'_> {
 pub fn collect_pure_functions(
     program: &oxc_ast::ast::Program<'_>,
     scoping: &Scoping,
+    facts: &BindingFacts,
 ) -> HashMap<SymbolId, PureFunction> {
     let mut collector = PureFunctionCollector {
         scoping,
+        facts,
         functions: HashMap::new(),
     };
     collector.visit_program(program);
