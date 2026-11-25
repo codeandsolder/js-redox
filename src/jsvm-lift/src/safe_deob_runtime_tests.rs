@@ -954,6 +954,38 @@ fn depythonify_safe_deob_callable_capture_runtime_equivalence() -> Result<()> {
 
 #[test]
 #[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_destructuring_assignment_runtime_equivalence() -> Result<()> {
+    let sources = [
+        "let a,b;({x:a,y:b}={x:7,y:9});let r=[a,b];[r[0],r[1]];",
+        "let x;({x}={x: 7});let r=[x];r[0];",
+        "let x;({x=7}={x: void 0});let r=[x];r[0];",
+        "let x;({x=7}={x: null});let r=[x];r[0];",
+        "let x;({x:{y:x=7}}={x:{y:void 0}});let r=[x];r[0];",
+        "let a=[1],s={x:7};({x:a[(s.x=9,0)]}=s);a[0];",
+        "let s={x:7},a=[1],old=a;({x:a[(a=[9],0)]}=s);[old[0],a[0]];",
+        "let a=[0],old=a,s={x:void 0};({x:a[0]=(a=[9],7)}=s);[old[0],a[0]];",
+        "let a=[0],s={x:7,y:8};({x:a[0],...a[(s.y=9,1)]}=s);[a[0],a[1].y];",
+        "let s={x:7,y:8},a,r;({x:a,...r}=s);let q=[a,r.y];[q[0],q[1]];",
+        "let s={x:7},a;let r=({x:a}=s);[r===s,r.x];",
+        "let s={x:7,y:8},a=[0];({x:a[0],y:a[0]}=s);a[0];",
+        "let s={x:7},a=[0];({[(s.x=9,'x')]:a[0]}=s);a[0];",
+        "let a=[[7]],s={x:9};let k={toString(){a[0]=[11];return 'x'}};({[k]:a[0][0]}=s);a[0][0];",
+        "let a=[7],s={get x(){a[0]=9;return 8}};let x;({x}=s);a[0];",
+        "let a=[7];a[Symbol.iterator]=function*(){a[0]=9;yield 11};let x;[x]=a;[x,a[0]];",
+        "let f=function(x){({a:arguments[0]}={a: 9});return [x]};let r=f(7);r[0];",
+        "let a=[0],s={get x(){events.push('get');return 7}};({[(events.push('key'),'x')]:a[(events.push('target'),0)]}=s);a[0];",
+        "let a=[0],s={get y(){events.push('get');return 9}};({...a[(events.push('target'),0)]}=s);a[0].y;",
+        "let a=[0],s={x:void 0};({x:a[(events.push('target'),0)]=(events.push('default'),7)}=s);a[0];",
+        "let a=[0];try{({x:a[(events.push('target'),0)]}=null)}catch(e){events.push(e.name)}a[0];",
+        "let a=[0],s={x:7};const x=0;try{({x,y:a[0]}=s)}catch(e){events.push(e.name)}a[0];",
+        "let a=[0],s={x:7,y:8};({x:a[0],...s}=s);[a[0],s.x,s.y];",
+        "let s={x:7};let r;({x:r}=(s={x:9}));r;",
+    ];
+    script_runtime_equivalence(&sources, "object-assignment-patterns", false)
+}
+
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
 fn depythonify_safe_deob_arguments_objects_runtime_equivalence() -> Result<()> {
     let sources = [
         "let f=function(a){arguments[0]=9;return [a]};let r=f(7);r[0];",

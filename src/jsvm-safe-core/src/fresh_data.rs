@@ -36,6 +36,7 @@ mod dispatch;
 mod heap;
 mod origins;
 mod parameters;
+mod patterns;
 mod scope_instances;
 use cells::CellId;
 use heap::{
@@ -568,20 +569,24 @@ impl Analyzer<'_, '_> {
         environment: &mut Environment,
     ) -> Option<Reference> {
         if let SimpleAssignmentTarget::AssignmentTargetIdentifier(identifier) = target {
-            if let Some(cell) = self.implicit_arguments_cell(identifier) {
-                return Some(Reference::Binding(cell));
-            }
-            let symbol = self.lexical_reference(identifier)?;
-            let flags = self.scoping.symbol_flags(symbol);
-            // Declaration bindings are mutable; a named function expression's
-            // self name is an immutable binding outside its parameter cells.
-            let mutable = (flags.is_variable() || flags.is_function())
-                && !flags.intersects(SymbolFlags::ConstVariable | SymbolFlags::FunctionExpression);
-            return mutable
-                .then(|| self.cell_id(symbol).map(Reference::Binding))
-                .flatten();
+            return self.identifier_reference(identifier);
         }
         self.member_reference(target.as_member_expression()?, environment)
+    }
+
+    fn identifier_reference(&self, identifier: &IdentifierReference<'_>) -> Option<Reference> {
+        if let Some(cell) = self.implicit_arguments_cell(identifier) {
+            return Some(Reference::Binding(cell));
+        }
+        let symbol = self.lexical_reference(identifier)?;
+        let flags = self.scoping.symbol_flags(symbol);
+        // Declaration bindings are mutable; a named function expression's
+        // self name is an immutable binding outside its parameter cells.
+        let mutable = (flags.is_variable() || flags.is_function())
+            && !flags.intersects(SymbolFlags::ConstVariable | SymbolFlags::FunctionExpression);
+        mutable
+            .then(|| self.cell_id(symbol).map(Reference::Binding))
+            .flatten()
     }
 
     fn logical_decision(operator: &str, fact: &Fact) -> Option<bool> {
@@ -601,6 +606,11 @@ impl Analyzer<'_, '_> {
         assignment: &oxc_ast::ast::AssignmentExpression<'_>,
         environment: &mut Environment,
     ) -> Evaluation {
+        if assignment.operator == AssignmentOperator::Assign
+            && assignment.left.as_assignment_target_pattern().is_some()
+        {
+            return self.destructuring_assignment(assignment, environment);
+        }
         let Some(reference) = assignment
             .left
             .as_simple_assignment_target()
@@ -1927,6 +1937,79 @@ mod tests {
                 ("[f][0]===f".into(), "true".into()),
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn object_assignment_patterns_preserve_reference_evaluation_order() -> Result<(), BudgetExceeded>
+    {
+        for (source, expected) in [
+            (
+                "let a,b;({x:a,y:b}={x:7,y:9});let r=[a,b];r[0];r[1];",
+                vec![("r[0]", "7"), ("r[1]", "9")],
+            ),
+            ("let x;({x}={x: 7});let r=[x];r[0];", vec![("r[0]", "7")]),
+            (
+                "let x;({x=7}={x:void 0});let r=[x];r[0];",
+                vec![("r[0]", "7")],
+            ),
+            (
+                "let x;({x=7}={x:null});let r=[x];r[0];",
+                vec![("r[0]", "null")],
+            ),
+            (
+                "let x;({x:{y:x=7}}={x:{y:void 0}});let r=[x];r[0];",
+                vec![("r[0]", "7")],
+            ),
+            (
+                "let a=[1],s={x:7};({x:a[(s.x=9,0)]}=s);a[0];",
+                vec![("a[0]", "9")],
+            ),
+            (
+                "let s={x:7},a=[1],old=a;({x:a[(a=[9],0)]}=s);old[0];a[0];",
+                vec![("old[0]", "7"), ("a[0]", "9")],
+            ),
+            (
+                "let a=[0],old=a,s={x:void 0};({x:a[0]=(a=[9],7)}=s);old[0];a[0];",
+                vec![("old[0]", "7"), ("a[0]", "9")],
+            ),
+            (
+                "let a=[0],s={x:7,y:8};({x:a[0],...a[(s.y=9,1)]}=s);a[0];a[1].y;",
+                vec![("a[0]", "7"), ("a[1].y", "9")],
+            ),
+            (
+                "let s={x:7,y:8},a,r;({x:a,...r}=s);let q=[a,r.y];q[0];q[1];",
+                vec![("r.y", "8"), ("q[0]", "7"), ("q[1]", "8")],
+            ),
+            ("let s={x:7},a;let r=({x:a}=s);r.x;", vec![("r.x", "7")]),
+            (
+                "let s={x:7,y:8},a=[0];({x:a[0],y:a[0]}=s);a[0];",
+                vec![("a[0]", "8")],
+            ),
+            (
+                "let s={x:7},a=[0];({[(s.x=9,'x')]:a[0]}=s);a[0];",
+                vec![("a[0]", "9")],
+            ),
+            (
+                "let a=[7],s={x:9};let k={toString(){a[0]=11;return 'x'}};({[k]:a[0]}=s);a[0];",
+                vec![],
+            ),
+            (
+                "let a=[7],s={get x(){a[0]=9;return 8}};let x;({x}=s);a[0];",
+                vec![],
+            ),
+            ("let a=[7];let x;[x]=a;a[0];", vec![]),
+            (
+                "let f=function(x){({a:arguments[0]}={a: 9});return [x]};let r=f(7);r[0];",
+                vec![("r[0]", "9")],
+            ),
+        ] {
+            let expected = expected
+                .into_iter()
+                .map(|(source, value)| (source.to_owned(), value.to_owned()))
+                .collect::<Vec<_>>();
+            assert_eq!(reads(source)?, expected, "{source}");
+        }
         Ok(())
     }
 
