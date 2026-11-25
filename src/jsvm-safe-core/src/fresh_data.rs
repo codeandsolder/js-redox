@@ -33,6 +33,7 @@ mod coverage;
 mod dispatch;
 mod heap;
 mod origins;
+mod scope_instances;
 use heap::{
     value_weight, AllocationId, AllocationKind, Environment, Fact, Locations, Lookup, OwnData,
 };
@@ -177,7 +178,8 @@ impl FreshDataReads {
             scoping,
             bindings,
             pure_functions,
-            named_functions: activation::NamedFunctions::collect(program, budget)?,
+            callables: activation::CallableIndex::collect(program, budget)?,
+            scope_instances: scope_instances::ScopeInstances::default(),
             lexical_scopes: Vec::new(),
             activation_scopes: Vec::new(),
             reads: Self::default(),
@@ -255,8 +257,9 @@ struct Analyzer<'c, 'ast> {
     scoping: &'c Scoping,
     bindings: &'c BindingFacts,
     pure_functions: &'c HashMap<SymbolId, PureFunction>,
-    named_functions: activation::NamedFunctions<'ast>,
-    lexical_scopes: Vec<Option<ScopeId>>,
+    callables: activation::CallableIndex<'ast>,
+    scope_instances: scope_instances::ScopeInstances,
+    lexical_scopes: Vec<Option<scope_instances::ScopeTicket>>,
     activation_scopes: Vec<ScopeId>,
     reads: FreshDataReads,
     visited_lists: HashSet<(u32, u32)>,
@@ -695,13 +698,19 @@ impl Analyzer<'_, '_> {
                 |value| Evaluation::primitive(Value::Bool(!value.truthy()), argument.inert),
             ),
             "void" => Evaluation::primitive(Value::Undefined, argument.inert),
-            "typeof" if matches!(argument.fact, Some(Fact::Objects(_))) => {
-                Evaluation::primitive(Value::String("object".into()), argument.inert)
+            "typeof" => {
+                let fact = if let Some(Fact::Objects(locations)) = argument.fact {
+                    self.heap_result(environment.reference_type(&locations, self.budget))
+                        .flatten()
+                        .map(|kind| Fact::Primitive(Value::String(kind.into())))
+                } else {
+                    None
+                };
+                Evaluation {
+                    fact,
+                    inert: argument.inert,
+                }
             }
-            "typeof" => Evaluation {
-                fact: None,
-                inert: argument.inert,
-            },
             _ => self.barrier(environment),
         }
     }
@@ -1001,16 +1010,7 @@ impl Analyzer<'_, '_> {
             }
             Expression::ArrayExpression(array) => self.array_expression(array, environment),
             Expression::ObjectExpression(object) => self.object_expression(object, environment),
-            Expression::CallExpression(call) => {
-                // Callee lookup precedes argument evaluation. An unknown
-                // getter/global lookup can mutate anything visible to it.
-                if let Some(result) = self.local_call(call, environment) {
-                    return result;
-                }
-                self.expression(&call.callee, environment);
-                self.arguments(&call.arguments, environment);
-                self.barrier(environment)
-            }
+            Expression::CallExpression(call) => self.local_call(call, environment),
             Expression::NewExpression(call) => {
                 self.expression(&call.callee, environment);
                 self.arguments(&call.arguments, environment);
@@ -1020,8 +1020,11 @@ impl Analyzer<'_, '_> {
                 self.assignment(assignment, environment)
             }
             Expression::UpdateExpression(update) => self.update_expression(update, environment),
-            Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_) => {
-                Evaluation::unknown_inert()
+            Expression::FunctionExpression(function) => {
+                self.allocate_callable(function.scope_id.get(), environment)
+            }
+            Expression::ArrowFunctionExpression(function) => {
+                self.allocate_callable(function.scope_id.get(), environment)
             }
             _ => eval(expression).map_or_else(
                 || {
@@ -1031,6 +1034,21 @@ impl Analyzer<'_, '_> {
                 |value| Evaluation::primitive(value, true),
             ),
         }
+    }
+
+    fn allocate_callable(
+        &mut self,
+        scope: Option<ScopeId>,
+        environment: &mut Environment,
+    ) -> Evaluation {
+        let origin = scope.and_then(|scope| {
+            self.heap_result(
+                self.scope_instances
+                    .capture(scope, self.scoping, self.budget),
+            )
+            .flatten()
+        });
+        self.allocate(environment, OwnData::callable(origin), true)
     }
 
     fn arguments(&mut self, arguments: &[Argument<'_>], environment: &mut Environment) {
@@ -1169,6 +1187,17 @@ impl Analyzer<'_, '_> {
         true
     }
 
+    fn refresh_iteration_scope(&mut self, statement: &ForStatement<'_>) {
+        if matches!(&statement.init,
+            Some(ForStatementInit::VariableDeclaration(declaration))
+                if declaration.kind == VariableDeclarationKind::Let)
+        {
+            if let Some(scope) = statement.scope_id.get() {
+                self.scope_instances.refresh(scope);
+            }
+        }
+    }
+
     fn for_initializer(
         &mut self,
         statement: &ForStatement<'_>,
@@ -1211,6 +1240,7 @@ impl Analyzer<'_, '_> {
             return None;
         }
         self.for_initializer(statement, environment)?;
+        self.refresh_iteration_scope(statement);
         loop {
             self.consume_iteration()?;
             let condition = self.expression(test, environment);
@@ -1226,6 +1256,7 @@ impl Analyzer<'_, '_> {
                 // proof; return/throw exits the enclosing activation.
                 return self.retire_scope(scope, environment).then_some(false);
             }
+            self.refresh_iteration_scope(statement);
             if let Some(update) = &statement.update {
                 self.expression(update, environment);
             }
@@ -1250,6 +1281,10 @@ impl Analyzer<'_, '_> {
         self.return_frame = previous_returns
             .as_ref()
             .map(activation::ReturnFrame::empty_like);
+        let ticket = statement
+            .scope_id
+            .get()
+            .map(|scope| self.scope_instances.enter(scope));
         let disposes = self.enter_resource_scope(statement.scope_id.get());
         let result = if self.has_dispatch_shape(statement) {
             self.simulate_dispatch(statement, &mut candidate)
@@ -1259,6 +1294,9 @@ impl Analyzer<'_, '_> {
         }
         .filter(|_| !self.loop_failed);
         self.leave_resource_scope(disposes, &mut candidate);
+        if let Some(ticket) = ticket {
+            self.scope_instances.leave(ticket);
+        }
         let loop_returns = std::mem::replace(&mut self.return_frame, previous_returns);
         let proven = result.is_some();
         let mut observations = std::mem::replace(&mut self.reads, previous_reads);
@@ -1311,9 +1349,16 @@ impl Analyzer<'_, '_> {
                 self.expression(&statement.expression, environment);
             }
             Statement::BlockStatement(block) => {
+                let ticket = block
+                    .scope_id
+                    .get()
+                    .map(|scope| self.scope_instances.enter(scope));
                 let disposes = self.enter_resource_scope(block.scope_id.get());
                 let normal = self.statements(&block.body, environment);
                 self.leave_resource_scope(disposes, environment);
+                if let Some(ticket) = ticket {
+                    self.scope_instances.leave(ticket);
+                }
                 if block
                     .scope_id
                     .get()
@@ -1391,16 +1436,15 @@ impl Analyzer<'_, '_> {
 }
 
 impl<'a> Visit<'a> for Analyzer<'_, 'a> {
-    fn enter_scope(&mut self, flags: ScopeFlags, scope: &std::cell::Cell<Option<ScopeId>>) {
-        self.lexical_scopes.push(if flags.is_function() {
-            scope.get()
-        } else {
-            None
-        });
+    fn enter_scope(&mut self, _: ScopeFlags, scope: &std::cell::Cell<Option<ScopeId>>) {
+        self.lexical_scopes
+            .push(scope.get().map(|scope| self.scope_instances.enter(scope)));
     }
 
     fn leave_scope(&mut self) {
-        self.lexical_scopes.pop();
+        if let Some(Some(ticket)) = self.lexical_scopes.pop() {
+            self.scope_instances.leave(ticket);
+        }
     }
 
     fn visit_statements(&mut self, statements: &oxc_allocator::Vec<'a, Statement<'a>>) {
@@ -1585,6 +1629,113 @@ mod tests {
         assert_eq!(
             observed(alias, true)?,
             vec![("a===b".into(), "true".into())]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn callable_values_keep_identity_and_live_lexical_captures() -> Result<(), BudgetExceeded> {
+        for (source, expected) in [
+            ("let f=x=>[x];let a=f(7);a[0];", vec![("a[0]", "7")]),
+            (
+                "let f=function(x){return [x];};let alias=f;let a=alias(7);a[0];",
+                vec![("a[0]", "7")],
+            ),
+            (
+                "let f=function inner(x){return [x];};let a=f(7);a[0];",
+                vec![("a[0]", "7")],
+            ),
+            (
+                "let a=[7];let f=()=>{a[0]=9;return a;};let b=f();a[0];b[0];",
+                vec![("a[0]", "9"), ("b[0]", "9")],
+            ),
+            (
+                "let a=[7];let f=()=>a;a=[9];let b=f();b[0];",
+                vec![("b[0]", "9")],
+            ),
+            ("let fs=[x=>[x]];let a=fs[0](7);a[0];", vec![("a[0]", "7")]),
+            (
+                "let f=x=>[x];let a=f((f=x=>[9],7));a[0];",
+                vec![("a[0]", "7")],
+            ),
+            (
+                "let f=x=>[x];let a=f(7);let b=f(9);a[0];b[0];",
+                vec![("a[0]", "7"), ("b[0]", "9")],
+            ),
+            (
+                "let a=[7];let f=()=>[a[0]];let b=f();a[0]=9;let c=f();b[0];c[0];",
+                vec![("b[0]", "7"), ("c[0]", "9")],
+            ),
+            ("let f;{let x=7;f=()=>[x];}let a=f();a[0];", vec![]),
+            (
+                "let f;for(let i=0;i<2;i++){if(i===0)f=()=>[i];else{let a=f();a[0];}}",
+                vec![],
+            ),
+            (
+                "let a;for(let i=0;i<2;i++){let f=()=>[i];a=f();}a[0];",
+                vec![("a[0]", "1")],
+            ),
+            (
+                "let f;for(let i=0;i<2;i++)if(i===0)f=()=>[i];else{let a=f();a[0];}",
+                vec![],
+            ),
+            ("let a;for(let i=0,f=()=>[i];i<1;i++){a=f();}a[0];", vec![]),
+            (
+                "let f;let a;for(let i=0;i<2;f=()=>[i],i++){if(i===1)a=f();}a[0];",
+                vec![("a[0]", "1")],
+            ),
+            (
+                "let a;for(let i=0;i<2;i++){let x=i;let f=()=>[x];a=f();}a[0];",
+                vec![("a[0]", "1")],
+            ),
+            (
+                "let f=(()=>{let x=7;return ()=>[x];})();let a=f();a[0];",
+                vec![],
+            ),
+            (
+                "let a=[7];let f=()=>{unknown();return [9];};let b=f();b[0];a[0];",
+                vec![("b[0]", "9")],
+            ),
+            (
+                "let f=()=>[7];let a=f;f=()=>[9];let b=a();b[0];",
+                vec![("b[0]", "7")],
+            ),
+            (
+                "let f=()=>[7];let a=[typeof f];a[0];",
+                vec![("a[0]", "\"function\"")],
+            ),
+            (
+                "let f=()=>[7];let a=[typeof {}];a[0];",
+                vec![("a[0]", "\"object\"")],
+            ),
+            (
+                "let f=function(){};let a=[7];delete f.prototype;a[0];",
+                vec![],
+            ),
+            ("let f=()=>[7];let a={...f,x:7};a.x;", vec![("a.x", "7")]),
+            (
+                "let f=()=>[7];let a={f};let b=a.f();b[0];",
+                vec![("b[0]", "7")],
+            ),
+            (
+                "let a=[7];let f=()=>[a[0]];let b=f((a[0]=9,0));b[0];",
+                vec![("b[0]", "9")],
+            ),
+        ] {
+            let expected = expected
+                .into_iter()
+                .map(|(source, value)| (source.to_owned(), value.to_owned()))
+                .collect::<Vec<_>>();
+            assert_eq!(reads(source)?, expected, "{source}");
+        }
+        let source = "let f=()=>7;let g=f;let h=()=>7;f===g;f===h;[f][0]===f;";
+        assert_eq!(
+            observed(source, true)?,
+            vec![
+                ("f===g".into(), "true".into()),
+                ("f===h".into(), "false".into()),
+                ("[f][0]===f".into(), "true".into()),
+            ]
         );
         Ok(())
     }

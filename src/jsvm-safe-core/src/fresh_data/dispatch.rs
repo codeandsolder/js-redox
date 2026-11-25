@@ -112,9 +112,37 @@ impl Analyzer<'_, '_> {
         shape: &Shape<'_, '_>,
         environment: &mut Environment,
     ) -> Option<Iteration> {
+        let body = self.scope_instances.enter(shape.body.scope_id.get()?);
+        let result = self.dispatch_body(shape, environment);
+        self.scope_instances.leave(body);
+        result
+    }
+
+    fn dispatch_body(
+        &mut self,
+        shape: &Shape<'_, '_>,
+        environment: &mut Environment,
+    ) -> Option<Iteration> {
         if !self.statements(shape.prefix, environment) {
             return None;
         }
+        let switch = self.scope_instances.enter(shape.switch.scope_id.get()?);
+        let iteration = self.dispatch_arms(shape, environment);
+        self.scope_instances.leave(switch);
+        let iteration = iteration?;
+        if !self.retire_scope(shape.body.scope_id.get()?, environment)
+            || !self.collect_heap(environment)
+        {
+            return None;
+        }
+        Some(iteration)
+    }
+
+    fn dispatch_arms(
+        &mut self,
+        shape: &Shape<'_, '_>,
+        environment: &mut Environment,
+    ) -> Option<Iteration> {
         let mut iteration = Iteration {
             arms: Vec::new(),
             continues: false,
@@ -154,11 +182,6 @@ impl Analyzer<'_, '_> {
                 }
             }
         }
-        if !self.retire_scope(shape.body.scope_id.get()?, environment)
-            || !self.collect_heap(environment)
-        {
-            return None;
-        }
         Some(iteration)
     }
 
@@ -173,6 +196,7 @@ impl Analyzer<'_, '_> {
             return None;
         }
         self.for_initializer(statement, environment)?;
+        self.refresh_iteration_scope(statement);
         let mut trace = DispatchTrace {
             iterations: Vec::new(),
             test_exit: false,
@@ -205,6 +229,7 @@ impl Analyzer<'_, '_> {
                 // Bound generated source as well as interpretation time.
                 return None;
             }
+            self.refresh_iteration_scope(statement);
             if let Some(update) = &statement.update {
                 self.expression(update, environment);
             }
