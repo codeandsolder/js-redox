@@ -5284,7 +5284,7 @@ impl NormalExitProof {
     }
 }
 
-/// ECMAScript ForBodyEvaluation and WhileLoopEvaluation maintain V, initially
+/// ECMAScript `ForBodyEvaluation` and `WhileLoopEvaluation` maintain V, initially
 /// undefined. A non-Empty body value replaces V; Empty retains it. Enumerate
 /// the bounded state/value product and record both global and edge-local
 /// normal exit facts, preserving signed zero independently of graph identity.
