@@ -34,6 +34,7 @@ const MAIN_FIXTURES: &[&str] = &[
     "reference-identity-table.js",
     "reference-identity-table-sync.js",
     "reference-identity-table-lexical.js",
+    "reference-identity-table-callable.js",
     "ordered-switch.js",
     "ordered-switch-for.js",
     "ordered-switch-bounded.js",
@@ -217,7 +218,7 @@ fn assert_state_and_alias_contract(file: &str, outcome: &SafeDeobOutcome) {
             assert!(count(report, "dispatch_switch_structured") >= 1);
             assert_eq!(count(report, "reaching_heap_dispatch"), 0);
         }
-        "reference-identity-table-lexical.js" => {
+        "reference-identity-table-lexical.js" | "reference-identity-table-callable.js" => {
             assert!(count(report, "reaching_heap_compare") >= 2);
             assert!(count(report, "reaching_heap_dispatch") >= 1);
         }
