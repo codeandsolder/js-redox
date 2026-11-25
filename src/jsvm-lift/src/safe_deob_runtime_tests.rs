@@ -954,6 +954,63 @@ fn depythonify_safe_deob_callable_capture_runtime_equivalence() -> Result<()> {
 
 #[test]
 #[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_parameter_environments_runtime_equivalence() -> Result<()> {
+    let sources = [
+        "let f=(a=7,b=a+2)=>[a,b];let r=f();[r[0],r[1]];",
+        "let f=(a=7)=>[a];let r=f(void 0);r[0];",
+        "let f=(a=7)=>[a];let r=f(null);r[0];",
+        "let n=0;let f=(a=(n+=1),b=(n+=2))=>[a,b,n];let r=f();[r[0],r[1],r[2]];",
+        "let n=0;let f=(a=(n+=1),b=(n+=2))=>[a,b,n];let r=f(7,9);[r[0],r[1],r[2]];",
+        "function outer(x){let a=[7];let f=(v=(a[0]=9))=>[v];f(x);return a[0];}[outer(void 0),outer(1)];",
+        "function outer(x){let a=[7];let f=(v=(a[0]=7))=>[v];f(x);return a[0];}[outer(void 0),outer(1)];",
+        "let f=(...a)=>a;let b=f(7,9);[b[0],b[1],b.length];",
+        "let f=(a,...rest)=>[a,rest.length,rest[0]];let r=f(7,9);[r[0],r[1],r[2]];",
+        "let f=(...a)=>a;let b=f();b.length;",
+        "let f=(a=7,...rest)=>[a,rest.length];let r=f(void 0,9);[r[0],r[1]];",
+        "let o={x:7,f:function(a=this.x){return [a]}};let r=o.f();r[0];",
+        "let f=(a=7)=>{var x;return [x,a]};let r=f();[r[0],r[1]];",
+        "let f=(a=7,g=()=>[a])=>{var a=9;return g};let r=f()();r[0];",
+        "let f=(a=7,g=()=>[a])=>{a=9;return g};let r=f()();r[0];",
+        "let f=(g=()=>[a],a=7)=>{var a=9;return g};let r=f()();r[0];",
+        "let f=(a=7,g=()=>[a])=>{var a;return [a,g]};let p=f();let r=p[1]();[p[0],r[0]];",
+        "let f=(a=7,g=()=>[a])=>{var a;let h=()=>[a];a=9;return [g,h]};let p=f();let r=p[0](),s=p[1]();[r[0],s[0]];",
+        "let f=(a=7,g=()=>[a])=>{if(false){try{}catch(a){var a=11}}a=9;return g;};let r=f()();r[0];",
+        "let f=function(a=7,g=()=>[a]){function a(){return 9}return g;};let r=f()();r[0];",
+        "let f=function(a=7,g=()=>[a]){function a(){return [9]}let p=a();return [g,p];};let p=f();let r=p[0](),s=p[1];[r[0],s[0]];",
+        "let a=7;let f=(g=()=>[a])=>{var a=9;return g};let r=f()();r[0];",
+        "let f=(a=7,g=()=>[a])=>{var a=9;return g};let g=f(),h=f(11);let r=g(),s=h();[r[0],s[0]];",
+        "let f=(a=7,g=()=>[a])=>{var a=9;return g};let g=f();for(let i=0;i<256;i++){let a=[i];}let r=g();r[0];",
+        "let o={x:7,f:function(g=()=>[this.x]){return g}};let r=o.f()();r[0];",
+        "let f=({x,y:z=9})=>[x,z];let r=f({x:7,y:void 0});[r[0],r[1]];",
+        "let f=({x:{y=7}})=>[y];let r=f({x:{y:void 0}});r[0];",
+        "let f=({x,...rest})=>[x,rest.y];let r=f({x:7,y:9});[r[0],r[1]];",
+        "let f=({x,...rest})=>rest;let r=f({x:7,y:9});r.y;",
+        "let f=({x})=>{var x;return [x]};let r=f({x:7});r[0];",
+        "let f=({['x']:a,b=a})=>[a,b];let r=f({x:7,b:void 0});[r[0],r[1]];",
+        "let a=[7];let f=({x})=>[x];f({get x(){a[0]=9;return 7}});a[0];",
+        "let f=([x])=>[x];let a=[7];a[Symbol.iterator]=function*(){yield 9};let r=f(a);r[0];",
+        "let {x,y:z=9}={x:7,y:void 0};let a=[x,z];[a[0],a[1]];",
+        "const {x,...r}={x:7,y:9};r.y;",
+        "function outer(){var {x,...r}={x:7,y:9};return r.y;}outer();",
+        "var {x}={x:7};let r=[x];r[0];",
+        "let a={x:7,y:9};let {x:v,...r}=a;let b=[v,r.y];[b[0],b[1]];",
+        "function outer(){let g=f;function f(){return [7]}function f(){return [9]}let r=g();return r[0];}outer();",
+        "let f=(a=b,b=7)=>[a];try{f()}catch(e){events.push(e.name)}f(9)[0];",
+        "let f=(a=7,g=()=>a)=>{eval('var a=9');return [a,g()]};let r=f();[r[0],r[1]];",
+        "let f=(a=7,g=()=>a)=>{var a;return [a,g()]};let r=f();[r[0],r[1]];",
+        "let f=function self(a=self){return [a]};let r=f();r[0]===f;",
+        "let f=function(a=7){return [arguments[0],a]};let r=f();[r[0],r[1]];",
+        "let f=({x=()=>y},y=7)=>x;let r=f({x:void 0})();r;",
+        "let a=[7];let f=({x=(a[0]=9),...r})=>r;let r=f({x:void 0,y:a});[r.y[0],a[0]];",
+        "let o={x:7,y:9,get z(){events.push('get');return 11}};let {z,...r}=o;[z,r.x,r.y];",
+        "let f=({x},y=()=>x)=>y;let g=f({x:7});g();",
+        "let f=(...{length})=>[length];let r=f(1,2,3);r[0];",
+    ];
+    script_runtime_equivalence(&sources, "parameter-environments", false)
+}
+
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
 fn depythonify_safe_deob_alternative_call_targets_runtime_equivalence() -> Result<()> {
     let sources = [
         "function outer(flag){let f=flag?()=>[7]:()=>[7];let a=f();return a[0];}[outer(true),outer(false)];",

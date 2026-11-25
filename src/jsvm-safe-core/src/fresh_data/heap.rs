@@ -468,7 +468,11 @@ impl OwnData {
         self.properties.join(&other.properties, budget)
     }
 
-    fn enumerable_data(&self, budget: &WorkBudget) -> Result<Option<Properties>, BudgetExceeded> {
+    fn enumerable_data(
+        &self,
+        excluded: &HashSet<String>,
+        budget: &WorkBudget,
+    ) -> Result<Option<Properties>, BudgetExceeded> {
         self.properties.charge_clone(budget)?;
         let mut properties = self.properties.clone();
         if self.kind == AllocationKind::Callable {
@@ -478,6 +482,10 @@ impl OwnData {
             // All tracked ordinary literal properties are enumerable,
             // except the intrinsic own Array length descriptor.
             properties.insert("length".to_owned(), Property::Absent);
+        }
+        for key in excluded {
+            charge(budget, key.len())?;
+            properties.insert(key.clone(), Property::Absent);
         }
         Ok(properties.data_only().then_some(properties))
     }
@@ -491,7 +499,17 @@ impl OwnData {
         source: &Fact,
         budget: &WorkBudget,
     ) -> Result<bool, BudgetExceeded> {
-        let Some(properties) = environment.enumerable_data(source, budget)? else {
+        self.spread_excluding(environment, source, &HashSet::new(), budget)
+    }
+
+    pub(super) fn spread_excluding(
+        &mut self,
+        environment: &Environment,
+        source: &Fact,
+        excluded: &HashSet<String>,
+        budget: &WorkBudget,
+    ) -> Result<bool, BudgetExceeded> {
+        let Some(properties) = environment.enumerable_data(source, excluded, budget)? else {
             return Ok(false);
         };
         self.properties.copy_from(&properties, budget)?;
@@ -1118,6 +1136,7 @@ impl Environment {
     fn enumerable_data(
         &self,
         source: &Fact,
+        excluded: &HashSet<String>,
         budget: &WorkBudget,
     ) -> Result<Option<Properties>, BudgetExceeded> {
         match source {
@@ -1128,7 +1147,7 @@ impl Environment {
                     let Some(data) = self.allocations.get(id) else {
                         return Ok(None);
                     };
-                    let Some(properties) = data.enumerable_data(budget)? else {
+                    let Some(properties) = data.enumerable_data(excluded, budget)? else {
                         return Ok(None);
                     };
                     if let Some(merged) = &mut merged {
@@ -1154,7 +1173,10 @@ impl Environment {
                         // values as unknown data rather than replacing them.
                         let fact = char::from_u32(u32::from(unit))
                             .map(|character| Fact::Primitive(Value::String(character.to_string())));
-                        properties.insert(index.to_string(), Property::Data(fact));
+                        let key = index.to_string();
+                        if !excluded.contains(&key) {
+                            properties.insert(key, Property::Data(fact));
+                        }
                     }
                 }
                 Ok(Some(properties))

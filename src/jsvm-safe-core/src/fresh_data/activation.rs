@@ -4,8 +4,8 @@ use super::{
     cells::CellId, scope_instances::ClosureOrigin, Analyzer, Environment, Evaluation, Fact, Value,
 };
 use oxc_ast::ast::{
-    ArrowFunctionBody, ArrowFunctionExpression, BindingPattern, CallExpression, Expression,
-    FormalParameters, Function, FunctionBody, FunctionType, Program, Statement, ThisExpression,
+    ArrowFunctionBody, ArrowFunctionExpression, CallExpression, Expression, FormalParameters,
+    Function, FunctionBody, FunctionType, Program, Statement, ThisExpression,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::Scoping;
@@ -243,9 +243,9 @@ struct Activation<'a> {
 
 impl<'a> Activation<'a> {
     fn from_node(node: CallableNode<'a>, scoping: &Scoping, publish_context: bool) -> Option<Self> {
-        let activation = match node {
-            CallableNode::Ordinary(function) => Self::ordinary(function, scoping, publish_context)?,
-            CallableNode::Arrow(function) if !function.r#async => Self {
+        match node {
+            CallableNode::Ordinary(function) => Self::ordinary(function, scoping, publish_context),
+            CallableNode::Arrow(function) if !function.r#async => Some(Self {
                 scope: function.scope_id.get()?,
                 params: &function.params,
                 body: match &function.body {
@@ -257,18 +257,9 @@ impl<'a> Activation<'a> {
                 self_binding: None,
                 this_mode: ThisMode::Lexical,
                 capture: None,
-            },
-            CallableNode::Arrow(_) => return None,
-        };
-        if activation.params.rest.is_some()
-            || activation.params.items.iter().any(|parameter| {
-                parameter.initializer.is_some()
-                    || !matches!(parameter.pattern, BindingPattern::BindingIdentifier(_))
-            })
-        {
-            return None;
+            }),
+            CallableNode::Arrow(_) => None,
         }
-        Some(activation)
     }
 
     fn ordinary(
@@ -345,9 +336,17 @@ impl<'ast> Analyzer<'_, 'ast> {
             let Some(function) = self.callables.get(symbol) else {
                 continue;
             };
+            let Some(function_scope) = function.scope_id.get() else {
+                continue;
+            };
             if !self
                 .bindings
                 .inert_function_declaration(self.scoping, function)
+                || !self.bindings.instantiated_function_declaration(
+                    self.scoping,
+                    symbol,
+                    function_scope,
+                )
             {
                 continue;
             }
@@ -367,69 +366,23 @@ impl<'ast> Analyzer<'_, 'ast> {
         environment: &mut Environment,
     ) -> Option<()> {
         if let Some(receiver) = activation.this_mode.binding(receiver) {
-            let instance = self.scope_instances.get(activation.scope)?;
+            let instance = self.scope_instances.get(activation.scope, || true)?;
             self.heap_result(environment.insert(
                 CellId::receiver(instance),
                 receiver,
                 self.budget,
             ))?;
         }
-        let cells = self.scoping.get_bindings(activation.scope).len();
-        self.heap_result(
-            self.budget
-                .consume(u64::try_from(cells).unwrap_or(u64::MAX)),
-        )?;
-        for (name, &symbol) in self.scoping.get_bindings(activation.scope) {
-            let flags = self.scoping.symbol_flags(symbol);
-            if flags.is_function_scoped_declaration()
-                && !flags.is_function()
-                && name.as_str() != "arguments"
-                && !self
-                    .bindings
-                    .is_mapped_arguments_exposed(self.scoping, symbol)
-            {
-                self.heap_result(environment.insert(
-                    self.cell_id(symbol)?,
-                    Fact::Primitive(Value::Undefined),
-                    self.budget,
-                ))?;
-            }
-        }
         if let Some(symbol) = activation.self_binding {
             let cell = self.cell_id(symbol)?;
             if let Some((_, function)) = &activation.capture {
                 let value = self.heap_result(function.copy(self.budget))?;
                 self.heap_result(environment.insert(cell, value, self.budget))?;
-            } else {
-                self.heap_result(environment.remove(cell, self.budget))?;
             }
         }
-        let mut arguments = arguments.into_iter();
-        for parameter in &activation.params.items {
-            let BindingPattern::BindingIdentifier(identifier) = &parameter.pattern else {
-                return None;
-            };
-            let symbol = identifier.symbol_id.get()?;
-            let cell = self.cell_id(symbol)?;
-            let value = arguments
-                .next()
-                .unwrap_or(Some(Fact::Primitive(Value::Undefined)));
-            // A hoisted function declaration can override a formal binding.
-            // A mapped arguments object may write it through an alias.
-            if self.scoping.symbol_flags(symbol).is_function()
-                || self
-                    .bindings
-                    .is_mapped_arguments_exposed(self.scoping, symbol)
-            {
-                continue;
-            }
-            if let Some(value) = value {
-                self.heap_result(environment.insert(cell, value, self.budget))?;
-            } else {
-                self.heap_result(environment.remove(cell, self.budget))?;
-            }
-        }
-        Some(())
+        self.initialize_parameters(activation.params, arguments, environment)?;
+        self.initialize_body_environment(activation.scope, activation.params, environment)?;
+        self.initialize_hoisted_callables(activation.scope, environment)
     }
 
     fn execute_activation(
@@ -696,7 +649,7 @@ impl<'ast> Analyzer<'_, 'ast> {
             .replace(ReturnFrame::new(self.pending_disposals));
         let disposes = self.enter_resource_scope(Some(activation.scope));
         self.activation_depth += 1;
-        let ticket = self.enter_instance(Some(activation.scope), &mut candidate);
+        let ticket = self.enter_empty_instance(activation.scope, &mut candidate);
         let summary = if ticket.is_some() {
             self.execute_activation(activation, arguments, receiver, &mut candidate)
         } else {
