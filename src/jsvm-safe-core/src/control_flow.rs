@@ -9,8 +9,8 @@
 use crate::numeric::exact_u32;
 use crate::value_eval::{
     canonical_array_index, eval, eval_binary, eval_logical_left, eval_unary_value,
-    eval_with_resolver, identical_primitive_value, js_to_uint32, strict_primitive_equal,
-    string_literal_value, template_element_value, LogicalStep, Value,
+    eval_with_resolver, identical_primitive_value, inert_literal_value, js_to_uint32,
+    strict_primitive_equal, string_literal_value, template_element_value, LogicalStep, Value,
 };
 use crate::{
     binding_facts::BindingFacts, direct_identifier_name, fragment, js_parse_int,
@@ -662,12 +662,9 @@ impl ArithmeticEnvironment<'_> {
         })
     }
 
-    fn set(&mut self, location: ArithmeticLocation, value: Option<Value>) -> Option<()> {
+    fn set(&mut self, location: ArithmeticLocation, value: Option<Value>) {
         match location {
             ArithmeticLocation::Binding(symbol) => {
-                if symbol == self.state && value.is_none() {
-                    return None;
-                }
                 self.slots.retain(|(owner, _), _| *owner != symbol);
                 if let Some(value) = value.filter(|_| self.trackable(symbol)) {
                     self.values.insert(symbol, value);
@@ -681,7 +678,6 @@ impl ArithmeticEnvironment<'_> {
                 }
             }
         }
-        Some(())
     }
 
     fn invalidate_opaque(&mut self) -> Option<()> {
@@ -707,7 +703,7 @@ impl ArithmeticEnvironment<'_> {
     // evaluator proves concrete primitives; these additional expressions
     // never call user code even when their resulting value is unknown.
     fn non_reentrant_expression(&self, expression: &Expression<'_>) -> bool {
-        if self.eval(expression).is_some() {
+        if self.eval(expression).is_some() || inert_literal_value(expression) {
             return true;
         }
         match expression.without_parentheses() {
@@ -742,7 +738,7 @@ impl ArithmeticEnvironment<'_> {
         }
     }
 
-    fn join(&mut self, other: &Self) -> Option<()> {
+    fn join(&mut self, other: &Self) {
         self.values.retain(|symbol, value| {
             other
                 .values
@@ -762,22 +758,19 @@ impl ArithmeticEnvironment<'_> {
             }
             true
         });
-        self.state_value()?;
-        Some(())
     }
 
     fn state_value(&self) -> Option<&Value> {
         self.values.get(&self.state)
     }
 
-    fn opaque_state_access(&self, visit: impl FnOnce(&mut StateWriteProbe<'_>)) -> bool {
-        let mut probe = StateWriteProbe {
-            scoping: self.scoping,
-            state: self.state,
-            found: false,
-            include_captured_reads: self.per_iteration_binding,
-            function_depth: 0,
-        };
+    fn opaque_state_access(&self, visit: impl FnOnce(&mut StateUseProbe<'_>)) -> bool {
+        let mut probe = StateUseProbe::new(
+            self.scoping,
+            self.state,
+            self.per_iteration_binding,
+            StateUseMode::Opaque,
+        );
         visit(&mut probe);
         probe.found
     }
@@ -793,51 +786,104 @@ impl ArithmeticEnvironment<'_> {
     }
 }
 
-struct StateWriteProbe<'c> {
-    scoping: &'c Scoping,
-    state: SymbolId,
-    found: bool,
-    include_captured_reads: bool,
-    function_depth: usize,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StateUseMode {
+    /// Any reference matters when legacy caller reflection can expose an invocation.
+    Any,
+    /// An opaque evaluation must not write the state or escape a per-iteration cell.
+    Opaque,
+    /// Recognized immediate calls are not deferred activations.
+    Deferred,
 }
 
-impl<'a> Visit<'a> for StateWriteProbe<'_> {
-    fn visit_identifier_reference(&mut self, id: &IdentifierReference<'a>) {
-        if let Some(reference) = id.reference_id.get() {
-            let reference = self.scoping.get_reference(reference);
-            self.found |= reference.symbol_id() == Some(self.state)
-                && (reference.is_write()
-                    || (self.include_captured_reads && self.function_depth > 0));
+struct StateUseProbe<'c> {
+    scoping: &'c Scoping,
+    state: SymbolId,
+    per_iteration_binding: bool,
+    mode: StateUseMode,
+    deferred_depth: usize,
+    found: bool,
+}
+
+impl<'c> StateUseProbe<'c> {
+    const fn new(
+        scoping: &'c Scoping,
+        state: SymbolId,
+        per_iteration_binding: bool,
+        mode: StateUseMode,
+    ) -> Self {
+        Self {
+            scoping,
+            state,
+            per_iteration_binding,
+            mode,
+            deferred_depth: 0,
+            found: false,
         }
     }
 
+    // Field keys and decorators execute during class definition; a non-static
+    // initializer executes later, when an instance is constructed.
+    fn visit_field_initializer<'a>(&mut self, value: Option<&Expression<'a>>, is_static: bool) {
+        if let Some(value) = value {
+            let depth = usize::from(!is_static);
+            self.deferred_depth += depth;
+            self.visit_expression(value);
+            self.deferred_depth -= depth;
+        }
+    }
+}
+
+impl<'a> Visit<'a> for StateUseProbe<'_> {
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if self.mode == StateUseMode::Deferred {
+            if let Some(invocation) = iife_body(expression, self.scoping) {
+                self.visit_function_body(invocation.body);
+                return;
+            }
+        }
+        walk::walk_expression(self, expression);
+    }
+
+    fn visit_identifier_reference(&mut self, id: &IdentifierReference<'a>) {
+        let Some(reference) = id.reference_id.get() else {
+            return;
+        };
+        let reference = self.scoping.get_reference(reference);
+        if reference.symbol_id() != Some(self.state) {
+            return;
+        }
+        let deferred = self.deferred_depth > 0;
+        self.found |= self.mode == StateUseMode::Any
+            || ((self.mode == StateUseMode::Opaque || deferred)
+                && (reference.is_write() || (self.per_iteration_binding && deferred)));
+    }
+
     fn visit_function(&mut self, node: &oxc_ast::ast::Function<'a>, flags: ScopeFlags) {
-        self.function_depth += 1;
+        self.deferred_depth += 1;
         walk::walk_function(self, node, flags);
-        self.function_depth -= 1;
+        self.deferred_depth -= 1;
     }
 
     fn visit_arrow_function_expression(
         &mut self,
         node: &oxc_ast::ast::ArrowFunctionExpression<'a>,
     ) {
-        self.function_depth += 1;
+        self.deferred_depth += 1;
         walk::walk_arrow_function_expression(self, node);
-        self.function_depth -= 1;
+        self.deferred_depth -= 1;
     }
-}
 
-struct StateReferenceProbe<'c> {
-    scoping: &'c Scoping,
-    state: SymbolId,
-    found: bool,
-}
+    fn visit_property_definition(&mut self, node: &oxc_ast::ast::PropertyDefinition<'a>) {
+        self.visit_decorators(&node.decorators);
+        self.visit_property_key(&node.key);
+        self.visit_field_initializer(node.value.as_ref(), node.r#static);
+    }
 
-impl<'a> Visit<'a> for StateReferenceProbe<'_> {
-    fn visit_identifier_reference(&mut self, id: &IdentifierReference<'a>) {
-        self.found |= id.reference_id.get().is_some_and(|reference| {
-            self.scoping.get_reference(reference).symbol_id() == Some(self.state)
-        });
+    fn visit_accessor_property(&mut self, node: &oxc_ast::ast::AccessorProperty<'a>) {
+        self.visit_decorators(&node.decorators);
+        self.visit_property_key(&node.key);
+        self.visit_field_initializer(node.value.as_ref(), node.r#static);
     }
 }
 
@@ -1020,53 +1066,6 @@ fn iife_body<'a>(expr: &'a Expression<'a>, scoping: &Scoping) -> Option<Immediat
     }
 }
 
-struct StateActivationProof<'c> {
-    scoping: &'c Scoping,
-    state: SymbolId,
-    per_iteration_binding: bool,
-    deferred_depth: usize,
-    valid: bool,
-}
-
-impl<'a> Visit<'a> for StateActivationProof<'_> {
-    fn visit_expression(&mut self, expression: &Expression<'a>) {
-        if let Some(invocation) = iife_body(expression, self.scoping) {
-            self.visit_function_body(invocation.body);
-        } else {
-            walk::walk_expression(self, expression);
-        }
-    }
-
-    fn visit_identifier_reference(&mut self, id: &IdentifierReference<'a>) {
-        if self.deferred_depth == 0 {
-            return;
-        }
-        if let Some(reference) = id.reference_id.get() {
-            let reference = self.scoping.get_reference(reference);
-            if reference.symbol_id() == Some(self.state)
-                && (reference.is_write() || self.per_iteration_binding)
-            {
-                self.valid = false;
-            }
-        }
-    }
-
-    fn visit_function(&mut self, node: &oxc_ast::ast::Function<'a>, flags: ScopeFlags) {
-        self.deferred_depth += 1;
-        walk::walk_function(self, node, flags);
-        self.deferred_depth -= 1;
-    }
-
-    fn visit_arrow_function_expression(
-        &mut self,
-        node: &oxc_ast::ast::ArrowFunctionExpression<'a>,
-    ) {
-        self.deferred_depth += 1;
-        walk::walk_arrow_function_expression(self, node);
-        self.deferred_depth -= 1;
-    }
-}
-
 fn assignment_location(
     env: &ArithmeticEnvironment<'_>,
     target: &oxc_ast::ast::AssignmentTarget<'_>,
@@ -1121,20 +1120,24 @@ fn simulate_assignment(
         .strip_suffix('=')
         .filter(|op| matches!(*op, "&&" | "||" | "??"))
     {
-        let Some(old) = old.as_ref() else {
-            if env.opaque_state_access(|probe| probe.visit_expression(&assign.right)) {
-                return None;
+        if let Some(old) = old.as_ref() {
+            match eval_logical_left(logical, old.clone())? {
+                LogicalStep::Value(value) => return Some((StateFlow::Normal, Some(value))),
+                LogicalStep::EvaluateRight => {}
             }
-            env.invalidate_opaque()?;
-            if matches!(location, Some(ArithmeticLocation::Binding(symbol)) if symbol == env.state)
-            {
-                return None;
+        } else {
+            // The assignment is short-circuited on one path. Join the
+            // unchanged environment with the evaluation and write path.
+            let mut taken = env.clone();
+            let (flow, value) = simulate_expression(&assign.right, &mut taken)?;
+            if flow == StateFlow::Normal {
+                if let Some(location) = location {
+                    taken.set(location, value);
+                } else {
+                    taken.invalidate_opaque()?;
+                }
             }
-            return Some((StateFlow::Normal, None));
-        };
-        match eval_logical_left(logical, old.clone())? {
-            LogicalStep::Value(value) => return Some((StateFlow::Normal, Some(value))),
-            LogicalStep::EvaluateRight => {}
+            return join_expression_paths(env, (StateFlow::Normal, None), taken, (flow, None));
         }
     }
     let (flow, right) = simulate_expression(&assign.right, env)?;
@@ -1154,7 +1157,7 @@ fn simulate_assignment(
         if value.is_none() && operator != "=" {
             env.invalidate_opaque()?;
         }
-        env.set(location, value.clone())?;
+        env.set(location, value.clone());
     } else {
         // An unproven PutValue can execute user code.
         env.invalidate_opaque()?;
@@ -1175,7 +1178,7 @@ fn simulate_update(
     };
     let Some(old) = env.read(location) else {
         env.invalidate_opaque()?;
-        env.set(location, None)?;
+        env.set(location, None);
         return Some((StateFlow::Normal, None));
     };
     let old = old.number();
@@ -1184,7 +1187,7 @@ fn simulate_update(
         "--" => old - 1.0,
         _ => return None,
     };
-    env.set(location, Some(Value::Number(next)))?;
+    env.set(location, Some(Value::Number(next)));
     Some((
         StateFlow::Normal,
         Some(Value::Number(if update.prefix { next } else { old })),
@@ -1207,11 +1210,12 @@ fn simulate_immediate_invocation(
 ) -> Option<ExpressionFlow> {
     let body = invocation.body;
     let previous = env.reflective_activation;
-    let mut probe = StateReferenceProbe {
-        scoping: env.scoping,
-        state: env.state,
-        found: false,
-    };
+    let mut probe = StateUseProbe::new(
+        env.scoping,
+        env.state,
+        env.per_iteration_binding,
+        StateUseMode::Any,
+    );
     probe.visit_function_body(body);
     env.reflective_activation |= invocation.reflective && probe.found;
     let mut locals = ActivationBindings::default();
@@ -1231,6 +1235,79 @@ fn simulate_immediate_invocation(
         StateFlow::Normal | StateFlow::Return => Some((StateFlow::Normal, None)),
         StateFlow::Break | StateFlow::Continue => None,
     }
+}
+
+fn join_expression_paths(
+    env: &mut ArithmeticEnvironment<'_>,
+    left: ExpressionFlow,
+    alternate: ArithmeticEnvironment<'_>,
+    right: ExpressionFlow,
+) -> Option<ExpressionFlow> {
+    match (left.0, right.0) {
+        (StateFlow::Normal, StateFlow::Normal) => {
+            env.join(&alternate);
+            let value = left.1.filter(|value| {
+                right
+                    .1
+                    .as_ref()
+                    .is_some_and(|other| identical_primitive_value(value, other))
+            });
+            Some((StateFlow::Normal, value))
+        }
+        (StateFlow::Normal, StateFlow::Throw) => Some(left),
+        (StateFlow::Throw, StateFlow::Normal) => {
+            // Preserve only the reaching normal path. An abrupt path's
+            // effects are still in the original, retained expression.
+            env.values = alternate.values;
+            env.slots = alternate.slots;
+            Some(right)
+        }
+        (StateFlow::Throw, StateFlow::Throw) => Some((StateFlow::Throw, None)),
+        _ => None,
+    }
+}
+
+fn simulate_binary(
+    binary: &oxc_ast::ast::BinaryExpression<'_>,
+    env: &mut ArithmeticEnvironment<'_>,
+) -> Option<ExpressionFlow> {
+    let (flow, left) = simulate_expression(&binary.left, env)?;
+    if flow != StateFlow::Normal {
+        return Some((flow, None));
+    }
+    let (flow, right) = simulate_expression(&binary.right, env)?;
+    if flow != StateFlow::Normal {
+        return Some((flow, None));
+    }
+    let operator = binary.operator.as_str();
+    let value = left
+        .as_ref()
+        .zip(right.as_ref())
+        .and_then(|(left, right)| eval_binary(operator, left, right));
+    if value.is_none() && !matches!(operator, "===" | "!==") {
+        // The unproved operands may have observable coercion behavior.
+        env.invalidate_opaque()?;
+    }
+    Some((StateFlow::Normal, value))
+}
+
+fn simulate_logical(
+    logical: &oxc_ast::ast::LogicalExpression<'_>,
+    env: &mut ArithmeticEnvironment<'_>,
+) -> Option<ExpressionFlow> {
+    let (flow, left) = simulate_expression(&logical.left, env)?;
+    if flow != StateFlow::Normal {
+        return Some((flow, None));
+    }
+    if let Some(left) = left {
+        return match eval_logical_left(logical.operator.as_str(), left)? {
+            LogicalStep::Value(value) => Some((StateFlow::Normal, Some(value))),
+            LogicalStep::EvaluateRight => simulate_expression(&logical.right, env),
+        };
+    }
+    let mut alternate = env.clone();
+    let right = simulate_expression(&logical.right, &mut alternate)?;
+    join_expression_paths(env, (StateFlow::Normal, None), alternate, right)
 }
 
 fn simulate_expression(
@@ -1254,20 +1331,27 @@ fn simulate_expression(
         }
         Expression::AssignmentExpression(assign) => simulate_assignment(assign, env),
         Expression::UpdateExpression(update) => simulate_update(update, env),
+        Expression::BinaryExpression(binary) => simulate_binary(binary, env),
+        Expression::LogicalExpression(logical) => simulate_logical(logical, env),
         Expression::ConditionalExpression(branch) => {
-            if let Some(test) = env.eval(&branch.test) {
-                simulate_expression(
+            let (flow, test) = simulate_expression(&branch.test, env)?;
+            if flow != StateFlow::Normal {
+                return Some((flow, None));
+            }
+            if let Some(test) = test {
+                return simulate_expression(
                     if test.truthy() {
                         &branch.consequent
                     } else {
                         &branch.alternate
                     },
                     env,
-                )
-            } else {
-                env.opaque_expression(expr)?;
-                Some((StateFlow::Normal, None))
+                );
             }
+            let mut alternate = env.clone();
+            let left = simulate_expression(&branch.consequent, env)?;
+            let right = simulate_expression(&branch.alternate, &mut alternate)?;
+            join_expression_paths(env, left, alternate, right)
         }
         Expression::UnaryExpression(unary)
             if matches!(
@@ -1369,7 +1453,7 @@ fn initialize_register_array(
             }
         }
     }
-    env.set(ArithmeticLocation::Binding(symbol), None)?;
+    env.set(ArithmeticLocation::Binding(symbol), None);
     env.slots.extend(
         slots
             .into_iter()
@@ -1404,7 +1488,7 @@ fn simulate_declaration(
                         .any(|element| matches!(element, ArrayExpressionElement::SpreadElement(_)))
                     {
                         env.opaque_expression(init)?;
-                        env.set(ArithmeticLocation::Binding(symbol), None)?;
+                        env.set(ArithmeticLocation::Binding(symbol), None);
                         continue;
                     }
                     let flow = initialize_register_array(symbol, array, env)?;
@@ -1421,9 +1505,9 @@ fn simulate_declaration(
             if !env.trackable(symbol) {
                 env.invalidate_opaque()?;
             }
-            env.set(ArithmeticLocation::Binding(symbol), value)?;
+            env.set(ArithmeticLocation::Binding(symbol), value);
         } else if declaration.kind != VariableDeclarationKind::Var {
-            env.set(ArithmeticLocation::Binding(symbol), Some(Value::Undefined))?;
+            env.set(ArithmeticLocation::Binding(symbol), Some(Value::Undefined));
         }
         // A var declaration without initializer performs no runtime write.
     }
@@ -1482,7 +1566,7 @@ fn simulate_statement(
                 })?;
             match (yes_flow, no_flow) {
                 (StateFlow::Normal, StateFlow::Normal) => {
-                    env.join(&alternate)?;
+                    env.join(&alternate);
                     Some(StateFlow::Normal)
                 }
                 (StateFlow::Normal, StateFlow::Return | StateFlow::Throw) => {
@@ -1493,7 +1577,7 @@ fn simulate_statement(
                     Some(StateFlow::Normal)
                 }
                 (left, right) if left == right => {
-                    env.join(&alternate)?;
+                    env.join(&alternate);
                     Some(left)
                 }
                 _ => None,
@@ -2570,15 +2654,15 @@ impl Collector<'_, '_> {
         // nested function. Deferred writers could change it during opaque
         // code or after a later iteration. A for-let cell additionally may
         // not escape through a deferred reader of an earlier iteration.
-        let mut activation = StateActivationProof {
-            scoping: self.scoping,
-            state: state_symbol,
-            per_iteration_binding: matches!(it.init.as_ref(), Some(oxc_ast::ast::ForStatementInit::VariableDeclaration(decl)) if decl.kind == VariableDeclarationKind::Let),
-            deferred_depth: 0,
-            valid: true,
-        };
+        let per_iteration_binding = matches!(it.init.as_ref(), Some(oxc_ast::ast::ForStatementInit::VariableDeclaration(decl)) if decl.kind == VariableDeclarationKind::Let);
+        let mut activation = StateUseProbe::new(
+            self.scoping,
+            state_symbol,
+            per_iteration_binding,
+            StateUseMode::Deferred,
+        );
         activation.visit_for_statement(it);
-        if !activation.valid {
+        if activation.found {
             return None;
         }
         let Statement::BlockStatement(body) = &it.body else {
@@ -2655,6 +2739,9 @@ impl Collector<'_, '_> {
         }
         let consequent = eval(&conditional.consequent)?;
         let alternate = eval(&conditional.alternate)?;
+        if identical_primitive_value(&consequent, &alternate) {
+            return None;
+        }
         consequent.render()?;
         alternate.render()?;
         Some((
@@ -2782,7 +2869,7 @@ impl Collector<'_, '_> {
         env.set(
             ArithmeticLocation::Binding(setup.state_symbol),
             Some(target),
-        )?;
+        );
         let mut chunks = vec![format!("{} = {target_text};", setup.state_var)];
         let mut state_path = Vec::new();
         let mut seen_states = HashSet::new();
@@ -3071,6 +3158,16 @@ mod live_arithmetic_tests {
         ("for(let s=1;s!==9;){switch(s){case 1:!function(){'use strict';push(s);s=9;}();break;}}", true),
         ("var saved;function capture(){saved=capture.caller;}for(let s=1;s!==9;){switch(s){case 1:try{!function(){capture();push(s);}();}finally{}s=2;break;case 2:s=9;break;}}saved();", false),
         ("for(let s=1;s!==9;){switch(s){case 1:!function(){try{if(flag)return;}finally{}s=2;}();s=s===1?9:3;break;case 3:s=9;break;}}", false),
+        ("for(let s=1;s!==9;){switch(s){case 1:push((s=2)+7);s=9;break;}}", false),
+        ("for(let s=1;s!==9;){switch(s){case 1:(s=2)+(s=9);break;}}", true),
+        ("for(let s=1;s!==9;){switch(s){case 1:s=(flag?(s=3,9):9);break;}}", true),
+        ("for(let s=1;s!==9;){switch(s){case 1:flag&&(s=2);s=9;break;}}", true),
+        ("for(let s=1;s!==9;){switch(s){case 1:s=flag?2:3;s=9;break;}}", true),
+        ("for(let s=1;s!==9;){switch(s){case 1:s=0;s||=9;break;}}", true),
+        ("for(let s=1;s!==9;){switch(s){case 1:s=1;s&&=9;break;}}", true),
+        ("for(let s=1;s!==9;){switch(s){case 1:s=null;s??=9;break;}}", true),
+        ("for(let s=1;s!==9;){switch(s){case 1:var C=class{x=s};s=9;break;}}new C().x;", false),
+        ("for(let s=1;s!==9;){switch(s){case 1:var C=class{static x=s};s=9;break;}}C.x;", true),
         // The switch's lexical environment is shared even across unselected cases.
         ("for(let s=1;s!==9;){switch(s){case 1:s=9;push(x);break;case 2:let x=1;break;}}", false),
     ];
