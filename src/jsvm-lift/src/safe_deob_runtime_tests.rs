@@ -954,6 +954,26 @@ fn depythonify_safe_deob_callable_capture_runtime_equivalence() -> Result<()> {
 
 #[test]
 #[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_string_own_runtime_equivalence() -> Result<()> {
+    let sources = [
+        "let s='abc';[s.length,s[0],s[2]];",
+        "let s='é😀z';[s.length,s[0],s[1],s[2],s[3]];",
+        "let s='😀',a=[7];[s[0],s[1],a[0]];",
+        "let s='abc';[s[-0],s[1n],s['01'],s['-0'],s[3]];",
+        "let s='abc',a=[7];let r=[s?.length,s?.[1]];[r[0],r[1],a[0]];",
+        "let {length:l,0:x,...rest}='abc';[l,x,rest[1],rest[2]];",
+        "let s='abc',a=[7];[s[(a[0]=9,0)],a[0]];",
+        "let s='abc',old=s;let r=s[(s='xyz',0)];[r,s,old];",
+        "Object.defineProperty(String.prototype,'01',{get(){events.push('get');return 9},configurable:true});let s='abc';[s.length,s[0],s['01']];",
+        "Object.defineProperty(String.prototype,'3',{get(){events.push('get');return 9},configurable:true});let s='abc';[s[2],s[3]];",
+        "Object.defineProperty(String.prototype,'0',{get(){events.push('get');return 9},configurable:true});let s='abc';[s.length,s[0]];",
+        "let s='abc',a=[7];let k={toString(){a[0]=9;return '0'}};[s[k],a[0]];",
+    ];
+    script_runtime_equivalence(&sources, "string-own-properties", false)
+}
+
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
 fn depythonify_safe_deob_optional_chain_runtime_equivalence() -> Result<()> {
     let sources = [
         "let a=null,b=[7];let r=[a?.[b[0]=9].x];[r[0],b[0]];",

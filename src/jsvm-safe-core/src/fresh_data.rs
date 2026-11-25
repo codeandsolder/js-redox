@@ -512,13 +512,13 @@ impl Analyzer<'_, '_> {
         let Some(name) = key.primitive_value().map(Value::js_string) else {
             return self.barrier(environment);
         };
-        let Some(Fact::Objects(locations)) = object.fact else {
+        let Some(receiver) = object.fact else {
             return self.barrier(environment);
         };
         // The receiver was evaluated before the key, but its contents must
         // be read *after* key evaluation, including any effects on aliases.
         let Some(fact) = self
-            .heap_result(environment.read(&locations, &name, self.budget))
+            .heap_result(environment.read_value(&receiver, &name, self.budget))
             .and_then(Result::ok)
         else {
             return self.barrier(environment);
@@ -1963,6 +1963,55 @@ mod tests {
                 ("[f][0]===f".into(), "true".into()),
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn string_own_properties_use_exact_utf16_indexing() -> Result<(), BudgetExceeded> {
+        for (source, expected) in [
+            (
+                "let s='abc';s.length;s[0];s[2];",
+                vec![("s.length", "3"), ("s[0]", "\"a\""), ("s[2]", "\"c\"")],
+            ),
+            (
+                "let s='é😀z';s.length;s[0];s[3];",
+                vec![("s.length", "4"), ("s[0]", "\"é\""), ("s[3]", "\"z\"")],
+            ),
+            ("let s='😀',a=[7];s[0];s[1];a[0];", vec![("a[0]", "7")]),
+            ("let s='abc',a=[7];s['01'];a[0];", vec![]),
+            ("let s='abc',a=[7];s['-0'];a[0];", vec![]),
+            ("let s='abc',a=[7];s[3];a[0];", vec![]),
+            (
+                "let s='abc';s[-0];s[1n];",
+                vec![("s[-0]", "\"a\""), ("s[1n]", "\"b\"")],
+            ),
+            (
+                "let s='abc',a=[7];let r=[s?.length,s?.[1]];r[0];r[1];a[0];",
+                vec![("r[0]", "3"), ("r[1]", "\"b\""), ("a[0]", "7")],
+            ),
+            (
+                "let {length:l,0:x,...rest}='abc';let r=[l,x,rest[1],rest[2]];r[0];r[1];r[2];r[3];",
+                vec![
+                    ("rest[1]", "\"b\""),
+                    ("rest[2]", "\"c\""),
+                    ("r[0]", "3"),
+                    ("r[1]", "\"a\""),
+                    ("r[2]", "\"b\""),
+                    ("r[3]", "\"c\""),
+                ],
+            ),
+            ("let s='abc',a=[7];s[(a[0]=9,0)];a[0];", vec![("a[0]", "9")]),
+            (
+                "let s='abc',old=s;let r=s[(s='xyz',0)];let a=[r,s,old];a[0];a[1];a[2];",
+                vec![("a[0]", "\"a\""), ("a[1]", "\"xyz\""), ("a[2]", "\"abc\"")],
+            ),
+        ] {
+            let expected = expected
+                .into_iter()
+                .map(|(source, value)| (source.to_owned(), value.to_owned()))
+                .collect::<Vec<_>>();
+            assert_eq!(reads(source)?, expected, "{source}");
+        }
         Ok(())
     }
 

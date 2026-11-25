@@ -156,6 +156,53 @@ pub(super) const fn value_weight(value: &Value) -> usize {
     }
 }
 
+/// Strings are indexed by UTF-16 code units, not Unicode scalar values.
+/// A surrogate is still an own data property, even though its value is
+/// outside the current UTF-8 proof domain.
+fn string_code_unit(unit: u16) -> Option<Fact> {
+    char::from_u32(u32::from(unit))
+        .map(|character| Fact::Primitive(Value::String(character.to_string())))
+}
+
+/// Prove only the mandatory own properties of a primitive string wrapper.
+/// All other lookups can reach a modified String.prototype.
+fn read_string_own(text: &str, key: &str, budget: &WorkBudget) -> Result<Lookup, BudgetExceeded> {
+    charge(budget, key.len())?;
+    if key == "length" {
+        charge(budget, text.len())?;
+        let length = text.encode_utf16().count();
+        // The string length is an exact integer. Construct it from 32-bit
+        // halves, avoiding an unchecked lossy integer-to-float conversion.
+        let Ok(length) = u64::try_from(length) else {
+            return Ok(Err(UnprovenLookup));
+        };
+        if length >= (1_u64 << 53) {
+            return Ok(Err(UnprovenLookup));
+        }
+        let high = u32::try_from(length >> 32).unwrap_or_default();
+        let low = u32::try_from(length & u64::from(u32::MAX)).unwrap_or_default();
+        let number = f64::from(high) * 4_294_967_296.0 + f64::from(low);
+        return Ok(Ok(Some(Fact::Primitive(Value::Number(number)))));
+    }
+    let Ok(index) = key.parse::<usize>() else {
+        return Ok(Err(UnprovenLookup));
+    };
+    // Unlike array indexes, string exotic indexes have no uint32 bound.
+    // A canonical nonnegative decimal below the actual length suffices.
+    if index.to_string() != key || index >= text.len() {
+        return Ok(Err(UnprovenLookup));
+    }
+    charge(
+        budget,
+        text.len().min(index.saturating_add(1).saturating_mul(3)),
+    )?;
+    Ok(text
+        .encode_utf16()
+        .nth(index)
+        .map(string_code_unit)
+        .ok_or(UnprovenLookup))
+}
+
 /// The value lattice is separate from the descriptor lattice. Unknown data
 /// values do not imply arbitrary getters or setters. `MaybeData` means either
 /// an absent own property or a writable own data property on every path.
@@ -1356,8 +1403,7 @@ impl Environment {
                         // A supplementary character is two indexed UTF-16
                         // code units. Preserve unrepresentable surrogate
                         // values as unknown data rather than replacing them.
-                        let fact = char::from_u32(u32::from(unit))
-                            .map(|character| Fact::Primitive(Value::String(character.to_string())));
+                        let fact = string_code_unit(unit);
                         let key = index.to_string();
                         if !excluded.contains(&key) {
                             properties.insert(key, Property::data(fact));
@@ -1433,6 +1479,19 @@ impl Environment {
             }
         }
         Ok(found)
+    }
+
+    pub(super) fn read_value(
+        &self,
+        receiver: &Fact,
+        key: &str,
+        budget: &WorkBudget,
+    ) -> Result<Lookup, BudgetExceeded> {
+        match receiver {
+            Fact::Objects(locations) => self.read(locations, key, budget),
+            Fact::Primitive(Value::String(text)) => read_string_own(text, key, budget),
+            Fact::Primitive(_) => Ok(Err(UnprovenLookup)),
+        }
     }
 
     pub(super) fn read(
