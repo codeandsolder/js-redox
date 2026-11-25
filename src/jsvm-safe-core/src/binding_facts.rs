@@ -52,6 +52,7 @@ pub struct BindingFacts {
     hoisted_functions: HashSet<ScopeId>,
     hoisted_function_bindings: HashMap<ScopeId, SymbolId>,
     statement_list_functions: HashMap<SymbolId, ScopeId>,
+    statement_list_declarations: HashSet<ScopeId>,
     direct_calls: HashMap<ReferenceId, Span>,
     scopes: Vec<Option<ScopeId>>,
     eval_sites: Vec<EvalSite>,
@@ -136,6 +137,7 @@ impl BindingFacts {
             hoisted_functions: HashSet::new(),
             hoisted_function_bindings: HashMap::new(),
             statement_list_functions: HashMap::new(),
+            statement_list_declarations: HashSet::new(),
             direct_calls: HashMap::new(),
             scopes: Vec::new(),
             eval_sites: Vec::new(),
@@ -147,6 +149,11 @@ impl BindingFacts {
             ambient_root: !program.source_type.is_module(),
         };
         facts.visit_program(program);
+        // A var in a simple catch with the same name writes the catch
+        // parameter, but its hoisted binding still belongs to the var scope.
+        facts
+            .hoisted_vars
+            .extend(scoping.catch_var_bindings().map(|(_, owner)| owner));
         facts.exported_bindings.extend(
             std::mem::take(&mut facts.exported_references)
                 .into_iter()
@@ -290,6 +297,15 @@ impl BindingFacts {
         let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
             return None;
         };
+        self.var_initializer_binding_target(scoping, declarator, identifier)
+    }
+
+    pub(crate) fn var_initializer_binding_target(
+        &self,
+        scoping: &Scoping,
+        declarator: &VariableDeclarator<'_>,
+        identifier: &oxc_ast::ast::BindingIdentifier<'_>,
+    ) -> Option<SymbolId> {
         let scope = *self.var_initializer_scopes.get(&declarator.span)?;
         let symbol = scoping
             .scope_ancestors(scope)
@@ -540,6 +556,27 @@ impl BindingFacts {
         self.mapped_arguments_exposed.contains(&scope)
     }
 
+    pub(crate) fn is_parameter(&self, symbol: SymbolId) -> bool {
+        self.parameters.contains(&symbol)
+    }
+
+    pub(crate) fn is_hoisted_var(&self, symbol: SymbolId) -> bool {
+        self.hoisted_vars.contains(&symbol)
+    }
+
+    /// With parameter expressions, an unredeclared formal and the
+    /// immutable named-expression binding remain in the outer environment.
+    pub(crate) fn parameter_binding_survives_body(
+        &self,
+        scoping: &Scoping,
+        symbol: SymbolId,
+    ) -> bool {
+        self.named_function_expressions.contains(&symbol)
+            || (self.parameters.contains(&symbol)
+                && !self.hoisted_vars.contains(&symbol)
+                && !scoping.symbol_flags(symbol).is_function())
+    }
+
     /// A parameter cell may be indirectly written through mapped arguments.
     /// This is a function-local property, including references in arrows.
     pub(crate) fn is_mapped_arguments_exposed(&self, scoping: &Scoping, symbol: SymbolId) -> bool {
@@ -614,7 +651,6 @@ impl BindingFacts {
         self.statement_list_functions.get(&symbol) == Some(&function_scope)
             && scoping.scope_parent_id(function_scope) == Some(scoping.symbol_scope_id(symbol))
             && self.has_declarative_storage(scoping, symbol)
-            && scoping.symbol_redeclarations(symbol).is_empty()
             && !self.is_mapped_arguments_exposed(scoping, symbol)
     }
 
@@ -635,7 +671,9 @@ impl BindingFacts {
         let owner = scoping.symbol_scope_id(symbol);
         let flags = scoping.scope_flags(owner);
         (flags.is_function() || flags.is_strict_mode())
-            && self.instantiated_function_declaration(scoping, symbol, scope)
+            && self.statement_list_declarations.contains(&scope)
+            && scoping.scope_parent_id(scope) == Some(owner)
+            && self.has_declarative_storage(scoping, symbol)
     }
 
     /// Resolve an invocation to the already instantiated lexical function.
@@ -810,6 +848,7 @@ impl<'a> Visit<'a> for BindingFacts {
                     function.scope_id.get(),
                 ) {
                     self.statement_list_functions.insert(symbol, scope);
+                    self.statement_list_declarations.insert(scope);
                 }
             }
             // This is one actual statement list. A switch case's lexical
@@ -900,9 +939,7 @@ impl<'a> Visit<'a> for BindingFacts {
         }
         if declaration.kind == VariableDeclarationKind::Var {
             for declarator in &declaration.declarations {
-                if declarator.init.is_some()
-                    && matches!(declarator.id, BindingPattern::BindingIdentifier(_))
-                {
+                if declarator.init.is_some() {
                     if let Some(Some(scope)) = self.scopes.last() {
                         self.var_initializer_scopes.insert(declarator.span, *scope);
                     }

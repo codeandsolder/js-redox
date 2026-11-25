@@ -34,6 +34,7 @@ mod coverage;
 mod dispatch;
 mod heap;
 mod origins;
+mod parameters;
 mod scope_instances;
 use cells::CellId;
 use heap::{
@@ -362,7 +363,10 @@ impl Analyzer<'_, '_> {
     fn cell_id(&self, symbol: SymbolId) -> Option<CellId> {
         let instance = self
             .scope_instances
-            .get(self.scoping.symbol_scope_id(symbol))?;
+            .get(self.scoping.symbol_scope_id(symbol), || {
+                self.bindings
+                    .parameter_binding_survives_body(self.scoping, symbol)
+            })?;
         Some(CellId::symbol(instance, symbol))
     }
 
@@ -419,15 +423,23 @@ impl Analyzer<'_, '_> {
         id
     }
 
+    fn enter_empty_instance(
+        &mut self,
+        scope: ScopeId,
+        environment: &mut Environment,
+    ) -> Option<scope_instances::ScopeTicket> {
+        let id = self.fresh_identity();
+        self.heap_result(environment.record_birth(id, self.budget))?;
+        Some(self.scope_instances.enter(scope, id))
+    }
+
     fn enter_instance(
         &mut self,
         scope: Option<ScopeId>,
         environment: &mut Environment,
     ) -> Option<scope_instances::ScopeTicket> {
         let scope = scope?;
-        let id = self.fresh_identity();
-        self.heap_result(environment.record_birth(id, self.budget))?;
-        let ticket = self.scope_instances.enter(scope, id);
+        let ticket = self.enter_empty_instance(scope, environment)?;
         if self
             .initialize_hoisted_callables(scope, environment)
             .is_none()
@@ -1076,7 +1088,7 @@ impl Analyzer<'_, '_> {
         let Some(instance) = self
             .callables
             .this_owner(expression)
-            .and_then(|owner| self.scope_instances.get(owner))
+            .and_then(|owner| self.scope_instances.get(owner, || true))
         else {
             return self.barrier(environment);
         };
@@ -1218,6 +1230,19 @@ impl Analyzer<'_, '_> {
             if kind == VariableDeclarationKind::Var && declarator.init.is_none() {
                 // Instantiation hoists the binding. Executing a bare var
                 // declaration never writes undefined to an existing cell.
+                continue;
+            }
+            if !matches!(declarator.id, BindingPattern::BindingIdentifier(_))
+                && matches!(
+                    kind,
+                    VariableDeclarationKind::Let
+                        | VariableDeclarationKind::Const
+                        | VariableDeclarationKind::Var
+                )
+            {
+                if !self.destructuring_declaration(declarator, kind, environment) {
+                    break;
+                }
                 continue;
             }
             let symbol = self.declaration_symbol(declarator, kind);
@@ -1889,6 +1914,157 @@ mod tests {
                 ("[f][0]===f".into(), "true".into()),
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn ordered_parameter_initialization_and_rest_arrays() -> Result<(), BudgetExceeded> {
+        for (source, expected) in [
+            (
+                "let f=(a=7,b=a+2)=>[a,b];let r=f();r[0];r[1];",
+                vec![("r[0]", "7"), ("r[1]", "9")],
+            ),
+            (
+                "let f=(a=7)=>[a];let r=f(void 0);r[0];",
+                vec![("r[0]", "7")],
+            ),
+            (
+                "let f=(a=7)=>[a];let r=f(null);r[0];",
+                vec![("r[0]", "null")],
+            ),
+            (
+                "let n=0;let f=(a=(n+=1),b=(n+=2))=>[a,b,n];let r=f();r[0];r[1];r[2];",
+                vec![("r[0]", "1"), ("r[1]", "3"), ("r[2]", "3")],
+            ),
+            (
+                "let n=0;let f=(a=(n+=1),b=(n+=2))=>[a,b,n];let r=f(7,9);r[0];r[1];r[2];",
+                vec![("r[0]", "7"), ("r[1]", "9"), ("r[2]", "0")],
+            ),
+            (
+                "function outer(x){let a=[7];let f=(v=(a[0]=9))=>[v];f(x);return a[0];}",
+                vec![],
+            ),
+            (
+                "function outer(x){let a=[7];let f=(v=(a[0]=7))=>[v];f(x);return a[0];}",
+                vec![("a[0]", "7")],
+            ),
+            (
+                "let f=(...a)=>a;let b=f(7,9);b[0];b[1];b.length;",
+                vec![("b[0]", "7"), ("b[1]", "9"), ("b.length", "2")],
+            ),
+            (
+                "let f=(a,...rest)=>[a,rest.length,rest[0]];let r=f(7,9);r[0];r[1];r[2];",
+                vec![("r[0]", "7"), ("r[1]", "1"), ("r[2]", "9")],
+            ),
+            (
+                "let f=(...a)=>a;let b=f();b.length;",
+                vec![("b.length", "0")],
+            ),
+            (
+                "let f=(a=7,...rest)=>[a,rest.length];let r=f(void 0,9);r[0];r[1];",
+                vec![("r[0]", "7"), ("r[1]", "1")],
+            ),
+            (
+                "let o={x:7,f:function(a=this.x){return [a]}};let r=o.f();r[0];",
+                vec![("r[0]", "7")],
+            ),
+            (
+                "let f=(a=7)=>{var x;return [x,a]};let r=f();r[0];r[1];",
+                vec![("r[0]", "void 0"), ("r[1]", "7")],
+            ),
+        ] {
+            let expected = expected
+                .into_iter()
+                .map(|(source, value)| (source.to_owned(), value.to_owned()))
+                .collect::<Vec<_>>();
+            assert_eq!(reads(source)?, expected, "{source}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn defaults_capture_parameter_cells_before_body_instantiation() -> Result<(), BudgetExceeded> {
+        for (source, expected) in [
+            ("let f=(a=7,g=()=>[a])=>{var a=9;return g};let r=f()();r[0];", vec![("r[0]", "7")]),
+            ("let f=(a=7,g=()=>[a])=>{a=9;return g};let r=f()();r[0];", vec![("r[0]", "9")]),
+            ("let f=(g=()=>[a],a=7)=>{var a=9;return g};let r=f()();r[0];", vec![("r[0]", "7")]),
+            ("let f=(a=7,g=()=>[a])=>{var a;return [a,g]};let p=f();let r=p[1]();p[0];r[0];", vec![("p[0]", "7"),("r[0]", "7")]),
+            ("let f=(a=7,g=()=>[a])=>{var a;let h=()=>[a];a=9;return [g,h]};let p=f();let r=p[0](),s=p[1]();r[0];s[0];", vec![("r[0]", "7"),("s[0]", "9")]),
+            ("let f=(a=7,g=()=>[a])=>{if(false){try{}catch(a){var a=11}}a=9;return g;};let r=f()();r[0];", vec![("r[0]", "7")]),
+            ("let f=function(a=7,g=()=>[a]){function a(){return 9}return g;};let r=f()();r[0];", vec![("r[0]", "7")]),
+            ("let f=function(a=7,g=()=>[a]){function a(){return [9]}let p=a();return [g,p];};let p=f();let r=p[0](),s=p[1];r[0];s[0];", vec![("r[0]", "7"),("s[0]", "9")]),
+            ("let a=7;let f=(g=()=>[a])=>{var a=9;return g};let r=f()();r[0];", vec![("r[0]", "7")]),
+            ("let f=(a=7,g=()=>[a])=>{var a=9;return g};let g=f(),h=f(11);let r=g(),s=h();r[0];s[0];", vec![("r[0]", "7"),("s[0]", "11")]),
+            ("let f=(a=7,g=()=>[a])=>{var a=9;return g};let g=f();for(let i=0;i<256;i++){let a=[i];}let r=g();r[0];", vec![("r[0]", "7")]),
+            ("let o={x:7,f:function(g=()=>[this.x]){return g}};let r=o.f()();r[0];", vec![("r[0]", "7")]),
+        ] {
+            let expected = expected.into_iter().map(|(source,value)| (source.to_owned(),value.to_owned())).collect::<Vec<_>>();
+            assert_eq!(reads(source)?, expected, "{source}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn object_binding_patterns_share_heap_lookup_and_copy_semantics() -> Result<(), BudgetExceeded>
+    {
+        for (source, expected) in [
+            (
+                "let f=({x,y:z=9})=>[x,z];let r=f({x:7,y:void 0});r[0];r[1];",
+                vec![("r[0]", "7"), ("r[1]", "9")],
+            ),
+            (
+                "let f=({x:{y=7}})=>[y];let r=f({x:{y:void 0}});r[0];",
+                vec![("r[0]", "7")],
+            ),
+            (
+                "let f=({x,...rest})=>[x,rest.y];let r=f({x:7,y:9});r[0];r[1];",
+                vec![("r[0]", "7"), ("r[1]", "9")],
+            ),
+            (
+                "let f=({x,...rest})=>rest;let r=f({x:7,y:9});r.y;",
+                vec![("r.y", "9")],
+            ),
+            (
+                "let f=({x})=>{var x;return [x]};let r=f({x:7});r[0];",
+                vec![("r[0]", "7")],
+            ),
+            (
+                "let f=({['x']:a,b=a})=>[a,b];let r=f({x:7,b:void 0});r[0];r[1];",
+                vec![("r[0]", "7"), ("r[1]", "7")],
+            ),
+            (
+                "let a=[7];let f=({x})=>[x];f({get x(){a[0]=9;return 7}});a[0];",
+                vec![],
+            ),
+            ("let f=([x])=>[x];let r=f([7]);r[0];", vec![]),
+            (
+                "let {x,y:z=9}={x:7,y:void 0};let a=[x,z];a[0];a[1];",
+                vec![("a[0]", "7"), ("a[1]", "9")],
+            ),
+            ("const {x,...r}={x:7,y:9};r.y;", vec![("r.y", "9")]),
+            (
+                "function outer(){var {x,...r}={x:7,y:9};return r.y;}",
+                vec![("r.y", "9")],
+            ),
+            ("var {x}={x: 7};let r=[x];r[0];", vec![]),
+            (
+                "let a={x:7,y:9};let {x:v,...r}=a;let b=[v,r.y];b[0];b[1];",
+                vec![("r.y", "9"), ("b[0]", "7"), ("b[1]", "9")],
+            ),
+        ] {
+            let expected = expected
+                .into_iter()
+                .map(|(source, value)| (source.to_owned(), value.to_owned()))
+                .collect::<Vec<_>>();
+            assert_eq!(reads(source)?, expected, "{source}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn last_hoisted_declaration_instantiates_once() -> Result<(), BudgetExceeded> {
+        let source = "function outer(){let g=f;function f(){return [7]}function f(){return [9]}let r=g();return r[0];}";
+        assert_eq!(reads(source)?, vec![("r[0]".into(), "9".into())]);
         Ok(())
     }
 

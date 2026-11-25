@@ -9,10 +9,36 @@ use oxc_syntax::scope::ScopeId;
 use std::{collections::HashMap, rc::Rc};
 use work_budget::{BudgetExceeded, WorkBudget};
 
+/// Oxc uses one static function scope for both parameter and body
+/// bindings. Default initializers can create closures over the parameter
+/// environment before the separate body variable environment is created.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct EnvironmentIdentity {
+    body: InstanceId,
+    parameters: Option<InstanceId>,
+}
+
+impl EnvironmentIdentity {
+    const fn single(id: InstanceId) -> Self {
+        Self {
+            body: id,
+            parameters: None,
+        }
+    }
+
+    fn binding(self, parameter: impl FnOnce() -> bool) -> InstanceId {
+        self.parameters.filter(|_| parameter()).unwrap_or(self.body)
+    }
+
+    fn roots(self) -> impl Iterator<Item = InstanceId> {
+        std::iter::once(self.body).chain(self.parameters)
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Instance {
     scope: ScopeId,
-    serial: InstanceId,
+    identity: EnvironmentIdentity,
 }
 
 #[derive(Clone)]
@@ -23,7 +49,7 @@ pub(super) struct ClosureOrigin {
 
 pub(super) struct ScopeTicket {
     scope: ScopeId,
-    previous: Option<InstanceId>,
+    previous: Option<EnvironmentIdentity>,
 }
 
 impl ScopeTicket {
@@ -34,37 +60,71 @@ impl ScopeTicket {
 
 #[derive(Default)]
 pub(super) struct ScopeInstances {
-    active: HashMap<ScopeId, InstanceId>,
+    active: HashMap<ScopeId, EnvironmentIdentity>,
 }
 
 impl ScopeInstances {
     pub(super) fn enter(&mut self, scope: ScopeId, serial: InstanceId) -> ScopeTicket {
+        self.enter_environment(scope, EnvironmentIdentity::single(serial))
+    }
+
+    fn enter_environment(&mut self, scope: ScopeId, identity: EnvironmentIdentity) -> ScopeTicket {
         ScopeTicket {
             scope,
-            previous: self.active.insert(scope, serial),
+            previous: self.active.insert(scope, identity),
         }
     }
 
     pub(super) fn leave(&mut self, ticket: &ScopeTicket) -> Option<InstanceId> {
-        if let Some(previous) = ticket.previous {
+        let previous = if let Some(previous) = ticket.previous {
             self.active.insert(ticket.scope, previous)
         } else {
             self.active.remove(&ticket.scope)
-        }
+        };
+        previous.map(|identity| identity.body)
     }
 
     /// `CreatePerIterationEnvironment` copies values into distinct cells.
     pub(super) fn refresh(&mut self, scope: ScopeId, serial: InstanceId) -> Option<InstanceId> {
         let previous = self.active.get_mut(&scope)?;
-        Some(std::mem::replace(previous, serial))
+        if previous.parameters.is_some() {
+            return None;
+        }
+        Some(std::mem::replace(previous, EnvironmentIdentity::single(serial)).body)
     }
 
-    pub(super) fn get(&self, scope: ScopeId) -> Option<InstanceId> {
-        self.active.get(&scope).copied()
+    /// Establish the body variable environment without changing the
+    /// identities already captured by closures in default initializers.
+    pub(super) fn split_parameters(
+        &mut self,
+        scope: ScopeId,
+        body: InstanceId,
+    ) -> Option<InstanceId> {
+        let identity = self.active.get_mut(&scope)?;
+        if identity.parameters.is_some() {
+            return None;
+        }
+        let parameters = identity.body;
+        *identity = EnvironmentIdentity {
+            body,
+            parameters: Some(parameters),
+        };
+        Some(parameters)
+    }
+
+    pub(super) fn get(
+        &self,
+        scope: ScopeId,
+        parameter: impl FnOnce() -> bool,
+    ) -> Option<InstanceId> {
+        Some(self.active.get(&scope)?.binding(parameter))
     }
 
     pub(super) fn roots(&self) -> impl Iterator<Item = InstanceId> + '_ {
-        self.active.values().copied()
+        self.active
+            .values()
+            .copied()
+            .flat_map(EnvironmentIdentity::roots)
     }
 
     /// Select the closure's original environment chain while its code
@@ -79,7 +139,7 @@ impl ScopeInstances {
         Ok(origin
             .ancestors
             .iter()
-            .map(|instance| self.enter(instance.scope, instance.serial))
+            .map(|instance| self.enter_environment(instance.scope, instance.identity))
             .collect())
     }
 
@@ -92,12 +152,12 @@ impl ScopeInstances {
         let mut ancestors = Vec::new();
         for parent in scoping.scope_ancestors(scope).skip(1) {
             budget.consume(1)?;
-            let Some(&serial) = self.active.get(&parent) else {
+            let Some(&identity) = self.active.get(&parent) else {
                 return Ok(None);
             };
             ancestors.push(Instance {
                 scope: parent,
-                serial,
+                identity,
             });
         }
         Ok(Some(ClosureOrigin {
@@ -109,7 +169,9 @@ impl ScopeInstances {
 
 impl ClosureOrigin {
     pub(super) fn instances(&self) -> impl Iterator<Item = InstanceId> + '_ {
-        self.ancestors.iter().map(|instance| instance.serial)
+        self.ancestors
+            .iter()
+            .flat_map(|instance| instance.identity.roots())
     }
 }
 
@@ -119,22 +181,38 @@ mod tests {
     use oxc_syntax::scope::ScopeId;
 
     #[test]
+    fn split_parameters_preserve_outer_cells_and_restore_prior_instance() {
+        let mut scopes = ScopeInstances::default();
+        let scope = ScopeId::new(0);
+        let outer = scopes.enter(scope, 1);
+        let inner = scopes.enter(scope, 2);
+        assert_eq!(scopes.split_parameters(scope, 3), Some(2));
+        assert_eq!(scopes.get(scope, || false), Some(3));
+        assert_eq!(scopes.get(scope, || true), Some(2));
+        assert_eq!(scopes.roots().collect::<Vec<_>>(), vec![3, 2]);
+        assert_eq!(scopes.leave(&inner), Some(3));
+        assert_eq!(scopes.get(scope, || false), Some(1));
+        assert_eq!(scopes.get(scope, || true), Some(1));
+        assert_eq!(scopes.leave(&outer), Some(1));
+    }
+
+    #[test]
     fn scope_tickets_restore_instances_and_iteration_refresh_does_not_reuse_them() {
         let mut scopes = ScopeInstances::default();
         let scope = ScopeId::new(0);
         let outer = scopes.enter(scope, 1);
-        let first = scopes.active[&scope];
+        let first = scopes.active[&scope].body;
         assert_eq!(scopes.refresh(scope, 2), Some(first));
-        let second = scopes.active[&scope];
+        let second = scopes.active[&scope].body;
         assert_ne!(first, second);
         let inner = scopes.enter(scope, 3);
-        assert_ne!(scopes.active[&scope], second);
+        assert_ne!(scopes.active[&scope].body, second);
         assert_eq!(scopes.leave(&inner), Some(3));
-        assert_eq!(scopes.active[&scope], second);
+        assert_eq!(scopes.active[&scope].body, second);
         assert_eq!(scopes.leave(&outer), Some(second));
         assert!(!scopes.active.contains_key(&scope));
         let next = scopes.enter(scope, 4);
-        assert_ne!(scopes.active[&scope], second);
+        assert_ne!(scopes.active[&scope].body, second);
         assert_eq!(scopes.leave(&next), Some(4));
     }
 }
