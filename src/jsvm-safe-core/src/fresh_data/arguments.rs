@@ -9,6 +9,7 @@ use oxc_ecmascript::IsSimpleParameterList;
 use oxc_syntax::{scope::ScopeId, symbol::SymbolFlags};
 use std::collections::HashSet;
 
+#[derive(Clone, Copy)]
 pub(super) struct ArgumentsSpec<'a, 'ast> {
     pub(super) scope: ScopeId,
     pub(super) params: &'a FormalParameters<'ast>,

@@ -1941,7 +1941,7 @@ mod tests {
             ("let f=function(a,...rest){a=9;return arguments};let r=f(7,8);r[0];r[1];r.length;", vec![("r[0]", "7"),("r[1]", "8"),("r.length", "2")]),
             ("let f=function(a){return [arguments,()=>[a]]};let p=f(7);p[0][0]=9;let r=p[1]();r[0];", vec![("r[0]", "9")]),
             ("let f=function(a){return [arguments,()=>[a]]};let p=f(7);for(let i=0;i<256;i++){let x=[i];}p[0][0]=9;let r=p[1]();r[0];", vec![("r[0]", "9")]),
-            ("let f=function(a){let b={__proto__:arguments};b[0]=9;return [a,b[0]]};let r=f(7);r[0];r[1];", vec![("r[0]", "7"),("r[1]", "9")]),
+            ("let f=function(a){let b={__proto__: arguments};b[0]=9;return [a,b[0]]};let r=f(7);r[0];r[1];", vec![("r[0]", "7"),("r[1]", "9")]),
             ("let f=function(a){a=9;return {__proto__:null,...arguments}};let r=f(7);r[0];r.length;r.callee;", vec![("r[0]", "9"),("r.length", "void 0"),("r.callee", "void 0")]),
             ("let f=function(a){let b={...arguments};a=9;return b};let r=f(7);r[0];", vec![("r[0]", "7")]),
             ("let f=function(a){let {0:x,...r}=arguments;return {__proto__:null,...r}};let r=f(7,8);r[0];r[1];r.length;", vec![("r[0]", "void 0"),("r[1]", "8"),("r.length", "void 0")]),
