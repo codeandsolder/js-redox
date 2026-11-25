@@ -12,15 +12,19 @@ use crate::value_eval::{
     literal_property_key, Value,
 };
 use oxc_ast::ast::{
-    Argument, ArrayExpressionElement, BindingPattern, CallExpression, Declaration, Expression,
-    ForStatement, ForStatementInit, IdentifierReference, MemberExpression, ObjectPropertyKind,
-    Program, PropertyKind, SimpleAssignmentTarget, Statement, VariableDeclaration,
-    VariableDeclarationKind, VariableDeclarator,
+    Argument, ArrayExpressionElement, BindingPattern, Declaration, Expression, ForStatement,
+    ForStatementInit, IdentifierReference, MemberExpression, ObjectPropertyKind, Program,
+    PropertyKind, SimpleAssignmentTarget, Statement, VariableDeclaration, VariableDeclarationKind,
+    VariableDeclarator,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::Scoping;
 use oxc_span::{GetSpan, Span};
-use oxc_syntax::{operator::AssignmentOperator, symbol::SymbolId};
+use oxc_syntax::{
+    operator::AssignmentOperator,
+    scope::{ScopeFlags, ScopeId},
+    symbol::SymbolId,
+};
 use std::collections::{HashMap, HashSet};
 use work_budget::{BudgetExceeded, WorkBudget};
 
@@ -173,6 +177,9 @@ impl FreshDataReads {
             scoping,
             bindings,
             pure_functions,
+            named_functions: activation::NamedFunctions::collect(program, budget)?,
+            lexical_scopes: Vec::new(),
+            activation_scopes: Vec::new(),
             reads: Self::default(),
             visited_lists: HashSet::new(),
             budget,
@@ -244,10 +251,13 @@ impl FreshDataReads {
     }
 }
 
-struct Analyzer<'c> {
+struct Analyzer<'c, 'ast> {
     scoping: &'c Scoping,
     bindings: &'c BindingFacts,
     pure_functions: &'c HashMap<SymbolId, PureFunction>,
+    named_functions: activation::NamedFunctions<'ast>,
+    lexical_scopes: Vec<Option<ScopeId>>,
+    activation_scopes: Vec<ScopeId>,
     reads: FreshDataReads,
     visited_lists: HashSet<(u32, u32)>,
     budget: &'c WorkBudget,
@@ -260,7 +270,7 @@ struct Analyzer<'c> {
     return_frame: Option<activation::ReturnFrame>,
 }
 
-impl Analyzer<'_> {
+impl Analyzer<'_, '_> {
     fn unobserved(&mut self, span: Span) {
         if self.loop_fuel.is_some() && self.heap_result(self.budget.consume(1)).is_some() {
             self.reads.gaps.insert(span);
@@ -992,12 +1002,9 @@ impl Analyzer<'_> {
             Expression::ArrayExpression(array) => self.array_expression(array, environment),
             Expression::ObjectExpression(object) => self.object_expression(object, environment),
             Expression::CallExpression(call) => {
-                if let Some(result) = self.scalar_call(call, environment) {
-                    return result;
-                }
                 // Callee lookup precedes argument evaluation. An unknown
                 // getter/global lookup can mutate anything visible to it.
-                if let Some(result) = self.immediate_call(call, environment) {
+                if let Some(result) = self.local_call(call, environment) {
                     return result;
                 }
                 self.expression(&call.callee, environment);
@@ -1024,52 +1031,6 @@ impl Analyzer<'_> {
                 |value| Evaluation::primitive(value, true),
             ),
         }
-    }
-
-    /// Use the same lexical scalar interpreter as call replacement. A
-    /// proven callable lookup itself is inert, but arguments need not be.
-    /// Once argument evaluation begins, never retry via the unknown-call
-    /// path: it would replay their effects in the abstract heap.
-    fn scalar_call(
-        &mut self,
-        call: &CallExpression<'_>,
-        environment: &mut Environment,
-    ) -> Option<Evaluation> {
-        if call.optional || call.arguments.iter().any(Argument::is_spread) {
-            return None;
-        }
-        let Expression::Identifier(identifier) = call.callee.without_parentheses() else {
-            return None;
-        };
-        let symbol = self
-            .bindings
-            .resolved_symbol(self.scoping, identifier.reference_id.get()?)?;
-        let functions = self.pure_functions;
-        let function = functions.get(&symbol)?;
-        self.bindings
-            .hoisted_callable_at(self.scoping, &call.callee, function.scope())?;
-        let mut values = Vec::with_capacity(call.arguments.len());
-        let mut inert = true;
-        for argument in &call.arguments {
-            let Some(expression) = argument.as_expression() else {
-                self.unobserved(call.span);
-                return Some(self.barrier(environment));
-            };
-            let value = self.expression(expression, environment);
-            inert &= value.inert;
-            values.push(match value.fact {
-                Some(Fact::Primitive(value)) => Some(value),
-                _ => None,
-            });
-        }
-        let result = function.evaluate(values.iter().map(Option::as_ref), self.budget);
-        if !self.checkpoint() {
-            return Some(self.barrier(environment));
-        }
-        Some(result.map_or_else(
-            || self.barrier(environment),
-            |value| Evaluation::primitive(value, inert),
-        ))
     }
 
     fn arguments(&mut self, arguments: &[Argument<'_>], environment: &mut Environment) {
@@ -1414,6 +1375,10 @@ impl Analyzer<'_> {
                 return false;
             }
             Statement::BreakStatement(_) | Statement::ContinueStatement(_) => return false,
+            Statement::FunctionDeclaration(function)
+                if self
+                    .bindings
+                    .inert_function_declaration(self.scoping, function) => {}
             Statement::EmptyStatement(_) => {}
             _ => {
                 self.unobserved(statement.span());
@@ -1425,7 +1390,19 @@ impl Analyzer<'_> {
     }
 }
 
-impl<'a> Visit<'a> for Analyzer<'_> {
+impl<'a> Visit<'a> for Analyzer<'_, 'a> {
+    fn enter_scope(&mut self, flags: ScopeFlags, scope: &std::cell::Cell<Option<ScopeId>>) {
+        self.lexical_scopes.push(if flags.is_function() {
+            scope.get()
+        } else {
+            None
+        });
+    }
+
+    fn leave_scope(&mut self) {
+        self.lexical_scopes.pop();
+    }
+
     fn visit_statements(&mut self, statements: &oxc_allocator::Vec<'a, Statement<'a>>) {
         if !self.checkpoint() {
             return;
@@ -1573,6 +1550,46 @@ mod tests {
     }
 
     #[test]
+    fn named_activations_preserve_heap_at_each_call_without_specializing_bodies(
+    ) -> Result<(), BudgetExceeded> {
+        for (source, expected) in [
+            ("function outer(){function build(v){let a=[v];return a;}let r=build(7);return r[0];}", vec![("r[0]", "7")]),
+            ("function outer(){let a=[7];function mutate(x){x[0]=9;return x;}let b=mutate(a);return a[0]+b[0];}", vec![("a[0]", "9"), ("b[0]", "9")]),
+            ("function outer(){let a=[7];function mutate(){a[0]=9;}mutate();return a[0];}", vec![("a[0]", "9")]),
+            ("function outer(){let a=[0,0];function write(i){a[i]=i+7;}for(let i=0;i<2;i++){write(i);}return a[0]+a[1];}", vec![("a[0]", "7"), ("a[1]", "8")]),
+            ("function outer(){function pick(v){let a=[v];return a[0];}let b=[pick(7),pick(9)];return b[0]+b[1];}", vec![("b[0]", "7"), ("b[1]", "9")]),
+            ("function outer(){function pick(v){let a=[v];return a[0];}let b=[pick(7)];let c=b[0];let alias=pick;return alias(9)+c;}", vec![("b[0]", "7")]),
+            ("function outer(flag){function build(){if(flag)return [7];return [7];}let b=build();return b[0];}", vec![("b[0]", "7")]),
+            ("function outer(flag){function build(){if(flag)return [7];return [9];}let b=build();return b[0];}", vec![]),
+            ("function outer(){let a=[7];function g(){a[0]=9;return a;}function f(){return g();}let b=f();return b[0]+a[0];}", vec![("b[0]", "9"), ("a[0]", "9")]),
+            ("function outer(){let a=build(7);function build(x){return [x];}return a[0];}", vec![("a[0]", "7")]),
+            ("function outer(){function f(a,n){if(n)f(a,n-1);a[0]++;return a;}let a=[0];f(a,2);return a[0];}", vec![]),
+            ("function outer(){function build(){effect();return [7];}let a=build();return a[0];}", vec![("a[0]", "7")]),
+            ("function outer(){function f(x,x){return [x];}let a=f(1,7);return a[0];}", vec![("a[0]", "7")]),
+            ("function outer(){function f(x){arguments[0]=9;return [x];}let a=f(7);return a[0];}", vec![]),
+            ("function outer(){function f(p){function p(){return 9}return [p];}let a=f(7);return a[0];}", vec![]),
+            ("function outer(){function f(){let x=[7];using r={[Symbol.dispose](){x[0]=9;}};return x;}let a=f();return a[0];}", vec![]),
+            ("function outer(){'use strict';{let a=build(7);function build(x){return [x];}return a[0];}}", vec![("a[0]", "7")]),
+            ("function outer(flag){function build(){if(flag)throw 0;return [7];}let a=build();return a[0];}", vec![("a[0]", "7")]),
+            ("function outer(){function f(){return [7];}eval('f=()=>[9]');let a=f();return a[0];}", vec![]),
+            ("function f(){return [7];}globalThis.f=()=>[9];let a=f();a[0];", vec![]),
+            // An unknown first property read may execute a getter and invalidate b.
+            ("function outer(){let a=[7];function f(){effect();return [9];}let b=f();return a[0]+b[0];}", vec![]),
+            ("function outer(){let a=[7];function f(){effect();return [9];}let b=f();return b[0]+a[0];}", vec![("b[0]", "9")]),
+            ("function outer(){function f(v){if(v)return [7];return [9];}let a=f(1);let b=f(0);return a[0]+b[0];}", vec![("a[0]", "7"), ("b[0]", "9")]),
+        ] {
+            let expected = expected.into_iter().map(|(source, value)| (source.to_owned(), value.to_owned())).collect::<Vec<_>>();
+            assert_eq!(reads(source)?, expected, "{source}");
+        }
+        let alias = "function outer(){function f(x){return x;}let a=[7];let b=f(a);return a===b;}";
+        assert_eq!(
+            observed(alias, true)?,
+            vec![("a===b".into(), "true".into())]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn return_paths_preserve_disjoint_allocation_graphs() -> Result<(), BudgetExceeded> {
         for (source, expected) in [
             ("function f(flag){let a=(()=>{if(flag)return [7];return [7];})();return a[0];}", vec![("a[0]", "7")]),
@@ -1655,7 +1672,7 @@ mod tests {
             ("function outer(){function index(x,y){return x;}let a=[7];index(0,a);return a[0];}", vec![("a[0]", "7")]),
             ("function outer(){function index(x){return (x=0,x);}let a=[7];index(a);return a[0];}", vec![("a[0]", "7")]),
             ("function outer(){function index(x){return x;}let a=[7];index(a[0]=9,a);return a[0];}", vec![("a[0]", "9")]),
-            ("function outer(){function index(x){return x;}let a=[7];index(a);return a[0];}", vec![]),
+            ("function outer(){function index(x){return x;}let a=[7];index(a);return a[0];}", vec![("a[0]", "7")]),
             ("function index(x){return x;}let a=[7];index(0);a[0];", vec![]),
             ("function outer(flag){if(flag){function index(x){return x;}}let a=[7];index(0);return a[0];}", vec![]),
         ] {

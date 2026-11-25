@@ -913,6 +913,42 @@ fn depythonify_safe_deob_declarative_var_runtime_equivalence() -> Result<()> {
 
 #[test]
 #[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_named_activation_runtime_equivalence() -> Result<()> {
+    let sources = [
+        "function outer(){function build(v){let a=[v];return a;}let r=build(7);return r[0];}outer();",
+        "function outer(){let a=[7];function mutate(x){x[0]=9;return x;}let b=mutate(a);return [a[0],b[0],a===b];}outer();",
+        "function outer(){let a=[7];function mutate(){a[0]=9;}mutate();return a[0];}outer();",
+        "function outer(){let a=[0,0];function write(i){a[i]=i+7;}for(let i=0;i<2;i++){write(i);}return a;}outer();",
+        "function outer(){function pick(v){let a=[v];return a[0];}let b=[pick(7),pick(9)];return b[0]+b[1];}outer();",
+        "function outer(){function pick(v){let a=[v];return a[0];}let b=[pick(7)];let c=b[0];let alias=pick;return alias(9)+c;}outer();",
+        "function outer(flag){function build(){if(flag)return [7];return [7];}let b=build();return b[0];}[outer(true),outer(false)];",
+        "function outer(flag){function build(){if(flag)return [7];return [9];}let b=build();return b[0];}[outer(true),outer(false)];",
+        "function outer(){let a=[7];function g(){a[0]=9;return a;}function f(){return g();}let b=f();return [b[0],a[0],a===b];}outer();",
+        "function outer(){let a=build(7);function build(x){return [x];}return a[0];}outer();",
+        "function outer(){function f(a,n){if(n)f(a,n-1);a[0]++;return a;}let a=[0];f(a,2);return a[0];}outer();",
+        "function outer(){function build(){events.push('effect');return [7];}let a=build();return a[0];}outer();",
+        "function outer(){function f(x,x){return [x];}let a=f(1,7);return a[0];}outer();",
+        "function outer(){function f(x){arguments[0]=9;return [x];}let a=f(7);return a[0];}outer();",
+        "function outer(){function f(p){function p(){return 9}return [p];}let a=f(7);return a[0]();}outer();",
+        "function outer(){function f(){let x=[7];using r={[Symbol.dispose](){x[0]=9;}};return x;}let a=f();return a[0];}outer();",
+        "function outer(){'use strict';{let a=build(7);function build(x){return [x];}return a[0];}}outer();",
+        "function outer(flag){function build(){if(flag)throw 0;return [7];}let a=build();return a[0];}try{outer(true)}catch(e){events.push(e)}outer(false);",
+        "function outer(){function f(){return [7];}eval('f=()=>[9]');let a=f();return a[0];}outer();",
+        "function f(){return [7];}globalThis.f=()=>[9];let a=f();a[0];",
+        "function outer(){let a=[7];function f(){events.push('effect');return [9];}let b=f();return a[0]+b[0];}outer();",
+        "function outer(){function f(v){if(v)return [7];return [9];}let a=f(1);let b=f(0);return a[0]+b[0];}outer();",
+        "function outer(){function f(x){return x;}let a=[7];let b=f(a);return a===b;}outer();",
+        "function outer(){let a=[0];function f(n){if(n)g(n-1);a[0]++;}function g(n){if(n)f(n-1);a[0]++;}f(4);return a[0];}outer();",
+        "function outer(){function f(x){return [x];}let a=f(7);return [a[0],f(9)[0]];}outer();",
+        "function outer(){function f(){return [7];}let a=f();const alias=f;return [a[0],alias()[0]];}outer();",
+        "function outer(){let a=[0];function f(x,y){x[0]=y;return x;}let b=f(a,(a[0]++,7));return [b[0],a[0]];}outer();",
+        "function outer(){function f(){return [7];}let a=f();function g(){return outer();}return a[0];}outer();",
+    ];
+    script_runtime_equivalence(&sources, "named-activation", false)
+}
+
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
 fn depythonify_safe_deob_immediate_activation_runtime_equivalence() -> Result<()> {
     let sources = [
         "let a=(()=>[7])();a[0];",
@@ -921,7 +957,7 @@ fn depythonify_safe_deob_immediate_activation_runtime_equivalence() -> Result<()
         "let a=[1];let b=(x=>{x[0]=7;return x;})(a);[a[0],b[0],a===b];",
         "let a=(()=>{let a=[7];for(let i=0;i<2;i++){if(i===1)return a;}return [9];})();a[0];",
         "function f(flag){let a=[7];let b=(()=>{if(flag)return a;return a;})();return b[0];}[f(false),f(true)];",
-        "function f(flag){let a=[7];let b=(()=>{if(flag)throw 0;return a;})();return b[0];}try{f(flag)}catch(e){e;}",
+        "function f(flag){let a=[7];let b=(()=>{if(flag)throw 0;return a;})();return b[0];}try{f(true)}catch(e){events.push(e);}f(false);",
         "let a=(()=>{events.push('effect');return [7];})();a[0];",
         "let a=(function(){events.push('effect');return [7];})();a[0];",
         "let a=(()=>{try{return [7];}finally{}return [9];})();a[0];",
