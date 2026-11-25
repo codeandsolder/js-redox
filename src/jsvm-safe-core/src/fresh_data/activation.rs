@@ -6,7 +6,7 @@ use super::{
 };
 use oxc_ast::ast::{
     ArrowFunctionBody, ArrowFunctionExpression, CallExpression, Expression, FormalParameters,
-    Function, FunctionBody, FunctionType, Program, Statement, ThisExpression,
+    Function, FunctionBody, FunctionType, Program, ThisExpression,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::Scoping;

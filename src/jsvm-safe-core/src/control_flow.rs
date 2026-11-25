@@ -382,8 +382,17 @@ fn statement_mentions(stmt: &Statement<'_>, name: &str) -> bool {
 }
 
 #[derive(Default)]
+pub(crate) struct StatementTransfers {
+    pub(crate) external_jump: bool,
+    pub(crate) labelled_jump: bool,
+    pub(crate) returns: bool,
+    pub(crate) throws: bool,
+}
+
+#[derive(Default)]
 struct LoopControlDetector {
-    found: bool,
+    summary: StatementTransfers,
+    labels: Vec<String>,
     break_depth: usize,
     continue_depth: usize,
 }
@@ -400,15 +409,37 @@ impl LoopControlDetector {
 
 impl<'a> Visit<'a> for LoopControlDetector {
     fn visit_break_statement(&mut self, it: &oxc_ast::ast::BreakStatement<'a>) {
-        if it.label.is_some() || self.break_depth == 0 {
-            self.found = true;
+        if let Some(label) = &it.label {
+            self.summary.labelled_jump = true;
+            self.summary.external_jump |=
+                !self.labels.iter().any(|name| name == label.name.as_str());
+        } else {
+            self.summary.external_jump |= self.break_depth == 0;
         }
     }
 
     fn visit_continue_statement(&mut self, it: &oxc_ast::ast::ContinueStatement<'a>) {
-        if it.label.is_some() || self.continue_depth == 0 {
-            self.found = true;
+        if let Some(label) = &it.label {
+            self.summary.labelled_jump = true;
+            self.summary.external_jump |=
+                !self.labels.iter().any(|name| name == label.name.as_str());
+        } else {
+            self.summary.external_jump |= self.continue_depth == 0;
         }
+    }
+
+    fn visit_labeled_statement(&mut self, it: &oxc_ast::ast::LabeledStatement<'a>) {
+        self.labels.push(it.label.name.to_string());
+        self.visit_statement(&it.body);
+        self.labels.pop();
+    }
+
+    fn visit_return_statement(&mut self, _: &oxc_ast::ast::ReturnStatement<'a>) {
+        self.summary.returns = true;
+    }
+
+    fn visit_throw_statement(&mut self, _: &oxc_ast::ast::ThrowStatement<'a>) {
+        self.summary.throws = true;
     }
 
     fn visit_switch_statement(&mut self, it: &oxc_ast::ast::SwitchStatement<'a>) {
@@ -444,12 +475,23 @@ impl<'a> Visit<'a> for LoopControlDetector {
     fn visit_arrow_function_expression(&mut self, _it: &oxc_ast::ast::ArrowFunctionExpression<'a>) {
         // Nested function control flow cannot target the surrounding statement.
     }
+
+    fn visit_class(&mut self, _: &oxc_ast::ast::Class<'a>) {
+        // Static blocks have their own control-transfer boundary.
+    }
+}
+
+pub(crate) fn statement_transfers(stmt: &Statement<'_>) -> StatementTransfers {
+    let mut detector = LoopControlDetector::default();
+    detector.visit_statement(stmt);
+    detector.summary
 }
 
 pub fn statement_has_loop_control(stmt: &Statement<'_>) -> bool {
-    let mut detector = LoopControlDetector::default();
-    detector.visit_statement(stmt);
-    detector.found
+    let summary = statement_transfers(stmt);
+    // Existing relocation proofs reject all labelled transfers, including
+    // labels wholly contained by the relocated statement.
+    summary.external_jump || summary.labelled_jump
 }
 
 pub fn direct_assignment_name<'a>(

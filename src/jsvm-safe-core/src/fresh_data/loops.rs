@@ -18,7 +18,7 @@ pub(super) enum Loop<'a, 'ast> {
 }
 
 impl<'a, 'ast> Loop<'a, 'ast> {
-    pub(super) const fn new(statement: &'a Statement<'ast>) -> Option<Self> {
+    pub(super) fn new(statement: &'a Statement<'ast>) -> Option<Self> {
         match statement {
             Statement::ForStatement(statement) => Some(Self::For(statement)),
             Statement::WhileStatement(statement) => Some(Self::While(statement)),

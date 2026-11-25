@@ -4,40 +4,18 @@ use super::{
     Analyzer, Environment, Fact, Value,
 };
 use oxc_ast::ast::{BlockStatement, Declaration, IfStatement, Statement, SwitchStatement};
-use oxc_ast_visit::Visit;
 use oxc_span::GetSpan;
-use oxc_syntax::scope::ScopeFlags;
-
-#[derive(Default)]
-struct TransferProbe {
-    returns: bool,
-    throws: bool,
-}
-
-impl<'a> Visit<'a> for TransferProbe {
-    fn visit_return_statement(&mut self, _: &oxc_ast::ast::ReturnStatement<'a>) {
-        self.returns = true;
-    }
-    fn visit_throw_statement(&mut self, _: &oxc_ast::ast::ThrowStatement<'a>) {
-        self.throws = true;
-    }
-    fn visit_function(&mut self, _: &oxc_ast::ast::Function<'a>, _: ScopeFlags) {}
-    fn visit_arrow_function_expression(&mut self, _: &oxc_ast::ast::ArrowFunctionExpression<'a>) {}
-    fn visit_class(&mut self, _: &oxc_ast::ast::Class<'a>) {}
-}
 
 /// Unsupported syntax may contain a transfer to an enclosing modeled
 /// region. Do not reinterpret that path as a normal completion.
 pub(super) fn unmodeled_transfer(statement: &Statement<'_>) -> bool {
-    let mut probe = TransferProbe::default();
-    probe.visit_statement(statement);
-    probe.returns || crate::control_flow::statement_has_loop_control(statement)
+    let summary = crate::control_flow::statement_transfers(statement);
+    summary.returns || summary.external_jump
 }
 
 pub(super) fn may_exit_loop(body: &Statement<'_>) -> bool {
-    let mut probe = TransferProbe::default();
-    probe.visit_statement(body);
-    probe.returns || probe.throws || crate::control_flow::statement_has_loop_control(body)
+    let summary = crate::control_flow::statement_transfers(body);
+    summary.returns || summary.throws || summary.external_jump
 }
 
 impl Analyzer<'_, '_> {
