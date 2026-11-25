@@ -15,15 +15,12 @@ permissions:
 jobs:
   strict-rust:
     name: Shared strict Rust policy
-    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@f01e6b6b93a444e11600b90b5ca5ff42ec4206ee # main
-    with:
-      rust-toolchain: nightly-2026-11-22
+    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@7d0552029497cf094787c3593f804d5bce137c4b # main
 
   rust:
-    name: Rust 1.100 quality gate
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@411fd9e8b72b47b2d086b6c18671434cc019699a # main
+    name: Rust quality gate
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@83ceff49d93d152cd95a1c9d6addb5cf03169477 # main
     with:
-      rust-toolchain: "1.100.0"
       rust-components: "rustfmt clippy"
       timeout-minutes: 20
       command: |
@@ -42,20 +39,19 @@ jobs:
             "$python_files" "$python_shebang_files"
           exit 1
         fi
-        cargo +1.100.0 fmt --all -- --check
-        cargo +1.100.0 test --locked --workspace
-        cargo +1.100.0 clippy --locked --workspace --all-targets -- -D warnings
+        cargo fmt --all -- --check
+        cargo test --locked --workspace
+        cargo clippy --locked --workspace --all-targets -- -D warnings
 
   semantic:
     name: Semantic/runtime regressions
     needs: rust
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@411fd9e8b72b47b2d086b6c18671434cc019699a # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@83ceff49d93d152cd95a1c9d6addb5cf03169477 # main
     with:
-      rust-toolchain: "1.100.0"
       timeout-minutes: 20
       command: |
         node tools/cloak-recorder/check-nested-cdp-session.mjs
-        cargo +1.100.0 test -p jsvm-lift --lib depythonify_safe_deob_ -- --ignored --nocapture
-        cargo +1.100.0 test -p jsvm-lift --lib node_confirms_ -- --ignored --nocapture
-        cargo +1.100.0 test -p jsvm-safe-core --lib node_confirms_ -- --ignored --nocapture
-        cargo +1.100.0 test -p jsvm-safe-core --lib global_accessor_after_state_write_keeps_real_successor -- --ignored --nocapture
+        cargo test -p jsvm-lift --lib depythonify_safe_deob_ -- --ignored --nocapture
+        cargo test -p jsvm-lift --lib node_confirms_ -- --ignored --nocapture
+        cargo test -p jsvm-safe-core --lib node_confirms_ -- --ignored --nocapture
+        cargo test -p jsvm-safe-core --lib global_accessor_after_state_write_keeps_real_successor -- --ignored --nocapture
