@@ -1059,7 +1059,7 @@ impl Analyzer<'_> {
         for argument in &call.arguments {
             let Some(expression) = argument.as_expression() else {
                 self.unobserved(call.span);
-                return Some(Self::barrier(environment));
+                return Some(self.barrier(environment));
             };
             let value = self.expression(expression, environment);
             inert &= value.inert;
@@ -1073,10 +1073,10 @@ impl Analyzer<'_> {
             .then(|| function.evaluate(&values, self.budget))
             .flatten();
         if !self.checkpoint() {
-            return Some(Self::barrier(environment));
+            return Some(self.barrier(environment));
         }
         Some(result.map_or_else(
-            || Self::barrier(environment),
+            || self.barrier(environment),
             |value| Evaluation::primitive(value, inert),
         ))
     }
