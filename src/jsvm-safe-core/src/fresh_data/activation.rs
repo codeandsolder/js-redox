@@ -263,6 +263,33 @@ impl<'ast> Analyzer<'_, 'ast> {
         self.unproved_returns(|probe| probe.visit_statement(statement));
     }
 
+    /// Install actual declaration objects on entry to their lexical owner.
+    /// Never reconstruct an allocation after an opaque effect: a previously
+    /// evaluated reference may still denote the same function object.
+    pub(super) fn initialize_hoisted_callables(
+        &mut self,
+        scope: ScopeId,
+        environment: &mut Environment,
+    ) -> Option<()> {
+        for &symbol in self.scoping.get_bindings(scope).values() {
+            self.heap_result(self.budget.consume(1))?;
+            let Some(function) = self.callables.get(symbol) else {
+                continue;
+            };
+            if !self
+                .bindings
+                .inert_function_declaration(self.scoping, function)
+            {
+                continue;
+            }
+            let value = self
+                .allocate_callable(function.scope_id.get(), environment)
+                .fact?;
+            self.heap_result(environment.insert(self.cell_id(symbol)?, value, self.budget))?;
+        }
+        Some(())
+    }
+
     fn initialize_activation(
         &mut self,
         activation: &Activation<'_>,

@@ -23,7 +23,7 @@ use oxc_span::{GetSpan, Span};
 use oxc_syntax::{
     operator::AssignmentOperator,
     scope::{ScopeFlags, ScopeId},
-    symbol::SymbolId,
+    symbol::{SymbolFlags, SymbolId},
 };
 use std::collections::{HashMap, HashSet};
 use work_budget::{BudgetExceeded, WorkBudget};
@@ -427,7 +427,15 @@ impl Analyzer<'_, '_> {
         let scope = scope?;
         let id = self.fresh_identity();
         self.heap_result(environment.record_birth(id, self.budget))?;
-        Some(self.scope_instances.enter(scope, id))
+        let ticket = self.scope_instances.enter(scope, id);
+        if self
+            .initialize_hoisted_callables(scope, environment)
+            .is_none()
+        {
+            let _ = self.scope_instances.leave(&ticket);
+            return None;
+        }
+        Some(ticket)
     }
 
     fn leave_instance(
@@ -538,7 +546,11 @@ impl Analyzer<'_, '_> {
         if let SimpleAssignmentTarget::AssignmentTargetIdentifier(identifier) = target {
             let symbol = self.lexical_reference(identifier)?;
             let flags = self.scoping.symbol_flags(symbol);
-            return (flags.is_variable() && !flags.is_const_variable())
+            // Declaration bindings are mutable; a named function expression's
+            // self name is an immutable binding outside its parameter cells.
+            let mutable = (flags.is_variable() || flags.is_function())
+                && !flags.intersects(SymbolFlags::ConstVariable | SymbolFlags::FunctionExpression);
+            return mutable
                 .then(|| self.cell_id(symbol).map(Reference::Binding))
                 .flatten();
         }
@@ -1482,20 +1494,52 @@ impl<'a> Visit<'a> for Analyzer<'_, 'a> {
     }
 
     fn visit_statements(&mut self, statements: &oxc_allocator::Vec<'a, Statement<'a>>) {
+        self.independent_statements(statements, true);
+        walk::walk_statements(self, statements);
+    }
+
+    fn visit_switch_case(&mut self, case: &oxc_ast::ast::SwitchCase<'a>) {
+        if let Some(test) = &case.test {
+            self.visit_expression(test);
+        }
+        // The case test and previous cases may already have modified the
+        // shared switch environment. This is not an instantiation boundary.
+        self.independent_statements(&case.consequent, false);
+        walk::walk_statements(self, &case.consequent);
+    }
+}
+
+impl Analyzer<'_, '_> {
+    fn independent_statements(&mut self, statements: &[Statement<'_>], at_entry: bool) {
         if !self.checkpoint() {
             return;
         }
-        if let (Some(first), Some(last)) = (statements.first(), statements.last()) {
-            if !self
-                .visited_lists
-                .contains(&(first.span().start, last.span().end))
+        let (Some(first), Some(last)) = (statements.first(), statements.last()) else {
+            return;
+        };
+        if self
+            .visited_lists
+            .contains(&(first.span().start, last.span().end))
+        {
+            return;
+        }
+        let mut environment = Environment::new();
+        if at_entry {
+            if let Some(scope) = self
+                .lexical_scopes
+                .last()
+                .and_then(Option::as_ref)
+                .map(scope_instances::ScopeTicket::scope)
             {
-                self.statements(statements, &mut Environment::new());
+                if self
+                    .initialize_hoisted_callables(scope, &mut environment)
+                    .is_none()
+                {
+                    return;
+                }
             }
         }
-        // Descend into independently executing bodies, including functions,
-        // loops and exception regions, with no assumed incoming allocation.
-        walk::walk_statements(self, statements);
+        self.statements(statements, &mut environment);
     }
 }
 
@@ -1781,6 +1825,44 @@ mod tests {
                 ("f===h".into(), "false".into()),
                 ("[f][0]===f".into(), "true".into()),
             ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn hoisted_callable_cells_follow_aliases_and_declaration_instances(
+    ) -> Result<(), BudgetExceeded> {
+        for (source, expected) in [
+            ("function outer(){let f=make;function make(x){return [x];}let a=f(7);return a[0];}", vec![("a[0]", "7")]),
+            ("function outer(){function make(){let x=7;function f(){return [x++];}return f;}let f=make();let a=f(),b=f();return a[0]+b[0];}", vec![("a[0]", "7"), ("b[0]", "8")]),
+            ("function outer(){function f(){return [7]}let old=f;f=()=>[9];let a=old(),b=f();return a[0]+b[0];}", vec![("a[0]", "7"), ("b[0]", "9")]),
+            ("function outer(){let a=f();function f(){return [7];}return a[0];}", vec![("a[0]", "7")]),
+            ("function outer(){let a=[null];{ 'use strict'; }function f(){return [7];}a[0]=f;let b=a[0]();return b[0];}", vec![("b[0]", "7")]),
+            ("function outer(){'use strict';let f;{let x=7;f=inner;function inner(){return [x];}}let a=f();return a[0];}", vec![("a[0]", "7")]),
+            ("function outer(){'use strict';let fs=[null,null];for(let i=0;i<2;i++){fs[i]=f;function f(){return [i];}}let a=fs[0](),b=fs[1]();return a[0]+b[0];}", vec![("a[0]", "0"),("b[0]", "1")]),
+            ("function outer(){function f(){return [7];}let g=f;let a=g((f=()=>[9],0));return a[0];}", vec![("a[0]", "7")]),
+            ("function outer(){function f(){return [7];}let g=f;unknown();let a=g();return a[0];}", vec![]),
+            ("function outer(n){'use strict';switch(n){case 0:f=()=>[9];case 1:let a=f();return a[0];function f(){return [7];}}}", vec![]),
+            ("function outer(){function f(){return [7];}f=()=>[9];function g(){return f();}let a=g();return a[0];}", vec![("a[0]", "9")]),
+            ("function outer(){function f(){return [7];}let a=f((f=()=>[9],0));let b=f();return a[0]+b[0];}", vec![("a[0]", "7"),("b[0]", "9")]),
+        ] {
+            let expected = expected.into_iter().map(|(source, value)| (source.to_owned(), value.to_owned())).collect::<Vec<_>>();
+            assert_eq!(reads(source)?, expected, "{source}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn hoisted_function_identity_is_not_recreated_after_effects() -> Result<(), BudgetExceeded> {
+        let source = "function outer(){function f(){}let g=f;f===g;f===(unknown(),f);}";
+        assert_eq!(
+            observed(source, true)?,
+            vec![("f===g".into(), "true".into())]
+        );
+        let source = "function outer(){function make(){function f(){}return f;}let a=make(),b=make();a===b;}";
+        assert_eq!(
+            observed(source, true)?,
+            vec![("a===b".into(), "false".into())]
         );
         Ok(())
     }

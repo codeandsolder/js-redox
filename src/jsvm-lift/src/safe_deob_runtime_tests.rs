@@ -953,6 +953,33 @@ fn depythonify_safe_deob_callable_capture_runtime_equivalence() -> Result<()> {
 
 #[test]
 #[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_hoisted_callable_cells_runtime_equivalence() -> Result<()> {
+    let sources = [
+        "function outer(){let f=make;function make(x){return [x];}let a=f(7);return a[0];}outer();",
+        "function outer(){function make(){let x=7;function f(){return [x++];}return f;}let f=make();let a=f(),b=f();return [a[0],b[0]];}outer();",
+        "function outer(){function f(){return [7]}let old=f;f=()=>[9];let a=old(),b=f();return [a[0],b[0]];}outer();",
+        "function outer(){let a=f();function f(){return [7];}return a[0];}outer();",
+        "function outer(){'use strict';let f;{let x=7;f=inner;function inner(){return [x];}}let a=f();return a[0];}outer();",
+        "function outer(){'use strict';let fs=[null,null];for(let i=0;i<2;i++){fs[i]=f;function f(){return [i];}}let a=fs[0](),b=fs[1]();return [a[0],b[0]];}outer();",
+        "function outer(){function f(){return [7];}let g=f;let a=g((f=()=>[9],0));return a[0];}outer();",
+        "function outer(){function f(){return [7];}let g=f;events.push(g);let a=g();return a[0];}outer();",
+        "function outer(n){'use strict';switch(n){case 0:f=()=>[9];case 1:let a=f();return a[0];function f(){return [7];}}}[outer(0),outer(1)];",
+        "function outer(){function f(){return [7];}f=()=>[9];function g(){return f();}let a=g();return a[0];}outer();",
+        "function outer(){function f(){return [7];}let a=f((f=()=>[9],0));let b=f();return [a[0],b[0]];}outer();",
+        "function outer(){function f(){}let g=f;return [f===g,f===(events.push('x'),f)];}outer();",
+        "function outer(){function make(){function f(){}return f;}let a=make(),b=make();return a===b;}outer();",
+        "function outer(){function f(){return [7]}function f(){return [9]}let a=f();return a[0];}outer();",
+        "function outer(f){function f(){return [7]}let a=f();return a[0];}outer(()=>[9]);",
+        "function outer(){function f(){return [7];}eval('f=()=>[9]');let a=f();return a[0];}outer();",
+        "function outer(){if(false){function f(){return [7]}}return typeof f;}outer();",
+        "let f=function self(self){return [self];};let a=f(7);a[0];",
+        "let f=function self(){var self=7;return [self];};let a=f();a[0];",
+    ];
+    script_runtime_equivalence(&sources, "hoisted-callable-cells", false)
+}
+
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
 fn depythonify_safe_deob_instance_cell_runtime_equivalence() -> Result<()> {
     let sources = [
         "let make=x=>()=>[x];let f=make(7),g=make(9);let a=f(),b=g();[a[0],b[0]];",
