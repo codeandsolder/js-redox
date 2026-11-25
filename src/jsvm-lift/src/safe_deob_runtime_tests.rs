@@ -953,6 +953,39 @@ fn depythonify_safe_deob_callable_capture_runtime_equivalence() -> Result<()> {
 
 #[test]
 #[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_receiver_cell_runtime_equivalence() -> Result<()> {
+    let sources = [
+        "let o={x:7,f:function(){return [this.x]}};let a=o.f();a[0];",
+        "let o={x:7,f(){return [this.x]}};let a=o.f();a[0];",
+        "let o={x:7,f(){this.x++;return this;}};let a=o.f();[a.x,o.x,a===o];",
+        "let o={x:7,f(){return [this.x]}};let a=o.f((o={x:9},0));a[0];",
+        "let o={x:7,f(){return [this.x]}};let a=o[(o={x:9},'f')]();a[0];",
+        "let o={x:7,f(){return [this.x]}};let a=(o.f)();a[0];",
+        "let f=function(){'use strict';return [this===void 0]};let a=f();a[0];",
+        "let o={x:7,f(){'use strict';return [this===void 0]}};let a=(0,o.f)();a[0];",
+        "globalThis.x=11;let o={x:7,f(){return [this.x]}};let a=(0,o.f)();a[0];",
+        "let o={x:7,f(){return [this.x]}};let p={x:9,f:o.f};let a=o.f(),b=p.f();[a[0],b[0]];",
+        "let o={x:7,f(){return [this.x]}};let a=o.f((o.x=9,0));a[0];",
+        "let o={x:7,f(){return [this.x]}};let a=o.f((events.push('arg'),o.x=9));a[0];",
+        "let o={x:7,f(){'use strict';let g=function(){return [this===void 0]};return g();}};let a=o.f();a[0];",
+        "let o={x:7,f(){return ()=>[this.x]}};let g=o.f();o.x=9;let a=g();a[0];",
+        "let o={x:7,f(){return {x:9,g:()=>[this.x]}}};let p=o.f();let a=p.g();a[0];",
+        "let o={x:7,f(){return ()=>[this.x]}};let p={x:9,f:o.f};let g=o.f(),h=p.f();let a=g(),b=h();[a[0],b[0]];",
+        "let o={x:7,f(){return ()=>[this.x]}};let g=o.f();o={x:9};for(let i=0;i<256;i++){let a=[i];}let a=g();a[0];",
+        "let o={x:7,f(){return [()=>this.x,()=>{this.x=9}]}};let p=o.f();p[1]();let a=[p[0]()];a[0];",
+        "let o={x:7,f(){return ()=>[this.x]}};let g=o.f();events.push(g);let a=g();a[0];",
+        "globalThis.x=11;let o={x:7,f:()=>[this.x]};let a=o.f();a[0];",
+        "let o={x:7,f(){return class{ x=9; g=()=>[this.x];};}};let C=o.f();let a=new C().g();a[0];",
+        "let o={x:7,f(){return class{static x=9;static g=()=>[this.x];};}};let C=o.f();let a=C.g();a[0];",
+        "let o={x:7,f(){return [this.x]}};let p={x:9,f:o.f};let a=(true?p.f:o.f)();a[0];",
+        "let o={x:7,f(){return [this.x]}};let a=(o.f=o.f)();a[0];",
+        "let o={x:7,f(){return [this.x]}};let a=o.f((o.f=()=>[9],0));a[0];",
+    ];
+    script_runtime_equivalence(&sources, "receiver-cell", false)
+}
+
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
 fn depythonify_safe_deob_hoisted_callable_cells_runtime_equivalence() -> Result<()> {
     let sources = [
         "function outer(){let f=make;function make(x){return [x];}let a=f(7);return a[0];}outer();",
