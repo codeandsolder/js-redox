@@ -1,3 +1,22 @@
+/// Convert an integer into the JavaScript Number domain. Precision loss above
+/// 2^53 is intentional here: JavaScript itself stores the value as IEEE-754 f64.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "JavaScript Number semantics intentionally round integers through IEEE-754 f64"
+)]
+pub const fn js_number_from_u64(value: u64) -> f64 {
+    value as f64
+}
+
+/// Signed counterpart; rounding is intentional JavaScript Number semantics.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "JavaScript Number semantics intentionally round integers through IEEE-754 f64"
+)]
+pub const fn js_number_from_i64(value: i64) -> f64 {
+    value as f64
+}
+
 /// ECMAScript strict numeric equality without approximate float comparisons.
 ///
 /// Equal finite or infinite IEEE-754 encodings compare equal, either signed
