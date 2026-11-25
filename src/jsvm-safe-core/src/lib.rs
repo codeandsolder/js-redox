@@ -1267,13 +1267,18 @@ impl Collector<'_, '_> {
             .initialization
             .stable_callable_symbol(self.scoping, &call.callee)?;
         let function = self.pure_functions.get(&symbol)?;
+        self.constants.initialization.hoisted_callable_at(
+            self.scoping,
+            &call.callee,
+            function.scope(),
+        )?;
         let values = call
             .arguments
             .iter()
             .map(eval_static_argument)
             .collect::<Option<Vec<_>>>()?;
         let text = function
-            .evaluate(&values)
+            .evaluate(&values, self.budget)
             .and_then(|value| value.render_expression())?;
         self.push(call.span, text, "pure_function_eval");
         Some(CallRewriteTraversal::WalkChildren)
@@ -1827,9 +1832,11 @@ fn remove_unused_proven_helpers(
     decoder_helpers
         .iter()
         .map(|(symbol, span)| (*symbol, *span))
-        .chain(pure_functions.iter().filter_map(|(symbol, function)| {
-            function.declaration_span().map(|span| (*symbol, span))
-        }))
+        .chain(
+            pure_functions
+                .iter()
+                .map(|(symbol, function)| (*symbol, function.declaration_span())),
+        )
         .filter(|(symbol, _)| {
             scoping.symbol_scope_id(*symbol) != root_scope && scoping.symbol_is_unused(*symbol)
         })
@@ -2040,7 +2047,7 @@ fn transform_once(
     let shorthand_spans = collect_shorthand_spans(&program);
     let proxies = collect_proxy_objects(&program, scoping, &constants.initialization);
     budget.checkpoint()?;
-    let pure_functions = collect_pure_functions(&program, scoping);
+    let pure_functions = collect_pure_functions(&program, scoping, &constants.initialization);
     let from_char_code_aliases =
         collect_from_char_code_aliases(&program, scoping, &constants.initialization);
     budget.checkpoint()?;
@@ -7636,6 +7643,47 @@ mod tests {
                 "{source} -> {}",
                 result.source
             );
+        }
+    }
+
+    #[test]
+    fn scalar_helper_cells_capture_initialization_and_hoisting() {
+        for (body, expected) in [
+            ("var y=x+1;return (x=9)+y;", "12"),
+            ("var y=x;var x=9;return y+x;", "11"),
+            ("var y;var y=x+1;y++;return y;", "4"),
+            ("var y=x+1;var y;return y;", "3"),
+            ("let y=x+1;const z=y;y+=4;return z+y;", "10"),
+            ("let y=x;return (y+=3,y++ + y);", "11"),
+            ("let y=0;y ||= x;y &&= 7;return y;", "7"),
+            ("return typeof y;var y=1;", "\"undefined\""),
+            ("return void 0;", "void 0"),
+        ] {
+            let source =
+                format!("function outer(){{function f(x){{{body}}}return f(2);}}sink(outer());");
+            let result = deobfuscate(&source, 32).unwrap_or_else(|| unreachable!("{source}"));
+            assert!(
+                result.transforms.contains_key("pure_function_eval"),
+                "{source} -> {}",
+                result.source
+            );
+            assert!(
+                result.source.contains(expected),
+                "{source} -> {}",
+                result.source
+            );
+        }
+        for source in [
+            "function outer(){function f(x){return x;function x(){}}return f(2);}outer();",
+            "function outer(){function f(){return y;let y=7;}return f();}outer();",
+            "function outer(){function f(){const x=7;x=9;return x;}return f();}outer();",
+            "function f(x){return x+1}globalThis.f=x=>x+9;f(2);",
+            "function outer(flag){if(flag){function f(x){return x+1}}return f(2);}outer(false);",
+            "function outer(flag){if(flag)function f(x){return x+1}return f(2);}outer(false);",
+            "function outer(){function f(x){return x+1}function f(x){return x+9}return f(2);}outer();",
+        ] {
+            let result = deobfuscate(source, 32).unwrap_or_else(|| unreachable!("{source}"));
+            assert!(!result.transforms.contains_key("pure_function_eval"), "{source} -> {}", result.source);
         }
     }
 
