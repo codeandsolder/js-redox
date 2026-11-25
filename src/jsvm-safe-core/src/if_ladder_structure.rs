@@ -5279,10 +5279,10 @@ pub fn reconstruct_while_adjacent(
 /// initializer) preserves the original hoisted binding; source declarations
 /// that actually execute remain in their exact original statement positions.
 #[derive(Default)]
-struct HoistedVars {
-    names: BTreeSet<String>,
+pub struct HoistedVars {
+    pub names: BTreeSet<String>,
     unsupported: bool,
-    function_declaration: bool,
+    pub function_declaration: bool,
 }
 
 /// Destructuring is only syntax for introducing several bindings: retain

@@ -1603,10 +1603,10 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
                 self.push(it.span, text, "reference_state_unflatten");
                 return;
             }
-            if let Some((text, proof)) = self.arithmetic_state_replacement(it) {
-                self.push_arithmetic(it.span, text, proof);
-                return;
-            }
+        }
+        if let Some((text, proof)) = self.arithmetic_state_replacement(it, live) {
+            self.push_arithmetic(it.span, text, proof);
+            return;
         }
         if self.allow_effect_statements {
             if let Some((span, text)) = self.structure_dispatch_switch(&it.body, it.span) {

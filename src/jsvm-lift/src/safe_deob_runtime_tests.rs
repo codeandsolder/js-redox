@@ -37,6 +37,8 @@ const MAIN_FIXTURES: [&str; 42] = [
     "ordered-switch-for.js",
     "ordered-switch-bounded.js",
     "arithmetic-state.js",
+    "arithmetic-state-lexical.js",
+    "arithmetic-state-iife-shadow-safety.js",
     "arithmetic-state-external.js",
     "arithmetic-state-registers.js",
     "arithmetic-state-register-key-safety.js",
@@ -222,7 +224,13 @@ fn assert_state_and_alias_contract(file: &str, outcome: &SafeDeobOutcome) {
             assert_eq!(count(report, "ordered_switch_unflatten"), 1);
             assert!(!outcome.source.contains("switch ("));
         }
-        "arithmetic-state.js"
+        "arithmetic-state.js" => assert_eq!(
+            count(report, "arithmetic_state_unflatten"),
+            0,
+            "ambient state may be accessor-backed"
+        ),
+        "arithmetic-state-lexical.js"
+        | "arithmetic-state-iife-shadow-safety.js"
         | "arithmetic-state-external.js"
         | "arithmetic-state-registers.js"
         | "arithmetic-state-register-key-safety.js"
@@ -1674,10 +1682,6 @@ fn depythonify_safe_deob_safety_runtime_equivalence() -> Result<()> {
         ),
         (
             "arithmetic-state-conditional-safety.js",
-            &["arithmetic_state_unflatten"][..],
-        ),
-        (
-            "arithmetic-state-iife-shadow-safety.js",
             &["arithmetic_state_unflatten"][..],
         ),
     ] {
