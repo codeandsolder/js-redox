@@ -7,7 +7,7 @@ mod fixed_base64_proof;
 mod rotation_proof;
 
 use crate::binding_facts::{BindingFacts, ReferenceIdentity};
-use crate::numeric::exact_usize;
+use crate::numeric::{exact_usize, js_number_from_i64, js_number_from_u64};
 use crate::rewrite::Replacement;
 use crate::value_eval::{
     canonical_array_index_key, eval, exact_computed_property_key, identical_primitive_values,
@@ -36,25 +36,6 @@ use std::{
     sync::LazyLock,
 };
 use work_budget::{BudgetExceeded, WorkBudget};
-
-/// Convert an integer into the JavaScript Number domain. Precision loss above
-/// 2^53 is intentional here: JavaScript itself stores the value as IEEE-754 f64.
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "JavaScript Number semantics intentionally round integers through IEEE-754 f64"
-)]
-const fn js_number_from_u64(value: u64) -> f64 {
-    value as f64
-}
-
-/// Signed counterpart; rounding is intentional JavaScript Number semantics.
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "JavaScript Number semantics intentionally round integers through IEEE-754 f64"
-)]
-const fn js_number_from_i64(value: i64) -> f64 {
-    value as f64
-}
 
 #[derive(Debug, Clone)]
 struct StaticArrayInfo {

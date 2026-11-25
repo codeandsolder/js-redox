@@ -6,7 +6,7 @@ use super::{
     origins::IdentityOrigins,
     scope_instances::ClosureOrigin,
 };
-use crate::numeric::exact_u32;
+use crate::numeric::{exact_u32, js_number_from_u64};
 use crate::value_eval::{
     canonical_array_index_key, identical_primitive_value, strict_primitive_equal, Value,
 };
@@ -171,17 +171,14 @@ fn read_string_own(text: &str, key: &str, budget: &WorkBudget) -> Result<Lookup,
     if key == "length" {
         charge(budget, text.len())?;
         let length = text.encode_utf16().count();
-        // The string length is an exact integer. Construct it from 32-bit
-        // halves, avoiding an unchecked lossy integer-to-float conversion.
+        // ECMAScript string lengths are bounded by the largest safe integer.
         let Ok(length) = u64::try_from(length) else {
             return Ok(Err(UnprovenLookup));
         };
         if length >= (1_u64 << 53) {
             return Ok(Err(UnprovenLookup));
         }
-        let high = u32::try_from(length >> 32).unwrap_or_default();
-        let low = u32::try_from(length & u64::from(u32::MAX)).unwrap_or_default();
-        let number = f64::from(high) * 4_294_967_296.0 + f64::from(low);
+        let number = js_number_from_u64(length);
         return Ok(Ok(Some(Fact::Primitive(Value::Number(number)))));
     }
     let Ok(index) = key.parse::<usize>() else {
