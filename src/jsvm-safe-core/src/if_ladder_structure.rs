@@ -6457,7 +6457,7 @@ try{
         ("let s;for(s=1;s!=9;)if(s==1){push('prefix');{3;}var x=(s=9,[]);}else if(s==9){s=9;}", false),
         ("let s;for(s=1;s!=9;)if(s==1){push('prefix');{-0;}let x=(s=9,[]);}else if(s==9){s=9;}", true),
         ("let s;for(s=1;s!=9;)if(s==1){push('prefix');7;let x=(s=9,[]);}else if(s==9){s=9;}", true),
-        ("let s;for(s=1;s!=9;)if(s==1){push(typeof x);let x=(s=9,[]);}else if(s==9){s=9;}", true),
+        ("let s;for(s=1;s!=9;)if(s==1){push(typeof x);7;let x=(s=9,[]);}else if(s==9){s=9;}", true),
         ("let s;for(s=1;s!=9;)if(s==1){let x=3;push(x);s=9;}else if(s==9){s=9;}", true),
         ("let s;for(s=1;s!=9;)if(s==1){if(flag){7;}else{7;}let x=(s=9,[]);}else if(s==9){s=9;}", true),
         ("let s;for(s=1;s!=9;)if(s==1){if(flag){7;}else{8;}let x=(s=9,[]);}else if(s==9){s=9;}", false),
