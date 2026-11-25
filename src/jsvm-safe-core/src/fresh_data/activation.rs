@@ -192,7 +192,7 @@ impl<'a> Activation<'a> {
                 publish_context,
                 self_binding: None,
             },
-            _ => return None,
+            CallableNode::Arrow(_) => return None,
         };
         if activation.params.rest.is_some()
             || activation.params.items.iter().any(|parameter| {
@@ -433,17 +433,14 @@ impl<'ast> Analyzer<'_, 'ast> {
             self.arguments(&call.arguments, environment);
             return self.barrier(environment);
         }
-        let direct = self.direct_activation(call);
-        let resolved = if let Some(direct) = direct {
-            Some(direct)
-        } else {
+        let resolved = self.direct_activation(call).or_else(|| {
             let callee = self.expression(&call.callee, environment);
             callee
                 .fact
                 .as_ref()
                 .and_then(|fact| self.captured_activation(fact, environment))
                 .map(|activation| (activation, None))
-        };
+        });
         let Some((activation, named)) = resolved else {
             self.arguments(&call.arguments, environment);
             return self.barrier(environment);
@@ -494,7 +491,7 @@ impl<'ast> Analyzer<'_, 'ast> {
         self.activation_scopes.push(activation.scope);
         let ticket = self.scope_instances.enter(activation.scope);
         let summary = self.execute_activation(&activation, arguments, &mut candidate);
-        self.scope_instances.leave(ticket);
+        self.scope_instances.leave(&ticket);
         self.activation_scopes.pop();
         self.leave_resource_scope(disposes, &mut candidate);
         self.return_frame = previous_frame;

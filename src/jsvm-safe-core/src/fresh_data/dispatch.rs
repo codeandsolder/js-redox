@@ -114,7 +114,7 @@ impl Analyzer<'_, '_> {
     ) -> Option<Iteration> {
         let body = self.scope_instances.enter(shape.body.scope_id.get()?);
         let result = self.dispatch_body(shape, environment);
-        self.scope_instances.leave(body);
+        self.scope_instances.leave(&body);
         result
     }
 
@@ -128,7 +128,7 @@ impl Analyzer<'_, '_> {
         }
         let switch = self.scope_instances.enter(shape.switch.scope_id.get()?);
         let iteration = self.dispatch_arms(shape, environment);
-        self.scope_instances.leave(switch);
+        self.scope_instances.leave(&switch);
         let iteration = iteration?;
         if !self.retire_scope(shape.body.scope_id.get()?, environment)
             || !self.collect_heap(environment)

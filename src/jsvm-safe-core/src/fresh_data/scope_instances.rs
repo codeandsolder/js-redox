@@ -41,7 +41,7 @@ impl ScopeInstances {
         }
     }
 
-    pub(super) fn leave(&mut self, ticket: ScopeTicket) {
+    pub(super) fn leave(&mut self, ticket: &ScopeTicket) {
         if let Some(previous) = ticket.previous {
             self.active.insert(ticket.scope, previous);
         } else {
@@ -49,7 +49,7 @@ impl ScopeInstances {
         }
     }
 
-    /// CreatePerIterationEnvironment copies the current binding values
+    /// `CreatePerIterationEnvironment` copies the current binding values
     /// but old closures still reference the previous cells.
     pub(super) fn refresh(&mut self, scope: ScopeId) {
         if let Some(serial) = self.active.get_mut(&scope) {
@@ -114,12 +114,12 @@ mod tests {
         assert_ne!(first, second);
         let inner = scopes.enter(scope);
         assert_ne!(scopes.active[&scope], second);
-        scopes.leave(inner);
+        scopes.leave(&inner);
         assert_eq!(scopes.active[&scope], second);
-        scopes.leave(outer);
+        scopes.leave(&outer);
         assert!(!scopes.active.contains_key(&scope));
         let next = scopes.enter(scope);
         assert_ne!(scopes.active[&scope], second);
-        scopes.leave(next);
+        scopes.leave(&next);
     }
 }

@@ -1295,7 +1295,7 @@ impl Analyzer<'_, '_> {
         .filter(|_| !self.loop_failed);
         self.leave_resource_scope(disposes, &mut candidate);
         if let Some(ticket) = ticket {
-            self.scope_instances.leave(ticket);
+            self.scope_instances.leave(&ticket);
         }
         let loop_returns = std::mem::replace(&mut self.return_frame, previous_returns);
         let proven = result.is_some();
@@ -1329,6 +1329,31 @@ impl Analyzer<'_, '_> {
         }
     }
 
+    fn block_statement(
+        &mut self,
+        block: &oxc_ast::ast::BlockStatement<'_>,
+        environment: &mut Environment,
+    ) -> bool {
+        let ticket = block
+            .scope_id
+            .get()
+            .map(|scope| self.scope_instances.enter(scope));
+        let disposes = self.enter_resource_scope(block.scope_id.get());
+        let normal = self.statements(&block.body, environment);
+        self.leave_resource_scope(disposes, environment);
+        if let Some(ticket) = ticket {
+            self.scope_instances.leave(&ticket);
+        }
+        if block
+            .scope_id
+            .get()
+            .is_some_and(|scope| !self.retire_scope(scope, environment))
+        {
+            return false;
+        }
+        normal && self.collect_heap(environment)
+    }
+
     fn statement(&mut self, statement: &Statement<'_>, environment: &mut Environment) -> bool {
         if !self.checkpoint() {
             return false;
@@ -1349,24 +1374,7 @@ impl Analyzer<'_, '_> {
                 self.expression(&statement.expression, environment);
             }
             Statement::BlockStatement(block) => {
-                let ticket = block
-                    .scope_id
-                    .get()
-                    .map(|scope| self.scope_instances.enter(scope));
-                let disposes = self.enter_resource_scope(block.scope_id.get());
-                let normal = self.statements(&block.body, environment);
-                self.leave_resource_scope(disposes, environment);
-                if let Some(ticket) = ticket {
-                    self.scope_instances.leave(ticket);
-                }
-                if block
-                    .scope_id
-                    .get()
-                    .is_some_and(|scope| !self.retire_scope(scope, environment))
-                {
-                    return false;
-                }
-                return normal && self.collect_heap(environment);
+                return self.block_statement(block, environment);
             }
             Statement::ForStatement(statement) => {
                 return self.bounded_for(statement, environment);
@@ -1443,7 +1451,7 @@ impl<'a> Visit<'a> for Analyzer<'_, 'a> {
 
     fn leave_scope(&mut self) {
         if let Some(Some(ticket)) = self.lexical_scopes.pop() {
-            self.scope_instances.leave(ticket);
+            self.scope_instances.leave(&ticket);
         }
     }
 
@@ -1728,6 +1736,11 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(reads(source)?, expected, "{source}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn callable_comparisons_use_allocation_identity() -> Result<(), BudgetExceeded> {
         let source = "let f=()=>7;let g=f;let h=()=>7;f===g;f===h;[f][0]===f;";
         assert_eq!(
             observed(source, true)?,
