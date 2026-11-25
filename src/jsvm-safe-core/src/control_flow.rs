@@ -604,6 +604,8 @@ struct ArithmeticEnvironment<'c> {
     arrays: HashSet<SymbolId>,
     slots: HashMap<(SymbolId, u32), Option<Value>>,
     reflective_activation: bool,
+    per_iteration_binding: bool,
+    immediate_depth: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -768,18 +770,20 @@ impl ArithmeticEnvironment<'_> {
         self.values.get(&self.state)
     }
 
-    fn writes_state(&self, visit: impl FnOnce(&mut StateWriteProbe<'_>)) -> bool {
+    fn opaque_state_access(&self, visit: impl FnOnce(&mut StateWriteProbe<'_>)) -> bool {
         let mut probe = StateWriteProbe {
             scoping: self.scoping,
             state: self.state,
             found: false,
+            include_captured_reads: self.per_iteration_binding,
+            function_depth: 0,
         };
         visit(&mut probe);
         probe.found
     }
 
     fn opaque_expression(&mut self, expression: &Expression<'_>) -> Option<()> {
-        if self.writes_state(|probe| probe.visit_expression(expression)) {
+        if self.opaque_state_access(|probe| probe.visit_expression(expression)) {
             return None;
         }
         if self.non_reentrant_expression(expression) {
@@ -793,14 +797,33 @@ struct StateWriteProbe<'c> {
     scoping: &'c Scoping,
     state: SymbolId,
     found: bool,
+    include_captured_reads: bool,
+    function_depth: usize,
 }
 
 impl<'a> Visit<'a> for StateWriteProbe<'_> {
     fn visit_identifier_reference(&mut self, id: &IdentifierReference<'a>) {
         if let Some(reference) = id.reference_id.get() {
             let reference = self.scoping.get_reference(reference);
-            self.found |= reference.symbol_id() == Some(self.state) && reference.is_write();
+            self.found |= reference.symbol_id() == Some(self.state)
+                && (reference.is_write()
+                    || (self.include_captured_reads && self.function_depth > 0));
         }
+    }
+
+    fn visit_function(&mut self, node: &oxc_ast::ast::Function<'a>, flags: ScopeFlags) {
+        self.function_depth += 1;
+        walk::walk_function(self, node, flags);
+        self.function_depth -= 1;
+    }
+
+    fn visit_arrow_function_expression(
+        &mut self,
+        node: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+    ) {
+        self.function_depth += 1;
+        walk::walk_arrow_function_expression(self, node);
+        self.function_depth -= 1;
     }
 }
 
@@ -1089,7 +1112,7 @@ fn simulate_assignment(
     // The Reference and any compound GetValue precede RHS evaluation.
     let old = location.and_then(|location| env.read(location));
     if location.is_none() {
-        if env.writes_state(|probe| probe.visit_assignment_target(&assign.left)) {
+        if env.opaque_state_access(|probe| probe.visit_assignment_target(&assign.left)) {
             return None;
         }
         env.invalidate_opaque()?;
@@ -1099,7 +1122,7 @@ fn simulate_assignment(
         .filter(|op| matches!(*op, "&&" | "||" | "??"))
     {
         let Some(old) = old else {
-            if env.writes_state(|probe| probe.visit_expression(&assign.right)) {
+            if env.opaque_state_access(|probe| probe.visit_expression(&assign.right)) {
                 return None;
             }
             env.invalidate_opaque()?;
@@ -1144,7 +1167,7 @@ fn simulate_update(
     env: &mut ArithmeticEnvironment<'_>,
 ) -> Option<ExpressionFlow> {
     let Some(location) = update_location(env, &update.argument) else {
-        if env.writes_state(|probe| probe.visit_simple_assignment_target(&update.argument)) {
+        if env.opaque_state_access(|probe| probe.visit_simple_assignment_target(&update.argument)) {
             return None;
         }
         env.invalidate_opaque()?;
@@ -1196,7 +1219,9 @@ fn simulate_immediate_invocation(
     env.values.retain(|symbol, _| !locals.0.contains(symbol));
     env.slots
         .retain(|(symbol, _), _| !locals.0.contains(symbol));
+    env.immediate_depth += 1;
     let flow = simulate_statements(&body.statements, env)?;
+    env.immediate_depth -= 1;
     env.reflective_activation = previous;
     env.values.retain(|symbol, _| !locals.0.contains(symbol));
     env.slots
@@ -1405,6 +1430,18 @@ fn simulate_declaration(
     Some(StateFlow::Normal)
 }
 
+#[derive(Default)]
+struct LocalReturnProbe(bool);
+
+impl<'a> Visit<'a> for LocalReturnProbe {
+    fn visit_return_statement(&mut self, _: &oxc_ast::ast::ReturnStatement<'a>) {
+        self.0 = true;
+    }
+
+    fn visit_function(&mut self, _: &oxc_ast::ast::Function<'a>, _: ScopeFlags) {}
+    fn visit_arrow_function_expression(&mut self, _: &oxc_ast::ast::ArrowFunctionExpression<'a>) {}
+}
+
 fn simulate_statement(
     stmt: &Statement<'_>,
     env: &mut ArithmeticEnvironment<'_>,
@@ -1464,10 +1501,17 @@ fn simulate_statement(
         }
         Statement::SwitchStatement(switch) => simulate_switch(switch, env),
         Statement::TryStatement(_) => {
-            if env.writes_state(|probe| probe.visit_statement(stmt))
+            if env.opaque_state_access(|probe| probe.visit_statement(stmt))
                 || statement_has_loop_control(stmt)
             {
                 return None;
+            }
+            if env.immediate_depth > 0 {
+                let mut returns = LocalReturnProbe::default();
+                returns.visit_statement(stmt);
+                if returns.0 {
+                    return None;
+                }
             }
             env.invalidate_opaque()?;
             Some(StateFlow::Normal)
@@ -1483,7 +1527,10 @@ fn simulate_statement(
             }
             Some(StateFlow::Return)
         }
-        Statement::ThrowStatement(_) => Some(StateFlow::Throw),
+        Statement::ThrowStatement(thrown) => {
+            simulate_expression(&thrown.argument, env)?;
+            Some(StateFlow::Throw)
+        }
         Statement::EmptyStatement(_) => Some(StateFlow::Normal),
         Statement::DebuggerStatement(_) => {
             // A debugger can mutate the suspended activation.
@@ -2602,7 +2649,7 @@ impl Collector<'_, '_> {
         // equality, so "3" must not be modeled as the Number 3. Retain the
         // complete safely evaluated value for both branches.
         if env.eval(&conditional.test).is_some()
-            || env.writes_state(|probe| probe.visit_expression(&conditional.test))
+            || env.opaque_state_access(|probe| probe.visit_expression(&conditional.test))
         {
             return None;
         }
@@ -2803,6 +2850,8 @@ impl Collector<'_, '_> {
             arrays: setup.register_arrays.clone(),
             slots: HashMap::new(),
             reflective_activation: false,
+            per_iteration_binding: matches!(it.init.as_ref(), Some(oxc_ast::ast::ForStatementInit::VariableDeclaration(decl)) if decl.kind == VariableDeclarationKind::Let),
+            immediate_depth: 0,
         };
         let mut chunks = setup.init_text.iter().cloned().collect::<Vec<_>>();
         if !setup.hoisted.is_empty() {
@@ -3020,6 +3069,8 @@ mod live_arithmetic_tests {
         ("for(let s=1;s!==9;){let regs=[9];switch(s){case 1:s=regs[0];break;}}", true),
         ("var saved;function capture(){saved=capture.caller;}for(let s=1;s!==9;){switch(s){case 1:!function(){capture();push(s);s=2;}();break;case 2:s=9;break;}}saved();", false),
         ("for(let s=1;s!==9;){switch(s){case 1:!function(){'use strict';push(s);s=9;}();break;}}", true),
+        ("var saved;function capture(){saved=capture.caller;}for(let s=1;s!==9;){switch(s){case 1:try{!function(){capture();push(s);}();}finally{}s=2;break;case 2:s=9;break;}}saved();", false),
+        ("for(let s=1;s!==9;){switch(s){case 1:!function(){try{if(flag)return;}finally{}s=2;}();s=s===1?9:3;break;case 3:s=9;break;}}", false),
         // The switch's lexical environment is shared even across unselected cases.
         ("for(let s=1;s!==9;){switch(s){case 1:s=9;push(x);break;case 2:let x=1;break;}}", false),
     ];
