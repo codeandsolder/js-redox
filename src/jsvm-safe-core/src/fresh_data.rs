@@ -1893,6 +1893,49 @@ mod tests {
     }
 
     #[test]
+    fn alternative_call_targets_join_return_values_and_effects() -> Result<(), BudgetExceeded> {
+        for (source, expected) in [
+            ("function outer(flag){let f=flag?()=>[7]:()=>[7];let a=f();return a[0];}", vec![("a[0]", "7")]),
+            ("function outer(flag){let f=flag?()=>[7]:()=>[9];let a=f();return a[0];}", vec![]),
+            ("function outer(flag){let a=[0];let f=flag?()=>{a[0]=7}:()=>{a[0]=7};f();return a[0];}", vec![("a[0]", "7")]),
+            ("function outer(flag){let a=[0];let f=flag?()=>{a[0]=7}:()=>{a[0]=9};f();return a[0];}", vec![]),
+            ("function outer(flag){let a=[0];let f=flag?()=>{a[0]=7}:()=>{};f();return a[0];}", vec![]),
+            ("function outer(flag){let f=flag?x=>[x]:x=>[x];let n=0;let a=f(++n);let b=[n];return a[0]+b[0];}", vec![("a[0]", "1"),("b[0]", "1")]),
+            ("function outer(flag){let a=[7];let f=flag?()=>a:()=>a;let b=f();b[0]=9;return a[0];}", vec![("a[0]", "9")]),
+            ("function outer(flag){let make=x=>()=>[x];let f=flag?make(7):make(7);let a=f();return a[0];}", vec![("a[0]", "7")]),
+            ("function outer(flag){let make=x=>()=>[x];let f=flag?make(7):make(9);let a=f();return a[0];}", vec![]),
+            ("function outer(flag){let f=flag?()=>[7]:()=>{unknown();return [7]};let a=f();return a[0];}", vec![("a[0]", "7")]),
+            ("function outer(flag){let a=[7];let f=flag?()=>{}:()=>{unknown()};f();return a[0];}", vec![]),
+            ("function outer(flag){let a=[7];let f=flag?()=>a:{};let b=f();return b[0];}", vec![]),
+            ("function outer(flag){let o={x:7,f:flag?function(){return [this.x]}:function(){return [this.x]}};let a=o.f();return a[0];}", vec![("a[0]", "7")]),
+            ("function outer(flag){let f=flag?()=>[7]:()=>[7];let a=f((f=()=>[9],0));return a[0];}", vec![("a[0]", "7")]),
+            ("function outer(flag){let make=()=>{let a=[7];return ()=>a;};let f=flag?make():make();let a=f();return a[0];}", vec![("a[0]", "7")]),
+            ("function outer(flag){let a=[7];let f=flag?()=>{a[0]=9;return a}:()=>{a[0]=9;return a};let b=f();return a[0]+b[0];}", vec![("a[0]", "9"),("b[0]", "9")]),
+        ] {
+            let expected = expected.into_iter().map(|(source,value)| (source.to_owned(),value.to_owned())).collect::<Vec<_>>();
+            assert_eq!(reads(source)?, expected, "{source}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn alternative_call_targets_preserve_allocation_identity() -> Result<(), BudgetExceeded> {
+        let source =
+            "function outer(flag){let a=[7];let f=flag?()=>a:()=>a;let b=f();return a===b;}";
+        assert_eq!(
+            observed(source, true)?,
+            vec![("a===b".into(), "true".into())]
+        );
+        let source =
+            "function outer(flag){let f=flag?()=>[7]:()=>[7];let a=f(),b=f();return a===b;}";
+        assert_eq!(
+            observed(source, true)?,
+            vec![("a===b".into(), "false".into())]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn receiver_bindings_follow_ordered_call_references() -> Result<(), BudgetExceeded> {
         for (source, expected) in [
             ("let o={x:7,f:function(){return [this.x]}};let a=o.f();a[0];", vec![("a[0]", "7")]),

@@ -787,14 +787,8 @@ impl Environment {
     /// An exact ordinary function object's internal call target cannot be
     /// replaced by an own-property write. Unknown effects still erase
     /// its descriptor proof along with other heap information.
-    pub(super) fn callable_origin(&self, fact: &Fact) -> Option<ClosureOrigin> {
-        let Fact::Objects(locations) = fact else {
-            return None;
-        };
-        let [id] = locations.as_ref() else {
-            return None;
-        };
-        self.allocations.get(id)?.closure.clone()
+    pub(super) fn callable_origin(&self, id: AllocationId) -> Option<ClosureOrigin> {
+        self.allocations.get(&id)?.closure.clone()
     }
 
     pub(super) fn reference_type(
