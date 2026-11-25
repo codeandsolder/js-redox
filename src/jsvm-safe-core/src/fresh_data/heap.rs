@@ -1127,12 +1127,16 @@ impl Environment {
 
     /// The caller can have pending receiver/argument/return temporaries
     /// which are not represented by a lexical binding in the callee.
+    pub(super) fn track_paths(&mut self, next_identity: usize) {
+        self.origins
+            .get_or_insert_with(|| IdentityOrigins::new(next_identity));
+    }
+
     pub(super) fn enter_activation(&mut self, next_identity: usize) {
         self.collection_suspended = true;
         // An enclosing activation needs the entire nested creation
         // history, including allocations invalidated before a return.
-        self.origins
-            .get_or_insert_with(|| IdentityOrigins::new(next_identity));
+        self.track_paths(next_identity);
     }
 
     pub(super) fn leave_activation(&mut self, caller: &Self) {

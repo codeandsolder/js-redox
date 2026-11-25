@@ -24,68 +24,6 @@ struct ReturnSummary {
     environment: Environment,
 }
 
-/// Every return from this activation contributes to one normal-call exit.
-/// Throw paths do not reach the caller's normal continuation.
-pub(super) struct ReturnFrame {
-    summary: Option<ReturnSummary>,
-    unproved: bool,
-    disposal_floor: usize,
-}
-
-impl ReturnFrame {
-    const fn new(disposal_floor: usize) -> Self {
-        Self {
-            summary: None,
-            unproved: false,
-            disposal_floor,
-        }
-    }
-
-    pub(super) const fn empty_like(&self) -> Self {
-        Self::new(self.disposal_floor)
-    }
-
-    fn record(
-        &mut self,
-        value: Option<Fact>,
-        environment: Environment,
-        budget: &WorkBudget,
-    ) -> Result<(), BudgetExceeded> {
-        budget.consume(1)?;
-        if let Some(previous) = &mut self.summary {
-            previous.value = match (&previous.value, value) {
-                (Some(left), Some(right)) => left.join(&right, budget)?,
-                _ => None,
-            };
-            previous.environment.join_returns(&environment, budget)?;
-        } else {
-            self.summary = Some(ReturnSummary { value, environment });
-        }
-        Ok(())
-    }
-
-    pub(super) fn merge(&mut self, other: Self, budget: &WorkBudget) -> Result<(), BudgetExceeded> {
-        self.unproved |= other.unproved;
-        if let Some(summary) = other.summary {
-            self.record(summary.value, summary.environment, budget)?;
-        }
-        Ok(())
-    }
-}
-
-#[derive(Default)]
-struct ReturnProbe(bool);
-
-impl<'a> Visit<'a> for ReturnProbe {
-    fn visit_return_statement(&mut self, _: &oxc_ast::ast::ReturnStatement<'a>) {
-        self.0 = true;
-    }
-
-    fn visit_function(&mut self, _: &Function<'a>, _: ScopeFlags) {}
-    fn visit_arrow_function_expression(&mut self, _: &ArrowFunctionExpression<'a>) {}
-    fn visit_class(&mut self, _: &oxc_ast::ast::Class<'a>) {}
-}
-
 /// References to arena-owned declaration nodes, indexed by semantic
 /// identity rather than spelling. The binding proof is checked at each call.
 #[derive(Clone, Copy)]
@@ -296,34 +234,6 @@ impl<'a> Activation<'a> {
 }
 
 impl<'ast> Analyzer<'_, 'ast> {
-    pub(super) fn record_return(&mut self, value: Option<Fact>, environment: &Environment) {
-        let Some(frame) = &self.return_frame else {
-            return;
-        };
-        let mut after = environment.clone();
-        // The caller's resources remain live. Only resources in this
-        // activation's scopes are unwound on its return.
-        if self.pending_disposals > frame.disposal_floor {
-            self.invalidate(&mut after);
-        }
-        if let Some(frame) = &mut self.return_frame {
-            let result = frame.record(value, after, self.budget);
-            self.heap_result(result);
-        }
-    }
-
-    fn unproved_returns(&mut self, visit: impl FnOnce(&mut ReturnProbe)) {
-        if let Some(frame) = &mut self.return_frame {
-            let mut probe = ReturnProbe::default();
-            visit(&mut probe);
-            frame.unproved |= probe.0;
-        }
-    }
-
-    pub(super) fn unproved_statement_returns(&mut self, statement: &Statement<'_>) {
-        self.unproved_returns(|probe| probe.visit_statement(statement));
-    }
-
     /// Install actual declaration objects on entry to their lexical owner.
     /// Never reconstruct an allocation after an opaque effect: a previously
     /// evaluated reference may still denote the same function object.
@@ -404,24 +314,53 @@ impl<'ast> Analyzer<'_, 'ast> {
         arguments: Vec<Option<Fact>>,
         receiver: Option<Fact>,
         environment: &mut Environment,
-    ) -> Option<ReturnSummary> {
+    ) -> Option<super::flow::Flow> {
+        use super::flow::{CompletionValue, Flow, Transfer};
         self.initialize_activation(activation, arguments, receiver, environment)?;
         match activation.body {
             Body::Expression(expression) => {
                 let result = self.expression(expression, environment);
-                self.record_return(result.fact, environment);
+                Some(Flow::abrupt(
+                    Transfer::Return,
+                    CompletionValue::value(result.fact),
+                    environment,
+                ))
             }
-            Body::Statements(body) => {
-                if self.statements(&body.statements, environment) {
-                    self.record_return(Some(Fact::Primitive(Value::Undefined)), environment);
-                }
-            }
+            Body::Statements(body) => self.statements(&body.statements, environment),
         }
-        let frame = self.return_frame.take()?;
-        if frame.unproved {
+    }
+
+    fn summarize_activation(
+        &mut self,
+        mut flow: super::flow::Flow,
+        environment: &mut Environment,
+    ) -> Option<ReturnSummary> {
+        use super::flow::{CompletionValue, Transfer};
+        if flow.unproved {
             return None;
         }
-        frame.summary
+        let mut returned = flow.abrupt.remove(&Transfer::Return);
+        // A function with no explicit return returns undefined regardless
+        // of the last normal statement's completion value.
+        if flow.normal.is_some() {
+            let path = super::flow::Path {
+                value: CompletionValue::undefined(),
+                environment: environment.clone(),
+            };
+            self.heap_result(super::flow::Path::accumulate(
+                &mut returned,
+                path,
+                self.budget,
+            ))?;
+        }
+        if flow.abrupt.keys().any(|kind| *kind != Transfer::Throw) {
+            return None;
+        }
+        let returned = returned?;
+        Some(ReturnSummary {
+            value: self.heap_result(returned.value.into_fact(self.budget))?,
+            environment: returned.environment,
+        })
     }
 
     /// Distinct environment instances have distinct cell identities.
@@ -709,24 +648,23 @@ impl<'ast> Analyzer<'_, 'ast> {
         };
         let previous_reads = std::mem::take(&mut self.reads);
         let previous_lists = std::mem::take(&mut self.visited_lists);
-        let previous_frame = self
-            .return_frame
-            .replace(ReturnFrame::new(self.pending_disposals));
-        let disposes = self.enter_resource_scope(Some(activation.scope));
+        let disposes = self.bindings.scope_may_dispose(activation.scope);
         self.activation_depth += 1;
         let ticket = self.enter_empty_instance(activation.scope, &mut candidate);
-        let summary = if ticket.is_some() {
+        let flow = if ticket.is_some() {
             self.execute_activation(activation, arguments, receiver, &mut candidate)
         } else {
             None
         };
-        self.leave_resource_scope(disposes, &mut candidate);
+        let summary = flow.and_then(|mut flow| {
+            self.dispose_paths(disposes, &mut flow, &mut candidate);
+            self.summarize_activation(flow, &mut candidate)
+        });
         self.leave_instance(ticket, &mut candidate);
         self.activation_depth -= 1;
         for ticket in selected.into_iter().rev() {
             let _ = self.scope_instances.leave(&ticket);
         }
-        self.return_frame = previous_frame;
         let observations = std::mem::replace(&mut self.reads, previous_reads);
         let visited = std::mem::replace(&mut self.visited_lists, previous_lists);
         if let Some(mut summary) =
@@ -750,16 +688,5 @@ impl<'ast> Analyzer<'_, 'ast> {
             self.loop_failed = true;
         }
         self.barrier(environment)
-    }
-
-    pub(super) fn merge_loop_returns(&mut self, frame: Option<ReturnFrame>) {
-        if let (Some(current), Some(frame)) = (&mut self.return_frame, frame) {
-            let result = current.merge(frame, self.budget);
-            self.heap_result(result);
-        }
-    }
-
-    pub(super) fn unproved_loop_returns(&mut self, statement: &oxc_ast::ast::ForStatement<'_>) {
-        self.unproved_returns(|probe| walk::walk_for_statement(probe, statement));
     }
 }

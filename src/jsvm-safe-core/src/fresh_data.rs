@@ -12,9 +12,9 @@ use crate::value_eval::{
     literal_property_key, Value,
 };
 use oxc_ast::ast::{
-    Argument, ArrayExpressionElement, BindingPattern, Declaration, Expression, ForStatement,
-    ForStatementInit, IdentifierReference, MemberExpression, ObjectPropertyKind, Program,
-    PropertyKind, SimpleAssignmentTarget, Statement, VariableDeclaration, VariableDeclarationKind,
+    Argument, ArrayExpressionElement, BindingPattern, Expression, ForStatement,
+    IdentifierReference, MemberExpression, ObjectPropertyKind, Program, PropertyKind,
+    SimpleAssignmentTarget, Statement, VariableDeclaration, VariableDeclarationKind,
     VariableDeclarator,
 };
 use oxc_ast_visit::{walk, Visit};
@@ -34,11 +34,14 @@ mod cells;
 mod chains;
 mod coverage;
 mod dispatch;
+mod flow;
 mod heap;
+mod loops;
 mod origins;
 mod parameters;
 mod patterns;
 mod scope_instances;
+mod statements;
 use cells::CellId;
 use heap::{
     value_weight, AllocationId, AllocationKind, Environment, Fact, Locations, Lookup, OwnData,
@@ -180,26 +183,7 @@ impl FreshDataReads {
         pure_functions: &HashMap<SymbolId, PureFunction>,
         budget: &WorkBudget,
     ) -> Result<Self, BudgetExceeded> {
-        let mut analyzer = Analyzer {
-            scoping,
-            bindings,
-            pure_functions,
-            callables: activation::CallableIndex::collect(program, budget)?,
-            scope_instances: scope_instances::ScopeInstances::default(),
-            lexical_scopes: Vec::new(),
-            activation_depth: 0,
-            activation_fuel: 0,
-            reads: Self::default(),
-            visited_lists: HashSet::new(),
-            budget,
-            failure: None,
-            next_identity: 0,
-            loop_fuel: None,
-            loop_failed: false,
-            opaque_generation: 0,
-            pending_disposals: 0,
-            return_frame: None,
-        };
+        let mut analyzer = Analyzer::new(program, scoping, bindings, pure_functions, budget)?;
         analyzer.visit_program(program);
         analyzer.failure.map_or(Ok(analyzer.reads), Err)
     }
@@ -277,8 +261,35 @@ struct Analyzer<'c, 'ast> {
     loop_fuel: Option<usize>,
     loop_failed: bool,
     opaque_generation: u64,
-    pending_disposals: usize,
-    return_frame: Option<activation::ReturnFrame>,
+}
+
+impl<'c, 'ast> Analyzer<'c, 'ast> {
+    fn new(
+        program: &Program<'ast>,
+        scoping: &'c Scoping,
+        bindings: &'c BindingFacts,
+        pure_functions: &'c HashMap<SymbolId, PureFunction>,
+        budget: &'c WorkBudget,
+    ) -> Result<Self, BudgetExceeded> {
+        Ok(Self {
+            scoping,
+            bindings,
+            pure_functions,
+            callables: activation::CallableIndex::collect(program, budget)?,
+            scope_instances: scope_instances::ScopeInstances::default(),
+            lexical_scopes: Vec::new(),
+            activation_depth: 0,
+            activation_fuel: 0,
+            reads: FreshDataReads::default(),
+            visited_lists: HashSet::new(),
+            budget,
+            failure: None,
+            next_identity: 0,
+            loop_fuel: None,
+            loop_failed: false,
+            opaque_generation: 0,
+        })
+    }
 }
 
 impl Analyzer<'_, '_> {
@@ -1338,279 +1349,6 @@ impl Analyzer<'_, '_> {
         }
         true
     }
-
-    fn statements(&mut self, statements: &[Statement<'_>], environment: &mut Environment) -> bool {
-        if let (Some(first), Some(last)) = (statements.first(), statements.last()) {
-            self.visited_lists
-                .insert((first.span().start, last.span().end));
-        }
-        for statement in statements {
-            if !self.statement(statement, environment) || !self.collect_heap(environment) {
-                // An abrupt path has no normal successor, not an opaque effect.
-                environment.clear();
-                return false;
-            }
-        }
-        true
-    }
-
-    /// Implicit disposal runs on leaving a resource-owning scope. Even if
-    /// the returned value was already captured, a disposer can mutate its
-    /// object graph or any other reachable binding.
-    fn enter_resource_scope(&mut self, scope: Option<oxc_syntax::scope::ScopeId>) -> bool {
-        let active = scope.is_some_and(|scope| self.bindings.scope_may_dispose(scope));
-        self.pending_disposals += usize::from(active);
-        active
-    }
-
-    fn leave_resource_scope(&mut self, active: bool, environment: &mut Environment) {
-        if active {
-            self.pending_disposals -= 1;
-            self.invalidate(environment);
-        }
-    }
-
-    fn refresh_iteration_scope(
-        &mut self,
-        statement: &ForStatement<'_>,
-        environment: &mut Environment,
-    ) -> Option<()> {
-        if matches!(&statement.init,
-            Some(ForStatementInit::VariableDeclaration(declaration))
-                if declaration.kind == VariableDeclarationKind::Let)
-        {
-            let scope = statement.scope_id.get()?;
-            let id = self.fresh_identity();
-            let old = self.scope_instances.refresh(scope, id)?;
-            self.heap_result(environment.copy_instance(old, id, self.budget))?;
-        }
-        Some(())
-    }
-
-    fn for_initializer(
-        &mut self,
-        statement: &ForStatement<'_>,
-        environment: &mut Environment,
-    ) -> Option<()> {
-        if let Some(initializer) = &statement.init {
-            match initializer {
-                ForStatementInit::VariableDeclaration(declaration) => {
-                    self.declaration(declaration, environment);
-                }
-                expression => {
-                    self.expression(expression.as_expression()?, environment);
-                }
-            }
-        }
-        Some(())
-    }
-
-    fn consume_iteration(&mut self) -> Option<()> {
-        let fuel = self.loop_fuel.as_mut()?;
-        *fuel = fuel.checked_sub(1)?;
-        self.heap_result(self.budget.consume(1))
-    }
-
-    fn simulate_for(
-        &mut self,
-        statement: &ForStatement<'_>,
-        environment: &mut Environment,
-    ) -> Option<bool> {
-        let test = statement.test.as_ref()?;
-        // A literal true test cannot reach a normal exit without a transfer.
-        // Avoid spending the entire speculative execution budget on it.
-        if eval(test).is_some_and(|value| value.truthy()) {
-            return None;
-        }
-        if crate::control_flow::statement_has_loop_control(&statement.body) {
-            return None;
-        }
-        self.for_initializer(statement, environment)?;
-        self.refresh_iteration_scope(statement, environment)?;
-        loop {
-            self.consume_iteration()?;
-            let condition = self.expression(test, environment);
-            if !condition.fact.as_ref()?.truthy() {
-                return Some(true);
-            }
-            let normal = self.statement(&statement.body, environment);
-            if self.loop_failed {
-                return None;
-            }
-            if !normal {
-                // Direct transfers to the loop are excluded by the shape
-                // proof; return/throw exits the enclosing activation.
-                return Some(false);
-            }
-            self.refresh_iteration_scope(statement, environment)?;
-            if let Some(update) = &statement.update {
-                self.expression(update, environment);
-            }
-            if !self.collect_heap(environment) {
-                return None;
-            }
-        }
-    }
-
-    /// Prove a bounded normal execution transaction, including nested loops.
-    /// If any test or transfer is unproved, discard speculative observations
-    /// as well as the speculative heap. A partial path is not a rewrite proof.
-    fn bounded_for(&mut self, statement: &ForStatement<'_>, environment: &mut Environment) -> bool {
-        let outermost = self.loop_fuel.is_none();
-        if outermost {
-            self.loop_fuel = Some(4096);
-        }
-        let mut candidate = environment.clone();
-        let previous_reads = std::mem::take(&mut self.reads);
-        let previous_lists = std::mem::take(&mut self.visited_lists);
-        let previous_returns = self.return_frame.take();
-        self.return_frame = previous_returns
-            .as_ref()
-            .map(activation::ReturnFrame::empty_like);
-        let ticket = self.enter_instance(statement.scope_id.get(), &mut candidate);
-        let disposes = self.enter_resource_scope(statement.scope_id.get());
-        let result = if self.has_dispatch_shape(statement) {
-            self.simulate_dispatch(statement, &mut candidate)
-                .map(|()| true)
-        } else {
-            self.simulate_for(statement, &mut candidate)
-        }
-        .filter(|_| !self.loop_failed);
-        self.leave_resource_scope(disposes, &mut candidate);
-        let scope_exit = self.leave_instance(ticket, &mut candidate);
-        let result = result.filter(|_| scope_exit);
-        let loop_returns = std::mem::replace(&mut self.return_frame, previous_returns);
-        let proven = result.is_some();
-        let mut observations = std::mem::replace(&mut self.reads, previous_reads);
-        let mut visited = std::mem::replace(&mut self.visited_lists, previous_lists);
-        if outermost {
-            self.loop_fuel = None;
-            self.loop_failed = false;
-        } else if !proven {
-            // A successful inner iteration cannot publish observations if
-            // another execution of the same inner loop was not proved.
-            self.loop_failed = true;
-        }
-        if proven {
-            if outermost
-                && self
-                    .heap_result(observations.discard_unobserved(&mut visited, self.budget))
-                    .is_none()
-            {
-                return false;
-            }
-            self.reads.merge(observations);
-            self.visited_lists.extend(visited);
-            *environment = candidate;
-            self.merge_loop_returns(loop_returns);
-            result.unwrap_or(true)
-        } else {
-            self.invalidate(environment);
-            self.unproved_loop_returns(statement);
-            true
-        }
-    }
-
-    fn block_statement(
-        &mut self,
-        block: &oxc_ast::ast::BlockStatement<'_>,
-        environment: &mut Environment,
-    ) -> bool {
-        let ticket = self.enter_instance(block.scope_id.get(), environment);
-        let disposes = self.enter_resource_scope(block.scope_id.get());
-        let normal = self.statements(&block.body, environment);
-        self.leave_resource_scope(disposes, environment);
-        let scope_exit = self.leave_instance(ticket, environment);
-        normal && scope_exit && self.collect_heap(environment)
-    }
-
-    fn statement(&mut self, statement: &Statement<'_>, environment: &mut Environment) -> bool {
-        if !self.checkpoint() {
-            return false;
-        }
-        match statement {
-            Statement::VariableDeclaration(declaration) => {
-                self.declaration(declaration, environment);
-            }
-            Statement::ExportDeclaration(export) => {
-                if let Declaration::VariableDeclaration(declaration) = &export.declaration {
-                    self.declaration(declaration, environment);
-                } else {
-                    self.unobserved(statement.span());
-                    self.invalidate(environment);
-                }
-            }
-            Statement::ExpressionStatement(statement) => {
-                self.expression(&statement.expression, environment);
-            }
-            Statement::BlockStatement(block) => {
-                return self.block_statement(block, environment);
-            }
-            Statement::ForStatement(statement) => {
-                return self.bounded_for(statement, environment);
-            }
-            Statement::IfStatement(branch) => {
-                let test = self.expression(&branch.test, environment);
-                if let Some(value) = &test.fact {
-                    return if value.truthy() {
-                        self.statement(&branch.consequent, environment)
-                    } else {
-                        branch
-                            .alternate
-                            .as_ref()
-                            .is_none_or(|alternate| self.statement(alternate, environment))
-                    };
-                }
-                let mut other = environment.clone();
-                let first_new = self.next_identity;
-                let previous_floor = environment.protect_before(first_new);
-                other.protect_before(first_new);
-                let left = self.statement(&branch.consequent, environment);
-                let right = branch
-                    .alternate
-                    .as_ref()
-                    .is_none_or(|alternate| self.statement(alternate, &mut other));
-                environment.protect_before(previous_floor);
-                other.protect_before(previous_floor);
-                match (left, right) {
-                    (true, true) => {
-                        if !self.join_heap(environment, &other, first_new) {
-                            return false;
-                        }
-                    }
-                    (false, true) => *environment = other,
-                    (true, false) => {}
-                    (false, false) => return false,
-                }
-            }
-            Statement::ReturnStatement(ret) => {
-                let value = ret
-                    .argument
-                    .as_ref()
-                    .map_or(Some(Fact::Primitive(Value::Undefined)), |argument| {
-                        self.expression(argument, environment).fact
-                    });
-                self.record_return(value, environment);
-                return false;
-            }
-            Statement::ThrowStatement(throw) => {
-                self.expression(&throw.argument, environment);
-                return false;
-            }
-            Statement::BreakStatement(_) | Statement::ContinueStatement(_) => return false,
-            Statement::FunctionDeclaration(function)
-                if self
-                    .bindings
-                    .inert_function_declaration(self.scoping, function) => {}
-            Statement::EmptyStatement(_) => {}
-            _ => {
-                self.unobserved(statement.span());
-                self.unproved_statement_returns(statement);
-                self.invalidate(environment);
-            }
-        }
-        true
-    }
 }
 
 impl<'a> Visit<'a> for Analyzer<'_, 'a> {
@@ -1659,6 +1397,7 @@ impl Analyzer<'_, '_> {
             return;
         }
         let mut environment = Environment::new();
+        environment.track_paths(self.next_identity);
         if at_entry {
             if let Some(scope) = self
                 .lexical_scopes
@@ -1674,7 +1413,7 @@ impl Analyzer<'_, '_> {
                 }
             }
         }
-        self.statements(statements, &mut environment);
+        let _ = self.statements(statements, &mut environment);
     }
 }
 
@@ -1689,7 +1428,13 @@ mod tests {
         observed(source, false)
     }
 
-    fn observed(source: &str, comparisons: bool) -> Result<Vec<(String, String)>, BudgetExceeded> {
+    fn with_analyzer<T>(
+        source: &str,
+        operation: impl for<'c, 'ast> FnOnce(
+            &Program<'ast>,
+            Analyzer<'c, 'ast>,
+        ) -> Result<T, BudgetExceeded>,
+    ) -> Result<T, BudgetExceeded> {
         let allocator = Allocator::default();
         let program = crate::parse_as(&allocator, source, SourceType::cjs())
             .unwrap_or_else(|| unreachable!("{source}"));
@@ -1700,13 +1445,16 @@ mod tests {
         let scoping = semantic.semantic.scoping();
         let bindings = BindingFacts::analyze(&program, scoping);
         let pure_functions = crate::collect_pure_functions(&program, scoping, &bindings);
-        let analysis = FreshDataReads::analyze(
-            &program,
-            scoping,
-            &bindings,
-            &pure_functions,
-            &WorkBudget::unlimited("fresh-data-tests"),
-        )?;
+        let budget = WorkBudget::unlimited("fresh-data-tests");
+        let analyzer = Analyzer::new(&program, scoping, &bindings, &pure_functions, &budget)?;
+        operation(&program, analyzer)
+    }
+
+    fn observed(source: &str, comparisons: bool) -> Result<Vec<(String, String)>, BudgetExceeded> {
+        let analysis = with_analyzer(source, |program, mut analyzer| {
+            analyzer.visit_program(program);
+            analyzer.failure.map_or(Ok(analyzer.reads), Err)
+        })?;
         let observations = if comparisons {
             analysis.comparisons
         } else {
@@ -1726,6 +1474,86 @@ mod tests {
                 ))
             })
             .collect())
+    }
+
+    #[test]
+    fn completion_paths_preserve_empty_and_explicit_undefined() -> Result<(), BudgetExceeded> {
+        for (source, expected) in [
+            ("7; {}", "7"),
+            ("7; outer:{break outer;}", "7"),
+            ("outer:{7;break outer;}", "7"),
+            ("7; while(false){}", "void 0"),
+            ("let i=0;while(i++<2){i;}", "2"),
+            ("let i=0;while(i++<2){if(i===1){3;}else{}}", "void 0"),
+            ("do{3;break;}while(false);", "3"),
+            ("for(let i=0;i<2;i++){3;continue;}", "3"),
+            ("for(let i=0;i<2;i++){3;if(i===1)continue;}", "void 0"),
+            ("switch(1){case 1:3;case 2:break;}", "3"),
+            ("7;switch(3){case 1:3;case 2:break;}", "void 0"),
+            ("7;switch(1){case 1:break;}", "void 0"),
+            ("outer:for(;;){7;break outer;}", "7"),
+            ("let i=0;outer:inner:while(i++<2){5;continue outer;}", "5"),
+            (
+                "let i=0;while(i++<2){switch(i){case 1:3;break;case 2:break;}}",
+                "void 0",
+            ),
+            ("for(let i=0;i<2;i++){if(i===0){3;}else{;}}", "void 0"),
+            ("for(let i=0;i<2;i++){{let x;}}", "void 0"),
+            ("let i=0;for(;i<2;99){i++;i;}", "2"),
+            ("let i=0;do{i++;i;}while(i<3);", "3"),
+            ("outer:{switch(1){case 1:9;break outer;}}", "9"),
+        ] {
+            let actual = with_analyzer(source, |program, mut analyzer| {
+                let mut environment = Environment::new();
+                environment.track_paths(analyzer.next_identity);
+                let _ticket = analyzer.enter_instance(program.scope_id.get(), &mut environment);
+                let flow = analyzer.statements(&program.body, &mut environment);
+                if let Some(failure) = analyzer.failure {
+                    return Err(failure);
+                }
+                let flow = flow.unwrap_or_else(|| unreachable!("{source}"));
+                assert!(flow.abrupt.is_empty() && !flow.unproved, "{source}");
+                let value = flow.normal.unwrap_or_else(|| unreachable!("{source}"));
+                Ok(value
+                    .into_fact(analyzer.budget)?
+                    .and_then(|fact| fact.primitive().and_then(Value::render)))
+            })?;
+            assert_eq!(actual.as_deref(), Some(expected), "{source}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn loop_and_switch_paths_join_reaching_heaps_by_transfer_target() -> Result<(), BudgetExceeded>
+    {
+        for (source, expected) in [
+            ("let a=[0],i=0;while(i<3){a[0]+=2;i++;}a[0];", vec![("a[0]","6")]),
+            ("let a=[0],i=0;do{a[0]+=2;i++;}while(i<3);a[0];", vec![("a[0]","6")]),
+            ("let a=[0];for(;;){a[0]=7;break;}a[0];", vec![("a[0]","7")]),
+            ("let a=[0];for(let i=0;i<4;i++){if(i===1)continue;a[0]+=i;}a[0];", vec![("a[0]","5")]),
+            ("let a=[0];do{a[0]=7;break;}while((a[0]=9,true));a[0];", vec![("a[0]","7")]),
+            ("let a=[0],i=0;outer:while(i<3){i++;for(let j=0;j<3;j++){if(j===1)continue outer;a[0]++;}a[0]=99;}a[0];", vec![("a[0]","3")]),
+            ("let a=[0];outer:{a[0]=7;break outer;a[0]=9;}a[0];", vec![("a[0]","7")]),
+            ("let a=[0];outer:inner:for(let i=0;i<3;i++){a[0]++;continue outer;}a[0];", vec![("a[0]","3")]),
+            ("let a=[0];outer:for(let i=0;i<3;i++){for(;;){a[0]=7;break outer;}a[0]=9;}a[0];", vec![("a[0]","7")]),
+            ("function f(flag){let a=[0];for(let i=0;i<1;i++){a[0]=7;if(flag)break;}return a[0];}", vec![("a[0]","7")]),
+            ("function f(flag){let a=[0];for(let i=0;i<1;i++){if(flag){a[0]=7;break;}a[0]=9;}return a[0];}", vec![]),
+            ("function f(flag){let a=[0];for(let i=0;i<2;i++){a[0]=7;if(flag)continue;a[0]=7;}return a[0];}", vec![("a[0]","7")]),
+            ("let a=[0];switch(2){case (a[0]=1,1):a[0]=99;break;default:a[0]=99;break;case (a[0]=2,2):a[0]=7;break;}a[0];", vec![("a[0]","7")]),
+            ("let a=[0];switch(1){case 1:a[0]=7;case 2:a[0]+=2;break;default:a[0]=99;}a[0];", vec![("a[0]","9")]),
+            ("let a=[0];for(let i=0;i<3;i++){switch(i){case 0:continue;case 1:a[0]+=7;break;default:a[0]+=9;}a[0]++;}a[0];", vec![("a[0]","18")]),
+            ("let a=[0];switch(3){case 1:a[0]=9;break;}a[0];", vec![("a[0]","0")]),
+            ("let f=()=>{let a=[0];while(true){a[0]=7;return a;}};let r=f();r[0];", vec![("r[0]","7")]),
+            ("function outer(flag){function f(){let a=[0];for(let i=0;i<1;i++){if(flag)return [7];a[0]=7;}return a;}let r=f();return r[0];}", vec![("r[0]","7")]),
+            ("function outer(flag){function f(){let a=[0];for(let i=0;i<1;i++){if(flag)return [9];a[0]=7;}return a;}let r=f();return r[0];}", vec![]),
+            ("let a=[0],g;for(let i=0;i<3;i++){if(i===1){g=()=>[i];continue;}}let r=g();r[0];", vec![("r[0]","1")]),
+            ("let a=[7];while(true){try{break;}finally{a[0]=9;}}a[0];", vec![]),
+            ("function f(flag){let a=[7];switch(flag){case 1:a[0]=9;}return a[0];}", vec![]),
+        ] {
+            let expected = expected.into_iter().map(|(source,value)| (source.to_owned(),value.to_owned())).collect::<Vec<_>>();
+            assert_eq!(reads(source)?, expected, "{source}");
+        }
+        Ok(())
     }
 
     #[test]

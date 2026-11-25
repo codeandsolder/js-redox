@@ -4,7 +4,7 @@
 //! from a previously created object whose contents became unproved. The
 //! interpreter allocates monotonically numbered identities, so contiguous
 //! runs of births are represented by one interval rather than one tombstone
-//! per identity. Track them only while an arbitrary return-path join is open.
+//! per identity. Track them across ordinary statement and arbitrary abrupt-path joins.
 use super::heap::charge;
 use std::{ops::Range, rc::Rc};
 use work_budget::{BudgetExceeded, WorkBudget};

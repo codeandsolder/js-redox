@@ -1,6 +1,9 @@
 //! Exact normal dispatcher traces derived from the reaching allocation heap.
 //! Selection is evaluated in source order, never from a predicted table shape.
-use super::{Analyzer, Environment, Observation, ReachingObservations};
+use super::{
+    flow::{CompletionValue, Flow, Transfer},
+    Analyzer, Environment, Fact, Observation, ReachingObservations,
+};
 use crate::{
     completion, control_flow::statement_has_loop_control, fragment,
     statement_hazards::DeclarationHazard,
@@ -72,22 +75,22 @@ impl<'a, 'ast> Shape<'a, 'ast> {
     }
 }
 
-enum Selection {
+pub(super) enum Selection {
     Case(usize),
     NoMatch,
 }
 
 impl Analyzer<'_, '_> {
-    fn select_arm(
+    /// Select case labels in source order, including those following default.
+    /// Rewriting a trace removes tests, so that caller additionally requires
+    /// inert discriminant and label evaluation.
+    pub(super) fn select_cases(
         &mut self,
         switch: &SwitchStatement<'_>,
+        discriminant: &Fact,
+        inert_required: bool,
         environment: &mut Environment,
     ) -> Option<Selection> {
-        let discriminant = self.expression(&switch.discriminant, environment);
-        if !discriminant.inert {
-            return None;
-        }
-        let discriminant = discriminant.fact?;
         let mut default = None;
         for (index, case) in switch.cases.iter().enumerate() {
             let Some(test) = &case.test else {
@@ -95,7 +98,7 @@ impl Analyzer<'_, '_> {
                 continue;
             };
             let label = self.expression(test, environment);
-            if !label.inert {
+            if inert_required && !label.inert {
                 return None;
             }
             let equal =
@@ -111,7 +114,7 @@ impl Analyzer<'_, '_> {
         &mut self,
         shape: &Shape<'_, '_>,
         environment: &mut Environment,
-    ) -> Option<Iteration> {
+    ) -> Option<(Iteration, Flow)> {
         let body = self.enter_instance(shape.body.scope_id.get(), environment);
         let result = self.dispatch_body(shape, environment);
         self.leave_instance(body, environment)
@@ -124,27 +127,38 @@ impl Analyzer<'_, '_> {
         &mut self,
         shape: &Shape<'_, '_>,
         environment: &mut Environment,
-    ) -> Option<Iteration> {
-        if !self.statements(shape.prefix, environment) {
+    ) -> Option<(Iteration, Flow)> {
+        let prefix = self.statements(shape.prefix, environment)?;
+        if prefix.normal.is_none() || prefix.unproved {
             return None;
         }
+        let discriminant = self.expression(&shape.switch.discriminant, environment);
+        if !discriminant.inert {
+            return None;
+        }
+        let discriminant = discriminant.fact?;
         let switch = self.enter_instance(shape.switch.scope_id.get(), environment);
-        let iteration = self.dispatch_arms(shape, environment);
-        self.leave_instance(switch, environment)
-            .then_some(iteration)
-            .flatten()
+        let iteration = self.dispatch_arms(shape, &discriminant, environment);
+        let exited = self.leave_instance(switch, environment);
+        let (iteration, mut flow) = iteration.filter(|_| exited)?;
+        self.heap_result(flow.merge_abrupt(prefix, self.budget))?;
+        Some((iteration, flow))
     }
 
     fn dispatch_arms(
         &mut self,
         shape: &Shape<'_, '_>,
+        discriminant: &Fact,
         environment: &mut Environment,
-    ) -> Option<Iteration> {
+    ) -> Option<(Iteration, Flow)> {
         let mut iteration = Iteration {
             arms: Vec::new(),
             continues: false,
         };
-        if let Selection::Case(start) = self.select_arm(shape.switch, environment)? {
+        let mut flow = Flow::normal(CompletionValue::undefined());
+        if let Selection::Case(start) =
+            self.select_cases(shape.switch, discriminant, true, environment)?
+        {
             'cases: for (index, case) in shape.switch.cases.iter().enumerate().skip(start) {
                 let mut transfer = None;
                 let mut count = 0;
@@ -160,9 +174,17 @@ impl Analyzer<'_, '_> {
                         }
                         _ if statement_has_loop_control(statement) => return None,
                         _ => {
-                            if !self.statement(statement, environment)
-                                || !self.collect_heap(environment)
+                            let next = self.statement(statement, environment)?;
+                            if next.unproved
+                                || next.normal.is_none()
+                                || next.abrupt.keys().any(|kind| {
+                                    matches!(kind, Transfer::Break(_) | Transfer::Continue(_))
+                                })
                             {
+                                return None;
+                            }
+                            self.sequence_flow(&mut flow, next)?;
+                            if !self.collect_heap(environment) {
                                 return None;
                             }
                             count = offset + 1;
@@ -179,14 +201,14 @@ impl Analyzer<'_, '_> {
                 }
             }
         }
-        Some(iteration)
+        Some((iteration, flow))
     }
 
     pub(super) fn simulate_dispatch(
         &mut self,
         statement: &ForStatement<'_>,
         environment: &mut Environment,
-    ) -> Option<()> {
+    ) -> Option<Flow> {
         let shape = Shape::new(statement, self.scoping)?;
         self.for_initializer(statement, environment)?;
         self.refresh_iteration_scope(statement, environment)?;
@@ -194,6 +216,7 @@ impl Analyzer<'_, '_> {
             iterations: Vec::new(),
             test_exit: false,
         };
+        let mut flow = Flow::normal(CompletionValue::undefined());
         loop {
             self.consume_iteration()?;
             self.heap_result(self.budget.consume(u64::from(
@@ -209,7 +232,9 @@ impl Analyzer<'_, '_> {
                     break;
                 }
             }
-            let iteration = self.dispatch_iteration(&shape, environment)?;
+            let (iteration, mut iteration_flow) = self.dispatch_iteration(&shape, environment)?;
+            flow.normal = iteration_flow.normal.take();
+            self.heap_result(flow.merge_abrupt(iteration_flow, self.budget))?;
             if self.loop_failed {
                 return None;
             }
@@ -232,7 +257,7 @@ impl Analyzer<'_, '_> {
             Observation::Exact(trace),
             PartialEq::eq,
         );
-        Some(())
+        Some(flow)
     }
 
     pub(super) fn has_dispatch_shape(&self, statement: &ForStatement<'_>) -> bool {
