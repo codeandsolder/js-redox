@@ -964,7 +964,7 @@ fn depythonify_safe_deob_destructuring_assignment_runtime_equivalence() -> Resul
         "let a=[1],s={x: 7};({x: a[(s.x=9,0)]}=s);a[0];",
         "let s={x: 7},a=[1],old=a;({x: a[(a=[9],0)]}=s);[old[0],a[0]];",
         "let a=[0],old=a,s={x: void 0};({x: a[0]=(a=[9],7)}=s);[old[0],a[0]];",
-        "let a=[0],s={x: 7,y:8};({x: a[0],...a[(s.y=9,1)]}=s);[a[0],a[1].y];",
+        "let a=[0,null],s={x: 7,y:8};({x: a[0],...a[(s.y=9,1)]}=s);[a[0],a[1].y];",
         "let s={x: 7,y:8},a,r;({x: a,...r}=s);let q=[a,r.y];[q[0],q[1]];",
         "let s={x: 7},a;let r=({x: a}=s);[r===s,r.x];",
         "let s={x: 7,y:8},a=[0];({x: a[0],y:a[0]}=s);a[0];",
