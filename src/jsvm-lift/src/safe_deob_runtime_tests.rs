@@ -1003,7 +1003,7 @@ fn depythonify_safe_deob_parameter_environments_runtime_equivalence() -> Result<
         "let f=({x=()=>y},y=7)=>x;let r=f({x:void 0})();r;",
         "let a=[7];let f=({x=(a[0]=9),...r})=>r;let r=f({x:void 0,y:a});[r.y[0],a[0]];",
         "let o={x:7,y:9,get z(){events.push('get');return 11}};let {z,...r}=o;[z,r.x,r.y];",
-        "let f=({x},y=()=>x)=>y;let g=f({x:7});g();",
+        "let f=({x},y=()=>x)=>y;let g=f({x: 7});g();",
         "let f=(...{length})=>[length];let r=f(1,2,3);r[0];",
     ];
     script_runtime_equivalence(&sources, "parameter-environments", false)

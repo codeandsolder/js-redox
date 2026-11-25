@@ -1970,7 +1970,7 @@ mod tests {
             ),
             (
                 "let f=(a=7)=>{var x;return [x,a]};let r=f();r[0];r[1];",
-                vec![("r[0]", "undefined"), ("r[1]", "7")],
+                vec![("r[0]", "void 0"), ("r[1]", "7")],
             ),
         ] {
             let expected = expected
