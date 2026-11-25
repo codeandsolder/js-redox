@@ -1769,7 +1769,7 @@ mod tests {
 
         let mut invalidated = heap.clone();
         invalidated.clear();
-        assert!(invalidated.bindings.len() == 0);
+        assert_eq!(invalidated.bindings.len(), 0);
         assert!(invalidated.allocations.is_empty());
         assert!(heap.get(symbol).is_some());
         assert!(heap.allocations.contains_key(&0));
@@ -1801,7 +1801,7 @@ mod tests {
         for id in 2..4096 {
             heap.allocate(id, OwnData::new(AllocationKind::Ordinary), &budget)?;
             uncollected.allocate(id, OwnData::new(AllocationKind::Ordinary), &budget)?;
-            heap.collect_if_needed([ROOT].into_iter(), &budget)?;
+            heap.collect_if_needed(std::iter::once(ROOT), &budget)?;
             peak = peak.max(heap.allocations.len());
             // Both maps would be copied at an unknown conditional branch.
             collected_entries += heap.allocations.len();
@@ -1810,10 +1810,10 @@ mod tests {
         assert!(peak < MIN_COLLECTION_SIZE);
         assert!(collected_entries < original_entries / 32);
         eprintln!("peak retained allocations: {peak} vs {}; cumulative fork entries: {collected_entries} vs {original_entries}", uncollected.allocations.len());
-        heap.collect([ROOT].into_iter(), &budget)?;
+        heap.collect(std::iter::once(ROOT), &budget)?;
         assert_eq!(heap.allocations.len(), 2);
         heap.remove(cell(0), &budget)?;
-        heap.collect([ROOT].into_iter(), &budget)?;
+        heap.collect(std::iter::once(ROOT), &budget)?;
         assert!(heap.allocations.is_empty());
         Ok(())
     }
@@ -1826,7 +1826,7 @@ mod tests {
         for (id, &symbol) in symbols.iter().enumerate() {
             let object = heap.allocate(id, OwnData::new(AllocationKind::Ordinary), &budget)?;
             heap.insert(symbol, object, &budget)?;
-            heap.collect_if_needed([ROOT].into_iter(), &budget)?;
+            heap.collect_if_needed(std::iter::once(ROOT), &budget)?;
         }
         assert_eq!(heap.allocations.len(), symbols.len());
         heap.collect_after_scope_exit(ROOT, std::iter::empty(), &budget)?;
@@ -1851,7 +1851,7 @@ mod tests {
         other.protect_before(first_new);
         let replacement = heap.allocate(first_new, data, &budget)?;
         heap.insert(symbol, replacement, &budget)?;
-        heap.collect([ROOT].into_iter(), &budget)?;
+        heap.collect(std::iter::once(ROOT), &budget)?;
         assert!(heap.allocations.contains_key(&0));
         heap.protect_before(0);
         other.protect_before(0);

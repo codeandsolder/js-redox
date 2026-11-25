@@ -354,7 +354,7 @@ impl<'ast> Analyzer<'_, 'ast> {
 
     /// Distinct environment instances have distinct cell identities.
     /// Bound both native stack depth and the total speculative call tree.
-    fn can_enter(&self) -> bool {
+    const fn can_enter(&self) -> bool {
         const MAX_ACTIVATION_DEPTH: usize = 32;
         self.activation_depth < MAX_ACTIVATION_DEPTH
             && (self.activation_depth == 0 || self.activation_fuel > 0)

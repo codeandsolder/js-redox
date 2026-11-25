@@ -413,7 +413,7 @@ impl Analyzer<'_, '_> {
         }
     }
 
-    fn fresh_identity(&mut self) -> usize {
+    const fn fresh_identity(&mut self) -> usize {
         let id = self.next_identity;
         self.next_identity += 1;
         id
