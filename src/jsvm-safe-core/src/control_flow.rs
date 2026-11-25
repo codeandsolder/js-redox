@@ -766,7 +766,7 @@ impl<'a> Visit<'a> for LoopControlDetector {
     }
 }
 
-pub(super) fn statement_has_loop_control(stmt: &Statement<'_>) -> bool {
+pub fn statement_has_loop_control(stmt: &Statement<'_>) -> bool {
     let mut detector = LoopControlDetector::default();
     detector.visit_statement(stmt);
     detector.found
