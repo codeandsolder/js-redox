@@ -954,6 +954,36 @@ fn depythonify_safe_deob_callable_capture_runtime_equivalence() -> Result<()> {
 
 #[test]
 #[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_alternative_call_targets_runtime_equivalence() -> Result<()> {
+    let sources = [
+        "function outer(flag){let f=flag?()=>[7]:()=>[7];let a=f();return a[0];}[outer(true),outer(false)];",
+        "function outer(flag){let f=flag?()=>[7]:()=>[9];let a=f();return a[0];}[outer(true),outer(false)];",
+        "function outer(flag){let a=[0];let f=flag?()=>{a[0]=7}:()=>{a[0]=7};f();return a[0];}[outer(true),outer(false)];",
+        "function outer(flag){let a=[0];let f=flag?()=>{a[0]=7}:()=>{a[0]=9};f();return a[0];}[outer(true),outer(false)];",
+        "function outer(flag){let a=[0];let f=flag?()=>{a[0]=7}:()=>{};f();return a[0];}[outer(true),outer(false)];",
+        "function outer(flag){let f=flag?x=>[x]:x=>[x];let n=0;let a=f(++n);return [a[0],n];}[outer(true),outer(false)];",
+        "function outer(flag){let a=[7];let f=flag?()=>a:()=>a;let b=f();b[0]=9;return [a[0],a===b];}[outer(true),outer(false)];",
+        "function outer(flag){let make=x=>()=>[x];let f=flag?make(7):make(7);let a=f();return a[0];}[outer(true),outer(false)];",
+        "function outer(flag){let make=x=>()=>[x];let f=flag?make(7):make(9);let a=f();return a[0];}[outer(true),outer(false)];",
+        "function outer(flag){let f=flag?()=>[7]:()=>{events.push('effect');return [7]};let a=f();return a[0];}[outer(true),outer(false)];",
+        "function outer(flag){let a=[7];let f=flag?()=>{}:()=>{events.push(a);a[0]=9};f();return a[0];}[outer(true),outer(false)];",
+        "function outer(flag){let a=[7];let f=flag?()=>a:{};let b=f();return b[0];}try{outer(false)}catch(e){events.push(e.name)}outer(true);",
+        "function outer(flag){let o={x:7,f:flag?function(){return [this.x]}:function(){return [this.x]}};let a=o.f();return a[0];}[outer(true),outer(false)];",
+        "function outer(flag){let f=flag?()=>[7]:()=>[7];let a=f((f=()=>[9],0));return a[0];}[outer(true),outer(false)];",
+        "function outer(flag){let make=()=>{let a=[7];return ()=>a;};let f=flag?make():make();let a=f();return a[0];}[outer(true),outer(false)];",
+        "function outer(flag){let a=[7];let f=flag?()=>{a[0]=9;return a}:()=>{a[0]=9;return a};let b=f();return [a[0],b[0]];}[outer(true),outer(false)];",
+        "function outer(flag){let f=flag?()=>[7]:()=>[7];let a=f(),b=f();return a===b;}[outer(true),outer(false)];",
+        "function outer(flag){let a=[7],b=[9];let o=flag?{x:a,f(){return this.x}}:{x:b,f(){return this.x}};let r=o.f();return r[0];}[outer(true),outer(false)];",
+        "function outer(flag){let make=x=>function self(){return [x,self]};let f=flag?make(7):make(9);let a=f();return [a[0],a[1]===f];}[outer(true),outer(false)];",
+        "function outer(flag){let a=[7];let f=flag?()=>{throw 1}:()=>a;let b=f();return b[0];}try{outer(true)}catch(e){events.push(e)}outer(false);",
+        "function outer(flag){let a=[7];let f=flag?()=>a:async()=>a;let b=f();return b[0];}[outer(true),outer(false)];",
+        "function outer(flag){let a=[7];let f=flag?()=>a:()=>a;let r=f((events.push('arg'),a[0]=9));return r[0];}[outer(true),outer(false)];",
+    ];
+    script_runtime_equivalence(&sources, "alternative-call-targets", false)
+}
+
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
 fn depythonify_safe_deob_receiver_cell_runtime_equivalence() -> Result<()> {
     let sources = [
         "let o={x:7,f:function(){return [this.x]}};let a=o.f();a[0];",

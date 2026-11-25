@@ -13,8 +13,10 @@ use oxc_syntax::{
     scope::{ScopeFlags, ScopeId},
     symbol::SymbolId,
 };
-use std::collections::HashMap;
+use std::{collections::HashMap, rc::Rc};
 use work_budget::{BudgetExceeded, WorkBudget};
+
+const MAX_ACTIVATIONS: usize = 256;
 
 struct ReturnSummary {
     value: Option<Fact>,
@@ -221,6 +223,11 @@ impl ThisMode {
             Self::Sloppy => receiver.filter(|fact| matches!(fact, Fact::Objects(_))),
         }
     }
+}
+
+enum CallTargets<'a> {
+    Single(Activation<'a>),
+    Alternatives(Vec<Activation<'a>>),
 }
 
 struct Activation<'a> {
@@ -490,18 +497,37 @@ impl<'ast> Analyzer<'_, 'ast> {
         Some((Activation::from_node(node, self.scoping, publish)?, symbol))
     }
 
-    /// Resolve an already evaluated callable value using its creation
-    /// environment, not its current storage location or source spelling.
-    fn captured_activation(
+    /// Resolve every possible call target before argument evaluation.
+    /// Each allocation captures its own lexical instance chain. A missing
+    /// origin or unsupported target makes the whole call opaque.
+    fn captured_activations(
         &mut self,
         fact: &Fact,
         environment: &Environment,
-    ) -> Option<Activation<'ast>> {
-        let origin = environment.callable_origin(fact)?;
-        let node = *self.callables.nodes.get(&origin.scope)?;
-        let mut activation = Activation::from_node(node, self.scoping, false)?;
-        activation.capture = Some((origin, self.heap_result(fact.copy(self.budget))?));
-        Some(activation)
+    ) -> Option<CallTargets<'ast>> {
+        let Fact::Objects(locations) = fact else {
+            return None;
+        };
+        self.heap_result(super::heap::charge(self.budget, locations.len()))?;
+        if locations.len() > MAX_ACTIVATIONS {
+            return None;
+        }
+        let resolve = |id| {
+            let origin = environment.callable_origin(id)?;
+            let node = *self.callables.nodes.get(&origin.scope)?;
+            let mut activation = Activation::from_node(node, self.scoping, false)?;
+            activation.capture = Some((origin, Fact::Objects(Rc::from([id]))));
+            Some(activation)
+        };
+        if let [id] = locations.as_ref() {
+            return resolve(*id).map(CallTargets::Single);
+        }
+        locations
+            .iter()
+            .copied()
+            .map(resolve)
+            .collect::<Option<Vec<_>>>()
+            .map(CallTargets::Alternatives)
     }
 
     /// Evaluate local calls with fresh activation cells. Resolve the callee
@@ -526,21 +552,24 @@ impl<'ast> Analyzer<'_, 'ast> {
             return self.barrier(environment);
         }
         let mut receiver = Some(Fact::Primitive(Value::Undefined));
-        let resolved = self.direct_activation(call).or_else(|| {
-            let (callee, this_arg) = self.evaluate_callee(&call.callee, environment);
-            receiver = this_arg;
-            callee
-                .fact
-                .as_ref()
-                .and_then(|fact| self.captured_activation(fact, environment))
-                .map(|activation| (activation, None))
-        });
-        let Some((activation, named)) = resolved else {
+        let resolved = self
+            .direct_activation(call)
+            .map(|(activation, named)| (CallTargets::Single(activation), named))
+            .or_else(|| {
+                let (callee, this_arg) = self.evaluate_callee(&call.callee, environment);
+                receiver = this_arg;
+                callee
+                    .fact
+                    .as_ref()
+                    .and_then(|fact| self.captured_activations(fact, environment))
+                    .map(|activations| (activations, None))
+            });
+        let Some((activations, named)) = resolved else {
             self.arguments(&call.arguments, environment);
             return self.barrier(environment);
         };
         if !self.can_enter()
-            || (activation.reflective && self.bindings.implicit_arguments_exposed(activation.scope))
+            || matches!(&activations, CallTargets::Single(activation) if activation.reflective && self.bindings.implicit_arguments_exposed(activation.scope))
         {
             self.arguments(&call.arguments, environment);
             return self.barrier(environment);
@@ -573,7 +602,67 @@ impl<'ast> Analyzer<'_, 'ast> {
                 }
             }
         }
-        self.run_activation(&activation, arguments, receiver, environment)
+        if self.activation_depth == 0 {
+            self.activation_fuel = MAX_ACTIVATIONS;
+        }
+        match activations {
+            CallTargets::Single(activation) => {
+                self.run_activation(&activation, arguments, receiver, environment)
+            }
+            CallTargets::Alternatives(activations) => {
+                self.run_alternatives(activations, &arguments, receiver.as_ref(), environment)
+            }
+        }
+    }
+
+    /// All candidate calls start after the same argument evaluation.
+    /// Allocation identities born in one alternative cannot be present
+    /// in another; pre-fork identities must agree across every outcome.
+    fn run_alternatives(
+        &mut self,
+        activations: Vec<Activation<'_>>,
+        arguments: &[Option<Fact>],
+        receiver: Option<&Fact>,
+        environment: &mut Environment,
+    ) -> Evaluation {
+        if activations.is_empty() || activations.len() > self.activation_fuel {
+            return self.barrier(environment);
+        }
+        let base = environment.clone();
+        let first_new = self.next_identity;
+        let mut result = None::<Evaluation>;
+        for activation in activations {
+            let charge = arguments
+                .iter()
+                .flatten()
+                .chain(receiver)
+                .try_for_each(|fact| super::heap::charge(self.budget, fact.clone_weight()));
+            if self.heap_result(charge).is_none() {
+                return self.barrier(environment);
+            }
+            let mut alternative = base.clone();
+            let next = self.run_activation(
+                &activation,
+                arguments.to_vec(),
+                receiver.cloned(),
+                &mut alternative,
+            );
+            if let Some(previous) = &mut result {
+                if !self.join_heap(environment, &alternative, first_new) {
+                    return self.barrier(environment);
+                }
+                previous.fact = match (previous.fact.as_ref(), next.fact.as_ref()) {
+                    (Some(left), Some(right)) => {
+                        self.heap_result(left.join(right, self.budget)).flatten()
+                    }
+                    _ => None,
+                };
+            } else {
+                *environment = alternative;
+                result = Some(next);
+            }
+        }
+        result.unwrap_or_default()
     }
 
     fn run_activation(
@@ -583,12 +672,11 @@ impl<'ast> Analyzer<'_, 'ast> {
         receiver: Option<Fact>,
         environment: &mut Environment,
     ) -> Evaluation {
-        const MAX_ACTIVATIONS: usize = 256;
-        if !self.can_enter() || self.heap_result(self.budget.consume(1)).is_none() {
+        if !self.can_enter()
+            || self.activation_fuel == 0
+            || self.heap_result(self.budget.consume(1)).is_none()
+        {
             return self.barrier(environment);
-        }
-        if self.activation_depth == 0 {
-            self.activation_fuel = MAX_ACTIVATIONS;
         }
         self.activation_fuel -= 1;
         let before_effect = self.opaque_generation;
