@@ -1548,7 +1548,10 @@ mod tests {
             ("function outer(flag){function f(){let a=[0];for(let i=0;i<1;i++){if(flag)return [9];a[0]=7;}return a;}let r=f();return r[0];}", vec![]),
             ("function outer(flag){let escaped;let f=()=>{let a=[0];escaped=a;if(flag)return [7];a[0]=7;return a;};let r=f();return [r[0],escaped[0]];}", vec![]),
             ("function outer(flag){let f=()=>{let a=[0];if(flag)return [7];a[0]=7;return a;};let r=f();return r[0];}", vec![("r[0]","7")]),
-            ("function outer(flag){let f=()=>{let a=[0],g=()=>a[0];if(flag)return ()=>7;a[0]=7;return g;};let g=f();let r=[g()];return r[0];}", vec![("r[0]","7")]),
+            // Closures retain their full lexical instance chain. A constant closure
+            // created inside f still reaches f's cells; the outside factory does not.
+            ("function outer(flag){let f=()=>{let a=[0],g=()=>a[0];if(flag)return ()=>7;a[0]=7;return g;};let g=f();let r=[g()];return r[0];}", vec![]),
+            ("function outer(flag){let make=()=>()=>7;let f=()=>{let a=[0],g=()=>a[0];if(flag)return make();a[0]=7;return g;};let g=f();let r=[g()];return r[0];}", vec![("r[0]","7")]),
             ("function outer(flag){let a=[0];let f=()=>{if(flag)return [7];a[0]=7;return a;};let r=f();return [r[0],a[0]];}", vec![]),
 
             ("let a=[0],g;for(let i=0;i<3;i++){if(i===1){g=()=>[i];continue;}}let r=g();r[0];", vec![("r[0]","1")]),

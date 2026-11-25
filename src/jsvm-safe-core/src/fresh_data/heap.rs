@@ -1336,14 +1336,14 @@ impl Environment {
             left: &left,
             right: &right,
         };
-        self.join_paths(&other, None, Some(projection), budget)
+        self.join_paths(&other, None, Some(&projection), budget)
     }
 
     fn join_paths(
         &mut self,
         other: &Self,
         first_new: Option<AllocationId>,
-        projection: Option<ExitProjection<'_, '_>>,
+        projection: Option<&ExitProjection<'_, '_>>,
         budget: &WorkBudget,
     ) -> Result<(), BudgetExceeded> {
         // A failed join is not a usable abstract state: its caller aborts
@@ -1352,9 +1352,7 @@ impl Environment {
         let right_origins = other.origins.as_ref();
         let absent = |id, origins: Option<&IdentityOrigins>, trace: Option<&Reachability<'_>>| {
             trace.is_some_and(|trace| {
-                projection
-                    .as_ref()
-                    .is_some_and(|projection| id >= projection.entry)
+                projection.is_some_and(|projection| id >= projection.entry)
                     && !trace.marked.contains(&id)
                     && !trace.marked_instances.contains(&id)
             }) || first_new.map_or_else(
@@ -1362,8 +1360,8 @@ impl Environment {
                 |floor| id >= floor,
             )
         };
-        let absent_left = |id| absent(id, left_origins, projection.as_ref().map(|p| p.left));
-        let absent_right = |id| absent(id, right_origins, projection.as_ref().map(|p| p.right));
+        let absent_left = |id| absent(id, left_origins, projection.map(|p| p.left));
+        let absent_right = |id| absent(id, right_origins, projection.map(|p| p.right));
         if first_new.is_none() {
             charge(
                 budget,
