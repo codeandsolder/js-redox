@@ -1132,7 +1132,7 @@ fn depythonify_safe_deob_exception_dispatcher_reaching_runtime_equivalence() -> 
         for throwing in [false, true] {
             let args = if shadow { "'outer', log" } else { "log" };
             let suffix = format!(
-                r#"
+                r"
                 ;(() => {{
                     let attempts = 0;
                     const calls = [];
@@ -1148,7 +1148,7 @@ fn depythonify_safe_deob_exception_dispatcher_reaching_runtime_equivalence() -> 
                         return [error.name, error.message, calls];
                     }}
                 }})()
-            "#
+            "
             );
             comparisons.push(script_observations::Comparison {
                 label: format!("{label}-{throwing}"),
