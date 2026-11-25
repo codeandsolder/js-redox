@@ -2775,19 +2775,21 @@ impl Collector<'_, '_> {
                             self.conditional_state_split(stmt, env)
                         {
                             let tail = &case.consequent[statement_index + 1..];
-                            if !tail.iter().all(|tail_stmt| {
+                            if tail.iter().all(|tail_stmt| {
                                 matches!(tail_stmt, Statement::BreakStatement(brk) if brk.label.is_none())
-                            }) || (tail.is_empty() && case_index + 1 < switch.cases.len()) {
-                                return None;
+                            }) && (!tail.is_empty() || case_index + 1 == switch.cases.len()) {
+                                return Some((
+                                    ArithmeticCaseOutcome::Conditional {
+                                        test,
+                                        consequent,
+                                        alternate,
+                                    },
+                                    register_reads_rewritten,
+                                ));
                             }
-                            return Some((
-                                ArithmeticCaseOutcome::Conditional {
-                                    test,
-                                    consequent,
-                                    alternate,
-                                },
-                                register_reads_rewritten,
-                            ));
+                            // A divergent intermediate state need not split
+                            // the dispatcher: the remaining statements (or
+                            // switch fallthrough) may re-establish one value.
                         }
                         if statement_has_loop_control(stmt) {
                             return None;
@@ -3053,7 +3055,7 @@ mod arithmetic_entry_tests {
         ("repeated", "var s=2;for(let i=0;i<2;i++){for(;s!==5;){switch(s){case 2:out.push('A');s=5;break;}}}", false),
         ("reset", "for(let i=0;i<2;i++){var s=2;for(;s!==5;){switch(s){case 2:out.push('A');s=5;break;}}}", true),
         ("nested", "var s=2;out.push('before');{for(;s!==5;){switch(s){case 2:out.push('A');s=5;break;}}}", true),
-        ("fallthrough", "var s=2;for(;s!==5;){switch(s){case 2:s=flag?3:4;case 3:out.push('fall');s=5;break;case 4:out.push('wrong');s=5;break;}}", false),
+        ("fallthrough", "var s=2;for(;s!==5;){switch(s){case 2:s=flag?3:4;case 3:out.push('fall');s=5;break;case 4:out.push('wrong');s=5;break;}}", true),
         ("last_case", "var s=2;for(;s!==5;){switch(s){case 3:out.push('A');s=5;break;case 4:out.push('B');s=5;break;case 2:s=flag?3:4;}}", true),
         ("arguments", "var s=2;out.push(arguments[0]);for(;s!==5;){switch(s){case 2:out.push('A');s=5;break;}}", true),
         ("redeclared", "var s=2;var s=flag?3:2;for(;s!==5;){switch(s){case 2:out.push('A');s=5;break;case 3:out.push('B');s=5;break;}}", false),
