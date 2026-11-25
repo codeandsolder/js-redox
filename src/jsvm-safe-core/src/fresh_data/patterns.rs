@@ -133,6 +133,9 @@ impl Analyzer<'_, '_> {
         // A destructuring assignment obtains its RHS before evaluating
         // any target reference, and the expression returns that RHS.
         let value = self.expression(&assignment.right, environment).fact;
+        if !environment.reachable() {
+            return Evaluation::default();
+        }
         if self
             .assign_pattern(&assignment.left, value.as_ref(), environment)
             .is_none()
@@ -152,6 +155,9 @@ impl Analyzer<'_, '_> {
         source: Option<&Fact>,
         environment: &mut Environment,
     ) -> Option<()> {
+        if !environment.reachable() {
+            return Some(());
+        }
         self.heap_result(self.budget.consume(1))?;
         match pattern {
             AssignmentTarget::ObjectAssignmentTarget(pattern) => {
@@ -184,6 +190,9 @@ impl Analyzer<'_, '_> {
         value: Option<&Fact>,
         environment: &mut Environment,
     ) -> Option<()> {
+        if !environment.reachable() {
+            return Some(());
+        }
         match destination {
             Destination::Reference(reference) => {
                 if !self.heap_result(reference.write(environment, value, self.budget))? {
@@ -215,6 +224,9 @@ impl Analyzer<'_, '_> {
             }
             AssignmentTargetProperty::AssignmentTargetPropertyProperty(property) => {
                 let key = self.pattern_key(&property.name, property.computed, environment);
+                if !environment.reachable() {
+                    return None;
+                }
                 let (target, default) = match &property.binding {
                     AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(value) => {
                         (&value.binding, Some(&value.init))
@@ -235,7 +247,14 @@ impl Analyzer<'_, '_> {
     ) -> Option<()> {
         let mut source = ObjectPatternSource::new(self, source, pattern.rest.is_some());
         for property in &pattern.properties {
-            let (key, destination, default) = self.assignment_property(property, environment)?;
+            if !environment.reachable() {
+                return Some(());
+            }
+            let property = self.assignment_property(property, environment);
+            if !environment.reachable() {
+                return Some(());
+            }
+            let (key, destination, default) = property?;
             source.record_key(self, &key)?;
             let mut value = source.read(self, &key, environment)?.fact;
             if let Some(default) = default {
@@ -243,8 +262,15 @@ impl Analyzer<'_, '_> {
             }
             self.write_destination(destination, value.as_ref(), environment)?;
         }
+        if !environment.reachable() {
+            return Some(());
+        }
         if let Some(rest) = &pattern.rest {
-            let destination = self.destination(&rest.target, environment)?;
+            let destination = self.destination(&rest.target, environment);
+            if !environment.reachable() {
+                return Some(());
+            }
+            let destination = destination?;
             let value = source.rest(self, environment)?.fact;
             self.write_destination(destination, value.as_ref(), environment)?;
         }

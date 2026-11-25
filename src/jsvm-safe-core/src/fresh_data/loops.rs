@@ -221,16 +221,8 @@ impl Analyzer<'_, '_> {
             }
             self.refresh_iteration_scope(statement, environment)?;
         }
-        // A constant truthy (or absent) test without a syntactic exit
-        // cannot reach a normal continuation. Avoid spending the full
-        // iteration budget on such a loop.
-        if node
-            .test()
-            .is_none_or(|test| crate::value_eval::eval(test).is_some_and(|value| value.truthy()))
-            && !super::statements::may_exit_loop(node.body())
-        {
-            return None;
-        }
+        // An apparently endless loop may leave through a callee's throw.
+        // Progress detection and shared fuel bound speculation instead.
         let mut run = LoopRun::new();
         let mut progress = ProgressProbe::new(environment);
         while run.flow.normal.is_some() {

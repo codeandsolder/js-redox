@@ -135,10 +135,19 @@ impl Analyzer<'_, '_> {
     ) -> Option<()> {
         let mut source = ObjectPatternSource::new(self, source, pattern.rest.is_some());
         for property in &pattern.properties {
+            if !environment.reachable() {
+                return Some(());
+            }
             let key = self.pattern_key(&property.key, property.computed, environment);
+            if !environment.reachable() {
+                return Some(());
+            }
             source.record_key(self, &key)?;
             let value = source.read(self, &key, environment)?.fact;
             self.bind_pattern(&property.value, value, environment)?;
+        }
+        if !environment.reachable() {
+            return Some(());
         }
         if let Some(rest) = &pattern.rest {
             let value = source.rest(self, environment)?.fact;

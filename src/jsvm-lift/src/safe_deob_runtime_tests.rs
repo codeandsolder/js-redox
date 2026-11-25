@@ -1217,6 +1217,12 @@ fn depythonify_safe_deob_interprocedural_exception_runtime_equivalence() -> Resu
         "let a=[7],f=()=>{throw 1;};try{new (f())(a[0]=9);}catch{}a[0];",
         "let a=[7],f=()=>{throw 1;};try{let {x=f(),y=(a[0]=9)}={x:void 0,y:void 0};}catch{}a[0];",
         "let a=[7],f=()=>{throw 1;};try{try{throw {x:void 0};}catch({x=f()}){a[0]=9;}}catch{}a[0];",
+        "let a=[0],f=()=>{a[0]=7;throw 1;};try{while(true){f();}}catch{}a[0];",
+        "let a=[0],f=()=>{a[0]=7;throw 1;};try{for(;;){f();}}catch{}a[0];",
+        "let a=[7],f=()=>{throw 1;};try{({}=f());}catch{}a[0];",
+        "let a=[7],f=()=>{throw 1;};try{let {[f()]:x,...rest}={};}catch{}a[0];",
+        "let a=[7],f=()=>{throw 1;};try{({[f()]:a[0]}={});}catch{}a[0];",
+        "let a=[7],f=()=>{throw 1;};try{({x:a[f()],...a[0]}={x:9});}catch{}a[0];",
     ];
     script_eval_runtime_equivalence(&sources, "interprocedural-exceptions")
 }

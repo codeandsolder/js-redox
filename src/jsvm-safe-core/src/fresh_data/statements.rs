@@ -13,11 +13,6 @@ pub(super) fn unmodeled_transfer(statement: &Statement<'_>) -> bool {
     summary.returns || summary.jumps == crate::control_flow::JumpSummary::External
 }
 
-pub(super) fn may_exit_loop(body: &Statement<'_>) -> bool {
-    let summary = crate::control_flow::statement_transfers(body);
-    summary.returns || summary.throws || summary.jumps == crate::control_flow::JumpSummary::External
-}
-
 impl Analyzer<'_, '_> {
     pub(super) fn statements(
         &mut self,

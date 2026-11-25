@@ -527,6 +527,9 @@ impl Analyzer<'_, '_> {
         data: OwnData,
         inert: bool,
     ) -> Evaluation {
+        if !environment.reachable() {
+            return Evaluation::default();
+        }
         let id = self.fresh_identity();
         let Some(fact) = self.heap_result(environment.allocate(id, data, self.budget)) else {
             return self.barrier(environment);
@@ -1386,6 +1389,9 @@ impl Analyzer<'_, '_> {
                 || Evaluation::primitive(Value::Undefined, true),
                 |init| self.expression(init, environment),
             );
+            if !environment.reachable() {
+                break;
+            }
             let Some(symbol) = symbol else {
                 if !matches!(declarator.id, BindingPattern::BindingIdentifier(_)) {
                     self.unobserved(declarator.id.span());
@@ -1754,6 +1760,14 @@ mod tests {
             ("let a=[7],f=()=>{throw 1;};try{throw f();}catch(e){a[0]=e;}a[0];", vec![("a[0]","1")]),
             ("let a=[7],f=()=>{throw 1;};try{f();}catch{a[0]=9;}a[0];", vec![("a[0]","9")]),
             ("let a=[7],f=()=>{unknown();throw 1;};try{f();}catch{}a[0];", vec![]),
+            ("let a=[0],f=()=>{a[0]=7;throw 1;};try{while(true){f();}}catch{}a[0];", vec![("a[0]","7")]),
+            ("let a=[0],f=()=>{a[0]=7;throw 1;};try{for(;;){f();}}catch{}a[0];", vec![("a[0]","7")]),
+            ("let a=[7],f=()=>{throw 1;};try{({}=f());}catch{}a[0];", vec![("a[0]","7")]),
+            ("let a=[7],f=()=>{throw 1;};try{let {[f()]:x,...rest}={};}catch{}a[0];", vec![("a[0]","7")]),
+            ("let a=[7],f=()=>{throw 1;};try{({[f()]:a[0]}={});}catch{}a[0];", vec![("a[0]","7")]),
+            ("let a=[7],f=()=>{throw 1;};try{({x:a[f()],...a[0]}={x:9});}catch{}a[0];", vec![("a[0]","7")]),
+            ("let a=[7],f=()=>{throw 1;};try{let {x=f(),y=(a[0]=9)}={x:void 0,y:void 0};}catch{}a[0];", vec![("a[0]","7")]),
+            ("let a=[7],f=()=>{throw 1;};try{try{throw {x:void 0};}catch({x=f()}){a[0]=9;}}catch{}a[0];", vec![("a[0]","7")]),
         ] {
             let expected = expected.into_iter().map(|(source,value)| (source.to_owned(),value.to_owned())).collect::<Vec<_>>();
             assert_eq!(reads(source)?, expected, "{source}");
