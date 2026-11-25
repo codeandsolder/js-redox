@@ -169,7 +169,7 @@ pub(super) struct Flow {
 }
 
 impl Flow {
-    pub(super) fn normal(value: CompletionValue) -> Self {
+    pub(super) const fn normal(value: CompletionValue) -> Self {
         Self {
             normal: Some(value),
             abrupt: BTreeMap::new(),
@@ -177,7 +177,7 @@ impl Flow {
         }
     }
 
-    pub(super) fn empty() -> Self {
+    pub(super) const fn empty() -> Self {
         Self::normal(CompletionValue::Empty)
     }
 
@@ -199,7 +199,7 @@ impl Flow {
         }
     }
 
-    pub(super) fn opaque(unproved: bool) -> Self {
+    pub(super) const fn opaque(unproved: bool) -> Self {
         Self {
             unproved,
             ..Self::normal(CompletionValue::opaque())
