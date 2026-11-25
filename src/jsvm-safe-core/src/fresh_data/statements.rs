@@ -102,6 +102,9 @@ impl Analyzer<'_, '_> {
         environment: &mut Environment,
     ) -> Option<Flow> {
         let test = self.expression(&branch.test, environment);
+        if !environment.reachable() {
+            return Some(Flow::no_paths());
+        }
         let mut flow = if let Some(value) = &test.fact {
             if value.truthy() {
                 self.statement(&branch.consequent, environment)?
@@ -160,13 +163,20 @@ impl Analyzer<'_, '_> {
     ) -> Option<Flow> {
         // Discriminant evaluation precedes switch lexical instantiation.
         let discriminant = self.expression(&switch.discriminant, environment).fact;
+        if !environment.reachable() {
+            return Some(Flow::no_paths());
+        }
         let ticket = self.enter_instance(switch.scope_id.get(), environment);
         let disposes = switch
             .scope_id
             .get()
             .is_some_and(|scope| self.bindings.scope_may_dispose(scope));
         let flow = discriminant.and_then(|discriminant| {
-            let selection = self.select_cases(switch, &discriminant, false, environment)?;
+            let selection = self.select_cases(switch, &discriminant, false, environment);
+            if !environment.reachable() {
+                return Some(Flow::no_paths());
+            }
+            let selection = selection?;
             let mut flow = Flow::normal(CompletionValue::undefined());
             if let super::dispatch::Selection::Case(start) = selection {
                 for case in switch.cases.iter().skip(start) {
@@ -229,7 +239,20 @@ impl Analyzer<'_, '_> {
         if !self.checkpoint() {
             return None;
         }
+        if !environment.reachable() {
+            return Some(Flow::no_paths());
+        }
         self.heap_result(self.budget.consume(1))?;
+        self.capture_expression_exceptions(environment, |analyzer, environment| {
+            analyzer.evaluate_statement(statement, environment)
+        })
+    }
+
+    fn evaluate_statement(
+        &mut self,
+        statement: &Statement<'_>,
+        environment: &mut Environment,
+    ) -> Option<Flow> {
         match statement {
             Statement::VariableDeclaration(declaration) => {
                 self.declaration(declaration, environment);
@@ -274,6 +297,9 @@ impl Analyzer<'_, '_> {
                     .map_or(Some(Fact::Primitive(Value::Undefined)), |argument| {
                         self.expression(argument, environment).fact
                     });
+                if !environment.reachable() {
+                    return Some(Flow::no_paths());
+                }
                 return Some(Flow::abrupt(
                     Transfer::Return,
                     CompletionValue::value(value),
@@ -282,6 +308,9 @@ impl Analyzer<'_, '_> {
             }
             Statement::ThrowStatement(throw) => {
                 let value = self.expression(&throw.argument, environment).fact;
+                if !environment.reachable() {
+                    return Some(Flow::no_paths());
+                }
                 return Some(Flow::abrupt(
                     Transfer::Throw,
                     CompletionValue::value(value),

@@ -101,6 +101,9 @@ impl Analyzer<'_, '_> {
         value: Option<Fact>,
         environment: &mut Environment,
     ) -> Option<()> {
+        if !environment.reachable() {
+            return Some(());
+        }
         self.heap_result(self.budget.consume(1))?;
         match pattern {
             BindingPattern::BindingIdentifier(identifier) => {
@@ -186,6 +189,9 @@ impl Analyzer<'_, '_> {
     ) -> Option<()> {
         let mut arguments = arguments.into_iter();
         for parameter in &params.items {
+            if !environment.reachable() {
+                return Some(());
+            }
             let mut value = arguments
                 .next()
                 .unwrap_or(Some(Fact::Primitive(Value::Undefined)));
@@ -193,6 +199,9 @@ impl Analyzer<'_, '_> {
                 value = self.apply_default(value, initializer, environment);
             }
             self.bind_pattern(&parameter.pattern, value, environment)?;
+        }
+        if !environment.reachable() {
+            return Some(());
         }
         if let Some(rest) = &params.rest {
             // Rest parameters construct an ordinary fresh array directly;

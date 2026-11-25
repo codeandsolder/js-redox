@@ -211,6 +211,9 @@ impl Analyzer<'_, '_> {
     ) -> Option<Flow> {
         let shape = Shape::new(statement, self.scoping)?;
         self.for_initializer(statement, environment)?;
+        if !environment.reachable() {
+            return None;
+        }
         self.refresh_iteration_scope(statement, environment)?;
         let mut trace = DispatchTrace {
             iterations: Vec::new(),
@@ -250,6 +253,9 @@ impl Analyzer<'_, '_> {
             self.refresh_iteration_scope(statement, environment)?;
             if let Some(update) = &statement.update {
                 self.expression(update, environment);
+                if !environment.reachable() {
+                    return None;
+                }
             }
         }
         self.reads.dispatches.observe(

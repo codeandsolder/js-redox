@@ -216,6 +216,9 @@ impl Analyzer<'_, '_> {
     ) -> Option<Flow> {
         if let Loop::For(statement) = node {
             self.for_initializer(statement, environment)?;
+            if !environment.reachable() {
+                return Some(Flow::no_paths());
+            }
             self.refresh_iteration_scope(statement, environment)?;
         }
         // A constant truthy (or absent) test without a syntactic exit
@@ -232,9 +235,16 @@ impl Analyzer<'_, '_> {
         let mut progress = ProgressProbe::new(environment);
         while run.flow.normal.is_some() {
             self.consume_iteration()?;
-            if !matches!(node, Loop::DoWhile(_)) && !self.loop_test(node, environment)? {
-                self.heap_result(run.record_test_exit(environment, self.budget))?;
-                break;
+            if !matches!(node, Loop::DoWhile(_)) {
+                let test = self.loop_test(node, environment);
+                if !environment.reachable() {
+                    run.flow.normal = None;
+                    break;
+                }
+                if !test? {
+                    self.heap_result(run.record_test_exit(environment, self.budget))?;
+                    break;
+                }
             }
             let body = self.statement(node.body(), environment)?;
             if body.unproved || self.loop_failed {
@@ -250,9 +260,20 @@ impl Analyzer<'_, '_> {
                     self.expression(update, environment);
                 }
             }
-            if matches!(node, Loop::DoWhile(_)) && !self.loop_test(node, environment)? {
-                self.heap_result(run.record_test_exit(environment, self.budget))?;
+            if !environment.reachable() {
+                run.flow.normal = None;
                 break;
+            }
+            if matches!(node, Loop::DoWhile(_)) {
+                let test = self.loop_test(node, environment);
+                if !environment.reachable() {
+                    run.flow.normal = None;
+                    break;
+                }
+                if !test? {
+                    self.heap_result(run.record_test_exit(environment, self.budget))?;
+                    break;
+                }
             }
             if !self.collect_heap(environment)
                 || self.heap_result(progress.stalled(environment, self.budget))?
@@ -273,11 +294,15 @@ impl Analyzer<'_, '_> {
         let scope = node.scope();
         let ticket = self.enter_instance(scope, environment);
         let disposes = scope.is_some_and(|scope| self.bindings.scope_may_dispose(scope));
-        let flow = match node {
-            Loop::For(statement) if dispatch => self.simulate_dispatch(statement, environment),
-            _ => self.simulate_loop(node, labels, environment),
-        }
-        .filter(|flow| !flow.unproved && !self.loop_failed);
+        let flow = self.capture_expression_exceptions(environment, |analyzer, environment| {
+            match node {
+                Loop::For(statement) if dispatch => {
+                    analyzer.simulate_dispatch(statement, environment)
+                }
+                _ => analyzer.simulate_loop(node, labels, environment),
+            }
+            .filter(|flow| !flow.unproved && !analyzer.loop_failed)
+        });
         let flow = flow.map(|mut flow| {
             self.dispose_paths(disposes, &mut flow, environment);
             flow

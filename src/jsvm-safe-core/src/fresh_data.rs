@@ -275,6 +275,7 @@ struct Analyzer<'c, 'ast> {
     loop_failed: bool,
     opaque_generation: u64,
     exception_generation: u64,
+    expression_exceptions: flow::Flow,
     repeated_depth: usize,
 }
 
@@ -304,6 +305,7 @@ impl<'c, 'ast> Analyzer<'c, 'ast> {
             loop_failed: false,
             opaque_generation: 0,
             exception_generation: 0,
+            expression_exceptions: flow::Flow::no_paths(),
             repeated_depth: 0,
         })
     }
@@ -367,6 +369,9 @@ impl Analyzer<'_, '_> {
     }
 
     fn invalidate(&mut self, environment: &mut Environment) {
+        if !environment.reachable() {
+            return;
+        }
         self.note_exception();
         self.opaque_generation = self.opaque_generation.saturating_add(1);
         environment.clear();
@@ -923,6 +928,9 @@ impl Analyzer<'_, '_> {
         environment: &mut Environment,
     ) -> Evaluation {
         let left = self.expression(&logical.left, environment);
+        if !environment.reachable() {
+            return Evaluation::default();
+        }
         let decision = left
             .fact
             .as_ref()
@@ -955,6 +963,9 @@ impl Analyzer<'_, '_> {
         environment: &mut Environment,
     ) -> Evaluation {
         let test = self.expression(&conditional.test, environment);
+        if !environment.reachable() {
+            return Evaluation::default();
+        }
         if let Some(fact) = &test.fact {
             let selected = if fact.truthy() {
                 &conditional.consequent
@@ -969,8 +980,25 @@ impl Analyzer<'_, '_> {
         let first_new = self.next_identity;
         let left = self.expression(&conditional.consequent, environment);
         let right = self.expression(&conditional.alternate, &mut other);
+        let reached = (environment.reachable(), other.reachable());
         if !self.join_heap(environment, &other, first_new) {
             return self.barrier(environment);
+        }
+        match reached {
+            (true, false) => {
+                return Evaluation {
+                    fact: left.fact,
+                    inert: false,
+                }
+            }
+            (false, true) => {
+                return Evaluation {
+                    fact: right.fact,
+                    inert: false,
+                }
+            }
+            (false, false) => return Evaluation::default(),
+            (true, true) => {}
         }
         let fact = if let (Some(left), Some(right)) = (left.fact.as_ref(), right.fact.as_ref()) {
             self.heap_result(left.join(right, self.budget)).flatten()
@@ -1101,6 +1129,9 @@ impl Analyzer<'_, '_> {
         expression: &Expression<'_>,
         environment: &mut Environment,
     ) -> Evaluation {
+        if !environment.reachable() {
+            return Evaluation::default();
+        }
         let evaluation = self.evaluate_expression(expression, environment);
         self.observe_expression(expression, evaluation, environment)
     }
@@ -1111,6 +1142,9 @@ impl Analyzer<'_, '_> {
         evaluation: Evaluation,
         environment: &mut Environment,
     ) -> Evaluation {
+        if !environment.reachable() {
+            return Evaluation::default();
+        }
         let member = expression.is_member_expression();
         let comparison = matches!(expression, Expression::BinaryExpression(binary)
             if matches!(binary.operator.as_str(), "==" | "!=" | "===" | "!=="));
@@ -1318,6 +1352,9 @@ impl Analyzer<'_, '_> {
         environment: &mut Environment,
     ) {
         for declarator in &declaration.declarations {
+            if !environment.reachable() {
+                break;
+            }
             let kind = declaration.kind;
             if kind == VariableDeclarationKind::Var && declarator.init.is_none() {
                 // Instantiation hoists the binding. Executing a bare var
@@ -1676,6 +1713,47 @@ mod tests {
             ("let a=[0],g;for(let i=0;i<3;i++){if(i===1){g=()=>[i];continue;}}let r=g();r[0];", vec![("r[0]","1")]),
             ("let a=[7];while(true){try{break;}finally{a[0]=9;}}a[0];", vec![("a[0]","9")]),
             ("function f(flag){let a=[7];switch(flag){case 1:a[0]=9;}return a[0];}", vec![]),
+        ] {
+            let expected = expected.into_iter().map(|(source,value)| (source.to_owned(),value.to_owned())).collect::<Vec<_>>();
+            assert_eq!(reads(source)?, expected, "{source}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn interprocedural_throws_preserve_values_effects_and_order() -> Result<(), BudgetExceeded> {
+        for (source, expected) in [
+            ("let a=[0],f=()=>{a[0]=7;throw a;};try{f();a[0]=9;}catch(e){e[0];}a[0];", vec![("e[0]","7"),("a[0]","7")]),
+            ("let a=[0],f=()=>{throw 7;};try{a[0]=f();a[0]=9;}catch(e){a[0]=e;}a[0];", vec![("a[0]","7")]),
+            ("let f=()=>{throw [7];},a;try{f();}catch(e){a=e;}a[0];", vec![("a[0]","7")]),
+            ("let f=()=>{throw [7];},g=()=>f();let a;try{g();}catch(e){a=e;}a[0];", vec![("a[0]","7")]),
+            ("let a=[7],f=()=>{throw 1;};try{(f(),a[0]=9);}catch{}a[0];", vec![("a[0]","7")]),
+            ("let a=[7],f=()=>{throw 1;};try{f()+ (a[0]=9);}catch{}a[0];", vec![("a[0]","7")]),
+            ("let a=[7],f=()=>{throw 1;};try{f()[a[0]=9];}catch{}a[0];", vec![("a[0]","7")]),
+            ("let a=[7],f=()=>{throw 1;};try{f()?.[a[0]=9];}catch{}a[0];", vec![("a[0]","7")]),
+            ("let a=[7],f=()=>{throw 1;},g=()=>{a[0]=9;};try{g(f(),a[0]=8);}catch{}a[0];", vec![("a[0]","7")]),
+            ("let a=[7],f=()=>{throw 1;};try{[f(),a[0]=9];}catch{}a[0];", vec![("a[0]","7")]),
+            ("let a=[7],f=()=>{throw 1;};try{({[f()]:a[0]=9});}catch{}a[0];", vec![("a[0]","7")]),
+            ("let a=[7],f=()=>{throw 1;};try{let x=f(),y=(a[0]=9);}catch{}a[0];", vec![("a[0]","7")]),
+            ("let a=[7],f=()=>{throw 1;};try{if(f())a[0]=9;else a[0]=8;}catch{}a[0];", vec![("a[0]","7")]),
+            ("let a=[7],f=()=>{throw 1;};try{switch(f()){case 1:a[0]=9;}}catch{}a[0];", vec![("a[0]","7")]),
+            ("let a=[7],f=()=>{throw 1;};try{switch(1){case f():a[0]=9;default:a[0]=8;}}catch{}a[0];", vec![("a[0]","7")]),
+            ("let a=[7],f=()=>{throw 1;};try{for(let i=f();;){a[0]=9;break;}}catch{}a[0];", vec![("a[0]","7")]),
+            ("let a=[7],f=()=>{throw 1;};try{while(f()){a[0]=9;}}catch{}a[0];", vec![("a[0]","7")]),
+            ("let a=[0],f=()=>{throw 1;};try{do{a[0]=7;}while(f());}catch{}a[0];", vec![("a[0]","7")]),
+            ("let a=[0],f=()=>{throw 1;};try{for(let i=0;i<3;f()){a[0]=7;i++;}}catch{}a[0];", vec![("a[0]","7")]),
+            ("let a=[7],f=()=>{throw 1;},g=(x=f(),y=(a[0]=9))=>{a[0]=8;};try{g();}catch{}a[0];", vec![("a[0]","7")]),
+            ("let a=[7],f=()=>{throw 1;},g=()=>{try{return f();}finally{a[0]=9;}};try{g();}catch{}a[0];", vec![("a[0]","9")]),
+            ("let f=()=>{throw [7];},g=()=>{try{f();}finally{return [9];}};let a=g();a[0];", vec![("a[0]","9")]),
+            ("function outer(flag){let a=[0],f=()=>{a[0]=7;throw 1;};try{flag?f():(a[0]=7);}catch{}return a[0];}", vec![("a[0]","7")]),
+            ("function outer(flag){let a=[0],f=()=>{a[0]=9;throw 1;};try{flag?f():(a[0]=7);}catch{}return a[0];}", vec![]),
+            ("function outer(flag){let f=()=>{throw 1;};try{let a=flag?f():[7];return a[0];}catch{return 0;}}", vec![("a[0]","7")]),
+            ("function outer(flag){let f=()=>{throw 1;},g=()=>[7];let h=flag?f:g;try{let a=h();return a[0];}catch{return 0;}}", vec![("a[0]","7")]),
+            ("function outer(flag){let a=[7],f=()=>{throw 1;};try{flag&&f();}catch{}return a[0];}", vec![("a[0]","7")]),
+            ("function outer(flag){let a=[7],f=()=>{throw 1;};try{flag||f();}catch{}return a[0];}", vec![("a[0]","7")]),
+            ("let a=[7],f=()=>{throw 1;};try{throw f();}catch(e){a[0]=e;}a[0];", vec![("a[0]","1")]),
+            ("let a=[7],f=()=>{throw 1;};try{f();}catch{a[0]=9;}a[0];", vec![("a[0]","9")]),
+            ("let a=[7],f=()=>{unknown();throw 1;};try{f();}catch{}a[0];", vec![]),
         ] {
             let expected = expected.into_iter().map(|(source,value)| (source.to_owned(),value.to_owned())).collect::<Vec<_>>();
             assert_eq!(reads(source)?, expected, "{source}");
