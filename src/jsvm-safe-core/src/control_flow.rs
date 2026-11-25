@@ -23,7 +23,10 @@ use oxc_ast::ast::{
 use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::{ReferenceId, Scoping};
 use oxc_span::{GetSpan, Span};
-use oxc_syntax::{scope::ScopeFlags, symbol::SymbolId};
+use oxc_syntax::{
+    scope::{ScopeFlags, ScopeId},
+    symbol::SymbolId,
+};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Default)]
@@ -600,6 +603,7 @@ struct ArithmeticEnvironment<'c> {
     values: HashMap<SymbolId, Value>,
     arrays: HashSet<SymbolId>,
     slots: HashMap<(SymbolId, u32), Option<Value>>,
+    reflective_activation: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -678,9 +682,62 @@ impl ArithmeticEnvironment<'_> {
         Some(())
     }
 
-    fn invalidate_opaque(&mut self) {
+    fn invalidate_opaque(&mut self) -> Option<()> {
+        // An opaque call can expose a sloppy immediate function through
+        // legacy caller reflection, allowing its captured state cell to escape.
+        if self.reflective_activation {
+            return None;
+        }
         self.values.retain(|symbol, _| *symbol == self.state);
         self.slots.clear();
+        Some(())
+    }
+
+    fn retire_scope(&mut self, scope: ScopeId) {
+        let bindings = self.scoping.get_bindings(scope);
+        self.values
+            .retain(|symbol, _| !bindings.values().any(|binding| binding == symbol));
+        self.slots
+            .retain(|(symbol, _), _| !bindings.values().any(|binding| binding == symbol));
+    }
+
+    // Unknown values are not necessarily unknown effects. The shared
+    // evaluator proves concrete primitives; these additional expressions
+    // never call user code even when their resulting value is unknown.
+    fn non_reentrant_expression(&self, expression: &Expression<'_>) -> bool {
+        if self.eval(expression).is_some() {
+            return true;
+        }
+        match expression.without_parentheses() {
+            Expression::Identifier(id) => {
+                self.symbol(id).is_some_and(|symbol| self.trackable(symbol))
+            }
+            Expression::BinaryExpression(binary)
+                if matches!(binary.operator.as_str(), "===" | "!==") =>
+            {
+                self.non_reentrant_expression(&binary.left)
+                    && self.non_reentrant_expression(&binary.right)
+            }
+            Expression::LogicalExpression(logical) => {
+                self.non_reentrant_expression(&logical.left)
+                    && self.non_reentrant_expression(&logical.right)
+            }
+            Expression::ConditionalExpression(conditional) => {
+                self.non_reentrant_expression(&conditional.test)
+                    && self.non_reentrant_expression(&conditional.consequent)
+                    && self.non_reentrant_expression(&conditional.alternate)
+            }
+            Expression::UnaryExpression(unary)
+                if matches!(unary.operator.as_str(), "!" | "void" | "typeof") =>
+            {
+                self.non_reentrant_expression(&unary.argument)
+            }
+            Expression::SequenceExpression(sequence) => sequence
+                .expressions
+                .iter()
+                .all(|expression| self.non_reentrant_expression(expression)),
+            _ => false,
+        }
     }
 
     fn join(&mut self, other: &Self) -> Option<()> {
@@ -725,8 +782,10 @@ impl ArithmeticEnvironment<'_> {
         if self.writes_state(|probe| probe.visit_expression(expression)) {
             return None;
         }
-        self.invalidate_opaque();
-        Some(())
+        if self.non_reentrant_expression(expression) {
+            return Some(());
+        }
+        self.invalidate_opaque()
     }
 }
 
@@ -742,6 +801,20 @@ impl<'a> Visit<'a> for StateWriteProbe<'_> {
             let reference = self.scoping.get_reference(reference);
             self.found |= reference.symbol_id() == Some(self.state) && reference.is_write();
         }
+    }
+}
+
+struct StateReferenceProbe<'c> {
+    scoping: &'c Scoping,
+    state: SymbolId,
+    found: bool,
+}
+
+impl<'a> Visit<'a> for StateReferenceProbe<'_> {
+    fn visit_identifier_reference(&mut self, id: &IdentifierReference<'a>) {
+        self.found |= id.reference_id.get().is_some_and(|reference| {
+            self.scoping.get_reference(reference).symbol_id() == Some(self.state)
+        });
     }
 }
 
@@ -874,13 +947,18 @@ pub fn direct_assignment_name<'a>(
     }
 }
 
-fn iife_body<'a>(expr: &'a Expression<'a>) -> Option<&'a oxc_ast::ast::FunctionBody<'a>> {
+struct ImmediateInvocation<'a> {
+    body: &'a oxc_ast::ast::FunctionBody<'a>,
+    reflective: bool,
+}
+
+fn iife_body<'a>(expr: &'a Expression<'a>, scoping: &Scoping) -> Option<ImmediateInvocation<'a>> {
     match expr {
-        Expression::ParenthesizedExpression(p) => iife_body(&p.expression),
+        Expression::ParenthesizedExpression(p) => iife_body(&p.expression, scoping),
         Expression::UnaryExpression(u)
             if matches!(u.operator.as_str(), "!" | "void" | "+" | "-" | "~") =>
         {
-            iife_body(&u.argument)
+            iife_body(&u.argument, scoping)
         }
         Expression::CallExpression(call) if !call.optional && call.arguments.is_empty() => {
             match call.callee.without_parentheses() {
@@ -895,9 +973,11 @@ fn iife_body<'a>(expr: &'a Expression<'a>) -> Option<&'a oxc_ast::ast::FunctionB
                     (!body
                         .statements
                         .iter()
-                        .any(|statement| statement_mentions(statement, "arguments"))
-                        && body.directives.is_empty())
-                    .then_some(&**body)
+                        .any(|statement| statement_mentions(statement, "arguments")))
+                    .then_some(ImmediateInvocation {
+                        body,
+                        reflective: !scoping.scope_flags(fun.scope_id.get()?).is_strict_mode(),
+                    })
                 }
                 Expression::ArrowFunctionExpression(fun)
                     if !fun.r#async && fun.params.items.is_empty() && fun.params.rest.is_none() =>
@@ -905,7 +985,10 @@ fn iife_body<'a>(expr: &'a Expression<'a>) -> Option<&'a oxc_ast::ast::FunctionB
                     let oxc_ast::ast::ArrowFunctionBody::FunctionBody(body) = &fun.body else {
                         return None;
                     };
-                    body.directives.is_empty().then_some(&**body)
+                    Some(ImmediateInvocation {
+                        body,
+                        reflective: false,
+                    })
                 }
                 _ => None,
             }
@@ -924,8 +1007,8 @@ struct StateActivationProof<'c> {
 
 impl<'a> Visit<'a> for StateActivationProof<'_> {
     fn visit_expression(&mut self, expression: &Expression<'a>) {
-        if let Some(body) = iife_body(expression) {
-            self.visit_function_body(body);
+        if let Some(invocation) = iife_body(expression, self.scoping) {
+            self.visit_function_body(invocation.body);
         } else {
             walk::walk_expression(self, expression);
         }
@@ -1009,7 +1092,7 @@ fn simulate_assignment(
         if env.writes_state(|probe| probe.visit_assignment_target(&assign.left)) {
             return None;
         }
-        env.invalidate_opaque();
+        env.invalidate_opaque()?;
     }
     if let Some(logical) = operator
         .strip_suffix('=')
@@ -1019,7 +1102,7 @@ fn simulate_assignment(
             if env.writes_state(|probe| probe.visit_expression(&assign.right)) {
                 return None;
             }
-            env.invalidate_opaque();
+            env.invalidate_opaque()?;
             if matches!(location, Some(ArithmeticLocation::Binding(symbol)) if symbol == env.state)
             {
                 return None;
@@ -1046,12 +1129,12 @@ fn simulate_assignment(
     };
     if let Some(location) = location {
         if value.is_none() && operator != "=" {
-            env.invalidate_opaque();
+            env.invalidate_opaque()?;
         }
         env.set(location, value.clone())?;
     } else {
         // An unproven PutValue can execute user code.
-        env.invalidate_opaque();
+        env.invalidate_opaque()?;
     }
     Some((StateFlow::Normal, value))
 }
@@ -1064,11 +1147,11 @@ fn simulate_update(
         if env.writes_state(|probe| probe.visit_simple_assignment_target(&update.argument)) {
             return None;
         }
-        env.invalidate_opaque();
+        env.invalidate_opaque()?;
         return Some((StateFlow::Normal, None));
     };
     let Some(old) = env.read(location) else {
-        env.invalidate_opaque();
+        env.invalidate_opaque()?;
         env.set(location, None)?;
         return Some((StateFlow::Normal, None));
     };
@@ -1096,15 +1179,25 @@ impl<'a> Visit<'a> for ActivationBindings {
 }
 
 fn simulate_immediate_invocation(
-    body: &oxc_ast::ast::FunctionBody<'_>,
+    invocation: ImmediateInvocation<'_>,
     env: &mut ArithmeticEnvironment<'_>,
 ) -> Option<ExpressionFlow> {
+    let body = invocation.body;
+    let previous = env.reflective_activation;
+    let mut probe = StateReferenceProbe {
+        scoping: env.scoping,
+        state: env.state,
+        found: false,
+    };
+    probe.visit_function_body(body);
+    env.reflective_activation |= invocation.reflective && probe.found;
     let mut locals = ActivationBindings::default();
     locals.visit_function_body(body);
     env.values.retain(|symbol, _| !locals.0.contains(symbol));
     env.slots
         .retain(|(symbol, _), _| !locals.0.contains(symbol));
     let flow = simulate_statements(&body.statements, env)?;
+    env.reflective_activation = previous;
     env.values.retain(|symbol, _| !locals.0.contains(symbol));
     env.slots
         .retain(|(symbol, _), _| !locals.0.contains(symbol));
@@ -1169,13 +1262,13 @@ fn simulate_expression(
                 .and_then(|value| eval_unary_value(unary.operator.as_str(), value));
             if value.is_none() && matches!(unary.operator.as_str(), "+" | "-" | "~") {
                 // ToNumeric of an unproved object may invoke user code.
-                env.invalidate_opaque();
+                env.invalidate_opaque()?;
             }
             Some((flow, value))
         }
         _ => {
-            if let Some(body) = iife_body(expr) {
-                return simulate_immediate_invocation(body, env);
+            if let Some(invocation) = iife_body(expr, env.scoping) {
+                return simulate_immediate_invocation(invocation, env);
             }
             env.opaque_expression(expr)?;
             Some((StateFlow::Normal, None))
@@ -1206,6 +1299,8 @@ fn simulate_switch(
     switch: &oxc_ast::ast::SwitchStatement<'_>,
     env: &mut ArithmeticEnvironment<'_>,
 ) -> Option<StateFlow> {
+    let scope = switch.scope_id.get()?;
+    env.retire_scope(scope);
     let Some(start) = select_switch_case(switch, env)? else {
         return Some(StateFlow::Normal);
     };
@@ -1213,11 +1308,18 @@ fn simulate_switch(
         for stmt in &case.consequent {
             match simulate_statement(stmt, env)? {
                 StateFlow::Normal => {}
-                StateFlow::Break => return Some(StateFlow::Normal),
-                flow => return Some(flow),
+                StateFlow::Break => {
+                    env.retire_scope(scope);
+                    return Some(StateFlow::Normal);
+                }
+                flow => {
+                    env.retire_scope(scope);
+                    return Some(flow);
+                }
             }
         }
     }
+    env.retire_scope(scope);
     Some(StateFlow::Normal)
 }
 
@@ -1292,7 +1394,7 @@ fn simulate_declaration(
                 return Some(flow);
             }
             if !env.trackable(symbol) {
-                env.invalidate_opaque();
+                env.invalidate_opaque()?;
             }
             env.set(ArithmeticLocation::Binding(symbol), value)?;
         } else if declaration.kind != VariableDeclarationKind::Var {
@@ -1308,7 +1410,13 @@ fn simulate_statement(
     env: &mut ArithmeticEnvironment<'_>,
 ) -> Option<StateFlow> {
     match stmt {
-        Statement::BlockStatement(block) => simulate_statements(&block.body, env),
+        Statement::BlockStatement(block) => {
+            let scope = block.scope_id.get()?;
+            env.retire_scope(scope);
+            let flow = simulate_statements(&block.body, env)?;
+            env.retire_scope(scope);
+            Some(flow)
+        }
         Statement::VariableDeclaration(decl) => simulate_declaration(decl, env),
         Statement::ExpressionStatement(es) => {
             simulate_expression(&es.expression, env).map(|(flow, _)| flow)
@@ -1361,7 +1469,7 @@ fn simulate_statement(
             {
                 return None;
             }
-            env.invalidate_opaque();
+            env.invalidate_opaque()?;
             Some(StateFlow::Normal)
         }
         Statement::BreakStatement(brk) if brk.label.is_none() => Some(StateFlow::Break),
@@ -1592,6 +1700,7 @@ struct ArithmeticStateSetup<'a> {
     test: &'a Expression<'a>,
     loop_termination: &'static str,
     selector_stmts: &'a [Statement<'a>],
+    body_scope: ScopeId,
     switch: &'a oxc_ast::ast::SwitchStatement<'a>,
     register_arrays: HashSet<SymbolId>,
 }
@@ -2399,6 +2508,7 @@ impl Collector<'_, '_> {
         let facts = &self.constants.initialization;
         if !facts.is_private(self.scoping, state_symbol)
             || facts.is_mapped_arguments_exposed(self.scoping, state_symbol)
+            || !self.scoping.symbol_redeclarations(state_symbol).is_empty()
             || self
                 .scoping
                 .get_resolved_reference_ids(state_symbol)
@@ -2463,6 +2573,7 @@ impl Collector<'_, '_> {
             test,
             loop_termination,
             selector_stmts,
+            body_scope: body.scope_id.get()?,
             switch,
             register_arrays: self.confined_register_arrays(it),
         })
@@ -2595,6 +2706,7 @@ impl Collector<'_, '_> {
         env: &mut ArithmeticEnvironment<'_>,
         chunks: &mut Vec<String>,
     ) -> Option<(ArithmeticCaseOutcome, usize)> {
+        env.retire_scope(setup.body_scope);
         let mut rewritten = self.arithmetic_selector_statements(setup, env, chunks)?;
         if setup.completion_live {
             chunks.push("void 0;".to_owned());
@@ -2619,7 +2731,7 @@ impl Collector<'_, '_> {
         // mutate any previously known non-state value. The conditional assignment
         // itself overwrites the dispatcher state afterwards, so retain no other
         // abstract facts across that boundary.
-        env.invalidate_opaque();
+        env.invalidate_opaque()?;
         env.set(
             ArithmeticLocation::Binding(setup.state_symbol),
             Some(target),
@@ -2690,6 +2802,7 @@ impl Collector<'_, '_> {
             values: HashMap::from([(setup.state_symbol, setup.initial.clone())]),
             arrays: setup.register_arrays.clone(),
             slots: HashMap::new(),
+            reflective_activation: false,
         };
         let mut chunks = setup.init_text.iter().cloned().collect::<Vec<_>>();
         if !setup.hoisted.is_empty() {
@@ -2905,6 +3018,8 @@ mod live_arithmetic_tests {
         // The first branch can execute an unknown setter rather than define an own slot.
         ("for(let s=1;s!==9;){let regs=[];switch(s){case 1:regs[0]=9;s=regs[0];break;}}", false),
         ("for(let s=1;s!==9;){let regs=[9];switch(s){case 1:s=regs[0];break;}}", true),
+        ("var saved;function capture(){saved=capture.caller;}for(let s=1;s!==9;){switch(s){case 1:!function(){capture();push(s);s=2;}();break;case 2:s=9;break;}}saved();", false),
+        ("for(let s=1;s!==9;){switch(s){case 1:!function(){'use strict';push(s);s=9;}();break;}}", true),
         // The switch's lexical environment is shared even across unselected cases.
         ("for(let s=1;s!==9;){switch(s){case 1:s=9;push(x);break;case 2:let x=1;break;}}", false),
     ];

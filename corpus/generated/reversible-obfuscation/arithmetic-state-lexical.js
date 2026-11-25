@@ -1,3 +1,4 @@
+"use strict";
 let out = "";
 for (let state = 6; void 0 !== state;) {
   var low = 7 & state, shifted = state >> 3, high = 7 & shifted;
