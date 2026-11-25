@@ -1,13 +1,17 @@
-//! Immediate invocation proofs share the ordinary statement/heap interpreter.
+//! Local invocation proofs share the ordinary statement/heap interpreter.
 //! The call itself remains in the output; only reaching facts cross its exit.
 use super::{Analyzer, Environment, Evaluation, Fact, Value};
 use oxc_ast::ast::{
     ArrowFunctionBody, ArrowFunctionExpression, BindingPattern, CallExpression, Expression,
-    FormalParameters, Function, FunctionBody, Statement,
+    FormalParameters, Function, FunctionBody, FunctionType, Program, Statement,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::Scoping;
-use oxc_syntax::scope::{ScopeFlags, ScopeId};
+use oxc_syntax::{
+    scope::{ScopeFlags, ScopeId},
+    symbol::SymbolId,
+};
+use std::collections::HashMap;
 use work_budget::{BudgetExceeded, WorkBudget};
 
 struct ReturnSummary {
@@ -77,6 +81,60 @@ impl<'a> Visit<'a> for ReturnProbe {
     fn visit_class(&mut self, _: &oxc_ast::ast::Class<'a>) {}
 }
 
+/// References to arena-owned declaration nodes, indexed by semantic
+/// identity rather than spelling. The binding proof is checked at each call.
+pub(super) struct NamedFunctions<'a> {
+    functions: HashMap<SymbolId, &'a Function<'a>>,
+}
+
+struct NamedCollector<'c, 'a> {
+    functions: NamedFunctions<'a>,
+    budget: &'c WorkBudget,
+    failure: Option<BudgetExceeded>,
+}
+
+impl<'a> Visit<'a> for NamedCollector<'_, 'a> {
+    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        if self.failure.is_some() {
+            return;
+        }
+        if let Err(error) = self.budget.consume(1) {
+            self.failure = Some(error);
+            return;
+        }
+        if function.r#type == FunctionType::FunctionDeclaration {
+            if let Some(symbol) = function.id.as_ref().and_then(|id| id.symbol_id.get()) {
+                // Oxc's visitor alloc accessor is for arena-backed AST nodes;
+                // declarations visited here are allocated in the program arena.
+                let declaration = self.alloc(function);
+                self.functions.functions.insert(symbol, declaration);
+            }
+        }
+        walk::walk_function(self, function, flags);
+    }
+}
+
+impl<'a> NamedFunctions<'a> {
+    pub(super) fn collect(
+        program: &Program<'a>,
+        budget: &WorkBudget,
+    ) -> Result<Self, BudgetExceeded> {
+        let mut collector = NamedCollector {
+            functions: Self {
+                functions: HashMap::new(),
+            },
+            budget,
+            failure: None,
+        };
+        collector.visit_program(program);
+        collector.failure.map_or(Ok(collector.functions), Err)
+    }
+
+    fn get(&self, symbol: SymbolId) -> Option<&'a Function<'a>> {
+        self.functions.get(&symbol).copied()
+    }
+}
+
 enum Body<'a> {
     Statements(&'a FunctionBody<'a>),
     Expression(&'a Expression<'a>),
@@ -87,10 +145,15 @@ struct Activation<'a> {
     params: &'a FormalParameters<'a>,
     body: Body<'a>,
     reflective: bool,
+    publish_context: bool,
 }
 
 impl<'a> Activation<'a> {
-    fn new(call: &'a CallExpression<'a>, scoping: &Scoping) -> Option<Self> {
+    fn new(
+        call: &'a CallExpression<'a>,
+        scoping: &Scoping,
+        named: Option<&'a Function<'a>>,
+    ) -> Option<Self> {
         if call.optional
             || call
                 .arguments
@@ -99,28 +162,25 @@ impl<'a> Activation<'a> {
         {
             return None;
         }
-        let activation = match call.callee.without_parentheses() {
-            Expression::FunctionExpression(function)
-                if !function.r#async && !function.generator && function.id.is_none() =>
-            {
-                let scope = function.scope_id.get()?;
-                Self {
-                    scope,
-                    params: &function.params,
-                    body: Body::Statements(function.body.as_ref()?),
-                    reflective: !scoping.scope_flags(scope).is_strict_mode(),
+        let activation = if let Some(function) = named {
+            Self::ordinary(function, scoping, false)?
+        } else {
+            match call.callee.without_parentheses() {
+                Expression::FunctionExpression(function) if function.id.is_none() => {
+                    Self::ordinary(function, scoping, true)?
                 }
-            }
-            Expression::ArrowFunctionExpression(function) if !function.r#async => Self {
-                scope: function.scope_id.get()?,
-                params: &function.params,
-                body: match &function.body {
-                    ArrowFunctionBody::FunctionBody(body) => Body::Statements(body),
-                    expression => Body::Expression(expression.as_expression()?),
+                Expression::ArrowFunctionExpression(function) if !function.r#async => Self {
+                    scope: function.scope_id.get()?,
+                    params: &function.params,
+                    body: match &function.body {
+                        ArrowFunctionBody::FunctionBody(body) => Body::Statements(body),
+                        expression => Body::Expression(expression.as_expression()?),
+                    },
+                    reflective: false,
+                    publish_context: true,
                 },
-                reflective: false,
-            },
-            _ => return None,
+                _ => return None,
+            }
         };
         // Parameter instantiation for a simple list uses one declarative
         // environment. Defaults/rest/destructuring require an additional
@@ -135,9 +195,31 @@ impl<'a> Activation<'a> {
         }
         Some(activation)
     }
+
+    fn ordinary(
+        function: &'a Function<'a>,
+        scoping: &Scoping,
+        publish_context: bool,
+    ) -> Option<Self> {
+        if function.r#async || function.generator {
+            return None;
+        }
+        let scope = function.scope_id.get()?;
+        Some(Self {
+            scope,
+            params: &function.params,
+            body: Body::Statements(function.body.as_ref()?),
+            // Named declarations can be called at other sites. Their
+            // context-specific observations are never published, so
+            // reflection is an ordinary effect barrier, not a reason to
+            // discard an otherwise proved normal return summary.
+            reflective: publish_context && !scoping.scope_flags(scope).is_strict_mode(),
+            publish_context,
+        })
+    }
 }
 
-impl Analyzer<'_> {
+impl Analyzer<'_, '_> {
     pub(super) fn record_return(&mut self, value: Option<Fact>, environment: &Environment) {
         let Some(frame) = &self.return_frame else {
             return;
@@ -256,30 +338,77 @@ impl Analyzer<'_> {
         Some(summary)
     }
 
-    /// Evaluate a source-local, immediate function expression or arrow with
-    /// fresh activation cells. Legacy sloppy caller reflection may expose
-    /// the function object via unknown reentrant code. Such a call cannot
-    /// publish context-specialized body observations.
-    pub(super) fn immediate_call(
+    /// Enter a fresh local activation. Semantic `SymbolId` values identify cells
+    /// only within one live instance of a lexical scope, so an overlapping
+    /// recursive activation must remain opaque until instance-indexed cells
+    /// are available. Bound native recursion independently of loop fuel.
+    fn can_enter(&self, scope: ScopeId) -> bool {
+        const MAX_ACTIVATION_DEPTH: usize = 64;
+        self.activation_scopes.len() < MAX_ACTIVATION_DEPTH
+            && !self
+                .lexical_scopes
+                .iter()
+                .flatten()
+                .chain(&self.activation_scopes)
+                .any(|&active| {
+                    active == scope || self.scoping.scope_is_descendant_of(active, scope)
+                })
+    }
+
+    /// Evaluate local direct calls with fresh activation cells. Named
+    /// declaration results flow back to this call site, but body observations
+    /// must not be specialized to one invocation: the same declaration can
+    /// execute elsewhere, including through an escaped alias.
+    pub(super) fn local_call(
         &mut self,
         call: &CallExpression<'_>,
         environment: &mut Environment,
     ) -> Option<Evaluation> {
-        let activation = Activation::new(call, self.scoping)?;
-        if activation.reflective && self.bindings.implicit_arguments_exposed(activation.scope) {
-            // Even returning the implicit arguments object without an
-            // opaque call can expose arguments.callee for later invocation.
+        let named = if let Expression::Identifier(identifier) = call.callee.without_parentheses() {
+            let symbol = self
+                .bindings
+                .resolved_symbol(self.scoping, identifier.reference_id.get()?)?;
+            let function = self.named_functions.get(symbol)?;
+            self.bindings.hoisted_callable_at(
+                self.scoping,
+                &call.callee,
+                function.scope_id.get()?,
+            )?;
+            Some((symbol, function))
+        } else {
+            None
+        };
+        let activation = Activation::new(call, self.scoping, named.map(|(_, function)| function))?;
+        if !self.can_enter(activation.scope)
+            || (activation.reflective && self.bindings.implicit_arguments_exposed(activation.scope))
+        {
             return None;
         }
-        let arguments = call
-            .arguments
-            .iter()
-            .map(|argument| {
-                argument
-                    .as_expression()
-                    .map(|expression| self.expression(expression, environment).fact)
-            })
-            .collect::<Option<Vec<_>>>()?;
+
+        // Resolve the callee first, then evaluate each argument exactly once.
+        // The scalar fast path and full heap path use these same values.
+        let mut arguments = Vec::with_capacity(call.arguments.len());
+        let mut inert = true;
+        for argument in &call.arguments {
+            let expression = argument.as_expression()?;
+            let result = self.expression(expression, environment);
+            inert &= result.inert;
+            arguments.push(result.fact);
+        }
+        if let Some((symbol, _)) = named {
+            if let Some(function) = self.pure_functions.get(&symbol) {
+                let values = arguments.iter().map(|fact| match fact {
+                    Some(Fact::Primitive(value)) => Some(value),
+                    _ => None,
+                });
+                if let Some(value) = function.evaluate(values, self.budget) {
+                    return Some(Evaluation::primitive(value, inert));
+                }
+                if !self.checkpoint() {
+                    return Some(self.barrier(environment));
+                }
+            }
+        }
         let before_effect = self.opaque_generation;
         let mut candidate = environment.clone();
         candidate.enter_activation(self.next_allocation);
@@ -289,7 +418,9 @@ impl Analyzer<'_> {
             .return_frame
             .replace(ReturnFrame::new(self.pending_disposals));
         let disposes = self.enter_resource_scope(Some(activation.scope));
+        self.activation_scopes.push(activation.scope);
         let summary = self.execute_activation(&activation, arguments, &mut candidate);
+        self.activation_scopes.pop();
         self.leave_resource_scope(disposes, &mut candidate);
         self.return_frame = previous_frame;
         let observations = std::mem::replace(&mut self.reads, previous_reads);
@@ -299,8 +430,10 @@ impl Analyzer<'_> {
         {
             summary.environment.leave_activation(environment);
             *environment = summary.environment;
-            self.reads.merge(observations);
-            self.visited_lists.extend(visited);
+            if activation.publish_context {
+                self.reads.merge(observations);
+                self.visited_lists.extend(visited);
+            }
             // Do not erase the invocation, even when its result is known.
             return Some(Evaluation {
                 fact: summary.value,

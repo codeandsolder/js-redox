@@ -77,7 +77,7 @@ enum Selection {
     NoMatch,
 }
 
-impl Analyzer<'_> {
+impl Analyzer<'_, '_> {
     fn select_arm(
         &mut self,
         switch: &SwitchStatement<'_>,

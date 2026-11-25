@@ -604,6 +604,26 @@ impl BindingFacts {
             && self.binding_has_stable_value(scoping, symbol)
     }
 
+    /// A hoisted declaration's statement is inert in a function body or
+    /// strict lexical block. Sloppy block declarations may additionally
+    /// install an Annex B var binding when the statement executes.
+    pub(crate) fn inert_function_declaration(
+        &self,
+        scoping: &Scoping,
+        function: &Function<'_>,
+    ) -> bool {
+        let Some(symbol) = function.id.as_ref().and_then(|id| id.symbol_id.get()) else {
+            return false;
+        };
+        let Some(scope) = function.scope_id.get() else {
+            return false;
+        };
+        let owner = scoping.symbol_scope_id(symbol);
+        let flags = scoping.scope_flags(owner);
+        (flags.is_function() || flags.is_strict_mode())
+            && self.hoisted_callable_declaration(scoping, symbol, scope)
+    }
+
     /// Resolve an invocation to the already instantiated lexical function.
     /// A body's declaration does not exist in its owner's separate
     /// parameter environment, including closures created in defaults.
