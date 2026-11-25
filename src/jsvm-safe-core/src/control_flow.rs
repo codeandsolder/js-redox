@@ -2019,10 +2019,10 @@ impl Collector<'_, '_> {
         if !matches!(binary.operator.as_str(), "!=" | "!==") {
             return None;
         }
-        let (state, terminal) = match (&binary.left, &binary.right) {
-            (Expression::Identifier(state), terminal)
-            | (terminal, Expression::Identifier(state)) => (state, terminal),
-            _ => return None,
+        let ((Expression::Identifier(state), terminal) | (terminal, Expression::Identifier(state))) =
+            (&binary.left, &binary.right)
+        else {
+            return None;
         };
         if !matches!(eval(terminal), Some(Value::Number(number)) if number.is_finite() && number.fract() == 0.0)
         {
@@ -2571,7 +2571,8 @@ const vm=require('node:vm');
 const source=process.argv[1];
 for(const flag of [false,true]){
   for(const code of [source,'eval('+JSON.stringify(source)+')']){
-    console.log(JSON.stringify(vm.runInNewContext(code,{flag},{timeout:1500})));
+    const options={};options.timeout=1500;
+    console.log(JSON.stringify(vm.runInNewContext(code,{flag},options)));
   }
 }
 ";
