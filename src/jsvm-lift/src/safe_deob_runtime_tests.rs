@@ -769,6 +769,18 @@ fn depythonify_safe_deob_reaching_heap_dispatch_runtime_equivalence() -> Result<
 
 #[test]
 #[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_observation_coverage_runtime_equivalence() -> Result<()> {
+    let sources = [
+        "function f(target){for(let i=0;i<2;){let a=i===0?[0]:target;let b=[i];i=i+(a[0]=b[0],1);}}let t=[0];f(t);t[0];",
+        "function f(target){for(let i=0;i<2;){let a=i===0?[0]:target;let b=[i];i=i+(a[0]+=b[0],1);}}let t=[7];f(t);t[0];",
+        "function f(target){for(let i=0;i<2;){let a=i===0?[0]:target;let b=[i];i=i+(a[0]=(()=>{let c=[i];return c[0];})(),1);}}let t=[0];f(t);t[0];",
+        "function f(target){for(let i=0;i<2;){let a=i===0?[0]:target;let b=[i];i=i+(a[0]=b[0],1);}}let t={set 0(v){events.push(v);}};f(t);events;",
+    ];
+    script_runtime_equivalence(&sources, "observation-coverage", false)
+}
+
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
 fn depythonify_safe_deob_reference_construction_runtime_equivalence() -> Result<()> {
     let source = fixture("reference-identity-table-sync.js")?;
     let (builder, _) = source
