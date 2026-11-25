@@ -5,7 +5,7 @@
 //! rendered: irreducible graphs and unmodelled state transitions are left
 //! unchanged rather than emitted with altered execution order.
 use crate::{
-    control_flow::direct_assignment_name,
+    control_flow::{direct_assignment_name, statement_has_loop_control},
     direct_identifier_name, fragment,
     numeric::exact_u64,
     value_eval::{eval, inert_literal_value, known_bool, Value},
@@ -51,6 +51,15 @@ enum RouteCompletion {
     Unproven,
 }
 
+impl RouteCompletion {
+    const fn update_empty(self, previous: Self) -> Self {
+        match self {
+            Self::Empty => previous,
+            other => other,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Route {
     effects: Vec<String>,
@@ -76,7 +85,7 @@ impl Route {
         }
     }
 
-    fn change_completion(&mut self, f: fn(RouteCompletion) -> RouteCompletion) {
+    fn change_completion(&mut self, f: impl Fn(RouteCompletion) -> RouteCompletion + Copy) {
         match &mut self.next {
             Next::State(_) => self.completion = f(self.completion),
             Next::Choose { yes, no, .. } => {
@@ -87,14 +96,7 @@ impl Route {
     }
 
     fn if_statement_completion(&mut self) {
-        self.change_completion(|completion| match completion {
-            RouteCompletion::Empty => RouteCompletion::Undefined,
-            other => other,
-        });
-    }
-
-    fn unproven_completion(&mut self) {
-        self.change_completion(|_| RouteCompletion::Unproven);
+        self.change_completion(|completion| completion.update_empty(RouteCompletion::Undefined));
     }
 
     fn transitions(&self, out: &mut Vec<(u64, RouteCompletion, bool)>) {
@@ -124,11 +126,44 @@ impl Route {
             Next::Choose { .. } => None,
         }
     }
-    fn has_target(&self, target: u64) -> bool {
+    fn has_normal_target(&self, target: u64) -> bool {
         match &self.next {
-            Next::State(state) => *state == target,
-            Next::Choose { yes, no, .. } => yes.has_target(target) || no.has_target(target),
+            Next::State(state) => *state == target && self.completion != RouteCompletion::Abrupt,
+            Next::Choose { yes, no, .. } => {
+                yes.has_normal_target(target) || no.has_normal_target(target)
+            }
         }
+    }
+
+    /// Compose an ordered pure numeric guard in the *same* source iteration.
+    /// A numeric assignment to the exit label does not exit the loop until
+    /// its next test; a return or throw, by contrast, skips the guard.
+    fn follow_guard(&mut self, target: u64, successor: Option<&Self>) -> Option<()> {
+        match &mut self.next {
+            Next::State(_) if self.completion == RouteCompletion::Abrupt => {}
+            Next::State(state) => {
+                if !self.transition_proven {
+                    return None;
+                }
+                if *state == target {
+                    let mut next = successor?.clone();
+                    next.if_statement_completion();
+                    self.effects.append(&mut next.effects);
+                    self.next = next.next;
+                    self.completion = next.completion;
+                    self.transition_proven = next.transition_proven;
+                } else {
+                    // An unselected IfStatement returns explicit undefined;
+                    // it does not inherit the previous statement's value.
+                    self.completion = RouteCompletion::Undefined;
+                }
+            }
+            Next::Choose { yes, no, .. } => {
+                yes.follow_guard(target, successor)?;
+                no.follow_guard(target, successor)?;
+            }
+        }
+        Some(())
     }
 }
 
@@ -367,121 +402,166 @@ fn assigned_state_in_initializer(expr: &Expression<'_>, state: &str) -> Option<u
     result
 }
 
-/// Statement-form state dispatchers are the same graph as ternary
-/// dispatchers, with effects spread across statement blocks instead of
-/// comma expressions. Keep the original effect order and lexical scope.
-/// Compose the guarded transitions of a lexical block without moving
-/// lexical declarations or observable effects outside their original scope.
-fn parse_statement_block_route(
-    block: &oxc_ast::ast::BlockStatement<'_>,
-    state: &str,
-    exit: u64,
-    source: &str,
-) -> Option<Route> {
-    let (last, prefix) = block.body.split_last()?;
-    // Compose any number of ordered numeric-state guards after a
-    // modeled state selection. Each guard observes the state left
-    // by its predecessor, including earlier guard writes. The
-    // source statements stay in their original try/catch region.
-    let mut guard_start = block.body.len();
-    while guard_start > 0 {
-        let Statement::IfStatement(guard) = &block.body[guard_start - 1] else {
-            break;
-        };
-        if guard.alternate.is_some() || state_test(&guard.test, state).is_none() {
-            break;
+/// Declarations without initializers and empty blocks have no runtime
+/// effects or Completion value. The independent hoist pass retains every
+/// var binding, including those in discarded branches.
+fn inert_empty_statement(stmt: &Statement<'_>) -> bool {
+    match stmt {
+        Statement::EmptyStatement(_) => true,
+        Statement::VariableDeclaration(decl) => {
+            decl.kind == VariableDeclarationKind::Var
+                && decl.declarations.iter().all(|item| item.init.is_none())
         }
-        guard_start -= 1;
+        Statement::BlockStatement(block) => block.body.iter().all(inert_empty_statement),
+        _ => false,
     }
-    if guard_start > 0 && guard_start < block.body.len() {
-        let (before, guards) = block.body.split_at(guard_start);
-        let (prior, earlier) = before.split_last()?;
-        if earlier.iter().any(|statement| {
-            matches!(
-                statement,
-                Statement::VariableDeclaration(declaration)
-                    if declaration.kind != VariableDeclarationKind::Var
-            ) || matches!(
-                statement,
-                Statement::FunctionDeclaration(_) | Statement::ClassDeclaration(_)
-            )
-        }) {
-            return None;
+}
+
+fn expression_completion(expression: &Expression<'_>) -> RouteCompletion {
+    // A successful simple assignment supplies its RHS value even when its
+    // PutValue has effects. Those effects remain in the retained prefix.
+    let expression = match unparen(expression) {
+        Expression::AssignmentExpression(assignment) if assignment.operator.as_str() == "=" => {
+            &assignment.right
         }
-        let mut route = parse_statement_route(prior, state, exit, source)?;
-        for statement in guards {
-            let Statement::IfStatement(guard) = statement else {
-                return None;
+        other => other,
+    };
+    match eval(expression) {
+        Some(Value::Number(value)) if value == 0.0 && value.is_sign_negative() => {
+            RouteCompletion::NegativeZero
+        }
+        Some(Value::Number(value)) => {
+            exact_u64(value).map_or(RouteCompletion::Unproven, RouteCompletion::Number)
+        }
+        Some(Value::Undefined) => RouteCompletion::Undefined,
+        _ => RouteCompletion::Unproven,
+    }
+}
+
+fn statement_normal_completion(statement: &Statement<'_>) -> RouteCompletion {
+    match statement {
+        Statement::EmptyStatement(_) | Statement::VariableDeclaration(_) => RouteCompletion::Empty,
+        Statement::ExpressionStatement(expr) => expression_completion(&expr.expression),
+        Statement::BlockStatement(block) => statement_list_completion(block.body.iter()),
+        Statement::ReturnStatement(_) | Statement::ThrowStatement(_) => RouteCompletion::Abrupt,
+        Statement::IfStatement(branch) => {
+            let yes = || {
+                statement_normal_completion(&branch.consequent)
+                    .update_empty(RouteCompletion::Undefined)
             };
-            let matched = state_test(&guard.test, state)?;
-            // The numeric comparison itself is pure. A guard that
-            // cannot match any modeled normal successor contributes
-            // no transition, even if its body is otherwise opaque.
-            // The synthetic exit is an abrupt completion, not a
-            // numeric state that a following statement can observe.
-            if matched == exit || !route.has_target(matched) {
-                continue;
-            }
-            let follow_up = parse_statement_route(&guard.consequent, state, exit, source)?;
-            if !splice_conditional_successor(&mut route, matched, &follow_up) {
-                return None;
+            let no = || {
+                branch
+                    .alternate
+                    .as_ref()
+                    .map_or(RouteCompletion::Empty, statement_normal_completion)
+                    .update_empty(RouteCompletion::Undefined)
+            };
+            match known_bool(&branch.test) {
+                Some(true) => yes(),
+                Some(false) => no(),
+                None => match (yes(), no()) {
+                    (RouteCompletion::Abrupt, other) | (other, RouteCompletion::Abrupt) => other,
+                    (left, right) if left == right => left,
+                    _ => RouteCompletion::Unproven,
+                },
             }
         }
-        let mut effects = earlier
-            .iter()
-            .map(|statement| fragment(source, statement.span()).to_owned())
-            .collect::<Vec<_>>();
-        effects.append(&mut route.effects);
-        route.effects = effects;
-        // Follow-up guards are modeled for state transitions, but their
-        // additional if-statement Completion can replace the predecessor's
-        // value. Keep that proof obligation explicit until every guard's
-        // selected/unselected branch has a compositional certificate.
-        route.unproven_completion();
-        return Some(route);
+        _ => RouteCompletion::Unproven,
     }
-    // Moving a block-local declaration outside its original block
-    // changes temporal-dead-zone/closure semantics. Retain those
-    // structures until the graph emitter can render lexical regions.
-    if prefix.iter().any(|statement| {
-        matches!(
-            statement,
-            Statement::VariableDeclaration(declaration)
-                if declaration.kind != oxc_ast::ast::VariableDeclarationKind::Var
-        ) || matches!(
-            statement,
-            Statement::FunctionDeclaration(_) | Statement::ClassDeclaration(_)
-        )
-    }) {
-        return None;
+}
+
+fn statement_list_completion<'a, 'ast: 'a>(
+    statements: impl IntoIterator<Item = &'a Statement<'ast>>,
+) -> RouteCompletion {
+    let mut completion = RouteCompletion::Empty;
+    for statement in statements {
+        let value = statement_normal_completion(statement);
+        completion = value.update_empty(completion);
+        if completion == RouteCompletion::Abrupt {
+            break;
+        }
     }
-    let mut route = parse_statement_route(last, state, exit, source)?;
+    completion
+}
+
+/// Compose the statement list value, retaining the effects in order. The
+/// caller decides whether a lexical region can be emitted as one block.
+fn prepend_statement_prefix(route: &mut Route, prefix: &[&Statement<'_>], source: &str) {
+    let previous = statement_list_completion(prefix.iter().copied());
+    route.change_completion(|completion| completion.update_empty(previous));
     let mut effects = prefix
         .iter()
         .map(|statement| fragment(source, statement.span()).to_owned())
         .collect::<Vec<_>>();
     effects.append(&mut route.effects);
     route.effects = effects;
-    // A trailing Empty completion inherits an earlier nonempty statement's
-    // value; if such a prefix exists, the complete block value is unknown.
-    // Nonempty final completions overwrite any normally evaluated prefix.
-    if prefix.iter().any(|statement| {
-        !matches!(
-            statement,
-            Statement::EmptyStatement(_)
-                | Statement::ExpressionStatement(_)
-                | Statement::VariableDeclaration(_)
-        )
-    }) {
-        route.unproven_completion();
-    } else if prefix
+}
+
+/// Compose the source statement list before rendering the numeric graph.
+/// Ordered guards observe earlier writes, including a write to the numeric
+/// exit label. Empty statements and uninitialized vars do not interrupt
+/// the guard sequence or overwrite its accumulated result.
+fn parse_statement_block_route(
+    block: &oxc_ast::ast::BlockStatement<'_>,
+    state: &str,
+    exit: u64,
+    source: &str,
+) -> Option<Route> {
+    if block.body.iter().any(statement_has_loop_control) {
+        return None;
+    }
+    let statements = block
+        .body
         .iter()
-        .any(|statement| matches!(statement, Statement::ExpressionStatement(_)))
-    {
-        route.change_completion(|completion| match completion {
-            RouteCompletion::Empty => RouteCompletion::Unproven,
-            other => other,
-        });
+        .filter(|stmt| !inert_empty_statement(stmt))
+        .collect::<Vec<_>>();
+    let guard_start = statements.iter().rposition(|statement| {
+        !matches!(statement, Statement::IfStatement(guard)
+            if guard.alternate.is_none() && state_test(&guard.test, state).is_some())
+    })? + 1;
+    let (before, guards) = statements.split_at(guard_start);
+    let (prior, prefix) = before.split_last()?;
+    let mut route = parse_statement_route(prior, state, exit, source)?;
+    for statement in guards {
+        let Statement::IfStatement(guard) = statement else {
+            return None;
+        };
+        let matched = state_test(&guard.test, state)?;
+        let successor = if route.has_normal_target(matched) {
+            Some(parse_statement_route(
+                &guard.consequent,
+                state,
+                exit,
+                source,
+            )?)
+        } else {
+            None
+        };
+        route.follow_guard(matched, successor.as_ref())?;
+    }
+    // The preceding statement list is part of the same block and must
+    // not be mistaken for an additional iteration of the dispatcher.
+    prepend_statement_prefix(&mut route, prefix, source);
+    // A declaration belongs to the entire original block, even before its
+    // initializer. In particular, moving a terminal let into a nested block
+    // can turn a TDZ read in the prefix into a global read. Keep the exact
+    // lexical region for a linear route instead of extracting its effects.
+    let mut lexical = false;
+    for statement in &block.body {
+        match statement {
+            Statement::VariableDeclaration(decl) => match decl.kind {
+                VariableDeclarationKind::Var => {}
+                VariableDeclarationKind::Let | VariableDeclarationKind::Const => lexical = true,
+                // Disposal at block exit may retarget the state.
+                _ => return None,
+            },
+            Statement::FunctionDeclaration(_) | Statement::ClassDeclaration(_) => lexical = true,
+            _ => {}
+        }
+    }
+    if lexical {
+        route.plain_target()?;
+        route.effects = vec![fragment(source, block.span).to_owned()];
     }
     Some(route)
 }
@@ -506,7 +586,15 @@ fn parse_statement_route(
             completion: RouteCompletion::Abrupt,
             transition_proven: true,
         }),
-        Statement::VariableDeclaration(declaration) if declaration.declarations.len() == 1 => {
+        Statement::VariableDeclaration(declaration)
+            if declaration.declarations.len() == 1
+                && matches!(
+                    declaration.kind,
+                    VariableDeclarationKind::Var
+                        | VariableDeclarationKind::Let
+                        | VariableDeclarationKind::Const
+                ) =>
+        {
             // Destructuring can execute property getters after the modeled
             // state write; only a simple binding has a proven effect order.
             let BindingPattern::BindingIdentifier(_) = &declaration.declarations[0].id else {
@@ -5403,7 +5491,7 @@ fn reconstruct_state_loop(
     let code = emitter.walk(initial, exit)?;
     let mut hoisted = HoistedVars::default();
     hoisted.visit_statement(body);
-    if hoisted.unsupported {
+    if hoisted.unsupported || hoisted.function_declaration {
         return None;
     }
     let declarations = if hoisted.names.is_empty() {
@@ -6249,10 +6337,10 @@ try{
     }
 
     #[test]
-    fn rejects_if_else_dispatch_that_writes_unknown_or_lexically_scoped_state() {
+    fn rejects_if_else_dispatch_with_unknown_state_or_branching_lexical_region() {
         for source in [
             "function f(){var s;for(s=3;s!=9;)if(s==3){s=external()}else if(s==9){s=9;}}",
-            "function f(){var s;for(s=3;s!=9;)if(s==3){const v=9;s=9;}else if(s==9){s=9;}}",
+            "function f(flag){var s;for(s=3;s!=9;)if(s==3){const v=9;s=flag?9:4;}else if(s==4){s=9;}}",
         ] {
             let allocator = Allocator::default();
             let parsed = parse_program(&allocator, source, SourceType::cjs());
@@ -6350,9 +6438,61 @@ try{
         // No normal exit is needed for an unconditional throw.
         ("let s;for(s=1;s!=9;)if(s==1){throw new TypeError('x');}else if(s==9){s=9;}", true),
         ("try{let s;for(s=1;s!=9;)if(s==1){if(flag){throw new TypeError('x');}else{s=9;}}else if(s==9){s=9;}}catch(e){push(e.name);4;}finally{push('finally');}", true),
-        // A trailing declaration after an expression is not yet modeled.
-        ("let s;for(s=1;s!=9;)if(s==1){s=9;var x;}else if(s==9){s=9;}", false),
+        // Uninitialized var declarations preserve the preceding Completion.
+        ("let s;for(s=1;s!=9;)if(s==1){s=9;var x;}else if(s==9){s=9;}", true),
     ];
+
+    const STATEMENT_COMPOSITION_CASES: &[(&str, bool)] = &[
+        // The numeric exit label is not an abrupt completion. Its guard
+        // can execute effects and retarget the next iteration.
+        ("let s;for(s=1;s!=9;)if(s==1){s=9;if(s==9){push('retarget');s=3;}}else if(s==3){push('third');s=9;}else if(s==9){s=9;}", true),
+        ("let s=1;while(s!=9)if(s==1){s=9;if(s==9){push('retarget');s=3;}}else if(s==3){push('third');s=9;}else if(s==9){s=9;}", true),
+        // An unmatched final if overwrites the value with undefined.
+        ("7;let s;for(s=1;s!=9;)if(s==1){s=9;if(s==3){s=4;}}else if(s==9){s=9;}", true),
+        ("let s;for(s=1;s!=9;)if(s==1){s=flag?9:3;if(s==3){push('guard');s=9;}}else if(s==9){s=9;}", true),
+        ("let s;for(s=1;s!=9;)if(s==1){s=2;var hidden;{}if(s==2){push('first');s=3;};;if(s==3){push('second');s=9;}var other;}else if(s==9){s=9;}", true),
+        // The selected guard itself has Empty Completion.
+        ("let s;for(s=1;s!=9;)if(s==1){s=2;if(s==2){let x=(s=9,[]);}}else if(s==9){s=9;}", true),
+        // Source statement list UpdateEmpty, including nested blocks.
+        ("let s;for(s=1;s!=9;)if(s==1){push('prefix');{3;}var x=(s=9,[]);}else if(s==9){s=9;}", false),
+        ("let s;for(s=1;s!=9;)if(s==1){push('prefix');{-0;}let x=(s=9,[]);}else if(s==9){s=9;}", true),
+        ("let s;for(s=1;s!=9;)if(s==1){push('prefix');7;let x=(s=9,[]);}else if(s==9){s=9;}", true),
+        ("let s;for(s=1;s!=9;)if(s==1){push(typeof x);let x=(s=9,[]);}else if(s==9){s=9;}", true),
+        ("let s;for(s=1;s!=9;)if(s==1){let x=3;push(x);s=9;}else if(s==9){s=9;}", true),
+        ("let s;for(s=1;s!=9;)if(s==1){if(flag){7;}else{7;}let x=(s=9,[]);}else if(s==9){s=9;}", true),
+        ("let s;for(s=1;s!=9;)if(s==1){if(flag){7;}else{8;}let x=(s=9,[]);}else if(s==9){s=9;}", false),
+        // Unknown prefix normal values are harmless if a final known
+        // assignment replaces them. The original try/finally stays put.
+        ("let s;for(s=1;s!=9;)if(s==1){try{push('try');if(flag)throw new TypeError('x');}finally{push('finally');}s=9;}else if(s==9){s=9;}", true),
+        ("let s;for(s=1;s!=9;)if(s==1){for(let i=0;i<1;i++){push('nested');break;}s=9;}else if(s==9){s=9;}", true),
+        // Abrupt completion cannot execute a later state guard.
+        ("let s;for(s=1;s!=9;)if(s==1){throw new TypeError('x');if(s==9){push('bad');s=3;}}else if(s==9){s=9;}", true),
+        // Unmodeled control transfers must not be relocated into generated
+        // loops or blocks whose break/continue targets differ.
+        ("let s;for(s=1;s!=9;)if(s==1){if(flag)break;s=9;}else if(s==9){s=9;}", false),
+        ("let n=2,s;L:for(s=1;s!=9;)if(s==1){if(n--)continue L;s=9;}else if(s==9){s=9;}", false),
+        // A later initialized declaration could invoke a global setter.
+        ("let s;for(s=1;s!=9;)if(s==1){s=9;var x=push('tail');}else if(s==9){s=9;}", false),
+    ];
+
+    #[test]
+    fn composes_ordered_guards_and_statement_list_completion(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for &(source, should_structure) in STATEMENT_COMPOSITION_CASES {
+            recover_live_loop(source, should_structure)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires Node; compare original ordered guards and composed statement lists"]
+    fn node_confirms_ordered_guard_completion_composition() -> Result<(), Box<dyn std::error::Error>>
+    {
+        for &(source, should_structure) in STATEMENT_COMPOSITION_CASES {
+            compare_live_loop_runtime(source, should_structure)?;
+        }
+        Ok(())
+    }
 
     #[test]
     fn mixed_exit_completion_classes_are_not_conflated() -> Result<(), Box<dyn std::error::Error>> {
