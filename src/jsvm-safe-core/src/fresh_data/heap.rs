@@ -1035,6 +1035,16 @@ impl Environment {
         self.collection_threshold = MIN_COLLECTION_SIZE;
     }
 
+    /// An opaque exception can occur anywhere in the protected evaluation.
+    /// All identities allocated so far may exist on that path, but no
+    /// descriptor or binding fact can be carried across it.
+    pub(super) fn unknown_exception(&self, next_identity: usize) -> Self {
+        let mut environment = self.clone();
+        environment.clear();
+        environment.origins = Some(IdentityOrigins::new(next_identity));
+        environment
+    }
+
     /// An exact ordinary function object's internal call target cannot be
     /// replaced by an own-property write. Unknown effects still erase
     /// its descriptor proof along with other heap information.

@@ -263,8 +263,7 @@ impl Analyzer<'_, '_> {
             self.loop_fuel = Some(4096);
         }
         let mut candidate = environment.clone();
-        let previous_reads = std::mem::take(&mut self.reads);
-        let previous_lists = std::mem::take(&mut self.visited_lists);
+        let observations = self.begin_observations(true);
         let dispatch = matches!(node, Loop::For(statement) if labels.is_empty() && self.has_dispatch_shape(statement));
         let previous_failure = self.loop_failed;
         let mut flow = self.execute_loop_attempt(node, &labels, dispatch, &mut candidate);
@@ -278,8 +277,7 @@ impl Analyzer<'_, '_> {
             candidate = environment.clone();
             flow = self.execute_loop_attempt(node, &labels, false, &mut candidate);
         }
-        let mut observations = std::mem::replace(&mut self.reads, previous_reads);
-        let mut visited = std::mem::replace(&mut self.visited_lists, previous_lists);
+        self.finish_observations(observations, flow.is_some())?;
         if outermost {
             self.loop_fuel = None;
             self.loop_failed = false;
@@ -287,11 +285,6 @@ impl Analyzer<'_, '_> {
             self.loop_failed = true;
         }
         if let Some(flow) = flow {
-            if outermost {
-                self.heap_result(observations.discard_unobserved(&mut visited, self.budget))?;
-            }
-            self.reads.merge(observations);
-            self.visited_lists.extend(visited);
             *environment = candidate;
             Some(flow)
         } else {

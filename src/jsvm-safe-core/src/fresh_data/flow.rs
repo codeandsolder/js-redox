@@ -177,6 +177,14 @@ impl Flow {
         }
     }
 
+    pub(super) const fn no_paths() -> Self {
+        Self {
+            normal: None,
+            abrupt: BTreeMap::new(),
+            unproved: false,
+        }
+    }
+
     pub(super) const fn empty() -> Self {
         Self::normal(CompletionValue::Empty)
     }

@@ -19,7 +19,16 @@ pub(super) struct ObjectPatternSource<'a> {
 }
 
 impl<'a> ObjectPatternSource<'a> {
-    pub(super) fn new(value: Option<&'a Fact>, has_rest: bool) -> Self {
+    pub(super) fn new(
+        analyzer: &mut Analyzer<'_, '_>,
+        value: Option<&'a Fact>,
+        has_rest: bool,
+    ) -> Self {
+        // Even an empty object pattern performs RequireObjectCoercible.
+        if value.is_none_or(|fact| matches!(fact.primitive(), Some(Value::Null | Value::Undefined)))
+        {
+            analyzer.note_exception();
+        }
         Self {
             value,
             excluded: has_rest.then(HashSet::new),
@@ -199,8 +208,9 @@ impl Analyzer<'_, '_> {
             AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(property) => {
                 let key =
                     Evaluation::primitive(Value::String(property.binding.name.to_string()), true);
-                let destination =
-                    Destination::Reference(self.identifier_reference(&property.binding)?);
+                let destination = Destination::Reference(
+                    self.identifier_reference(&property.binding, environment)?,
+                );
                 Some((key, destination, property.init.as_ref()))
             }
             AssignmentTargetProperty::AssignmentTargetPropertyProperty(property) => {
@@ -223,7 +233,7 @@ impl Analyzer<'_, '_> {
         source: Option<&Fact>,
         environment: &mut Environment,
     ) -> Option<()> {
-        let mut source = ObjectPatternSource::new(source, pattern.rest.is_some());
+        let mut source = ObjectPatternSource::new(self, source, pattern.rest.is_some());
         for property in &pattern.properties {
             let (key, destination, default) = self.assignment_property(property, environment)?;
             source.record_key(self, &key)?;

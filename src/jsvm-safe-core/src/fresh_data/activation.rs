@@ -10,6 +10,7 @@ use oxc_ast::ast::{
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::Scoping;
+use oxc_span::GetSpan;
 use oxc_syntax::{
     scope::{ScopeFlags, ScopeId},
     symbol::SymbolId,
@@ -353,6 +354,9 @@ impl<'ast> Analyzer<'_, 'ast> {
         if flow.abrupt.keys().any(|kind| *kind != Transfer::Throw) {
             return None;
         }
+        if flow.abrupt.contains_key(&Transfer::Throw) {
+            self.note_exception();
+        }
         let mut returned = returned.into_iter();
         let mut summary = returned.next()?;
         for path in returned {
@@ -648,8 +652,7 @@ impl<'ast> Analyzer<'_, 'ast> {
         let Some(selected) = self.heap_result(selected) else {
             return self.barrier(environment);
         };
-        let previous_reads = std::mem::take(&mut self.reads);
-        let previous_lists = std::mem::take(&mut self.visited_lists);
+        let observations = self.begin_observations(false);
         let disposes = self.bindings.scope_may_dispose(activation.scope);
         self.activation_depth += 1;
         let ticket = self.enter_empty_instance(activation.scope, &mut candidate);
@@ -667,22 +670,31 @@ impl<'ast> Analyzer<'_, 'ast> {
         for ticket in selected.into_iter().rev() {
             let _ = self.scope_instances.leave(&ticket);
         }
-        let observations = std::mem::replace(&mut self.reads, previous_reads);
-        let visited = std::mem::replace(&mut self.visited_lists, previous_lists);
-        if let Some(mut summary) =
-            summary.filter(|_| !activation.reflective || self.opaque_generation == before_effect)
+        let summary =
+            summary.filter(|_| !activation.reflective || self.opaque_generation == before_effect);
+        if self
+            .finish_observations(
+                observations,
+                summary.is_some() && activation.publish_context,
+            )
+            .is_none()
         {
+            return self.barrier(environment);
+        }
+        if let Some(mut summary) = summary {
             summary.environment.leave_activation(environment);
             *environment = summary.environment;
-            if activation.publish_context {
-                self.reads.merge(observations);
-                self.visited_lists.extend(visited);
-            }
             // Do not erase the invocation, even when its result is known.
             return Evaluation {
                 fact: summary.value,
                 inert: false,
             };
+        }
+        if activation.publish_context {
+            self.unobserved(match activation.body {
+                Body::Expression(expression) => expression.span(),
+                Body::Statements(body) => body.span,
+            });
         }
         if self.loop_fuel.is_some() {
             // Earlier iterations may already have observed this same body.

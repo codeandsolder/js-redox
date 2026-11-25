@@ -34,6 +34,7 @@ mod cells;
 mod chains;
 mod coverage;
 mod dispatch;
+mod exceptions;
 mod flow;
 mod heap;
 mod loops;
@@ -261,6 +262,8 @@ struct Analyzer<'c, 'ast> {
     loop_fuel: Option<usize>,
     loop_failed: bool,
     opaque_generation: u64,
+    exception_generation: u64,
+    repeated_depth: usize,
 }
 
 impl<'c, 'ast> Analyzer<'c, 'ast> {
@@ -288,13 +291,15 @@ impl<'c, 'ast> Analyzer<'c, 'ast> {
             loop_fuel: None,
             loop_failed: false,
             opaque_generation: 0,
+            exception_generation: 0,
+            repeated_depth: 0,
         })
     }
 }
 
 impl Analyzer<'_, '_> {
     fn unobserved(&mut self, span: Span) {
-        if self.loop_fuel.is_some() && self.heap_result(self.budget.consume(1)).is_some() {
+        if self.repeated_depth > 0 && self.heap_result(self.budget.consume(1)).is_some() {
             self.reads.gaps.insert(span);
         }
     }
@@ -345,7 +350,12 @@ impl Analyzer<'_, '_> {
             .is_some()
     }
 
+    const fn note_exception(&mut self) {
+        self.exception_generation = self.exception_generation.saturating_add(1);
+    }
+
     fn invalidate(&mut self, environment: &mut Environment) {
+        self.note_exception();
         self.opaque_generation = self.opaque_generation.saturating_add(1);
         environment.clear();
     }
@@ -426,20 +436,23 @@ impl Analyzer<'_, '_> {
                 inert: true,
             };
         }
-        let scope = reference_flags.scope_id();
-        Evaluation {
-            fact: None,
-            inert: symbol.is_some_and(|symbol| {
-                self.bindings
-                    .proves_value_initialized(self.scoping, symbol, scope, identifier.span)
-                    || self.bindings.proves_initialized(
-                        self.scoping,
-                        symbol,
-                        scope,
-                        identifier.span,
-                    )
-            }),
+        let inert = symbol.is_some_and(|symbol| self.initialized(symbol, identifier));
+        if !inert {
+            self.note_exception();
         }
+        Evaluation { fact: None, inert }
+    }
+
+    fn initialized(&self, symbol: SymbolId, identifier: &IdentifierReference<'_>) -> bool {
+        let Some(reference) = identifier.reference_id.get() else {
+            return false;
+        };
+        let scope = self.scoping.get_reference(reference).scope_id();
+        self.bindings
+            .proves_value_initialized(self.scoping, symbol, scope, identifier.span)
+            || self
+                .bindings
+                .proves_initialized(self.scoping, symbol, scope, identifier.span)
     }
 
     const fn fresh_identity(&mut self) -> usize {
@@ -590,12 +603,16 @@ impl Analyzer<'_, '_> {
         environment: &mut Environment,
     ) -> Option<Reference> {
         if let SimpleAssignmentTarget::AssignmentTargetIdentifier(identifier) = target {
-            return self.identifier_reference(identifier);
+            return self.identifier_reference(identifier, environment);
         }
         self.member_reference(target.as_member_expression()?, environment)
     }
 
-    fn identifier_reference(&self, identifier: &IdentifierReference<'_>) -> Option<Reference> {
+    fn identifier_reference(
+        &mut self,
+        identifier: &IdentifierReference<'_>,
+        environment: &Environment,
+    ) -> Option<Reference> {
         if let Some(cell) = self.implicit_arguments_cell(identifier) {
             return Some(Reference::Binding(cell));
         }
@@ -605,9 +622,14 @@ impl Analyzer<'_, '_> {
         // self name is an immutable binding outside its parameter cells.
         let mutable = (flags.is_variable() || flags.is_function())
             && !flags.intersects(SymbolFlags::ConstVariable | SymbolFlags::FunctionExpression);
-        mutable
-            .then(|| self.cell_id(symbol).map(Reference::Binding))
-            .flatten()
+        if !mutable {
+            return None;
+        }
+        let cell = self.cell_id(symbol)?;
+        if environment.get(cell).is_none() && !self.initialized(symbol, identifier) {
+            self.note_exception();
+        }
+        Some(Reference::Binding(cell))
     }
 
     fn logical_decision(operator: &str, fact: &Fact) -> Option<bool> {
@@ -1299,6 +1321,8 @@ impl Analyzer<'_, '_> {
                 )
             {
                 if !self.destructuring_declaration(declarator, kind, environment) {
+                    self.unobserved(declaration.span);
+                    self.invalidate(environment);
                     break;
                 }
                 continue;
@@ -1502,6 +1526,20 @@ mod tests {
             ("let i=0;for(;i<2;99){i++;i;}", "2"),
             ("let i=0;do{i++;i;}while(i<3);", "3"),
             ("outer:{switch(1){case 1:9;break outer;}}", "9"),
+            ("try{7;}finally{9;}", "7"),
+            ("try{}finally{7;}", "void 0"),
+            ("try{throw 7;}catch(e){e;}", "7"),
+            ("try{throw 7;}catch(e){9;}finally{11;}", "9"),
+            ("outer:{try{7;break outer;}finally{9;}}", "7"),
+            ("outer:{try{7;}finally{break outer;}}", "void 0"),
+            ("try{try{throw 7;}finally{throw 9;}}catch(e){e;}", "9"),
+            ("let i=0;while(i++<2){try{5;continue;}finally{9;}}", "5"),
+            (
+                "let i=0;while(i++<2){try{5;continue;}finally{break;}}",
+                "void 0",
+            ),
+            ("try{throw 1;}catch{7;}", "7"),
+            ("try{throw {x:7};}catch({x}){x;}", "7"),
         ] {
             let actual = with_analyzer(source, |program, mut analyzer| {
                 let mut environment = Environment::new();
@@ -1555,8 +1593,37 @@ mod tests {
             ("function outer(flag){let a=[0];let f=()=>{if(flag)return [7];a[0]=7;return a;};let r=f();return [r[0],a[0]];}", vec![]),
 
             ("let a=[0],g;for(let i=0;i<3;i++){if(i===1){g=()=>[i];continue;}}let r=g();r[0];", vec![("r[0]","1")]),
-            ("let a=[7];while(true){try{break;}finally{a[0]=9;}}a[0];", vec![]),
+            ("let a=[7];while(true){try{break;}finally{a[0]=9;}}a[0];", vec![("a[0]","9")]),
             ("function f(flag){let a=[7];switch(flag){case 1:a[0]=9;}return a[0];}", vec![]),
+        ] {
+            let expected = expected.into_iter().map(|(source,value)| (source.to_owned(),value.to_owned())).collect::<Vec<_>>();
+            assert_eq!(reads(source)?, expected, "{source}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn exceptions_and_finalizers_route_pending_completions() -> Result<(), BudgetExceeded> {
+        for (source, expected) in [
+            ("let a=[0];try{a[0]=7;throw a;}catch(e){a[0]=9;e[0];}a[0];", vec![("e[0]","9"),("a[0]","9")]),
+            ("let f=()=>{let a=[7];try{return a;}finally{a[0]=9;}};let r=f();r[0];", vec![("r[0]","9")]),
+            ("let f=()=>{try{return [7];}finally{return [9];}};let r=f();r[0];", vec![("r[0]","9")]),
+            ("let a=[0];try{try{throw 7;}finally{a[0]=9;}}catch(e){let r=[e];r[0];}a[0];", vec![("r[0]","7"),("a[0]","9")]),
+            ("let a=[0];try{throw {x:7};}catch({x}){a[0]=x;}a[0];", vec![("a[0]","7")]),
+            ("let a=[0];try{throw 7;}catch{a[0]=9;}a[0];", vec![("a[0]","9")]),
+            ("let a=[0];try{a[0]=7;}finally{a[0]++;}a[0];", vec![("a[0]","8")]),
+            ("let a=[0];outer:for(let i=0;i<3;i++){try{continue outer;}finally{a[0]++;}}a[0];", vec![("a[0]","3")]),
+            ("let a=[0];outer:for(;;){try{continue outer;}finally{a[0]=7;break outer;}}a[0];", vec![("a[0]","7")]),
+            ("let a=[7];try{unknown();}catch(e){a[0]=9;}a[0];", vec![]),
+            ("let a=[7];try{x=1;let x;}catch(e){a[0]=9;}a[0];", vec![]),
+            ("let a=[7];try{let {}=null;}catch(e){a[0]=9;}a[0];", vec![]),
+            ("let a=[7];try{({}=null);}catch(e){a[0]=9;}a[0];", vec![]),
+            ("function f(flag){let a=[7];try{if(flag)throw 1;a[0]=9;}finally{a[0];}}", vec![]),
+            ("function f(flag){let a=[7];try{if(flag)throw 1;a[0]=7;}finally{a[0];}}", vec![("a[0]","7")]),
+            ("function f(flag){let a=[7];try{let g=()=>{if(flag)throw 1;return 0;};g();}catch(e){a[0]=9;}return a[0];}", vec![]),
+            ("let a=[7];try{try{unknown();}catch(e){}}finally{a[0];}", vec![]),
+            ("let a=[0];try{throw [7];}catch(e){let g=()=>e;a=g();}a[0];", vec![("a[0]","7")]),
+            ("let a=[0];try{throw null;}catch({}){a[0]=9;}finally{a[0];}", vec![]),
         ] {
             let expected = expected.into_iter().map(|(source,value)| (source.to_owned(),value.to_owned())).collect::<Vec<_>>();
             assert_eq!(reads(source)?, expected, "{source}");
@@ -1600,7 +1667,7 @@ mod tests {
             ),
             (
                 "function f(){var a=[9];try{throw [];}catch(a){var a=[7];a[0];}return a[0];}",
-                vec![("a[0]", "7")],
+                vec![("a[0]", "7"), ("a[0]", "9")],
             ),
             ("var a=[7];a[0];", vec![]),
         ] {
@@ -1625,7 +1692,7 @@ mod tests {
             ("function f(flag){let a=[7];let b=(()=>{if(flag)throw 0;return a;})();return b[0];}", vec![("b[0]", "7")]),
             ("let a=(()=>{effect();return [7];})();a[0];", vec![("a[0]", "7")]),
             ("let a=(function(){effect();return [7];})();a[0];", vec![]),
-            ("let a=(()=>{try{return [7];}finally{}return [9];})();a[0];", vec![]),
+            ("let a=(()=>{try{return [7];}finally{}return [9];})();a[0];", vec![("a[0]", "7")]),
             ("let a=[7];let old=a;a[(()=>{a=[9];return 0;})()]=11;old[0];a[0];", vec![("old[0]", "11"),("a[0]", "9")]),
             ("let a=[[7],(()=>{let b=[8];return b;})()];a[0][0];a[1][0];", vec![("a[0][0]", "7"),("a[1][0]", "8")]),
             ("let result=[0,0];for(let i=0;i<2;i++){result[i]=(x=>{let a=[x];return a[0];})(i);}result[0];result[1];", vec![("result[0]", "0"),("result[1]", "1")]),

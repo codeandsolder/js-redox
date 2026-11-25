@@ -77,7 +77,7 @@ impl Analyzer<'_, '_> {
         }
     }
 
-    fn block_statement(
+    pub(super) fn block_statement(
         &mut self,
         block: &BlockStatement<'_>,
         environment: &mut Environment,
@@ -260,6 +260,12 @@ impl Analyzer<'_, '_> {
             }
             Statement::LabeledStatement(_) => {
                 return self.labelled_statement(statement, environment)
+            }
+            Statement::TryStatement(try_statement) => {
+                return Some(
+                    self.try_statement(try_statement, environment)
+                        .unwrap_or_else(|| self.opaque_statement(statement, environment)),
+                );
             }
             Statement::ReturnStatement(ret) => {
                 let value = ret
