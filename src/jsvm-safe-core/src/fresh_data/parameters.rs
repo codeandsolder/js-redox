@@ -95,7 +95,7 @@ impl Analyzer<'_, '_> {
         }
     }
 
-    fn bind_pattern(
+    pub(super) fn bind_pattern(
         &mut self,
         pattern: &BindingPattern<'_>,
         value: Option<Fact>,
@@ -130,7 +130,7 @@ impl Analyzer<'_, '_> {
         source: Option<&Fact>,
         environment: &mut Environment,
     ) -> Option<()> {
-        let mut source = ObjectPatternSource::new(source, pattern.rest.is_some());
+        let mut source = ObjectPatternSource::new(self, source, pattern.rest.is_some());
         for property in &pattern.properties {
             let key = self.pattern_key(&property.key, property.computed, environment);
             source.record_key(self, &key)?;

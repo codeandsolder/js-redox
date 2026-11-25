@@ -29,6 +29,21 @@ pub(super) enum Fact {
 }
 
 impl Fact {
+    pub(super) fn same_fact(
+        &self,
+        other: &Self,
+        budget: &WorkBudget,
+    ) -> Result<bool, BudgetExceeded> {
+        self.charge_merge(other, budget)?;
+        Ok(match (self, other) {
+            (Self::Primitive(left), Self::Primitive(right)) => {
+                identical_primitive_value(left, right)
+            }
+            (Self::Objects(left), Self::Objects(right)) => Rc::ptr_eq(left, right) || left == right,
+            _ => false,
+        })
+    }
+
     pub(super) fn join(
         &self,
         other: &Self,
@@ -1029,10 +1044,47 @@ impl Environment {
         Self::default()
     }
 
+    /// Recognize a repeated abstract state cheaply. This is only a
+    /// speculation stop condition, never a proof that the concrete loop
+    /// diverges. Ignore allocation-birth history and collector bookkeeping.
+    /// Descriptor sharing is sufficient for equality; changed descriptors
+    /// deliberately prevent this fast path.
+    pub(super) fn same_reaching_state(
+        &self,
+        other: &Self,
+        budget: &WorkBudget,
+    ) -> Result<bool, BudgetExceeded> {
+        if !Rc::ptr_eq(&self.allocations, &other.allocations) {
+            if self.allocations.len() != other.allocations.len() {
+                return Ok(false);
+            }
+            charge(budget, self.allocations.capacity())?;
+            if self.allocations.iter().any(|(id, data)| {
+                !other
+                    .allocations
+                    .get(id)
+                    .is_some_and(|other| Rc::ptr_eq(data, other))
+            }) {
+                return Ok(false);
+            }
+        }
+        self.bindings.same_state(&other.bindings, budget)
+    }
+
     pub(super) fn clear(&mut self) {
         self.bindings.clear();
         clear_shared(&mut self.allocations);
         self.collection_threshold = MIN_COLLECTION_SIZE;
+    }
+
+    /// An opaque exception can occur anywhere in the protected evaluation.
+    /// All identities allocated so far may exist on that path, but no
+    /// descriptor or binding fact can be carried across it.
+    pub(super) fn unknown_exception(&self, next_identity: usize) -> Self {
+        let mut environment = self.clone();
+        environment.clear();
+        environment.origins = Some(IdentityOrigins::new(next_identity));
+        environment
     }
 
     /// An exact ordinary function object's internal call target cannot be

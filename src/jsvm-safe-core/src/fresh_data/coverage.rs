@@ -62,3 +62,40 @@ impl ExcludedRegions {
         index > 0 && end <= self.0[index - 1].1
     }
 }
+
+/// Isolate speculative observations. Repeated source evaluations must agree
+/// and cover every execution before they can publish contextual facts.
+pub(super) struct ObservationTransaction {
+    previous_reads: super::FreshDataReads,
+    previous_lists: HashSet<(u32, u32)>,
+    repeated: bool,
+}
+
+impl super::Analyzer<'_, '_> {
+    pub(super) fn begin_observations(&mut self, repeated: bool) -> ObservationTransaction {
+        self.repeated_depth += usize::from(repeated);
+        ObservationTransaction {
+            previous_reads: std::mem::take(&mut self.reads),
+            previous_lists: std::mem::take(&mut self.visited_lists),
+            repeated,
+        }
+    }
+
+    pub(super) fn finish_observations(
+        &mut self,
+        transaction: ObservationTransaction,
+        commit: bool,
+    ) -> Option<()> {
+        let mut observations = std::mem::replace(&mut self.reads, transaction.previous_reads);
+        let mut visited = std::mem::replace(&mut self.visited_lists, transaction.previous_lists);
+        self.repeated_depth -= usize::from(transaction.repeated);
+        if commit {
+            if transaction.repeated && self.repeated_depth == 0 {
+                self.heap_result(observations.discard_unobserved(&mut visited, self.budget))?;
+            }
+            self.reads.merge(observations);
+            self.visited_lists.extend(visited);
+        }
+        Some(())
+    }
+}
