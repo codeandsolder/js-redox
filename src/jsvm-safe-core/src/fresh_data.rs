@@ -29,17 +29,19 @@ use std::collections::{HashMap, HashSet};
 use work_budget::{BudgetExceeded, WorkBudget};
 
 mod activation;
+mod cells;
 mod coverage;
 mod dispatch;
 mod heap;
 mod origins;
 mod scope_instances;
+use cells::CellId;
 use heap::{
     value_weight, AllocationId, AllocationKind, Environment, Fact, Locations, Lookup, OwnData,
 };
 
 enum Reference {
-    Binding(SymbolId),
+    Binding(CellId),
     Member { locations: Locations, key: String },
 }
 
@@ -181,12 +183,13 @@ impl FreshDataReads {
             callables: activation::CallableIndex::collect(program, budget)?,
             scope_instances: scope_instances::ScopeInstances::default(),
             lexical_scopes: Vec::new(),
-            activation_scopes: Vec::new(),
+            activation_depth: 0,
+            activation_fuel: 0,
             reads: Self::default(),
             visited_lists: HashSet::new(),
             budget,
             failure: None,
-            next_allocation: 0,
+            next_identity: 0,
             loop_fuel: None,
             loop_failed: false,
             opaque_generation: 0,
@@ -260,12 +263,13 @@ struct Analyzer<'c, 'ast> {
     callables: activation::CallableIndex<'ast>,
     scope_instances: scope_instances::ScopeInstances,
     lexical_scopes: Vec<Option<scope_instances::ScopeTicket>>,
-    activation_scopes: Vec<ScopeId>,
+    activation_depth: usize,
+    activation_fuel: usize,
     reads: FreshDataReads,
     visited_lists: HashSet<(u32, u32)>,
     budget: &'c WorkBudget,
     failure: Option<BudgetExceeded>,
-    next_allocation: AllocationId,
+    next_identity: AllocationId,
     loop_fuel: Option<usize>,
     loop_failed: bool,
     opaque_generation: u64,
@@ -355,6 +359,13 @@ impl Analyzer<'_, '_> {
             .then_some(symbol)
     }
 
+    fn cell_id(&self, symbol: SymbolId) -> Option<CellId> {
+        let instance = self
+            .scope_instances
+            .get(self.scoping.symbol_scope_id(symbol))?;
+        Some(CellId { instance, symbol })
+    }
+
     fn identifier(
         &mut self,
         identifier: &IdentifierReference<'_>,
@@ -373,7 +384,10 @@ impl Analyzer<'_, '_> {
         if !reference_flags.is_read() || reference_flags.is_write() {
             return self.barrier(environment);
         }
-        let Some(fact) = self.heap_result(environment.read_binding(symbol, self.budget)) else {
+        let Some(cell) = self.cell_id(symbol) else {
+            return self.barrier(environment);
+        };
+        let Some(fact) = self.heap_result(environment.read_binding(cell, self.budget)) else {
             return self.barrier(environment);
         };
         if let Some(fact) = fact {
@@ -399,14 +413,46 @@ impl Analyzer<'_, '_> {
         }
     }
 
+    const fn fresh_identity(&mut self) -> usize {
+        let id = self.next_identity;
+        self.next_identity += 1;
+        id
+    }
+
+    fn enter_instance(
+        &mut self,
+        scope: Option<ScopeId>,
+        environment: &mut Environment,
+    ) -> Option<scope_instances::ScopeTicket> {
+        let scope = scope?;
+        let id = self.fresh_identity();
+        self.heap_result(environment.record_birth(id, self.budget))?;
+        Some(self.scope_instances.enter(scope, id))
+    }
+
+    fn leave_instance(
+        &mut self,
+        ticket: Option<scope_instances::ScopeTicket>,
+        environment: &mut Environment,
+    ) -> bool {
+        if let Some(retired) = ticket.and_then(|ticket| self.scope_instances.leave(&ticket)) {
+            let result = environment.collect_after_scope_exit(
+                retired,
+                self.scope_instances.roots(),
+                self.budget,
+            );
+            return self.heap_result(result).is_some();
+        }
+        true
+    }
+
     fn allocate(
         &mut self,
         environment: &mut Environment,
         data: OwnData,
         inert: bool,
     ) -> Evaluation {
-        let id = self.next_allocation;
-        self.next_allocation += 1;
+        let id = self.fresh_identity();
         let Some(fact) = self.heap_result(environment.allocate(id, data, self.budget)) else {
             return self.barrier(environment);
         };
@@ -493,7 +539,8 @@ impl Analyzer<'_, '_> {
             let symbol = self.lexical_reference(identifier)?;
             let flags = self.scoping.symbol_flags(symbol);
             return (flags.is_variable() && !flags.is_const_variable())
-                .then_some(Reference::Binding(symbol));
+                .then(|| self.cell_id(symbol).map(Reference::Binding))
+                .flatten();
         }
         self.member_reference(target.as_member_expression()?, environment)
     }
@@ -555,7 +602,7 @@ impl Analyzer<'_, '_> {
                     inert: false,
                 };
             }
-            let skipped = (decision.is_none()).then(|| (environment.clone(), self.next_allocation));
+            let skipped = (decision.is_none()).then(|| (environment.clone(), self.next_identity));
             let value = self.expression(&assignment.right, environment);
             if !self
                 .heap_result(reference.write(environment, value.fact.as_ref(), self.budget))
@@ -773,7 +820,7 @@ impl Analyzer<'_, '_> {
             }
             None => {
                 let skip = environment.clone();
-                let first_new = self.next_allocation;
+                let first_new = self.next_identity;
                 let right = self.expression(&logical.right, environment);
                 if !self.join_heap(environment, &skip, first_new) {
                     return self.barrier(environment);
@@ -803,7 +850,7 @@ impl Analyzer<'_, '_> {
             return result;
         }
         let mut other = environment.clone();
-        let first_new = self.next_allocation;
+        let first_new = self.next_identity;
         let left = self.expression(&conditional.consequent, environment);
         let right = self.expression(&conditional.alternate, &mut other);
         if !self.join_heap(environment, &other, first_new) {
@@ -1066,7 +1113,7 @@ impl Analyzer<'_, '_> {
         &self,
         declarator: &VariableDeclarator<'_>,
         kind: VariableDeclarationKind,
-    ) -> Option<SymbolId> {
+    ) -> Option<CellId> {
         let symbol = match kind {
             VariableDeclarationKind::Var => self
                 .bindings
@@ -1082,7 +1129,8 @@ impl Analyzer<'_, '_> {
         (!self
             .bindings
             .is_mapped_arguments_exposed(self.scoping, symbol))
-        .then_some(symbol)
+        .then(|| self.cell_id(symbol))
+        .flatten()
     }
 
     fn declaration(
@@ -1134,7 +1182,9 @@ impl Analyzer<'_, '_> {
     /// completed lexical block additionally retires exactly its own cells;
     /// object identities can still be live through outer aliases.
     fn collect_heap(&mut self, environment: &mut Environment) -> bool {
-        if let Err(failure) = environment.collect_if_needed(self.budget) {
+        if let Err(failure) =
+            environment.collect_if_needed(self.scope_instances.roots(), self.budget)
+        {
             self.failure = Some(failure);
             self.invalidate(environment);
             return false;
@@ -1173,29 +1223,21 @@ impl Analyzer<'_, '_> {
         }
     }
 
-    fn retire_scope(
+    fn refresh_iteration_scope(
         &mut self,
-        scope: oxc_syntax::scope::ScopeId,
+        statement: &ForStatement<'_>,
         environment: &mut Environment,
-    ) -> bool {
-        if let Err(failure) =
-            environment.retire_bindings(self.scoping.get_bindings(scope).values(), self.budget)
-        {
-            self.failure = Some(failure);
-            return false;
-        }
-        true
-    }
-
-    fn refresh_iteration_scope(&mut self, statement: &ForStatement<'_>) {
+    ) -> Option<()> {
         if matches!(&statement.init,
             Some(ForStatementInit::VariableDeclaration(declaration))
                 if declaration.kind == VariableDeclarationKind::Let)
         {
-            if let Some(scope) = statement.scope_id.get() {
-                self.scope_instances.refresh(scope);
-            }
+            let scope = statement.scope_id.get()?;
+            let id = self.fresh_identity();
+            let old = self.scope_instances.refresh(scope, id)?;
+            self.heap_result(environment.copy_instance(old, id, self.budget))?;
         }
+        Some(())
     }
 
     fn for_initializer(
@@ -1233,19 +1275,16 @@ impl Analyzer<'_, '_> {
         if eval(test).is_some_and(|value| value.truthy()) {
             return None;
         }
-        let scope = statement.scope_id.get()?;
-        if crate::control_flow::statement_has_loop_control(&statement.body)
-            || !self.retire_scope(scope, environment)
-        {
+        if crate::control_flow::statement_has_loop_control(&statement.body) {
             return None;
         }
         self.for_initializer(statement, environment)?;
-        self.refresh_iteration_scope(statement);
+        self.refresh_iteration_scope(statement, environment)?;
         loop {
             self.consume_iteration()?;
             let condition = self.expression(test, environment);
             if !condition.fact.as_ref()?.truthy() {
-                return self.retire_scope(scope, environment).then_some(true);
+                return Some(true);
             }
             let normal = self.statement(&statement.body, environment);
             if self.loop_failed {
@@ -1254,9 +1293,9 @@ impl Analyzer<'_, '_> {
             if !normal {
                 // Direct transfers to the loop are excluded by the shape
                 // proof; return/throw exits the enclosing activation.
-                return self.retire_scope(scope, environment).then_some(false);
+                return Some(false);
             }
-            self.refresh_iteration_scope(statement);
+            self.refresh_iteration_scope(statement, environment)?;
             if let Some(update) = &statement.update {
                 self.expression(update, environment);
             }
@@ -1281,10 +1320,7 @@ impl Analyzer<'_, '_> {
         self.return_frame = previous_returns
             .as_ref()
             .map(activation::ReturnFrame::empty_like);
-        let ticket = statement
-            .scope_id
-            .get()
-            .map(|scope| self.scope_instances.enter(scope));
+        let ticket = self.enter_instance(statement.scope_id.get(), &mut candidate);
         let disposes = self.enter_resource_scope(statement.scope_id.get());
         let result = if self.has_dispatch_shape(statement) {
             self.simulate_dispatch(statement, &mut candidate)
@@ -1294,9 +1330,8 @@ impl Analyzer<'_, '_> {
         }
         .filter(|_| !self.loop_failed);
         self.leave_resource_scope(disposes, &mut candidate);
-        if let Some(ticket) = ticket {
-            self.scope_instances.leave(&ticket);
-        }
+        let scope_exit = self.leave_instance(ticket, &mut candidate);
+        let result = result.filter(|_| scope_exit);
         let loop_returns = std::mem::replace(&mut self.return_frame, previous_returns);
         let proven = result.is_some();
         let mut observations = std::mem::replace(&mut self.reads, previous_reads);
@@ -1334,24 +1369,12 @@ impl Analyzer<'_, '_> {
         block: &oxc_ast::ast::BlockStatement<'_>,
         environment: &mut Environment,
     ) -> bool {
-        let ticket = block
-            .scope_id
-            .get()
-            .map(|scope| self.scope_instances.enter(scope));
+        let ticket = self.enter_instance(block.scope_id.get(), environment);
         let disposes = self.enter_resource_scope(block.scope_id.get());
         let normal = self.statements(&block.body, environment);
         self.leave_resource_scope(disposes, environment);
-        if let Some(ticket) = ticket {
-            self.scope_instances.leave(&ticket);
-        }
-        if block
-            .scope_id
-            .get()
-            .is_some_and(|scope| !self.retire_scope(scope, environment))
-        {
-            return false;
-        }
-        normal && self.collect_heap(environment)
+        let scope_exit = self.leave_instance(ticket, environment);
+        normal && scope_exit && self.collect_heap(environment)
     }
 
     fn statement(&mut self, statement: &Statement<'_>, environment: &mut Environment) -> bool {
@@ -1392,7 +1415,7 @@ impl Analyzer<'_, '_> {
                     };
                 }
                 let mut other = environment.clone();
-                let first_new = self.next_allocation;
+                let first_new = self.next_identity;
                 let previous_floor = environment.protect_before(first_new);
                 other.protect_before(first_new);
                 let left = self.statement(&branch.consequent, environment);
@@ -1445,13 +1468,16 @@ impl Analyzer<'_, '_> {
 
 impl<'a> Visit<'a> for Analyzer<'_, 'a> {
     fn enter_scope(&mut self, _: ScopeFlags, scope: &std::cell::Cell<Option<ScopeId>>) {
-        self.lexical_scopes
-            .push(scope.get().map(|scope| self.scope_instances.enter(scope)));
+        let ticket = scope.get().map(|scope| {
+            let id = self.fresh_identity();
+            self.scope_instances.enter(scope, id)
+        });
+        self.lexical_scopes.push(ticket);
     }
 
     fn leave_scope(&mut self) {
         if let Some(Some(ticket)) = self.lexical_scopes.pop() {
-            self.scope_instances.leave(&ticket);
+            let _ = self.scope_instances.leave(&ticket);
         }
     }
 
@@ -1615,7 +1641,7 @@ mod tests {
             ("function outer(flag){function build(){if(flag)return [7];return [9];}let b=build();return b[0];}", vec![]),
             ("function outer(){let a=[7];function g(){a[0]=9;return a;}function f(){return g();}let b=f();return b[0]+a[0];}", vec![("b[0]", "9"), ("a[0]", "9")]),
             ("function outer(){let a=build(7);function build(x){return [x];}return a[0];}", vec![("a[0]", "7")]),
-            ("function outer(){function f(a,n){if(n)f(a,n-1);a[0]++;return a;}let a=[0];f(a,2);return a[0];}", vec![]),
+            ("function outer(){function f(a,n){if(n)f(a,n-1);a[0]++;return a;}let a=[0];f(a,2);return a[0];}", vec![("a[0]", "3")]),
             ("function outer(){function build(){effect();return [7];}let a=build();return a[0];}", vec![("a[0]", "7")]),
             ("function outer(){function f(x,x){return [x];}let a=f(1,7);return a[0];}", vec![("a[0]", "7")]),
             ("function outer(){function f(x){arguments[0]=9;return [x];}let a=f(7);return a[0];}", vec![]),
@@ -1674,10 +1700,13 @@ mod tests {
                 "let a=[7];let f=()=>[a[0]];let b=f();a[0]=9;let c=f();b[0];c[0];",
                 vec![("b[0]", "7"), ("c[0]", "9")],
             ),
-            ("let f;{let x=7;f=()=>[x];}let a=f();a[0];", vec![]),
+            (
+                "let f;{let x=7;f=()=>[x];}let a=f();a[0];",
+                vec![("a[0]", "7")],
+            ),
             (
                 "let f;for(let i=0;i<2;i++){if(i===0)f=()=>[i];else{let a=f();a[0];}}",
-                vec![],
+                vec![("a[0]", "0")],
             ),
             (
                 "let a;for(let i=0;i<2;i++){let f=()=>[i];a=f();}a[0];",
@@ -1685,9 +1714,12 @@ mod tests {
             ),
             (
                 "let f;for(let i=0;i<2;i++)if(i===0)f=()=>[i];else{let a=f();a[0];}",
-                vec![],
+                vec![("a[0]", "0")],
             ),
-            ("let a;for(let i=0,f=()=>[i];i<1;i++){a=f();}a[0];", vec![]),
+            (
+                "let a;for(let i=0,f=()=>[i];i<1;i++){a=f();}a[0];",
+                vec![("a[0]", "0")],
+            ),
             (
                 "let f;let a;for(let i=0;i<2;f=()=>[i],i++){if(i===1)a=f();}a[0];",
                 vec![("a[0]", "1")],
@@ -1698,7 +1730,7 @@ mod tests {
             ),
             (
                 "let f=(()=>{let x=7;return ()=>[x];})();let a=f();a[0];",
-                vec![],
+                vec![("a[0]", "7")],
             ),
             (
                 "let a=[7];let f=()=>{unknown();return [9];};let b=f();b[0];a[0];",
@@ -1750,6 +1782,49 @@ mod tests {
                 ("[f][0]===f".into(), "true".into()),
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn escaped_closures_retain_distinct_and_shared_cells() -> Result<(), BudgetExceeded> {
+        for (source, expected) in [
+            ("let make=x=>()=>[x];let f=make(7),g=make(9);let a=f(),b=g();a[0];b[0];", vec![("a[0]", "7"), ("b[0]", "9")]),
+            ("let make=()=>{let x=0;return [()=>[x++],()=>[x]]};let pair=make();let a=pair[0](),b=pair[1]();a[0];b[0];", vec![("a[0]", "0"), ("b[0]", "1")]),
+            ("let fs=[null,null,null];for(let i=0;i<3;i++)fs[i]=()=>[i];let a=fs[0](),b=fs[1](),c=fs[2]();a[0];b[0];c[0];", vec![("a[0]", "0"), ("b[0]", "1"), ("c[0]", "2")]),
+            ("function outer(){let fs=[null,null,null];for(var i=0;i<3;i++)fs[i]=()=>[i];let a=fs[0](),b=fs[1](),c=fs[2]();return a[0]+b[0]+c[0];}", vec![("a[0]", "3"), ("b[0]", "3"), ("c[0]", "3")]),
+            ("let make=()=>{let a=[7];return ()=>[a[0]++];};let f=make();let g=make();let a=f(),b=g(),c=f();a[0];b[0];c[0];", vec![("a[0]", "7"),("b[0]", "7"),("c[0]", "8")]),
+            ("let f=()=>{let x=[7];return ()=>x;};let g=f();for(let i=0;i<256;i++){let garbage=[i];}let a=g();a[0];", vec![("a[0]", "7")]),
+            ("let f=()=>{let x=[7];return [()=>x,()=>{x[0]=9}];};let pair=f();let a=pair[0]();pair[1]();a[0];", vec![("a[0]", "9")]),
+            ("let f=()=>{let x=[7];return ()=>x;};let g=f();unknown(g);let a=g();a[0];", vec![]),
+            ("let f=()=>{let x=7;return ()=>[x];};let g=f();let a=g();let b=f()();a[0];b[0];", vec![("a[0]", "7"), ("b[0]", "7")]),
+        ] {
+            let expected = expected.into_iter().map(|(source, value)| (source.to_owned(), value.to_owned())).collect::<Vec<_>>();
+            assert_eq!(reads(source)?, expected, "{source}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn recursion_uses_fresh_cells_and_preserves_caller_bindings() -> Result<(), BudgetExceeded> {
+        for (source, expected) in [
+            ("function outer(){function f(n){let a=[n];if(n){let b=f(n-1);return [a[0]+b[0]];}return a;}let r=f(3);return r[0];}", vec![("r[0]", "6")]),
+            ("let f=function self(n){return n?self(n-1):[7];};let a=f(2);a[0];", vec![("a[0]", "7")]),
+            ("let f=n=>n?f(n-1):[7];let a=f(2);a[0];", vec![("a[0]", "7")]),
+            ("function outer(){let a=[0];function f(n){if(n)g(n-1);a[0]++;}function g(n){if(n)f(n-1);a[0]++;}f(4);return a[0];}", vec![("a[0]", "5")]),
+            ("let make=x=>{let f=()=>[x];return [f,()=>{let a=make(x+1);return a[0]();}]};let a=make(7);let b=a[1]();let c=a[0]();b[0];c[0];", vec![("b[0]", "8"),("c[0]", "7")]),
+            ("let f=n=>{let x=[n];if(n)f(n-1);return x;};let a=f(3);a[0];", vec![("a[0]", "3")]),
+        ] {
+            let expected = expected.into_iter().map(|(source, value)| (source.to_owned(), value.to_owned())).collect::<Vec<_>>();
+            assert_eq!(reads(source)?, expected, "{source}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_recursive_call_tree_remains_bounded() -> Result<(), BudgetExceeded> {
+        let source =
+            "function outer(n){function f(n){if(n){f(n-1);f(n-1);}return [7];}let a=f(n);a[0];}";
+        assert_eq!(reads(source)?, vec![("a[0]".into(), "7".into())]);
         Ok(())
     }
 

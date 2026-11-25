@@ -112,10 +112,12 @@ impl Analyzer<'_, '_> {
         shape: &Shape<'_, '_>,
         environment: &mut Environment,
     ) -> Option<Iteration> {
-        let body = self.scope_instances.enter(shape.body.scope_id.get()?);
+        let body = self.enter_instance(shape.body.scope_id.get(), environment);
         let result = self.dispatch_body(shape, environment);
-        self.scope_instances.leave(&body);
-        result
+        self.leave_instance(body, environment)
+            .then_some(result)
+            .flatten()
+            .filter(|_| self.collect_heap(environment))
     }
 
     fn dispatch_body(
@@ -126,16 +128,11 @@ impl Analyzer<'_, '_> {
         if !self.statements(shape.prefix, environment) {
             return None;
         }
-        let switch = self.scope_instances.enter(shape.switch.scope_id.get()?);
+        let switch = self.enter_instance(shape.switch.scope_id.get(), environment);
         let iteration = self.dispatch_arms(shape, environment);
-        self.scope_instances.leave(&switch);
-        let iteration = iteration?;
-        if !self.retire_scope(shape.body.scope_id.get()?, environment)
-            || !self.collect_heap(environment)
-        {
-            return None;
-        }
-        Some(iteration)
+        self.leave_instance(switch, environment)
+            .then_some(iteration)
+            .flatten()
     }
 
     fn dispatch_arms(
@@ -191,12 +188,8 @@ impl Analyzer<'_, '_> {
         environment: &mut Environment,
     ) -> Option<()> {
         let shape = Shape::new(statement, self.scoping)?;
-        let scope = statement.scope_id.get()?;
-        if !self.retire_scope(scope, environment) {
-            return None;
-        }
         self.for_initializer(statement, environment)?;
-        self.refresh_iteration_scope(statement);
+        self.refresh_iteration_scope(statement, environment)?;
         let mut trace = DispatchTrace {
             iterations: Vec::new(),
             test_exit: false,
@@ -229,13 +222,10 @@ impl Analyzer<'_, '_> {
                 // Bound generated source as well as interpretation time.
                 return None;
             }
-            self.refresh_iteration_scope(statement);
+            self.refresh_iteration_scope(statement, environment)?;
             if let Some(update) = &statement.update {
                 self.expression(update, environment);
             }
-        }
-        if !self.retire_scope(scope, environment) {
-            return None;
         }
         self.reads.dispatches.observe(
             (statement.span.start, statement.span.end),

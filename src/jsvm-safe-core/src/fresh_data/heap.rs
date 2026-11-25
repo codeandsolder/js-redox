@@ -1,12 +1,15 @@
 //! Abstract heap for flow-local ordinary allocations. References are sets of
 //! allocation identities, never snapshots of object contents. Consequently an
 //! effect or a write through an alias also affects previously captured refs.
-use super::{origins::AllocationOrigins, scope_instances::ClosureOrigin};
+use super::{
+    cells::{CellId, CellStore, InstanceId},
+    origins::IdentityOrigins,
+    scope_instances::ClosureOrigin,
+};
 use crate::numeric::exact_u32;
 use crate::value_eval::{
     canonical_array_index_key, identical_primitive_value, strict_primitive_equal, Value,
 };
-use oxc_syntax::symbol::SymbolId;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use work_budget::{BudgetExceeded, WorkBudget};
@@ -40,7 +43,7 @@ impl Fact {
         Ok(self.clone())
     }
 
-    const fn clone_weight(&self) -> usize {
+    pub(super) const fn clone_weight(&self) -> usize {
         match self {
             Self::Primitive(value) => value_weight(value),
             Self::Objects(_) => 1,
@@ -650,22 +653,22 @@ impl LookupValues {
 /// Bound dead allocation retention without tracing the entire live heap
 /// after every statement. Collection is amortized against heap growth;
 /// the first threshold avoids overhead on ordinary short functions.
-const MIN_COLLECTION_SIZE: usize = 64;
+pub(super) const MIN_COLLECTION_SIZE: usize = 64;
 
 #[derive(Clone)]
 pub(super) struct Environment {
-    bindings: Rc<HashMap<SymbolId, Fact>>,
+    bindings: CellStore,
     allocations: Rc<HashMap<AllocationId, Rc<OwnData>>>,
     collection_threshold: usize,
     collection_floor: AllocationId,
     collection_suspended: bool,
-    origins: Option<AllocationOrigins>,
+    origins: Option<IdentityOrigins>,
 }
 
 impl Default for Environment {
     fn default() -> Self {
         Self {
-            bindings: Rc::default(),
+            bindings: CellStore::default(),
             allocations: Rc::default(),
             collection_threshold: MIN_COLLECTION_SIZE,
             collection_floor: 0,
@@ -680,6 +683,8 @@ impl Default for Environment {
 struct Reachability<'b> {
     marked: HashSet<AllocationId>,
     pending: Vec<AllocationId>,
+    marked_instances: HashSet<InstanceId>,
+    pending_instances: Vec<InstanceId>,
     weight: usize,
     budget: &'b WorkBudget,
 }
@@ -689,6 +694,8 @@ impl<'b> Reachability<'b> {
         Self {
             marked: HashSet::new(),
             pending: Vec::new(),
+            marked_instances: HashSet::new(),
+            pending_instances: Vec::new(),
             weight: 0,
             budget,
         }
@@ -704,6 +711,12 @@ impl<'b> Reachability<'b> {
     fn mark(&mut self, id: AllocationId) {
         if self.marked.insert(id) {
             self.pending.push(id);
+        }
+    }
+
+    fn mark_instance(&mut self, id: InstanceId) {
+        if self.marked_instances.insert(id) {
+            self.pending_instances.push(id);
         }
     }
 
@@ -731,6 +744,12 @@ impl<'b> Reachability<'b> {
 
     fn object(&mut self, data: &OwnData) -> Result<(), BudgetExceeded> {
         self.charge(data.properties.listed.capacity().saturating_add(1))?;
+        if let Some(closure) = &data.closure {
+            for instance in closure.instances() {
+                self.charge(1)?;
+                self.mark_instance(instance);
+            }
+        }
         if let Prototype::Objects(locations) = &data.prototype {
             self.locations(locations)?;
         }
@@ -742,7 +761,7 @@ impl<'b> Reachability<'b> {
 }
 
 // Avoid cloning an entire shared map merely to discard its contents.
-fn clear_shared<K, V>(map: &mut Rc<HashMap<K, V>>)
+pub(super) fn clear_shared<K, V>(map: &mut Rc<HashMap<K, V>>)
 where
     K: std::hash::Hash + Eq,
 {
@@ -760,7 +779,7 @@ impl Environment {
     }
 
     pub(super) fn clear(&mut self) {
-        clear_shared(&mut self.bindings);
+        self.bindings.clear();
         clear_shared(&mut self.allocations);
         self.collection_threshold = MIN_COLLECTION_SIZE;
     }
@@ -798,26 +817,16 @@ impl Environment {
         Ok(callable.map(|kind| if kind { "function" } else { "object" }))
     }
 
-    pub(super) fn get(&self, symbol: SymbolId) -> Option<&Fact> {
-        self.bindings.get(&symbol)
+    pub(super) fn get(&self, cell: CellId) -> Option<&Fact> {
+        self.bindings.get(cell)
     }
 
     pub(super) fn read_binding(
         &self,
-        symbol: SymbolId,
+        cell: CellId,
         budget: &WorkBudget,
     ) -> Result<Option<Fact>, BudgetExceeded> {
-        self.get(symbol).map(|fact| fact.copy(budget)).transpose()
-    }
-
-    fn charge_binding_copy(&self, budget: &WorkBudget) -> Result<(), BudgetExceeded> {
-        if Rc::strong_count(&self.bindings) > 1 {
-            charge(budget, self.bindings.capacity())?;
-            for fact in self.bindings.values() {
-                charge(budget, fact.clone_weight())?;
-            }
-        }
-        Ok(())
+        self.get(cell).map(|fact| fact.copy(budget)).transpose()
     }
 
     fn charge_allocation_copy(&self, budget: &WorkBudget) -> Result<(), BudgetExceeded> {
@@ -829,38 +838,40 @@ impl Environment {
 
     pub(super) fn insert(
         &mut self,
-        symbol: SymbolId,
+        cell: CellId,
         fact: Fact,
         budget: &WorkBudget,
     ) -> Result<(), BudgetExceeded> {
-        self.charge_binding_copy(budget)?;
-        Rc::make_mut(&mut self.bindings).insert(symbol, fact);
-        Ok(())
+        self.bindings.insert(cell, fact, budget)
     }
 
     pub(super) fn remove(
         &mut self,
-        symbol: SymbolId,
+        cell: CellId,
         budget: &WorkBudget,
     ) -> Result<(), BudgetExceeded> {
-        self.remove_binding(symbol, budget)?;
+        self.bindings.remove(cell, budget)
+    }
+
+    pub(super) fn record_birth(
+        &mut self,
+        id: usize,
+        budget: &WorkBudget,
+    ) -> Result<(), BudgetExceeded> {
+        if let Some(origins) = &mut self.origins {
+            origins.record(id, budget)?;
+        }
         Ok(())
     }
 
-    fn remove_binding(
+    pub(super) fn copy_instance(
         &mut self,
-        symbol: SymbolId,
+        from: InstanceId,
+        to: InstanceId,
         budget: &WorkBudget,
-    ) -> Result<Option<Fact>, BudgetExceeded> {
-        if let Some(bindings) = Rc::get_mut(&mut self.bindings) {
-            return Ok(bindings.remove(&symbol));
-        }
-        if self.bindings.contains_key(&symbol) {
-            self.charge_binding_copy(budget)?;
-            Ok(Rc::make_mut(&mut self.bindings).remove(&symbol))
-        } else {
-            Ok(None)
-        }
+    ) -> Result<(), BudgetExceeded> {
+        self.record_birth(to, budget)?;
+        self.bindings.copy_instance(from, to, budget)
     }
 
     pub(super) fn allocate(
@@ -870,45 +881,19 @@ impl Environment {
         budget: &WorkBudget,
     ) -> Result<Fact, BudgetExceeded> {
         self.charge_allocation_copy(budget)?;
-        if let Some(origins) = &mut self.origins {
-            origins.record(id, budget)?;
-        }
+        self.record_birth(id, budget)?;
         Rc::make_mut(&mut self.allocations).insert(id, Rc::new(data));
         Ok(Fact::Objects(Rc::from([id])))
     }
 
-    pub(super) fn retire_bindings<'a>(
-        &mut self,
-        symbols: impl Iterator<Item = &'a SymbolId>,
-        budget: &WorkBudget,
-    ) -> Result<(), BudgetExceeded> {
-        let mut retired = 0usize;
-        for symbol in symbols {
-            if let Some(Fact::Objects(locations)) = self.remove_binding(*symbol, budget)? {
-                retired = retired.saturating_add(locations.len());
-            }
-        }
-        if self.collection_suspended {
-            return Ok(());
-        }
-        if self.bindings.is_empty() && self.collection_floor == 0 {
-            self.clear();
-        } else if self.allocations.len() >= MIN_COLLECTION_SIZE
-            && retired >= self.allocations.len().div_ceil(2)
-        {
-            self.collect(budget)?;
-        }
-        Ok(())
-    }
-
     /// The caller can have pending receiver/argument/return temporaries
     /// which are not represented by a lexical binding in the callee.
-    pub(super) fn enter_activation(&mut self, next_allocation: AllocationId) {
+    pub(super) fn enter_activation(&mut self, next_identity: usize) {
         self.collection_suspended = true;
         // An enclosing activation needs the entire nested creation
         // history, including allocations invalidated before a return.
         self.origins
-            .get_or_insert_with(|| AllocationOrigins::new(next_allocation));
+            .get_or_insert_with(|| IdentityOrigins::new(next_identity));
     }
 
     pub(super) fn leave_activation(&mut self, caller: &Self) {
@@ -917,25 +902,6 @@ impl Environment {
         if caller.origins.is_none() {
             self.origins = None;
         }
-    }
-
-    pub(super) fn retire_activation(
-        &mut self,
-        scoping: &oxc_semantic::Scoping,
-        owner: oxc_syntax::scope::ScopeId,
-        budget: &WorkBudget,
-    ) -> Result<(), BudgetExceeded> {
-        charge(budget, self.bindings.capacity())?;
-        let retired = self
-            .bindings
-            .keys()
-            .copied()
-            .filter(|&symbol| {
-                let scope = scoping.symbol_scope_id(symbol);
-                scope == owner || scoping.scope_is_descendant_of(scope, owner)
-            })
-            .collect::<Vec<_>>();
-        self.retire_bindings(retired.iter(), budget)
     }
 
     /// Preserve allocations that existed before an outstanding branch
@@ -949,43 +915,89 @@ impl Environment {
     /// expression temporaries, pending assignment receivers or in-progress
     /// object literals need to be kept alive. Lexical bindings and their
     /// transitive (own-property and prototype) edges are the roots.
-    pub(super) fn collect_if_needed(&mut self, budget: &WorkBudget) -> Result<(), BudgetExceeded> {
-        if self.collection_suspended || self.allocations.len() < self.collection_threshold {
+    pub(super) fn collect_if_needed(
+        &mut self,
+        roots: impl Iterator<Item = InstanceId>,
+        budget: &WorkBudget,
+    ) -> Result<(), BudgetExceeded> {
+        if self.collection_suspended
+            || self.allocations.len().saturating_add(self.bindings.len())
+                < self.collection_threshold
+        {
             return Ok(());
         }
-        self.collect(budget)
+        self.collect(roots, budget)
     }
 
-    fn collect(&mut self, budget: &WorkBudget) -> Result<(), BudgetExceeded> {
+    pub(super) fn collect_after_scope_exit(
+        &mut self,
+        retired: InstanceId,
+        roots: impl Iterator<Item = InstanceId>,
+        budget: &WorkBudget,
+    ) -> Result<(), BudgetExceeded> {
+        if self.collection_suspended {
+            return Ok(());
+        }
+        let retired_cells = self.bindings.instance(retired).map_or(0, HashMap::len);
+        if retired_cells >= MIN_COLLECTION_SIZE
+            && retired_cells >= self.allocations.len().div_ceil(2)
+        {
+            self.collect(roots, budget)?;
+        }
+        Ok(())
+    }
+
+    fn collect(
+        &mut self,
+        roots: impl Iterator<Item = InstanceId>,
+        budget: &WorkBudget,
+    ) -> Result<(), BudgetExceeded> {
         let mut trace = Reachability::new(budget);
-        trace.charge(self.bindings.capacity())?;
+        for instance in roots {
+            trace.charge(1)?;
+            trace.mark_instance(instance);
+        }
         if self.collection_floor != 0 {
-            budget.consume(u64::try_from(self.allocations.capacity()).unwrap_or(u64::MAX))?;
+            trace.charge(
+                self.allocations
+                    .capacity()
+                    .saturating_add(self.bindings.capacity()),
+            )?;
             for &id in self.allocations.keys() {
                 if id < self.collection_floor {
                     trace.mark(id);
                 }
             }
-        }
-        for fact in self.bindings.values() {
-            trace.fact(fact)?;
-        }
-        let mut live_allocations = 0usize;
-        while let Some(id) = trace.pending.pop() {
-            // A captured identity can survive the invalidation of its
-            // descriptor proof. Missing objects have no traversable edges.
-            if let Some(data) = self.allocations.get(&id) {
-                live_allocations += 1;
-                trace.object(data)?;
+            for id in self.bindings.ids() {
+                if id < self.collection_floor {
+                    trace.mark_instance(id);
+                }
             }
         }
-        budget.consume(u64::try_from(self.allocations.capacity()).unwrap_or(u64::MAX))?;
+        let mut live_allocations = 0usize;
+        loop {
+            if let Some(instance) = trace.pending_instances.pop() {
+                if let Some(cells) = self.bindings.instance(instance) {
+                    trace.charge(cells.capacity())?;
+                    for fact in cells.values() {
+                        trace.fact(fact)?;
+                    }
+                }
+            } else if let Some(id) = trace.pending.pop() {
+                if let Some(data) = self.allocations.get(&id) {
+                    live_allocations += 1;
+                    trace.object(data)?;
+                }
+            } else {
+                break;
+            }
+        }
+        self.bindings.retain(&trace.marked_instances, budget)?;
+        charge(budget, self.allocations.capacity())?;
         if live_allocations != self.allocations.len() {
             self.charge_allocation_copy(budget)?;
             Rc::make_mut(&mut self.allocations).retain(|id, _| trace.marked.contains(id));
         }
-        // HashMap iteration follows capacity, not just length. Release
-        // excess capacity after a large transient expression or scope.
         if self.allocations.capacity()
             > self
                 .allocations
@@ -996,23 +1008,9 @@ impl Environment {
             self.charge_allocation_copy(budget)?;
             Rc::make_mut(&mut self.allocations).shrink_to_fit();
         }
-        if self.bindings.capacity()
-            > self
-                .bindings
-                .len()
-                .saturating_mul(4)
-                .max(MIN_COLLECTION_SIZE)
-        {
-            self.charge_binding_copy(budget)?;
-            Rc::make_mut(&mut self.bindings).shrink_to_fit();
-        }
-        // Make the next trace proportional to the surviving graph, not
-        // just the number of nodes. A single large object or many live
-        // primitive bindings must not incur a full scan every 64 literals.
-        self.collection_threshold = self
-            .allocations
-            .len()
-            .saturating_add(trace.weight.max(self.allocations.len()))
+        let live = self.allocations.len().saturating_add(self.bindings.len());
+        self.collection_threshold = live
+            .saturating_add(trace.weight.max(live))
             .max(MIN_COLLECTION_SIZE);
         Ok(())
     }
@@ -1049,31 +1047,36 @@ impl Environment {
     ) -> Result<(), BudgetExceeded> {
         // A failed join is not a usable abstract state: its caller aborts
         // the analysis. Stop merging immediately at the first budget error.
-        if !Rc::ptr_eq(&self.bindings, &other.bindings) {
-            self.charge_binding_copy(budget)?;
-            charge(budget, self.bindings.capacity())?;
-            let mut failure = Ok(());
-            Rc::make_mut(&mut self.bindings).retain(|symbol, fact| {
-                if failure.is_err() {
-                    return true;
-                }
-                let Some(right) = other.bindings.get(symbol) else {
-                    return false;
-                };
-                match fact.join(right, budget) {
-                    Ok(Some(joined)) => {
-                        *fact = joined;
-                        true
-                    }
-                    Ok(None) => false,
-                    Err(error) => {
-                        failure = Err(error);
-                        true
-                    }
-                }
-            });
-            failure?;
+        let left_origins = self.origins.as_ref();
+        let right_origins = other.origins.as_ref();
+        let absent = |id, origins: Option<&IdentityOrigins>| {
+            first_new.map_or_else(
+                || origins.is_some_and(|history| !history.may_exist(id)),
+                |floor| id >= floor,
+            )
+        };
+        if first_new.is_none() {
+            charge(
+                budget,
+                self.allocations
+                    .len()
+                    .saturating_add(self.bindings.len())
+                    .saturating_mul(right_origins.map_or(1, IdentityOrigins::search_cost))
+                    .saturating_add(
+                        other
+                            .allocations
+                            .len()
+                            .saturating_add(other.bindings.len())
+                            .saturating_mul(left_origins.map_or(1, IdentityOrigins::search_cost)),
+                    ),
+            )?;
         }
+        self.bindings.join(
+            &other.bindings,
+            |id| absent(id, left_origins),
+            |id| absent(id, right_origins),
+            budget,
+        )?;
         if !Rc::ptr_eq(&self.allocations, &other.allocations) {
             self.charge_allocation_copy(budget)?;
             charge(
@@ -1082,25 +1085,6 @@ impl Environment {
                     .capacity()
                     .saturating_add(other.allocations.capacity()),
             )?;
-            let left_origins = self.origins.as_ref();
-            let right_origins = other.origins.as_ref();
-            if first_new.is_none() {
-                charge(
-                    budget,
-                    self.allocations
-                        .len()
-                        .saturating_mul(right_origins.map_or(1, AllocationOrigins::search_cost))
-                        .saturating_add(other.allocations.len().saturating_mul(
-                            left_origins.map_or(1, AllocationOrigins::search_cost),
-                        )),
-                )?;
-            }
-            let absent = |id, origins: Option<&AllocationOrigins>| {
-                first_new.map_or_else(
-                    || origins.is_some_and(|history| !history.may_exist(id)),
-                    |floor| id >= floor,
-                )
-            };
             let allocations = Rc::make_mut(&mut self.allocations);
             let mut failure = Ok(());
             allocations.retain(|id, data| {
@@ -1349,6 +1333,15 @@ impl Environment {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oxc_syntax::symbol::SymbolId;
+
+    const ROOT: InstanceId = 0;
+    fn cell(index: usize) -> CellId {
+        CellId {
+            instance: ROOT,
+            symbol: SymbolId::new(index),
+        }
+    }
 
     fn descriptor_shape(property: &Property) -> (u8, Option<String>) {
         match property {
@@ -1423,11 +1416,59 @@ mod tests {
     }
 
     #[test]
+    fn instance_joins_preserve_births_and_copy_on_write_isolation() -> Result<(), BudgetExceeded> {
+        let budget = WorkBudget::unlimited("instance-cell-join");
+        let first = CellId {
+            instance: 1,
+            symbol: SymbolId::new(0),
+        };
+        let second = CellId {
+            instance: 2,
+            ..first
+        };
+        let third = CellId {
+            instance: 3,
+            ..first
+        };
+        let mut base = Environment::new();
+        base.enter_activation(1);
+        base.record_birth(1, &budget)?;
+        base.insert(first, Fact::Primitive(Value::Number(7.0)), &budget)?;
+        let mut left = base.clone();
+        let mut right = base.clone();
+        left.copy_instance(1, 2, &budget)?;
+        left.insert(second, Fact::Primitive(Value::Number(9.0)), &budget)?;
+        right.copy_instance(1, 3, &budget)?;
+        assert!(matches!(
+            left.read_binding(first, &budget)?,
+            Some(Fact::Primitive(Value::Number(7.0)))
+        ));
+        left.join_returns(&right, &budget)?;
+        assert!(matches!(
+            left.read_binding(second, &budget)?,
+            Some(Fact::Primitive(Value::Number(9.0)))
+        ));
+        assert!(matches!(
+            left.read_binding(third, &budget)?,
+            Some(Fact::Primitive(Value::Number(7.0)))
+        ));
+        let original = left.clone();
+        let mut invalidated = left.clone();
+        invalidated.clear();
+        left.join_returns(&invalidated, &budget)?;
+        left.join_returns(&original, &budget)?;
+        for cell in [first, second, third] {
+            assert!(left.read_binding(cell, &budget)?.is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn binding_reads_charge_primitive_copies_but_not_shared_location_contents(
     ) -> Result<(), BudgetExceeded> {
         let unlimited = WorkBudget::unlimited("binding-setup");
         let mut heap = Environment::new();
-        let symbol = SymbolId::new(0);
+        let symbol = cell(0);
         heap.insert(
             symbol,
             Fact::Primitive(Value::String("x".repeat(8192))),
@@ -1649,21 +1690,21 @@ mod tests {
         data.define_data("x".into(), Some(Fact::Primitive(Value::Number(7.0))));
         for id in 0..128 {
             let fact = heap.allocate(id, data.clone(), &unlimited)?;
-            heap.insert(SymbolId::new(id), fact, &unlimited)?;
+            heap.insert(cell(id), fact, &unlimited)?;
         }
         let mut fork = heap.clone();
         let bounded = WorkBudget::new("unchanged-join", work_budget::BudgetLimits::work(0));
         heap.join(&fork, 128, &bounded)?;
         let bounded = WorkBudget::new("map-detach", work_budget::BudgetLimits::work(16));
         assert!(fork
-            .insert(SymbolId::new(0), Fact::Primitive(Value::Null), &bounded)
+            .insert(cell(0), Fact::Primitive(Value::Null), &bounded)
             .is_err());
-        fork.insert(SymbolId::new(0), Fact::Primitive(Value::Null), &unlimited)?;
+        fork.insert(cell(0), Fact::Primitive(Value::Null), &unlimited)?;
         let bounded = WorkBudget::new("changed-join", work_budget::BudgetLimits::work(16));
         assert!(heap.join(&fork, 128, &bounded).is_err());
-        assert!(matches!(heap.get(SymbolId::new(0)), Some(Fact::Objects(_))));
+        assert!(matches!(heap.get(cell(0)), Some(Fact::Objects(_))));
         heap.join(&fork, 128, &unlimited)?;
-        assert!(heap.get(SymbolId::new(0)).is_none());
+        assert!(heap.get(cell(0)).is_none());
         Ok(())
     }
 
@@ -1693,7 +1734,7 @@ mod tests {
     #[test]
     fn fork_shares_unchanged_maps_and_isolates_the_first_mutation() -> Result<(), BudgetExceeded> {
         let budget = WorkBudget::unlimited("heap-fork");
-        let symbol = SymbolId::new(0);
+        let symbol = cell(0);
         let mut heap = Environment::new();
         let mut data = OwnData::new(AllocationKind::Ordinary);
         data.define_data("x".into(), Some(Fact::Primitive(Value::Number(7.0))));
@@ -1704,10 +1745,10 @@ mod tests {
         heap.insert(symbol, object.clone(), &budget)?;
 
         let unchanged = heap.clone();
-        assert!(Rc::ptr_eq(&heap.bindings, &unchanged.bindings));
+        assert!(heap.bindings.shares(&unchanged.bindings));
         assert!(Rc::ptr_eq(&heap.allocations, &unchanged.allocations));
         heap.join(&unchanged, 1, &budget)?;
-        assert!(Rc::ptr_eq(&heap.bindings, &unchanged.bindings));
+        assert!(heap.bindings.shares(&unchanged.bindings));
         assert!(Rc::ptr_eq(&heap.allocations, &unchanged.allocations));
 
         let mut changed = heap.clone();
@@ -1717,7 +1758,7 @@ mod tests {
             Some(&Fact::Primitive(Value::Number(9.0))),
             &budget
         )?);
-        assert!(Rc::ptr_eq(&heap.bindings, &changed.bindings));
+        assert!(heap.bindings.shares(&changed.bindings));
         assert!(!Rc::ptr_eq(&heap.allocations, &changed.allocations));
         assert!(matches!(
             heap.read(locations, "x", &budget)?,
@@ -1728,7 +1769,7 @@ mod tests {
 
         let mut invalidated = heap.clone();
         invalidated.clear();
-        assert!(invalidated.bindings.is_empty());
+        assert_eq!(invalidated.bindings.len(), 0);
         assert!(invalidated.allocations.is_empty());
         assert!(heap.get(symbol).is_some());
         assert!(heap.allocations.contains_key(&0));
@@ -1753,14 +1794,14 @@ mod tests {
         let mut child_data = OwnData::new(AllocationKind::Ordinary);
         child_data.set_literal_prototype(Some(root.clone()));
         Rc::make_mut(&mut heap.allocations).insert(1, Rc::new(child_data));
-        heap.insert(SymbolId::new(0), root, &budget)?;
+        heap.insert(cell(0), root, &budget)?;
         let mut uncollected = heap.clone();
         let mut peak = 0usize;
         let (mut collected_entries, mut original_entries) = (0usize, 0usize);
         for id in 2..4096 {
             heap.allocate(id, OwnData::new(AllocationKind::Ordinary), &budget)?;
             uncollected.allocate(id, OwnData::new(AllocationKind::Ordinary), &budget)?;
-            heap.collect_if_needed(&budget)?;
+            heap.collect_if_needed(std::iter::once(ROOT), &budget)?;
             peak = peak.max(heap.allocations.len());
             // Both maps would be copied at an unknown conditional branch.
             collected_entries += heap.allocations.len();
@@ -1769,10 +1810,10 @@ mod tests {
         assert!(peak < MIN_COLLECTION_SIZE);
         assert!(collected_entries < original_entries / 32);
         eprintln!("peak retained allocations: {peak} vs {}; cumulative fork entries: {collected_entries} vs {original_entries}", uncollected.allocations.len());
-        heap.collect(&budget)?;
+        heap.collect(std::iter::once(ROOT), &budget)?;
         assert_eq!(heap.allocations.len(), 2);
-        heap.remove(SymbolId::new(0), &budget)?;
-        heap.collect(&budget)?;
+        heap.remove(cell(0), &budget)?;
+        heap.collect(std::iter::once(ROOT), &budget)?;
         assert!(heap.allocations.is_empty());
         Ok(())
     }
@@ -1781,14 +1822,14 @@ mod tests {
     fn retiring_entire_scope_releases_large_allocation_graph() -> Result<(), BudgetExceeded> {
         let budget = WorkBudget::unlimited("heap-collection");
         let mut heap = Environment::new();
-        let symbols = (0..256).map(SymbolId::new).collect::<Vec<_>>();
+        let symbols = (0..256).map(cell).collect::<Vec<_>>();
         for (id, &symbol) in symbols.iter().enumerate() {
             let object = heap.allocate(id, OwnData::new(AllocationKind::Ordinary), &budget)?;
             heap.insert(symbol, object, &budget)?;
-            heap.collect_if_needed(&budget)?;
+            heap.collect_if_needed(std::iter::once(ROOT), &budget)?;
         }
         assert_eq!(heap.allocations.len(), symbols.len());
-        heap.retire_bindings(symbols.iter(), &budget)?;
+        heap.collect_after_scope_exit(ROOT, std::iter::empty(), &budget)?;
         assert!(heap.allocations.is_empty());
         assert_eq!(heap.collection_threshold, MIN_COLLECTION_SIZE);
         Ok(())
@@ -1798,7 +1839,7 @@ mod tests {
     fn collection_distinguishes_unreachable_branch_data_from_invalidation(
     ) -> Result<(), BudgetExceeded> {
         let budget = WorkBudget::unlimited("heap-collection");
-        let symbol = SymbolId::new(0);
+        let symbol = cell(0);
         let mut heap = Environment::new();
         let mut data = OwnData::new(AllocationKind::Ordinary);
         data.define_data("x".into(), Some(Fact::Primitive(Value::Number(7.0))));
@@ -1810,7 +1851,7 @@ mod tests {
         other.protect_before(first_new);
         let replacement = heap.allocate(first_new, data, &budget)?;
         heap.insert(symbol, replacement, &budget)?;
-        heap.collect(&budget)?;
+        heap.collect(std::iter::once(ROOT), &budget)?;
         assert!(heap.allocations.contains_key(&0));
         heap.protect_before(0);
         other.protect_before(0);
