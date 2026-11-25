@@ -840,6 +840,54 @@ fn depythonify_safe_deob_declarative_var_runtime_equivalence() -> Result<()> {
 
 #[test]
 #[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_immediate_activation_runtime_equivalence() -> Result<()> {
+    let sources = [
+        "let a=(()=>[7])();a[0];",
+        "let a=(()=>{let x=[7];return x;})();a[0];",
+        "let a=(function(){var a=[1,2];for(var i=0;i<2;i++)a[i]+=2;return a;})();[a[0],a[1]];",
+        "let a=[1];let b=(x=>{x[0]=7;return x;})(a);[a[0],b[0],a===b];",
+        "let a=(()=>{let a=[7];for(let i=0;i<2;i++){if(i===1)return a;}return [9];})();a[0];",
+        "function f(flag){let a=[7];let b=(()=>{if(flag)return a;return a;})();return b[0];}[f(false),f(true)];",
+        "function f(flag){let a=[7];let b=(()=>{if(flag)throw 0;return a;})();return b[0];}try{f(flag)}catch(e){e;}",
+        "let a=(()=>{events.push('effect');return [7];})();a[0];",
+        "let a=(function(){events.push('effect');return [7];})();a[0];",
+        "let a=(()=>{try{return [7];}finally{}return [9];})();a[0];",
+        "let a=(()=>{try{return [7];}finally{return [9];}})();a[0];",
+        "let a=[7];let old=a;a[(()=>{a=[9];return 0;})()]=11;[old[0],a[0]];",
+        "let a=[[7],(()=>{let b=[8];return b;})()];[a[0][0],a[1][0]];",
+        "let result=[0,0];for(let i=0;i<2;i++){result[i]=(x=>{let a=[x];return a[0];})(i);}[result[0],result[1]];",
+        "let result=[0,0];for(let i=0;i<2;i++){result[i]=(x=>{let a=[x];if(x===1){try{return a[0]}finally{}}return a[0];})(i);}result;",
+        "let outer=[7];let escaped=(function(){var arguments;return [arguments,outer[0]];})();outer[0]=9;escaped[0].callee()[1];",
+        "function expose(){return expose.caller;}let a=[7];let f=(function(){return [expose(),a[0]];})();a[0]=9;f[0]()[1];",
+        "let a=(function(x,x){return [x];})(1,7);a[0];",
+        "let a=(function(x,x){return [x];})(7);a[0];",
+        "let a=(function(p){function p(){return 9}return p;})([7]);a();",
+        "let a=(function(x){'use strict';var x;return x;})([7]);a[0];",
+        "let a=(()=>{var x;return [x];})();a[0];",
+        "let a;{using r={[Symbol.dispose](){a[0]=9;}};a=[7];events.push(a[0]);}a[0];",
+        "let a=(()=>{let x;using r={[Symbol.dispose](){x[0]=9;}};x=[7];return x;})();a[0];",
+        "let a=(()=>{let x;{using r={[Symbol.dispose](){x[0]=9;}};x=[7];return x;}})();a[0];",
+        "let a=(()=>{let x;using r={[Symbol.dispose](){x[0]=9;}};x=[7];return x[0];})();let b=[a];b[0];",
+        "let a;{using r={[Symbol.dispose](){a[0]=9;}};a=[7];let v=(()=>a[0])();events.push(v);}a[0];",
+        "let a;(()=>{using r={[Symbol.dispose](){a[0]=9;}};a=[7];})();a[0];",
+        "let a=(()=>{let x;using r={[Symbol.dispose](){x[0]=9;}};x=[7];for(let i=0;i<1;i++){return x;}})();a[0];",
+        "let a=(()=>{let x;using r={[Symbol.dispose](){throw new Error('dispose');}};x=[7];return x;})();a[0];",
+        "function f(flag){let a=(()=>{if(flag)return [7];return [7];})();return a[0];}[f(true),f(false)];",
+        "function f(flag){let a=(()=>{if(flag)return [[7]];return [[7]];})();return a[0][0];}[f(true),f(false)];",
+        "function f(flag){let a=(()=>{if(flag)return [7];return [9];})();return a[0];}[f(true),f(false)];",
+        "function f(flag){let a=(()=>{if(flag)return (()=>[7])();return [7];})();return a[0];}[f(true),f(false)];",
+        "function f(flag){let a=(()=>{if(flag)return {__proto__:{'x':7}};return {'x':7};})();return a.x;}[f(true),f(false)];",
+        "function f(flag){let a=(()=>{if(flag)return [7];for(let i=0;i<2;i++){if(i===1)return [7];}return [9];})();return a[0];}[f(true),f(false)];",
+        "function f(flag){let a=(()=>{let x=[7];if(flag){using r={[Symbol.dispose](){x[0]=9;}};x=[7];return x;}return x;})();return a[0];}[f(true),f(false)];",
+        "function f(flag){let a=(()=>{let x=[7];if(flag)return x;return [7];})();a[0]=8;return a[0];}[f(true),f(false)];",
+        "function f(flag){let a=(()=>{if(flag)return [7];return [7];})();a[0]=7;return a[0];}[f(true),f(false)];",
+        "function f(flag){let a=[7];let b=(()=>{if(flag)return [7];return [7];})();return a===b;}[f(true),f(false)];",
+    ];
+    script_runtime_equivalence(&sources, "immediate-activation", false)
+}
+
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
 fn depythonify_safe_deob_direct_decoder_runtime_equivalence() -> Result<()> {
     let sources = [
         "const t=['YQ==','Yg=='];function d(i){return atob(t[i])}Array.prototype['00']='Yw==';Array.prototype['0x0']='ZA==';[d(0),d('1'),d(-0),d(1n),d('00'),d('0x0')];",

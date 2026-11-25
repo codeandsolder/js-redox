@@ -23,9 +23,11 @@ use oxc_syntax::{operator::AssignmentOperator, symbol::SymbolId};
 use std::collections::{HashMap, HashSet};
 use work_budget::{BudgetExceeded, WorkBudget};
 
+mod activation;
 mod coverage;
 mod dispatch;
 mod heap;
+mod origins;
 use heap::{
     value_weight, AllocationId, AllocationKind, Environment, Fact, Locations, Lookup, OwnData,
 };
@@ -175,6 +177,9 @@ impl FreshDataReads {
             next_allocation: 0,
             loop_fuel: None,
             loop_failed: false,
+            opaque_generation: 0,
+            pending_disposals: 0,
+            return_frame: None,
         };
         analyzer.visit_program(program);
         analyzer.failure.map_or(Ok(analyzer.reads), Err)
@@ -246,6 +251,9 @@ struct Analyzer<'c> {
     next_allocation: AllocationId,
     loop_fuel: Option<usize>,
     loop_failed: bool,
+    opaque_generation: u64,
+    pending_disposals: usize,
+    return_frame: Option<activation::ReturnFrame>,
 }
 
 impl Analyzer<'_> {
@@ -301,8 +309,13 @@ impl Analyzer<'_> {
             .is_some()
     }
 
-    fn barrier(environment: &mut Environment) -> Evaluation {
+    fn invalidate(&mut self, environment: &mut Environment) {
+        self.opaque_generation = self.opaque_generation.saturating_add(1);
         environment.clear();
+    }
+
+    fn barrier(&mut self, environment: &mut Environment) -> Evaluation {
+        self.invalidate(environment);
         Evaluation::default()
     }
 
@@ -331,20 +344,20 @@ impl Analyzer<'_> {
         environment: &mut Environment,
     ) -> Evaluation {
         let Some(symbol) = self.lexical_reference(identifier) else {
-            return Self::barrier(environment);
+            return self.barrier(environment);
         };
         let Some(reference) = identifier.reference_id.get() else {
-            return Self::barrier(environment);
+            return self.barrier(environment);
         };
         let reference_flags = self.scoping.get_reference(reference);
         // This is an AST value-position read, including the receiver of a
         // property write. MemberWriteTarget marks the containing operation,
         // not a write to the receiver binding itself.
         if !reference_flags.is_read() || reference_flags.is_write() {
-            return Self::barrier(environment);
+            return self.barrier(environment);
         }
         let Some(fact) = self.heap_result(environment.read_binding(symbol, self.budget)) else {
-            return Self::barrier(environment);
+            return self.barrier(environment);
         };
         if let Some(fact) = fact {
             return Evaluation {
@@ -378,7 +391,7 @@ impl Analyzer<'_> {
         let id = self.next_allocation;
         self.next_allocation += 1;
         let Some(fact) = self.heap_result(environment.allocate(id, data, self.budget)) else {
-            return Self::barrier(environment);
+            return self.barrier(environment);
         };
         Evaluation {
             fact: Some(fact),
@@ -400,10 +413,10 @@ impl Analyzer<'_> {
         environment: &mut Environment,
     ) -> Evaluation {
         let Some(name) = key.primitive_value().map(Value::js_string) else {
-            return Self::barrier(environment);
+            return self.barrier(environment);
         };
         let Some(Fact::Objects(locations)) = object.fact else {
-            return Self::barrier(environment);
+            return self.barrier(environment);
         };
         // The receiver was evaluated before the key, but its contents must
         // be read *after* key evaluation, including any effects on aliases.
@@ -411,7 +424,7 @@ impl Analyzer<'_> {
             .heap_result(environment.read(&locations, &name, self.budget))
             .and_then(Result::ok)
         else {
-            return Self::barrier(environment);
+            return self.barrier(environment);
         };
         let inert = object.inert && key.inert;
         Evaluation { fact, inert }
@@ -491,7 +504,7 @@ impl Analyzer<'_> {
             .and_then(|target| self.reference(target, environment))
         else {
             self.unobserved(assignment.span);
-            return Self::barrier(environment);
+            return self.barrier(environment);
         };
         let operator = assignment.operator;
         if operator == AssignmentOperator::Assign {
@@ -500,7 +513,7 @@ impl Analyzer<'_> {
                 .heap_result(reference.write(environment, value.fact.as_ref(), self.budget))
                 .unwrap_or(false)
             {
-                environment.clear();
+                self.invalidate(environment);
             }
             return Evaluation {
                 fact: value.fact,
@@ -513,7 +526,7 @@ impl Analyzer<'_> {
             .and_then(Result::ok)
         else {
             self.unobserved(assignment.right.span());
-            return Self::barrier(environment);
+            return self.barrier(environment);
         };
         if let Some(logical) = operator.to_logical_operator() {
             let decision = previous
@@ -531,11 +544,11 @@ impl Analyzer<'_> {
                 .heap_result(reference.write(environment, value.fact.as_ref(), self.budget))
                 .unwrap_or(false)
             {
-                environment.clear();
+                self.invalidate(environment);
             }
             if let Some((skipped, first_new)) = skipped {
                 if !self.join_heap(environment, &skipped, first_new) {
-                    return Self::barrier(environment);
+                    return self.barrier(environment);
                 }
                 return Evaluation {
                     fact: None,
@@ -555,21 +568,21 @@ impl Analyzer<'_> {
             right.primitive_value(),
         ) {
             if !self.charge_values([left, right]) {
-                return Self::barrier(environment);
+                return self.barrier(environment);
             }
             eval_binary(binary.as_str(), left, right)
         } else {
             None
         };
         let Some(value) = value else {
-            return Self::barrier(environment);
+            return self.barrier(environment);
         };
         let fact = Fact::Primitive(value);
         if !self
             .heap_result(reference.write(environment, Some(&fact), self.budget))
             .unwrap_or(false)
         {
-            environment.clear();
+            self.invalidate(environment);
         }
         Evaluation {
             fact: Some(fact),
@@ -584,7 +597,7 @@ impl Analyzer<'_> {
     ) -> Evaluation {
         let Some(reference) = self.reference(&update.argument, environment) else {
             self.unobserved(update.span);
-            return Self::barrier(environment);
+            return self.barrier(environment);
         };
         let Some(previous) = self
             .heap_result(reference.read(environment, self.budget))
@@ -592,7 +605,7 @@ impl Analyzer<'_> {
             .flatten()
             .and_then(|fact| Some(fact.primitive()?.number()))
         else {
-            return Self::barrier(environment);
+            return self.barrier(environment);
         };
         let next = if update.operator.as_str() == "++" {
             previous + 1.0
@@ -607,7 +620,7 @@ impl Analyzer<'_> {
             ))
             .unwrap_or(false)
         {
-            environment.clear();
+            self.invalidate(environment);
         }
         Evaluation::primitive(
             Value::Number(if update.prefix { next } else { previous }),
@@ -626,7 +639,7 @@ impl Analyzer<'_> {
             .and_then(|member| self.member_reference(member, environment));
         let Some(Reference::Member { locations, key }) = reference else {
             self.unobserved(argument.span());
-            return Self::barrier(environment);
+            return self.barrier(environment);
         };
         if self
             .heap_result(environment.delete(&locations, &key, self.budget))
@@ -634,7 +647,7 @@ impl Analyzer<'_> {
         {
             Evaluation::primitive(Value::Bool(true), false)
         } else {
-            Self::barrier(environment)
+            self.barrier(environment)
         }
     }
 
@@ -650,7 +663,7 @@ impl Analyzer<'_> {
         let argument = self.expression(&unary.argument, environment);
         let value = if let Some(value) = argument.primitive_value() {
             if !self.charge_values([value]) {
-                return Self::barrier(environment);
+                return self.barrier(environment);
             }
             eval_unary_value(operator, value)
         } else {
@@ -675,7 +688,7 @@ impl Analyzer<'_> {
                 fact: None,
                 inert: argument.inert,
             },
-            _ => Self::barrier(environment),
+            _ => self.barrier(environment),
         }
     }
 
@@ -691,7 +704,7 @@ impl Analyzer<'_> {
             (left.primitive_value(), right.primitive_value())
         {
             if !self.charge_values([left_value, right_value]) {
-                return Self::barrier(environment);
+                return self.barrier(environment);
             }
             if let Some(value) = eval_binary(operator, left_value, right_value) {
                 return Evaluation::primitive(value, left.inert && right.inert);
@@ -714,7 +727,7 @@ impl Analyzer<'_> {
                 inert: left.inert && right.inert,
             }
         } else {
-            Self::barrier(environment)
+            self.barrier(environment)
         }
     }
 
@@ -740,7 +753,7 @@ impl Analyzer<'_> {
                 let first_new = self.next_allocation;
                 let right = self.expression(&logical.right, environment);
                 if !self.join_heap(environment, &skip, first_new) {
-                    return Self::barrier(environment);
+                    return self.barrier(environment);
                 }
                 Evaluation {
                     fact: None,
@@ -771,7 +784,7 @@ impl Analyzer<'_> {
         let left = self.expression(&conditional.consequent, environment);
         let right = self.expression(&conditional.alternate, &mut other);
         if !self.join_heap(environment, &other, first_new) {
-            return Self::barrier(environment);
+            return self.barrier(environment);
         }
         let fact = if let (Some(left), Some(right)) = (left.fact.as_ref(), right.fact.as_ref()) {
             self.heap_result(left.join(right, self.budget)).flatten()
@@ -797,14 +810,14 @@ impl Analyzer<'_> {
                 ArrayExpressionElement::Elision(_) => {}
                 ArrayExpressionElement::SpreadElement(spread) => {
                     self.expression(&spread.argument, environment);
-                    environment.clear();
+                    self.invalidate(environment);
                     known_index = false;
                     data.unknown_array_tail();
                     inert = false;
                 }
                 _ => {
                     let Some(value) = element.as_expression() else {
-                        return Self::barrier(environment);
+                        return self.barrier(environment);
                     };
                     let result = self.expression(value, environment);
                     inert &= result.inert;
@@ -838,7 +851,7 @@ impl Analyzer<'_> {
                             Ok(copied) => copied,
                             Err(failure) => {
                                 self.failure = Some(failure);
-                                return Self::barrier(environment);
+                                return self.barrier(environment);
                             }
                         },
                         None => false,
@@ -846,12 +859,12 @@ impl Analyzer<'_> {
                     if copied {
                         inert &= value.inert;
                     } else {
-                        environment.clear();
+                        self.invalidate(environment);
                         if self
                             .heap_result(data.define_unknown_key(true, None, self.budget))
                             .is_none()
                         {
-                            return Self::barrier(environment);
+                            return self.barrier(environment);
                         }
                         inert = false;
                     }
@@ -865,7 +878,7 @@ impl Analyzer<'_> {
                         inert &= result.inert;
                         let key = result.primitive_value().map(Value::js_string);
                         if key.is_none() {
-                            environment.clear();
+                            self.invalidate(environment);
                             inert = false;
                         }
                         key
@@ -880,7 +893,7 @@ impl Analyzer<'_> {
                             .heap_result(data.define_unknown_key(is_data, value.fact, self.budget))
                             .is_none()
                         {
-                            return Self::barrier(environment);
+                            return self.barrier(environment);
                         }
                         continue;
                     };
@@ -908,12 +921,12 @@ impl Analyzer<'_> {
             if matches!(binary.operator.as_str(), "==" | "!=" | "===" | "!=="));
         if member || comparison {
             if self.heap_result(self.budget.consume(1)).is_none() {
-                return Self::barrier(environment);
+                return self.barrier(environment);
             }
             let observation =
                 if let Some(value) = evaluation.primitive_value().filter(|_| evaluation.inert) {
                     if !self.charge_values([value]) {
-                        return Self::barrier(environment);
+                        return self.barrier(environment);
                     }
                     Observation::Exact(value.clone())
                 } else {
@@ -940,7 +953,7 @@ impl Analyzer<'_> {
         environment: &mut Environment,
     ) -> Evaluation {
         if !self.checkpoint() {
-            return Self::barrier(environment);
+            return self.barrier(environment);
         }
         match expression {
             Expression::Identifier(identifier) => self.identifier(identifier, environment),
@@ -953,7 +966,7 @@ impl Analyzer<'_> {
                     .and_then(|member| self.member_components(member, environment))
                 else {
                     self.unobserved(expression.span());
-                    return Self::barrier(environment);
+                    return self.barrier(environment);
                 };
                 self.member(object, &key, environment)
             }
@@ -977,14 +990,17 @@ impl Analyzer<'_> {
             Expression::CallExpression(call) => {
                 // Callee lookup precedes argument evaluation. An unknown
                 // getter/global lookup can mutate anything visible to it.
+                if let Some(result) = self.immediate_call(call, environment) {
+                    return result;
+                }
                 self.expression(&call.callee, environment);
                 self.arguments(&call.arguments, environment);
-                Self::barrier(environment)
+                self.barrier(environment)
             }
             Expression::NewExpression(call) => {
                 self.expression(&call.callee, environment);
                 self.arguments(&call.arguments, environment);
-                Self::barrier(environment)
+                self.barrier(environment)
             }
             Expression::AssignmentExpression(assignment) => {
                 self.assignment(assignment, environment)
@@ -996,7 +1012,7 @@ impl Analyzer<'_> {
             _ => eval(expression).map_or_else(
                 || {
                     self.unobserved(expression.span());
-                    Self::barrier(environment)
+                    self.barrier(environment)
                 },
                 |value| Evaluation::primitive(value, true),
             ),
@@ -1007,7 +1023,7 @@ impl Analyzer<'_> {
         for argument in arguments {
             if let Argument::SpreadElement(spread) = argument {
                 self.expression(&spread.argument, environment);
-                environment.clear();
+                self.invalidate(environment);
             } else if let Some(expression) = argument.as_expression() {
                 self.expression(expression, environment);
             }
@@ -1053,7 +1069,7 @@ impl Analyzer<'_> {
             if kind == VariableDeclarationKind::Var && symbol.is_none() {
                 // ResolveBinding for var initialization precedes its RHS.
                 // An unproved lookup may be observable even before GetValue.
-                environment.clear();
+                self.invalidate(environment);
             }
             let value = declarator.init.as_ref().map_or_else(
                 || Evaluation::primitive(Value::Undefined, true),
@@ -1063,7 +1079,7 @@ impl Analyzer<'_> {
                 if !matches!(declarator.id, BindingPattern::BindingIdentifier(_)) {
                     self.unobserved(declarator.id.span());
                 }
-                environment.clear();
+                self.invalidate(environment);
                 continue;
             };
             if let Some(fact) = value.fact {
@@ -1088,7 +1104,7 @@ impl Analyzer<'_> {
     fn collect_heap(&mut self, environment: &mut Environment) -> bool {
         if let Err(failure) = environment.collect_if_needed(self.budget) {
             self.failure = Some(failure);
-            environment.clear();
+            self.invalidate(environment);
             return false;
         }
         true
@@ -1101,11 +1117,28 @@ impl Analyzer<'_> {
         }
         for statement in statements {
             if !self.statement(statement, environment) || !self.collect_heap(environment) {
+                // An abrupt path has no normal successor, not an opaque effect.
                 environment.clear();
                 return false;
             }
         }
         true
+    }
+
+    /// Implicit disposal runs on leaving a resource-owning scope. Even if
+    /// the returned value was already captured, a disposer can mutate its
+    /// object graph or any other reachable binding.
+    fn enter_resource_scope(&mut self, scope: Option<oxc_syntax::scope::ScopeId>) -> bool {
+        let active = scope.is_some_and(|scope| self.bindings.scope_may_dispose(scope));
+        self.pending_disposals += usize::from(active);
+        active
+    }
+
+    fn leave_resource_scope(&mut self, active: bool, environment: &mut Environment) {
+        if active {
+            self.pending_disposals -= 1;
+            self.invalidate(environment);
+        }
     }
 
     fn retire_scope(
@@ -1150,7 +1183,7 @@ impl Analyzer<'_> {
         &mut self,
         statement: &ForStatement<'_>,
         environment: &mut Environment,
-    ) -> Option<()> {
+    ) -> Option<bool> {
         let test = statement.test.as_ref()?;
         // A literal true test cannot reach a normal exit without a transfer.
         // Avoid spending the entire speculative execution budget on it.
@@ -1168,10 +1201,16 @@ impl Analyzer<'_> {
             self.consume_iteration()?;
             let condition = self.expression(test, environment);
             if !condition.fact.as_ref()?.truthy() {
-                return self.retire_scope(scope, environment).then_some(());
+                return self.retire_scope(scope, environment).then_some(true);
             }
-            if !self.statement(&statement.body, environment) || self.loop_failed {
+            let normal = self.statement(&statement.body, environment);
+            if self.loop_failed {
                 return None;
+            }
+            if !normal {
+                // Direct transfers to the loop are excluded by the shape
+                // proof; return/throw exits the enclosing activation.
+                return self.retire_scope(scope, environment).then_some(false);
             }
             if let Some(update) = &statement.update {
                 self.expression(update, environment);
@@ -1185,7 +1224,7 @@ impl Analyzer<'_> {
     /// Prove a bounded normal execution transaction, including nested loops.
     /// If any test or transfer is unproved, discard speculative observations
     /// as well as the speculative heap. A partial path is not a rewrite proof.
-    fn bounded_for(&mut self, statement: &ForStatement<'_>, environment: &mut Environment) {
+    fn bounded_for(&mut self, statement: &ForStatement<'_>, environment: &mut Environment) -> bool {
         let outermost = self.loop_fuel.is_none();
         if outermost {
             self.loop_fuel = Some(4096);
@@ -1193,12 +1232,21 @@ impl Analyzer<'_> {
         let mut candidate = environment.clone();
         let previous_reads = std::mem::take(&mut self.reads);
         let previous_lists = std::mem::take(&mut self.visited_lists);
+        let previous_returns = self.return_frame.take();
+        self.return_frame = previous_returns
+            .as_ref()
+            .map(activation::ReturnFrame::empty_like);
+        let disposes = self.enter_resource_scope(statement.scope_id.get());
         let result = if self.has_dispatch_shape(statement) {
             self.simulate_dispatch(statement, &mut candidate)
+                .map(|()| true)
         } else {
             self.simulate_for(statement, &mut candidate)
-        };
-        let proven = result.is_some() && !self.loop_failed;
+        }
+        .filter(|_| !self.loop_failed);
+        self.leave_resource_scope(disposes, &mut candidate);
+        let loop_returns = std::mem::replace(&mut self.return_frame, previous_returns);
+        let proven = result.is_some();
         let mut observations = std::mem::replace(&mut self.reads, previous_reads);
         let mut visited = std::mem::replace(&mut self.visited_lists, previous_lists);
         if outermost {
@@ -1215,13 +1263,17 @@ impl Analyzer<'_> {
                     .heap_result(observations.discard_unobserved(&mut visited, self.budget))
                     .is_none()
             {
-                return;
+                return false;
             }
             self.reads.merge(observations);
             self.visited_lists.extend(visited);
             *environment = candidate;
+            self.merge_loop_returns(loop_returns);
+            result.unwrap_or(true)
         } else {
-            environment.clear();
+            self.invalidate(environment);
+            self.unproved_loop_returns(statement);
+            true
         }
     }
 
@@ -1238,14 +1290,16 @@ impl Analyzer<'_> {
                     self.declaration(declaration, environment);
                 } else {
                     self.unobserved(statement.span());
-                    environment.clear();
+                    self.invalidate(environment);
                 }
             }
             Statement::ExpressionStatement(statement) => {
                 self.expression(&statement.expression, environment);
             }
             Statement::BlockStatement(block) => {
+                let disposes = self.enter_resource_scope(block.scope_id.get());
                 let normal = self.statements(&block.body, environment);
+                self.leave_resource_scope(disposes, environment);
                 if block
                     .scope_id
                     .get()
@@ -1256,7 +1310,7 @@ impl Analyzer<'_> {
                 return normal && self.collect_heap(environment);
             }
             Statement::ForStatement(statement) => {
-                self.bounded_for(statement, environment);
+                return self.bounded_for(statement, environment);
             }
             Statement::IfStatement(branch) => {
                 let test = self.expression(&branch.test, environment);
@@ -1293,9 +1347,13 @@ impl Analyzer<'_> {
                 }
             }
             Statement::ReturnStatement(ret) => {
-                if let Some(argument) = &ret.argument {
-                    self.expression(argument, environment);
-                }
+                let value = ret
+                    .argument
+                    .as_ref()
+                    .map_or(Some(Fact::Primitive(Value::Undefined)), |argument| {
+                        self.expression(argument, environment).fact
+                    });
+                self.record_return(value, environment);
                 return false;
             }
             Statement::ThrowStatement(throw) => {
@@ -1306,7 +1364,8 @@ impl Analyzer<'_> {
             Statement::EmptyStatement(_) => {}
             _ => {
                 self.unobserved(statement.span());
-                environment.clear();
+                self.unproved_statement_returns(statement);
+                self.invalidate(environment);
             }
         }
         true
@@ -1424,6 +1483,76 @@ mod tests {
                 .into_iter()
                 .map(|(s, v)| (s.to_owned(), v.to_owned()))
                 .collect::<Vec<_>>();
+            assert_eq!(reads(source)?, expected, "{source}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn immediate_activations_preserve_reaching_allocations() -> Result<(), BudgetExceeded> {
+        for (source, expected) in [
+            ("let a=(()=>[7])();a[0];", vec![("a[0]", "7")]),
+            ("let a=(()=>{let x=[7];return x;})();a[0];", vec![("a[0]", "7")]),
+            ("let a=(function(){var a=[1,2];for(var i=0;i<2;i++)a[i]+=2;return a;})();a[0];a[1];", vec![("a[0]", "3"),("a[1]", "4")]),
+            ("let a=[1];let b=(x=>{x[0]=7;return x;})(a);a[0];b[0];", vec![("a[0]", "7"),("b[0]", "7")]),
+            ("let a=(()=>{let a=[7];for(let i=0;i<2;i++){if(i===1)return a;}return [9];})();a[0];", vec![("a[0]", "7")]),
+            ("function f(flag){let a=[7];let b=(()=>{if(flag)return a;return a;})();return b[0];}", vec![("b[0]", "7")]),
+            ("function f(flag){let a=[7];let b=(()=>{if(flag)throw 0;return a;})();return b[0];}", vec![("b[0]", "7")]),
+            ("let a=(()=>{effect();return [7];})();a[0];", vec![("a[0]", "7")]),
+            ("let a=(function(){effect();return [7];})();a[0];", vec![]),
+            ("let a=(()=>{try{return [7];}finally{}return [9];})();a[0];", vec![]),
+            ("let a=[7];let old=a;a[(()=>{a=[9];return 0;})()]=11;old[0];a[0];", vec![("old[0]", "11"),("a[0]", "9")]),
+            ("let a=[[7],(()=>{let b=[8];return b;})()];a[0][0];a[1][0];", vec![("a[0][0]", "7"),("a[1][0]", "8")]),
+            ("let result=[0,0];for(let i=0;i<2;i++){result[i]=(x=>{let a=[x];return a[0];})(i);}result[0];result[1];", vec![("result[0]", "0"),("result[1]", "1")]),
+            ("let outer=[7];let escaped=(function(){var arguments;return [arguments,outer[0]];})();outer[0]=9;escaped[0].callee()[1];", vec![]),
+        ] {
+            let expected = expected.into_iter().map(|(source, value)| (source.to_owned(), value.to_owned())).collect::<Vec<_>>();
+            assert_eq!(reads(source)?, expected, "{source}");
+        }
+        let aliases = "let a=[1];let b=(x=>x)(a);a===b;";
+        assert_eq!(
+            observed(aliases, true)?,
+            vec![("a===b".into(), "true".into())]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn return_paths_preserve_disjoint_allocation_graphs() -> Result<(), BudgetExceeded> {
+        for (source, expected) in [
+            ("function f(flag){let a=(()=>{if(flag)return [7];return [7];})();return a[0];}", vec![("a[0]", "7")]),
+            ("function f(flag){let a=(()=>{if(flag)return [[7]];return [[7]];})();return a[0][0];}", vec![("a[0][0]", "7")]),
+            ("function f(flag){let a=(()=>{if(flag)return [7];return [9];})();return a[0];}", vec![]),
+            ("function f(flag){let a=(()=>{if(flag)return (()=>[7])();return [7];})();return a[0];}", vec![("a[0]", "7")]),
+            ("function f(flag){let a=(()=>{if(flag)return {__proto__:{'x':7}};return {'x':7};})();return a.x;}", vec![("a.x", "7")]),
+            ("function f(flag){let a=(()=>{if(flag)return [7];for(let i=0;i<2;i++){if(i===1)return [7];}return [9];})();return a[0];}", vec![("a[0]", "7")]),
+            ("function f(flag){let a=(()=>{let x=[7];if(flag){using r={[Symbol.dispose](){x[0]=9;}};x=[7];return x;}return x;})();return a[0];}", vec![]),
+            ("function f(flag){let a=(()=>{let x=[7];if(flag)return x;return [7];})();a[0]=8;return a[0];}", vec![]),
+            ("function f(flag){let a=(()=>{if(flag)return [7];return [7];})();a[0]=7;return a[0];}", vec![("a[0]", "7")]),
+        ] {
+            let expected = expected.into_iter().map(|(source, value)| (source.to_owned(), value.to_owned())).collect::<Vec<_>>();
+            assert_eq!(reads(source)?, expected, "{source}");
+        }
+        let source = "function f(flag){let a=[7];let b=(()=>{if(flag)return [7];return [7];})();return a===b;}";
+        assert_eq!(
+            observed(source, true)?,
+            vec![("a===b".into(), "false".into())]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn disposal_effects_follow_scope_exit_and_return_value_capture() -> Result<(), BudgetExceeded> {
+        for (source, expected) in [
+            ("let a;{using r={[Symbol.dispose](){a[0]=9;}};a=[7];a[0];}a[0];", vec![("a[0]", "7")]),
+            ("let a=(()=>{let x;using r={[Symbol.dispose](){x[0]=9;}};x=[7];return x;})();a[0];", vec![]),
+            ("let a=(()=>{let x;{using r={[Symbol.dispose](){x[0]=9;}};x=[7];return x;}})();a[0];", vec![]),
+            ("let a=(()=>{let x;using r={[Symbol.dispose](){x[0]=9;}};x=[7];return x[0];})();let b=[a];b[0];", vec![("x[0]", "7"), ("b[0]", "7")]),
+            ("let a;{using r={[Symbol.dispose](){a[0]=9;}};a=[7];let v=(()=>a[0])();let b=[v];b[0];}a[0];", vec![("a[0]", "7"), ("b[0]", "7")]),
+            ("let a;(()=>{using r={[Symbol.dispose](){a[0]=9;}};a=[7];})();a[0];", vec![]),
+            ("let a=(()=>{let x;using r={[Symbol.dispose](){x[0]=9;}};x=[7];for(let i=0;i<1;i++){return x;}})();a[0];", vec![]),
+        ] {
+            let expected = expected.into_iter().map(|(source, value)| (source.to_owned(), value.to_owned())).collect::<Vec<_>>();
             assert_eq!(reads(source)?, expected, "{source}");
         }
         Ok(())

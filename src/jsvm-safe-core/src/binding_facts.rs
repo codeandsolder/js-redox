@@ -41,6 +41,7 @@ struct EvalSite {
 pub struct BindingFacts {
     hoisted_vars: HashSet<SymbolId>,
     var_initializer_scopes: HashMap<Span, ScopeId>,
+    resource_scopes: HashSet<ScopeId>,
     parameters: HashSet<SymbolId>,
     simple_parameter_functions: HashSet<ScopeId>,
     arguments_references: Vec<ReferenceId>,
@@ -123,6 +124,7 @@ impl BindingFacts {
         let mut facts = Self {
             hoisted_vars: HashSet::new(),
             var_initializer_scopes: HashMap::new(),
+            resource_scopes: HashSet::new(),
             parameters: HashSet::new(),
             simple_parameter_functions: HashSet::new(),
             arguments_references: Vec::new(),
@@ -525,6 +527,17 @@ impl BindingFacts {
         })
     }
 
+    /// Leaving this lexical scope can invoke a registered resource disposer.
+    pub(crate) fn scope_may_dispose(&self, scope: ScopeId) -> bool {
+        self.resource_scopes.contains(&scope)
+    }
+
+    /// In a sloppy ordinary activation, an observable implicit arguments
+    /// object can expose the callable itself through its callee property.
+    pub(crate) fn implicit_arguments_exposed(&self, scope: ScopeId) -> bool {
+        self.mapped_arguments_exposed.contains(&scope)
+    }
+
     /// A parameter cell may be indirectly written through mapped arguments.
     /// This is a function-local property, including references in arrows.
     pub(crate) fn is_mapped_arguments_exposed(&self, scoping: &Scoping, symbol: SymbolId) -> bool {
@@ -765,6 +778,10 @@ impl<'a> Visit<'a> for BindingFacts {
     }
 
     fn visit_variable_declaration(&mut self, declaration: &VariableDeclaration<'a>) {
+        if declaration.kind.is_using() {
+            self.resource_scopes
+                .extend(self.scopes.last().copied().flatten());
+        }
         if declaration.kind == VariableDeclarationKind::Var {
             for declarator in &declaration.declarations {
                 if declarator.init.is_some()

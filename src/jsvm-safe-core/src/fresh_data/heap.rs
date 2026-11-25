@@ -1,6 +1,7 @@
 //! Abstract heap for flow-local ordinary allocations. References are sets of
 //! allocation identities, never snapshots of object contents. Consequently an
 //! effect or a write through an alias also affects previously captured refs.
+use super::origins::AllocationOrigins;
 use crate::numeric::exact_u32;
 use crate::value_eval::{
     canonical_array_index_key, identical_primitive_value, strict_primitive_equal, Value,
@@ -11,7 +12,7 @@ use std::rc::Rc;
 use work_budget::{BudgetExceeded, WorkBudget};
 
 /// Charge variable-sized operations before allocating or iterating.
-fn charge(budget: &WorkBudget, units: usize) -> Result<(), BudgetExceeded> {
+pub(super) fn charge(budget: &WorkBudget, units: usize) -> Result<(), BudgetExceeded> {
     budget.consume(u64::try_from(units).unwrap_or(u64::MAX))
 }
 
@@ -642,6 +643,8 @@ pub(super) struct Environment {
     allocations: Rc<HashMap<AllocationId, Rc<OwnData>>>,
     collection_threshold: usize,
     collection_floor: AllocationId,
+    collection_suspended: bool,
+    origins: Option<AllocationOrigins>,
 }
 
 impl Default for Environment {
@@ -651,6 +654,8 @@ impl Default for Environment {
             allocations: Rc::default(),
             collection_threshold: MIN_COLLECTION_SIZE,
             collection_floor: 0,
+            collection_suspended: false,
+            origins: None,
         }
     }
 }
@@ -817,6 +822,9 @@ impl Environment {
         budget: &WorkBudget,
     ) -> Result<Fact, BudgetExceeded> {
         self.charge_allocation_copy(budget)?;
+        if let Some(origins) = &mut self.origins {
+            origins.record(id, budget)?;
+        }
         Rc::make_mut(&mut self.allocations).insert(id, Rc::new(data));
         Ok(Fact::Objects(Rc::from([id])))
     }
@@ -832,6 +840,9 @@ impl Environment {
                 retired = retired.saturating_add(locations.len());
             }
         }
+        if self.collection_suspended {
+            return Ok(());
+        }
         if self.bindings.is_empty() && self.collection_floor == 0 {
             self.clear();
         } else if self.allocations.len() >= MIN_COLLECTION_SIZE
@@ -840,6 +851,43 @@ impl Environment {
             self.collect(budget)?;
         }
         Ok(())
+    }
+
+    /// The caller can have pending receiver/argument/return temporaries
+    /// which are not represented by a lexical binding in the callee.
+    pub(super) fn enter_activation(&mut self, next_allocation: AllocationId) {
+        self.collection_suspended = true;
+        // An enclosing activation needs the entire nested creation
+        // history, including allocations invalidated before a return.
+        self.origins
+            .get_or_insert_with(|| AllocationOrigins::new(next_allocation));
+    }
+
+    pub(super) fn leave_activation(&mut self, caller: &Self) {
+        self.collection_suspended = caller.collection_suspended;
+        self.collection_floor = caller.collection_floor;
+        if caller.origins.is_none() {
+            self.origins = None;
+        }
+    }
+
+    pub(super) fn retire_activation(
+        &mut self,
+        scoping: &oxc_semantic::Scoping,
+        owner: oxc_syntax::scope::ScopeId,
+        budget: &WorkBudget,
+    ) -> Result<(), BudgetExceeded> {
+        charge(budget, self.bindings.capacity())?;
+        let retired = self
+            .bindings
+            .keys()
+            .copied()
+            .filter(|&symbol| {
+                let scope = scoping.symbol_scope_id(symbol);
+                scope == owner || scoping.scope_is_descendant_of(scope, owner)
+            })
+            .collect::<Vec<_>>();
+        self.retire_bindings(retired.iter(), budget)
     }
 
     /// Preserve allocations that existed before an outstanding branch
@@ -854,7 +902,7 @@ impl Environment {
     /// object literals need to be kept alive. Lexical bindings and their
     /// transitive (own-property and prototype) edges are the roots.
     pub(super) fn collect_if_needed(&mut self, budget: &WorkBudget) -> Result<(), BudgetExceeded> {
-        if self.allocations.len() < self.collection_threshold {
+        if self.collection_suspended || self.allocations.len() < self.collection_threshold {
             return Ok(());
         }
         self.collect(budget)
@@ -931,6 +979,26 @@ impl Environment {
         first_new: AllocationId,
         budget: &WorkBudget,
     ) -> Result<(), BudgetExceeded> {
+        self.join_paths(other, Some(first_new), budget)
+    }
+
+    /// Return paths may diverge at different points in a function or loop.
+    /// Absence must be established by per-path creation history, not by
+    /// assuming every object created after the call began is branch-local.
+    pub(super) fn join_returns(
+        &mut self,
+        other: &Self,
+        budget: &WorkBudget,
+    ) -> Result<(), BudgetExceeded> {
+        self.join_paths(other, None, budget)
+    }
+
+    fn join_paths(
+        &mut self,
+        other: &Self,
+        first_new: Option<AllocationId>,
+        budget: &WorkBudget,
+    ) -> Result<(), BudgetExceeded> {
         // A failed join is not a usable abstract state: its caller aborts
         // the analysis. Stop merging immediately at the first budget error.
         if !Rc::ptr_eq(&self.bindings, &other.bindings) {
@@ -966,6 +1034,25 @@ impl Environment {
                     .capacity()
                     .saturating_add(other.allocations.capacity()),
             )?;
+            let left_origins = self.origins.as_ref();
+            let right_origins = other.origins.as_ref();
+            if first_new.is_none() {
+                charge(
+                    budget,
+                    self.allocations
+                        .len()
+                        .saturating_mul(right_origins.map_or(1, AllocationOrigins::search_cost))
+                        .saturating_add(other.allocations.len().saturating_mul(
+                            left_origins.map_or(1, AllocationOrigins::search_cost),
+                        )),
+                )?;
+            }
+            let absent = |id, origins: Option<&AllocationOrigins>| {
+                first_new.map_or_else(
+                    || origins.is_some_and(|history| !history.may_exist(id)),
+                    |floor| id >= floor,
+                )
+            };
             let allocations = Rc::make_mut(&mut self.allocations);
             let mut failure = Ok(());
             allocations.retain(|id, data| {
@@ -973,7 +1060,7 @@ impl Environment {
                     return true;
                 }
                 let Some(right) = other.allocations.get(id) else {
-                    return *id >= first_new;
+                    return absent(*id, right_origins);
                 };
                 if !Rc::ptr_eq(data, right) {
                     failure = (|| {
@@ -987,10 +1074,17 @@ impl Environment {
             });
             failure?;
             for (&id, data) in other.allocations.iter() {
-                if id >= first_new {
+                if absent(id, left_origins) {
                     allocations.entry(id).or_insert_with(|| Rc::clone(data));
                 }
             }
+        }
+        // Ordinary branch joins also combine creation history: losing a
+        // birth here would let a later return join resurrect invalid data.
+        if let (Some(left), Some(right)) = (&mut self.origins, &other.origins) {
+            left.join(right, budget)?;
+        } else {
+            self.origins = None;
         }
         Ok(())
     }
@@ -1227,6 +1321,57 @@ mod tests {
             ),
             Property::Opaque => (3, None),
         }
+    }
+
+    #[test]
+    fn return_joins_keep_disjoint_births_but_never_resurrect_invalidated_data(
+    ) -> Result<(), BudgetExceeded> {
+        let budget = WorkBudget::unlimited("return-heap-join");
+        let mut data = OwnData::new(AllocationKind::Ordinary);
+        data.define_data("x".into(), Some(Fact::Primitive(Value::Number(7.0))));
+        let mut heap = Environment::new();
+        heap.allocate(0, data.clone(), &budget)?;
+        heap.enter_activation(1);
+        let mut left = heap.clone();
+        let mut right = heap.clone();
+        left.allocate(1, data.clone(), &budget)?;
+        right.allocate(2, data.clone(), &budget)?;
+        left.join_returns(&right, &budget)?;
+        assert!(matches!(
+            left.read(&Rc::from([0, 1, 2]), "x", &budget)?,
+            Ok(Some(Fact::Primitive(Value::Number(7.0))))
+        ));
+
+        // Both sides can contain allocation 3; one side loses its data
+        // after an effect. A third return from the original state must
+        // not revive that descriptor through the first two returns.
+        left.allocate(3, data.clone(), &budget)?;
+        let third = left.clone();
+        let mut invalidated = left.clone();
+        invalidated.clear();
+        left.join_returns(&invalidated, &budget)?;
+        left.join_returns(&third, &budget)?;
+        assert!(left.read(&Rc::from([3]), "x", &budget)?.is_err());
+
+        // A nested activation shares the parent birth history and a
+        // normal structured branch join must preserve invalidated births.
+        let mut nested = heap.clone();
+        nested.enter_activation(4);
+        nested.allocate(4, data.clone(), &budget)?;
+        nested.leave_activation(&heap);
+        let original = nested.clone();
+        let mut cleared = nested.clone();
+        cleared.clear();
+        let mut sibling = heap;
+        sibling.allocate(5, data, &budget)?;
+        cleared.join(&sibling, 4, &budget)?;
+        cleared.join_returns(&original, &budget)?;
+        assert!(cleared.read(&Rc::from([4]), "x", &budget)?.is_err());
+        assert!(matches!(
+            cleared.read(&Rc::from([5]), "x", &budget)?,
+            Ok(Some(Fact::Primitive(Value::Number(7.0))))
+        ));
+        Ok(())
     }
 
     #[test]
