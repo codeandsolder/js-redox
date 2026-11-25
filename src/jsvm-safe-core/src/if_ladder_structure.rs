@@ -44,6 +44,7 @@ enum Next {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RouteCompletion {
     Number(u64),
+    NegativeZero,
     Empty,
     Undefined,
     Abrupt,
@@ -59,21 +60,19 @@ struct Route {
 }
 
 impl Route {
-    fn jump(state: &str, target: u64) -> Self {
+    fn jump(state: &str, target: u64, expression: &str, negative_zero: bool) -> Self {
         Self {
-            effects: vec![format!("{state} = {target};")],
+            // Preserve the original proven numeric expression, rather than
+            // rendering the unsigned graph label. In particular, -0 and +0
+            // follow the same graph edges but are observable with Object.is.
+            effects: vec![format!("{state} = {expression};")],
             next: Next::State(target),
-            completion: RouteCompletion::Number(target),
+            completion: if negative_zero {
+                RouteCompletion::NegativeZero
+            } else {
+                RouteCompletion::Number(target)
+            },
             transition_proven: true,
-        }
-    }
-
-    fn all_transitions_proven(&self) -> bool {
-        match &self.next {
-            Next::State(_) => self.transition_proven,
-            Next::Choose { yes, no, .. } => {
-                yes.all_transitions_proven() && no.all_transitions_proven()
-            }
         }
     }
 
@@ -98,16 +97,18 @@ impl Route {
         self.change_completion(|_| RouteCompletion::Unproven);
     }
 
-    fn exit_completion(&self, exit: u64, out: &mut Vec<RouteCompletion>) {
+    fn transitions(&self, out: &mut Vec<(u64, RouteCompletion, bool)>) {
         match &self.next {
-            Next::State(target) if *target == exit => out.push(self.completion),
-            Next::Choose { yes, no, .. } => {
-                yes.exit_completion(exit, out);
-                no.exit_completion(exit, out);
+            Next::State(target) => {
+                out.push((*target, self.completion, self.transition_proven));
             }
-            Next::State(_) => {}
+            Next::Choose { yes, no, .. } => {
+                yes.transitions(out);
+                no.transitions(out);
+            }
         }
     }
+
     fn targets(&self, out: &mut Vec<u64>) {
         match &self.next {
             Next::State(target) => out.push(*target),
@@ -203,7 +204,18 @@ fn parse_target(expr: &Expression<'_>, state: &str, source: &str) -> Option<Rout
             result.effects = effects;
             Some(result)
         }
-        expr => Some(Route::jump(state, number(expr)?)),
+        expr => {
+            let Value::Number(value) = eval(expr)? else {
+                return None;
+            };
+            let target = exact_u64(value)?;
+            Some(Route::jump(
+                state,
+                target,
+                fragment(source, expr.span()),
+                value == 0.0 && value.is_sign_negative(),
+            ))
+        }
     }
 }
 
@@ -1471,17 +1483,19 @@ fn while_state_transitions_proven(
 /// numeric dispatch graph. It is separate from the graph's effect/order proof:
 /// the same graph may be safe inside a function but not as the final script
 /// statement, where its Completion value is observable.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum NumericForCompletion {
     Undefined,
-    ExitNumber(u64),
+    Number(u64),
+    NegativeZero,
 }
 
 impl NumericForCompletion {
     fn expression(self) -> String {
         match self {
             Self::Undefined => "void 0".to_owned(),
-            Self::ExitNumber(value) => value.to_string(),
+            Self::Number(value) => value.to_string(),
+            Self::NegativeZero => "-0".to_owned(),
         }
     }
 }
@@ -1494,8 +1508,8 @@ impl NumericForCompletion {
 /// classes, including the explicit undefined produced by an `IfStatement`
 /// `UpdateEmpty` and the Empty produced by var declarations. Only one common
 /// value on all normally exiting routes authorizes a live rewrite.
-/// Zero-valued numeric exits are excluded because state labels collapse +0
-/// and -0, although those Number values remain observably different.
+/// Signed zero is carried as an exact Completion fact independently of
+/// the unsigned state label, which correctly treats both signs as one state.
 pub fn reconstruct_for(
     it: &ForStatement<'_>,
     source: &str,
@@ -5252,6 +5266,34 @@ struct ReconstructedStateLoop {
     normal_completion: Option<NumericForCompletion>,
 }
 
+/// The control-flow graph merges both zero signs for equality and routing,
+/// but a statement Completion carries the sign of the exact source numeric
+/// fact. This is observable in script/eval evaluation and must survive Empty
+/// iterations without conflating the two values.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum LoopAccumulator {
+    Undefined,
+    Number(u64),
+    NegativeZero,
+}
+
+impl LoopAccumulator {
+    const fn certified(self) -> NumericForCompletion {
+        match self {
+            Self::Undefined => NumericForCompletion::Undefined,
+            Self::Number(value) => NumericForCompletion::Number(value),
+            Self::NegativeZero => NumericForCompletion::NegativeZero,
+        }
+    }
+}
+
+/// ECMAScript `ForBodyEvaluation` maintains V, initially undefined. Each
+/// ordinary body result with a non-Empty value *replaces* V; Empty preserves
+/// the prior value. A fixed-point over (state,V) models all normal paths,
+/// including cycles, rather than requiring a literal value on every exit
+/// edge. It is bounded by the existing graph-size proof and an explicit
+/// state/value-product limit; excessive state explosions fail without a
+/// speculative completion result.
 fn proven_normal_exit_completion(
     initial: u64,
     exit: u64,
@@ -5259,36 +5301,56 @@ fn proven_normal_exit_completion(
     reachable: &BTreeSet<u64>,
 ) -> Option<NumericForCompletion> {
     if initial == exit {
-        // The loop condition fails before the first body evaluation; the
-        // specified ForBodyEvaluation accumulator V starts at undefined.
         return Some(NumericForCompletion::Undefined);
     }
-    let mut proven = None;
+
+    let mut transitions = BTreeMap::new();
     for &state in reachable {
-        let route = graph.get(&state)?;
-        if !route.all_transitions_proven() {
+        let mut routes = Vec::new();
+        graph.get(&state)?.transitions(&mut routes);
+        if routes.iter().any(|(_, _, proven)| !proven) {
             return None;
         }
-        let mut exits = Vec::new();
-        route.exit_completion(exit, &mut exits);
-        for exit_value in exits {
-            let candidate = match exit_value {
+        transitions.insert(state, routes);
+    }
+
+    let first = (initial, LoopAccumulator::Undefined);
+    let mut queue = VecDeque::from([first]);
+    let mut visited = BTreeSet::from([first]);
+    let mut exits = BTreeSet::new();
+    while let Some((state, previous)) = queue.pop_front() {
+        if state == exit {
+            exits.insert(previous);
+            continue;
+        }
+        for &(next, completion, _) in transitions.get(&state)? {
+            let value = match completion {
                 RouteCompletion::Abrupt => continue,
-                RouteCompletion::Number(value) if value == exit && exit != 0 => {
-                    NumericForCompletion::ExitNumber(exit)
-                }
-                RouteCompletion::Undefined => NumericForCompletion::Undefined,
-                RouteCompletion::Number(_) | RouteCompletion::Empty | RouteCompletion::Unproven => {
-                    return None;
-                }
+                RouteCompletion::Empty => previous,
+                RouteCompletion::Undefined => LoopAccumulator::Undefined,
+                RouteCompletion::Number(value) => LoopAccumulator::Number(value),
+                RouteCompletion::NegativeZero => LoopAccumulator::NegativeZero,
+                RouteCompletion::Unproven => return None,
             };
-            if proven.is_some_and(|previous| previous != candidate) {
+            if next != exit && !reachable.contains(&next) {
                 return None;
             }
-            proven = Some(candidate);
+            if visited.insert((next, value)) {
+                // 2048 possible source states times their distinct last
+                // Completion values is finite, but may be very large.
+                // Bound the proof rather than allocating an unbounded matrix.
+                if visited.len() > 16_384 {
+                    return None;
+                }
+                queue.push_back((next, value));
+            }
         }
     }
-    proven
+    if exits.len() == 1 {
+        Some(exits.into_iter().next()?.certified())
+    } else {
+        None
+    }
 }
 
 fn reconstruct_state_loop(
@@ -5364,8 +5426,8 @@ fn reconstruct_state_loop(
 #[cfg(test)]
 mod tests {
     use super::{
-        closed_exception_dag_region, ordered_natural_loop_side, reconstruct_for,
-        ExceptionEntryProof, Next, Route, RouteCompletion,
+        closed_exception_dag_region, ordered_natural_loop_side, proven_normal_exit_completion,
+        reconstruct_for, ExceptionEntryProof, Next, NumericForCompletion, Route, RouteCompletion,
     };
     use crate::deobfuscate;
     use oxc_allocator::Allocator;
@@ -5377,6 +5439,442 @@ mod tests {
     use work_budget::WorkBudget;
 
     #[test]
+    #[ignore = "requires Node; verify observable signed-zero assignment and effect order"]
+    fn node_confirms_signed_zero_state_assignment_keeps_original_expression(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::process::Command;
+        let source = r"
+let s, seen=[];
+for(s=1;s!=9;)
+    s==1 ? (s=-0)
+    : s==0 ? (seen.push(Object.is(s,-0)),s=9)
+    : s==9 && (s=9);
+seen.join('|');";
+        let recovered = deobfuscate(
+            source,
+            12,
+            &WorkBudget::unlimited("signed-zero-state-original-expression"),
+        )?
+        .ok_or_else(|| std::io::Error::other("valid source did not recover"))?;
+        assert!(
+            recovered
+                .transforms
+                .get("if_ladder_structured")
+                .is_some_and(|count| *count > 0),
+            "{:?}: {}",
+            recovered.transforms,
+            recovered.source
+        );
+        let harness = r"
+const vm=require('node:vm');
+const src=process.argv[1],mode=process.argv[2];
+const code=mode==='eval'?'eval('+JSON.stringify(src)+')':src;
+const options={};options.timeout=1500;
+try {
+ const result=vm.runInNewContext(code,{},options);
+ console.log(JSON.stringify({type:typeof result, value:result}));
+} catch(error){
+ console.log(JSON.stringify({type:'throw',name:error.name}));
+}
+";
+        for mode in ["script", "eval"] {
+            let execute = |code: &str| -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+                let output = Command::new("node")
+                    .arg("-e")
+                    .arg(harness)
+                    .arg(code)
+                    .arg(mode)
+                    .output()?;
+                assert!(output.status.success(), "{output:?}");
+                Ok(serde_json::from_slice(&output.stdout)?)
+            };
+            let before = execute(source)?;
+            let after = execute(&recovered.source)?;
+            assert_eq!(before["value"], "true");
+            assert_eq!(
+                before, after,
+                "{mode}: signed zero changed: {}",
+                recovered.source
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires Node; differential matrix over concrete dispatcher paths"]
+    fn node_confirms_composed_dispatcher_completion_matrix(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::process::Command;
+        let entry_cases = [
+            "s=9;",
+            "let x=(s=9,[]);",
+            "s=2;",
+            "s=flag?9:2;",
+            "s=-0;",
+            "s=0;",
+            "globalThis.events.push('A');s=2;",
+            "let x=(s=2,[]);",
+        ];
+        let second_cases = [
+            "s=9;",
+            "let y=(s=9,[]);",
+            "s=3;",
+            "globalThis.events.push('B');s=9;",
+        ];
+        let third_cases = ["s=9;", "let z=(s=9,[]);"];
+        let harness = r"
+const vm=require('node:vm');
+const source=process.argv[1],flag=process.argv[2]==='true';
+const mode=process.argv[3],context={};
+context.flag=flag;
+const code=mode==='eval'?'eval('+JSON.stringify(source)+')':source;
+const options={};
+options.timeout=800;
+try {
+ const value=vm.runInNewContext(code,context,options);
+ console.log(JSON.stringify({
+  type:value===undefined?'undefined':typeof value,
+  value:value===undefined?null:value,
+  negativeZero:Object.is(value,-0),
+  events:context.events
+ }));
+} catch(error) {
+ console.log(JSON.stringify({type:'throw',name:error.name,events:context.events}));
+}
+";
+        let mut transformations = 0usize;
+        let mut comparisons = 0usize;
+        for (first_index, first) in entry_cases.iter().enumerate() {
+            for (second_index, second) in second_cases.iter().enumerate() {
+                for (third_index, third) in third_cases.iter().enumerate() {
+                    let source = format!(
+                        "let s;globalThis.events=[];for(s=1;s!=9;)                         if(s==1){{{first}}}                         else if(s==2){{{second}}}                         else if(s==3){{{third}}}                         else if(s==0){{globalThis.events.push(Object.is(s,-0));s=9;}}                         else if(s==9){{s=9;}}"
+                    );
+                    let recovered = deobfuscate(
+                        &source,
+                        12,
+                        &WorkBudget::unlimited("composed-dispatcher-completion-matrix"),
+                    )?
+                    .ok_or_else(|| std::io::Error::other("valid JS must recover"))?;
+                    transformations += recovered
+                        .transforms
+                        .get("if_ladder_structured")
+                        .copied()
+                        .unwrap_or(0);
+                    for flag in [false, true] {
+                        for mode in ["script", "eval"] {
+                            let observe = |code: &str| -> Result<
+                                serde_json::Value,
+                                Box<dyn std::error::Error>,
+                            > {
+                                let output = Command::new("node")
+                                    .arg("-e")
+                                    .arg(harness)
+                                    .arg(code)
+                                    .arg(flag.to_string())
+                                    .arg(mode)
+                                    .output()?;
+                                assert!(output.status.success(), "{output:?}");
+                                Ok(serde_json::from_slice(&output.stdout)?)
+                            };
+                            let before = observe(&source)?;
+                            let after = observe(&recovered.source)?;
+                            assert_eq!(
+                                before, after,
+                                "dispatcher ({first_index},{second_index},{third_index}),                                  flag={flag}, mode={mode}: {}", recovered.source
+                            );
+                            comparisons += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(comparisons, 256);
+        assert!(transformations >= 8, "{transformations} recovered loops");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires Node; confirm exact signed-zero ScriptEvaluation Completion"]
+    fn node_confirms_signed_zero_exit_completions_are_not_conflated(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::process::Command;
+        let sources = [
+            ("let s;for(s=1;s!=0;)s==1?(s=0):s==0&&(s=0);", false),
+            ("let s;for(s=1;s!=0;)s==1?(s=-0):s==0&&(s=0);", true),
+        ];
+        let harness = r"
+const vm=require('node:vm');
+const source=process.argv[1],mode=process.argv[2];
+const code=mode==='eval'?'eval('+JSON.stringify(source)+')':source;
+const options={};options.timeout=1200;
+try{
+ const value=vm.runInNewContext(code,{},options);
+ console.log(JSON.stringify({type:typeof value,
+   negativeZero:Object.is(value,-0),positiveZero:Object.is(value,0)}));
+}catch(error){
+ console.log(JSON.stringify({type:'throw',name:error.name}));
+}
+";
+        for (source, negative) in sources {
+            let recovered =
+                deobfuscate(source, 12, &WorkBudget::unlimited("signed-zero-loop-exit"))?
+                    .ok_or_else(|| std::io::Error::other("valid signed-zero loop must recover"))?;
+            assert!(
+                recovered
+                    .transforms
+                    .get("if_ladder_structured")
+                    .is_some_and(|count| *count > 0),
+                "{:?}: {}",
+                recovered.transforms,
+                recovered.source
+            );
+            for mode in ["script", "eval"] {
+                let observe =
+                    |input: &str| -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+                        let output = Command::new("node")
+                            .arg("-e")
+                            .arg(harness)
+                            .arg(input)
+                            .arg(mode)
+                            .output()?;
+                        assert!(output.status.success(), "{output:?}");
+                        Ok(serde_json::from_slice(&output.stdout)?)
+                    };
+                let before = observe(source)?;
+                let after = observe(&recovered.source)?;
+                assert_eq!(before["negativeZero"], negative);
+                assert_eq!(before, after, "{mode}: {}", recovered.source);
+            }
+        }
+        Ok(())
+    }
+
+    fn fixed_point_edge(target: u64, completion: RouteCompletion) -> Route {
+        Route {
+            effects: Vec::new(),
+            next: Next::State(target),
+            completion,
+            transition_proven: true,
+        }
+    }
+
+    fn fixed_point_fork(yes: Route, no: Route) -> Route {
+        Route {
+            effects: Vec::new(),
+            next: Next::Choose {
+                condition: "flag".to_owned(),
+                yes: Box::new(yes),
+                no: Box::new(no),
+            },
+            completion: RouteCompletion::Unproven,
+            transition_proven: true,
+        }
+    }
+
+    fn fixed_point_proof(
+        initial: u64,
+        routes: &BTreeMap<u64, Route>,
+    ) -> Option<NumericForCompletion> {
+        let reachable = routes.keys().copied().collect();
+        proven_normal_exit_completion(initial, 9, routes, &reachable)
+    }
+
+    #[test]
+    fn loop_completion_preserves_empty_and_handles_multiple_paths() {
+        assert_eq!(
+            fixed_point_proof(9, &BTreeMap::new()),
+            Some(NumericForCompletion::Undefined)
+        );
+        assert_eq!(
+            fixed_point_proof(
+                1,
+                &BTreeMap::from([
+                    (1, fixed_point_edge(3, RouteCompletion::Number(3))),
+                    (3, fixed_point_edge(9, RouteCompletion::Empty)),
+                ])
+            ),
+            Some(NumericForCompletion::Number(3)),
+        );
+        assert_eq!(
+            fixed_point_proof(
+                1,
+                &BTreeMap::from([
+                    (1, fixed_point_edge(3, RouteCompletion::Number(3))),
+                    (3, fixed_point_edge(9, RouteCompletion::Undefined)),
+                ])
+            ),
+            Some(NumericForCompletion::Undefined),
+        );
+        assert_eq!(
+            fixed_point_proof(
+                1,
+                &BTreeMap::from([
+                    (
+                        1,
+                        fixed_point_fork(
+                            fixed_point_edge(9, RouteCompletion::Number(9)),
+                            fixed_point_edge(3, RouteCompletion::Number(9)),
+                        )
+                    ),
+                    (3, fixed_point_edge(9, RouteCompletion::Empty)),
+                ])
+            ),
+            Some(NumericForCompletion::Number(9)),
+        );
+        assert_eq!(
+            fixed_point_proof(
+                1,
+                &BTreeMap::from([
+                    (
+                        1,
+                        fixed_point_fork(
+                            fixed_point_edge(9, RouteCompletion::Undefined),
+                            fixed_point_edge(3, RouteCompletion::Number(3)),
+                        )
+                    ),
+                    (3, fixed_point_edge(9, RouteCompletion::Empty)),
+                ])
+            ),
+            None,
+        );
+        assert_eq!(
+            fixed_point_proof(
+                1,
+                &BTreeMap::from([(
+                    1,
+                    fixed_point_fork(
+                        fixed_point_edge(1, RouteCompletion::Empty),
+                        fixed_point_edge(9, RouteCompletion::Number(9)),
+                    )
+                )])
+            ),
+            Some(NumericForCompletion::Number(9)),
+        );
+    }
+
+    #[test]
+    fn loop_completion_distinguishes_zero_signs_and_abrupt_paths() {
+        assert_eq!(
+            fixed_point_proof(
+                1,
+                &BTreeMap::from([(
+                    1,
+                    fixed_point_fork(
+                        fixed_point_edge(1, RouteCompletion::Number(3)),
+                        fixed_point_edge(9, RouteCompletion::Empty),
+                    )
+                )])
+            ),
+            None,
+        );
+        assert_eq!(
+            fixed_point_proof(
+                1,
+                &BTreeMap::from([(
+                    1,
+                    fixed_point_fork(
+                        fixed_point_edge(9, RouteCompletion::Abrupt),
+                        fixed_point_edge(9, RouteCompletion::Number(9)),
+                    )
+                )])
+            ),
+            Some(NumericForCompletion::Number(9)),
+        );
+        assert_eq!(
+            fixed_point_proof(
+                1,
+                &BTreeMap::from([(1, fixed_point_edge(9, RouteCompletion::Number(0)))])
+            ),
+            Some(NumericForCompletion::Number(0)),
+        );
+        assert_eq!(
+            fixed_point_proof(
+                1,
+                &BTreeMap::from([(1, fixed_point_edge(9, RouteCompletion::NegativeZero))])
+            ),
+            Some(NumericForCompletion::NegativeZero),
+        );
+        assert_eq!(
+            fixed_point_proof(
+                1,
+                &BTreeMap::from([(
+                    1,
+                    fixed_point_fork(
+                        fixed_point_edge(9, RouteCompletion::Number(0)),
+                        fixed_point_edge(9, RouteCompletion::NegativeZero),
+                    ),
+                )])
+            ),
+            None,
+        );
+        assert_eq!(
+            fixed_point_proof(
+                1,
+                &BTreeMap::from([
+                    (1, fixed_point_edge(0, RouteCompletion::Number(0))),
+                    (0, fixed_point_edge(9, RouteCompletion::Number(9))),
+                ])
+            ),
+            Some(NumericForCompletion::Number(9)),
+        );
+    }
+
+    #[test]
+    fn loop_completion_handles_cycles_and_rejects_unproven_edges() {
+        assert_eq!(
+            fixed_point_proof(
+                1,
+                &BTreeMap::from([
+                    (1, fixed_point_edge(0, RouteCompletion::Number(0))),
+                    (0, fixed_point_edge(9, RouteCompletion::Empty)),
+                ])
+            ),
+            Some(NumericForCompletion::Number(0)),
+        );
+        assert_eq!(
+            fixed_point_proof(
+                1,
+                &BTreeMap::from([
+                    (1, fixed_point_edge(0, RouteCompletion::NegativeZero)),
+                    (0, fixed_point_edge(9, RouteCompletion::Empty)),
+                ])
+            ),
+            Some(NumericForCompletion::NegativeZero),
+        );
+        assert_eq!(
+            fixed_point_proof(
+                1,
+                &BTreeMap::from([
+                    (1, fixed_point_edge(0, RouteCompletion::NegativeZero)),
+                    (0, fixed_point_edge(9, RouteCompletion::Number(9))),
+                ])
+            ),
+            Some(NumericForCompletion::Number(9)),
+        );
+        assert_eq!(
+            fixed_point_proof(
+                1,
+                &BTreeMap::from([(1, fixed_point_edge(1, RouteCompletion::Empty))])
+            ),
+            None,
+        );
+        assert_eq!(
+            fixed_point_proof(
+                1,
+                &BTreeMap::from([(
+                    1,
+                    Route {
+                        transition_proven: false,
+                        ..fixed_point_edge(9, RouteCompletion::Number(9))
+                    }
+                )])
+            ),
+            None,
+        );
+    }
+
+    #[test]
     fn duplicate_conditional_successors_count_as_one_incoming_edge() {
         let choose = |yes, no| Route {
             effects: Vec::new(),
@@ -5384,16 +5882,16 @@ mod tests {
             transition_proven: true,
             next: Next::Choose {
                 condition: "pick()".to_owned(),
-                yes: Box::new(Route::jump("state", yes)),
-                no: Box::new(Route::jump("state", no)),
+                yes: Box::new(Route::jump("state", yes, &yes.to_string(), false)),
+                no: Box::new(Route::jump("state", no, &no.to_string(), false)),
             },
         };
         let cases = BTreeMap::from([
             (1, Some(choose(2, 3))),
             (2, Some(choose(4, 4))),
-            (3, Some(Route::jump("state", 5))),
-            (4, Some(Route::jump("state", 5))),
-            (5, Some(Route::jump("state", 9))),
+            (3, Some(Route::jump("state", 5, "5", false))),
+            (4, Some(Route::jump("state", 5, "5", false))),
+            (5, Some(Route::jump("state", 9, "9", false))),
         ]);
         let roots = BTreeSet::from([1]);
         let reachable = BTreeSet::from([1, 2, 3, 4, 5]);
@@ -5426,14 +5924,14 @@ mod tests {
             transition_proven: true,
             next: Next::Choose {
                 condition: "pick()".to_owned(),
-                yes: Box::new(Route::jump("state", yes)),
-                no: Box::new(Route::jump("state", no)),
+                yes: Box::new(Route::jump("state", yes, &yes.to_string(), false)),
+                no: Box::new(Route::jump("state", no, &no.to_string(), false)),
             },
         };
         let graph = BTreeMap::from([
             (1, choose(2, 99)),
             (2, choose(3, 3)),
-            (3, Route::jump("state", 1)),
+            (3, Route::jump("state", 1, "1", false)),
         ]);
         let incoming = BTreeMap::from([
             (1, BTreeSet::from([3])),
@@ -5864,10 +6362,8 @@ mod tests {
     }
 
     #[test]
-    fn live_loop_proof_refuses_unmodeled_statement_and_signed_zero_completions() {
+    fn live_loop_proof_refuses_unmodeled_statement_and_binding_completions() {
         for source in [
-            "let s;for(s=1;s!=0;)s==1?(s=0):s==0&&(s=0);",
-            "let s;for(s=1;s!=-0;)s==1?(s=-0):s==0&&(s=0);",
             "var s;for(s=1;s!=9;)if(s==1){s=9;var x;}else if(s==9){s=9;}",
             // An unresolved global may be an accessor with observable side
             // effects, not the proved lexical state binding.
