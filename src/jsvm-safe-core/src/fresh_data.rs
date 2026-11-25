@@ -1945,53 +1945,53 @@ mod tests {
     {
         for (source, expected) in [
             (
-                "let a,b;({x:a,y:b}={x:7,y:9});let r=[a,b];r[0];r[1];",
+                "let a,b;({x: a,y:b}={x: 7,y:9});let r=[a,b];r[0];r[1];",
                 vec![("r[0]", "7"), ("r[1]", "9")],
             ),
             ("let x;({x}={x: 7});let r=[x];r[0];", vec![("r[0]", "7")]),
             (
-                "let x;({x=7}={x:void 0});let r=[x];r[0];",
+                "let x;({x=7}={x: void 0});let r=[x];r[0];",
                 vec![("r[0]", "7")],
             ),
             (
-                "let x;({x=7}={x:null});let r=[x];r[0];",
+                "let x;({x=7}={x: null});let r=[x];r[0];",
                 vec![("r[0]", "null")],
             ),
             (
-                "let x;({x:{y:x=7}}={x:{y:void 0}});let r=[x];r[0];",
+                "let x;({x: {y:x=7}}={x: {y:void 0}});let r=[x];r[0];",
                 vec![("r[0]", "7")],
             ),
             (
-                "let a=[1],s={x:7};({x:a[(s.x=9,0)]}=s);a[0];",
+                "let a=[1],s={x: 7};({x: a[(s.x=9,0)]}=s);a[0];",
                 vec![("a[0]", "9")],
             ),
             (
-                "let s={x:7},a=[1],old=a;({x:a[(a=[9],0)]}=s);old[0];a[0];",
+                "let s={x: 7},a=[1],old=a;({x: a[(a=[9],0)]}=s);old[0];a[0];",
                 vec![("old[0]", "7"), ("a[0]", "9")],
             ),
             (
-                "let a=[0],old=a,s={x:void 0};({x:a[0]=(a=[9],7)}=s);old[0];a[0];",
+                "let a=[0],old=a,s={x: void 0};({x: a[0]=(a=[9],7)}=s);old[0];a[0];",
                 vec![("old[0]", "7"), ("a[0]", "9")],
             ),
             (
-                "let a=[0],s={x:7,y:8};({x:a[0],...a[(s.y=9,1)]}=s);a[0];a[1].y;",
+                "let a=[0],s={x: 7,y:8};({x: a[0],...a[(s.y=9,1)]}=s);a[0];a[1].y;",
                 vec![("a[0]", "7"), ("a[1].y", "9")],
             ),
             (
-                "let s={x:7,y:8},a,r;({x:a,...r}=s);let q=[a,r.y];q[0];q[1];",
+                "let s={x: 7,y:8},a,r;({x: a,...r}=s);let q=[a,r.y];q[0];q[1];",
                 vec![("r.y", "8"), ("q[0]", "7"), ("q[1]", "8")],
             ),
-            ("let s={x:7},a;let r=({x:a}=s);r.x;", vec![("r.x", "7")]),
+            ("let s={x: 7},a;let r=({x: a}=s);r.x;", vec![("r.x", "7")]),
             (
-                "let s={x:7,y:8},a=[0];({x:a[0],y:a[0]}=s);a[0];",
+                "let s={x: 7,y:8},a=[0];({x: a[0],y:a[0]}=s);a[0];",
                 vec![("a[0]", "8")],
             ),
             (
-                "let s={x:7},a=[0];({[(s.x=9,'x')]:a[0]}=s);a[0];",
+                "let s={x: 7},a=[0];({[(s.x=9,'x')]:a[0]}=s);a[0];",
                 vec![("a[0]", "9")],
             ),
             (
-                "let a=[7],s={x:9};let k={toString(){a[0]=11;return 'x'}};({[k]:a[0]}=s);a[0];",
+                "let a=[7],s={x: 9};let k={toString(){a[0]=11;return 'x'}};({[k]:a[0]}=s);a[0];",
                 vec![],
             ),
             (
@@ -2000,7 +2000,7 @@ mod tests {
             ),
             ("let a=[7];let x;[x]=a;a[0];", vec![]),
             (
-                "let f=function(x){({a:arguments[0]}={a: 9});return [x]};let r=f(7);r[0];",
+                "let f=function(x){({a: arguments[0]}={a: 9});return [x]};let r=f(7);r[0];",
                 vec![("r[0]", "9")],
             ),
         ] {

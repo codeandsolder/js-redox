@@ -134,11 +134,11 @@ impl Analyzer<'_, '_> {
         for property in &pattern.properties {
             let key = self.pattern_key(&property.key, property.computed, environment);
             source.record_key(self, &key)?;
-            let value = source.read(self, &key, environment)?;
+            let value = source.read(self, &key, environment)?.fact;
             self.bind_pattern(&property.value, value, environment)?;
         }
         if let Some(rest) = &pattern.rest {
-            let value = source.rest(self, environment)?;
+            let value = source.rest(self, environment)?.fact;
             self.bind_pattern(&rest.argument, value, environment)?;
         }
         Some(())

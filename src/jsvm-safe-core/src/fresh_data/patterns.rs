@@ -47,31 +47,27 @@ impl<'a> ObjectPatternSource<'a> {
         analyzer: &mut Analyzer<'_, '_>,
         key: &Evaluation,
         environment: &mut Environment,
-    ) -> Option<Option<Fact>> {
+    ) -> Option<Evaluation> {
         let receiver = self
             .value
             .map(|value| value.copy(analyzer.budget))
             .transpose();
         let receiver = analyzer.heap_result(receiver)?;
-        Some(
-            analyzer
-                .member(
-                    Evaluation {
-                        fact: receiver,
-                        inert: true,
-                    },
-                    key,
-                    environment,
-                )
-                .fact,
-        )
+        Some(analyzer.member(
+            Evaluation {
+                fact: receiver,
+                inert: true,
+            },
+            key,
+            environment,
+        ))
     }
 
     pub(super) fn rest(
         &self,
         analyzer: &mut Analyzer<'_, '_>,
         environment: &mut Environment,
-    ) -> Option<Option<Fact>> {
+    ) -> Option<Evaluation> {
         let mut data = OwnData::new(AllocationKind::Ordinary);
         let copied = if let (Some(source), Some(excluded)) = (self.value, &self.excluded) {
             analyzer.heap_result(data.spread_excluding(
@@ -87,7 +83,7 @@ impl<'a> ObjectPatternSource<'a> {
             analyzer.invalidate(environment);
             analyzer.heap_result(data.define_unknown_key(true, None, analyzer.budget))?;
         }
-        Some(analyzer.allocate(environment, data, copied).fact)
+        Some(analyzer.allocate(environment, data, copied))
     }
 }
 
@@ -176,19 +172,17 @@ impl Analyzer<'_, '_> {
     fn write_destination(
         &mut self,
         destination: Destination<'_, '_>,
-        value: Option<Fact>,
+        value: Option<&Fact>,
         environment: &mut Environment,
     ) -> Option<()> {
         match destination {
             Destination::Reference(reference) => {
-                if !self.heap_result(reference.write(environment, value.as_ref(), self.budget))? {
+                if !self.heap_result(reference.write(environment, value, self.budget))? {
                     self.invalidate(environment);
                 }
                 Some(())
             }
-            Destination::Pattern(pattern) => {
-                self.assign_pattern(pattern, value.as_ref(), environment)
-            }
+            Destination::Pattern(pattern) => self.assign_pattern(pattern, value, environment),
         }
     }
 
@@ -233,16 +227,16 @@ impl Analyzer<'_, '_> {
         for property in &pattern.properties {
             let (key, destination, default) = self.assignment_property(property, environment)?;
             source.record_key(self, &key)?;
-            let mut value = source.read(self, &key, environment)?;
+            let mut value = source.read(self, &key, environment)?.fact;
             if let Some(default) = default {
                 value = self.apply_default(value, default, environment);
             }
-            self.write_destination(destination, value, environment)?;
+            self.write_destination(destination, value.as_ref(), environment)?;
         }
         if let Some(rest) = &pattern.rest {
             let destination = self.destination(&rest.target, environment)?;
-            let value = source.rest(self, environment)?;
-            self.write_destination(destination, value, environment)?;
+            let value = source.rest(self, environment)?.fact;
+            self.write_destination(destination, value.as_ref(), environment)?;
         }
         Some(())
     }
