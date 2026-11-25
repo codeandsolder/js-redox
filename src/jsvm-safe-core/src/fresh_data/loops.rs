@@ -51,6 +51,44 @@ impl<'a, 'ast> Loop<'a, 'ast> {
     }
 }
 
+/// Brent-style exponentially spaced checkpoints bound retained heap
+/// snapshots while detecting stalled or cyclic abstract continuations.
+/// An identical abstract state may represent different concrete states,
+/// so stop speculation and leave the source unchanged rather than infer
+/// termination or divergence.
+struct ProgressProbe {
+    checkpoint: Environment,
+    interval: usize,
+    elapsed: usize,
+}
+
+impl ProgressProbe {
+    fn new(environment: &Environment) -> Self {
+        Self {
+            checkpoint: environment.clone(),
+            interval: 1,
+            elapsed: 0,
+        }
+    }
+
+    fn stalled(
+        &mut self,
+        environment: &Environment,
+        budget: &WorkBudget,
+    ) -> Result<bool, BudgetExceeded> {
+        if self.checkpoint.same_reaching_state(environment, budget)? {
+            return Ok(true);
+        }
+        self.elapsed += 1;
+        if self.elapsed == self.interval {
+            self.checkpoint = environment.clone();
+            self.interval = self.interval.saturating_mul(2);
+            self.elapsed = 0;
+        }
+        Ok(false)
+    }
+}
+
 struct LoopRun {
     flow: Flow,
     normal_exit: Option<Path>,
@@ -190,6 +228,7 @@ impl Analyzer<'_, '_> {
             return None;
         }
         let mut run = LoopRun::new();
+        let mut progress = ProgressProbe::new(environment);
         while run.flow.normal.is_some() {
             self.consume_iteration()?;
             if !matches!(node, Loop::DoWhile(_)) && !self.loop_test(node, environment)? {
@@ -214,7 +253,9 @@ impl Analyzer<'_, '_> {
                 self.heap_result(run.record_test_exit(environment, self.budget))?;
                 break;
             }
-            if !self.collect_heap(environment) {
+            if !self.collect_heap(environment)
+                || self.heap_result(progress.stalled(environment, self.budget))?
+            {
                 return None;
             }
         }

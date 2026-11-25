@@ -125,6 +125,41 @@ impl CellStore {
         Ok(())
     }
 
+    pub(super) fn same_state(
+        &self,
+        other: &Self,
+        budget: &WorkBudget,
+    ) -> Result<bool, BudgetExceeded> {
+        if Rc::ptr_eq(&self.instances, &other.instances) {
+            return Ok(true);
+        }
+        if self.instances.len() != other.instances.len() {
+            return Ok(false);
+        }
+        charge(budget, self.instances.capacity())?;
+        for (id, cells) in self.instances.iter() {
+            let Some(previous) = other.instances.get(id) else {
+                return Ok(false);
+            };
+            if Rc::ptr_eq(cells, previous) {
+                continue;
+            }
+            if cells.len() != previous.len() {
+                return Ok(false);
+            }
+            charge(budget, cells.capacity())?;
+            for (key, value) in cells.iter() {
+                let Some(old) = previous.get(key) else {
+                    return Ok(false);
+                };
+                if !value.same_fact(old, budget)? {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
     pub(super) fn clear(&mut self) {
         clear_shared(&mut self.instances);
     }

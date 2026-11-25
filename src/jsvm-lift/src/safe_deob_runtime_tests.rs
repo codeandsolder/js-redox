@@ -1051,6 +1051,115 @@ fn depythonify_safe_deob_exception_completion_runtime_equivalence() -> Result<()
     script_eval_runtime_equivalence(&sources, "exception-completions")
 }
 
+const EXCEPTION_DISPATCHER_FIXTURES: &[(&str, &str, bool)] = &[
+    (
+        "trailing-return",
+        include_str!("../../../corpus/generated/exception-dispatcher/trailing-return.js"),
+        false,
+    ),
+    (
+        "conflicting-return-label",
+        include_str!("../../../corpus/generated/exception-dispatcher/conflicting-return-label.js"),
+        false,
+    ),
+    (
+        "effectful-trailing-return",
+        include_str!("../../../corpus/generated/exception-dispatcher/effectful-trailing-return.js"),
+        false,
+    ),
+    (
+        "catch-silent-chain",
+        include_str!("../../../corpus/generated/exception-dispatcher/catch-silent-chain.js"),
+        false,
+    ),
+    (
+        "effectful-terminal",
+        include_str!("../../../corpus/generated/exception-dispatcher/effectful-terminal.js"),
+        false,
+    ),
+    (
+        "catch-root",
+        include_str!("../../../corpus/generated/exception-dispatcher/catch-root.js"),
+        false,
+    ),
+    (
+        "effectful-predecessor",
+        include_str!("../../../corpus/generated/exception-dispatcher/effectful-predecessor.js"),
+        false,
+    ),
+    (
+        "catch-inlined-return",
+        include_str!("../../../corpus/generated/exception-dispatcher/catch-inlined-return.js"),
+        false,
+    ),
+    (
+        "return-asi",
+        include_str!("../../../corpus/generated/exception-dispatcher/return-asi.js"),
+        false,
+    ),
+    (
+        "return-shadow",
+        include_str!("../../../corpus/generated/exception-dispatcher/return-shadow.js"),
+        true,
+    ),
+    (
+        "predecessor-prefix",
+        include_str!("../../../corpus/generated/exception-dispatcher/predecessor-prefix.js"),
+        false,
+    ),
+    (
+        "later-initializer",
+        include_str!("../../../corpus/generated/exception-dispatcher/later-initializer.js"),
+        false,
+    ),
+    (
+        "effectful-condition",
+        include_str!("../../../corpus/generated/exception-dispatcher/effectful-condition.js"),
+        false,
+    ),
+];
+
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_exception_dispatcher_reaching_runtime_equivalence() -> Result<()> {
+    let mut comparisons = Vec::with_capacity(EXCEPTION_DISPATCHER_FIXTURES.len() * 2);
+    for &(name, source, shadow) in EXCEPTION_DISPATCHER_FIXTURES {
+        // Rewrite the function alone, just like the core regression. The
+        // independently added caller must not supply extra static facts.
+        let label = format!("exception-dispatcher-reaching-{name}");
+        let result =
+            deobfuscate_source(source, &label, SourceMode::Auto, 48, false, &budget(&label))?;
+        for throwing in [false, true] {
+            let args = if shadow { "'outer', log" } else { "log" };
+            let suffix = format!(
+                r#"
+                ;(() => {{
+                    let attempts = 0;
+                    const calls = [];
+                    const log = {{push(...args) {{
+                        calls.push(args);
+                        if ({throwing} && attempts++ === 0) throw new Error('injected');
+                        return calls.length;
+                    }}}};
+                    try {{
+                        const result = f({args});
+                        return [result === log ? 'returned-log' : result, calls];
+                    }} catch (error) {{
+                        return [error.name, error.message, calls];
+                    }}
+                }})()
+            "#
+            );
+            comparisons.push(script_observations::Comparison {
+                label: format!("{label}-{throwing}"),
+                original: format!("{source}{suffix}"),
+                rewritten: format!("{}{suffix}", result.source),
+            });
+        }
+    }
+    script_observations::compare_pairs("exception-dispatcher-reaching", &comparisons, false)
+}
+
 fn script_eval_runtime_equivalence(sources: &[&str], suite: &str) -> Result<()> {
     let mut comparisons = Vec::with_capacity(sources.len() * 2);
     for (index, source) in sources.iter().enumerate() {

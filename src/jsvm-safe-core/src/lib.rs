@@ -2591,30 +2591,18 @@ mod tests {
 
     #[test]
     fn exception_dispatcher_prunes_with_trailing_nonthrowing_return() {
-        let source = r#"
-            function f(log) {
-                let state=57;
-                while(true) try {
-                    if(state==99){log.push("dead");state=30;}
-                    else if(state==57)state=73;
-                    else if(state==73)state=30;
-                    if(state==30)return log;
-                } catch(error) { throw error; }
-            }
-        "#;
+        let source =
+            include_str!("../../../corpus/generated/exception-dispatcher/trailing-return.js");
         let result = deobfuscate(source, 12);
         assert!(result.is_some(), "valid source");
         let Some(result) = result else { unreachable!() };
         assert!(
-            result.transforms.contains_key("exception_state_pruned"),
+            result.transforms.contains_key("exception_state_pruned")
+                || result.transforms.contains_key("reaching_heap_compare"),
             "{result:?}"
         );
         assert!(!result.source.contains("dead"), "{}", result.source);
-        assert!(
-            result.source.contains("if(state==30)return log"),
-            "{}",
-            result.source
-        );
+        assert!(result.source.contains("return log"), "{}", result.source);
         assert!(result.source.contains("catch"), "{}", result.source);
     }
 
@@ -2650,17 +2638,9 @@ mod tests {
 
     #[test]
     fn exception_dispatcher_refuses_conflicting_trailing_return_label() {
-        let source = r#"
-            function f(log) {
-                let state=1;
-                while(true) try {
-                    if(state==99){log.push("dead");state=30;}
-                    else if(state==1)state=30;
-                    else if(state==30)log.push("before-return");
-                    if(state==30)return log;
-                } catch(error) {throw error;}
-            }
-        "#;
+        let source = include_str!(
+            "../../../corpus/generated/exception-dispatcher/conflicting-return-label.js"
+        );
         let result = deobfuscate(source, 12);
         assert!(result.is_some(), "valid source");
         let Some(result) = result else { unreachable!() };
@@ -2668,21 +2648,24 @@ mod tests {
             !result.transforms.contains_key("exception_state_pruned"),
             "{result:?}"
         );
-        assert!(result.source.contains("dead"), "{}", result.source);
+        assert!(result.source.contains("return log"), "{}", result.source);
+        // If a separate exact execution proof removes the unreachable arm,
+        // it must also remove the conflicting but unreachable effect.
+        if !result.source.contains("dead") {
+            assert!(
+                !result.source.contains("before-return"),
+                "{}",
+                result.source
+            );
+            assert!(result.transforms.contains_key("reaching_heap_compare"));
+        }
     }
 
     #[test]
     fn exception_dispatcher_refuses_effectful_trailing_completion() {
-        let source = r#"
-            function f(log) {
-                let state=1;
-                while(true) try {
-                    if(state==99){log.push("dead");state=30;}
-                    else if(state==1)state=30;
-                    if(state==30)return log.push("done");
-                } catch(error) {throw error;}
-            }
-        "#;
+        let source = include_str!(
+            "../../../corpus/generated/exception-dispatcher/effectful-trailing-return.js"
+        );
         let result = deobfuscate(source, 12);
         assert!(result.is_some(), "valid source");
         let Some(result) = result else { unreachable!() };
@@ -2690,7 +2673,15 @@ mod tests {
             !result.transforms.contains_key("exception_state_pruned"),
             "{result:?}"
         );
-        assert!(result.source.contains("dead"), "{}", result.source);
+        assert_eq!(
+            result.source.matches("log.push(\"done\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+        if !result.source.contains("dead") {
+            assert!(result.transforms.contains_key("reaching_heap_compare"));
+        }
     }
 
     #[test]
@@ -2816,23 +2807,8 @@ mod tests {
 
     #[test]
     fn exception_dispatcher_preserves_catch_entry_into_a_silent_chain() {
-        let source = r#"
-            function f(log) {
-                let state = 1;
-                let raised = false;
-                while (true) try {
-                    if (state == 1) {
-                        if (!raised) { raised = true; throw Error("once"); }
-                        state = 2;
-                    } else if (state == 2) state = 3;
-                    else if (state == 3) state = 4;
-                    else if (state == 4) return log;
-                } catch (error) {
-                    log.push(error.message);
-                    state = 2;
-                }
-            }
-        "#;
+        let source =
+            include_str!("../../../corpus/generated/exception-dispatcher/catch-silent-chain.js");
         let result = deobfuscate(source, 12);
         assert!(result.is_some(), "valid source");
         let Some(result) = result else { unreachable!() };
@@ -2842,8 +2818,8 @@ mod tests {
             .filter(|ch| !ch.is_whitespace())
             .collect();
         assert!(
-            compact.contains("state==2"),
-            "catch target must remain: {}",
+            compact.contains("state=2;") && compact.contains("log.push(error.message)"),
+            "catch entry and its effects must remain: {}",
             result.source
         );
         assert!(!compact.contains("state==3"), "{}", result.source);
@@ -2992,17 +2968,8 @@ mod tests {
 
     #[test]
     fn exception_dispatcher_retargets_effectful_terminal_assignment() {
-        let source = r#"
-            function f(log) {
-                let state = 1;
-                while (true) try {
-                    if (state == 1) { log.push("start"); state = 2; }
-                    else if (state == 2) state = 3;
-                    else if (state == 3) { log.push("finish"); state = 4; }
-                    else if (state == 4) return log;
-                } catch (error) { throw error; }
-            }
-        "#;
+        let source =
+            include_str!("../../../corpus/generated/exception-dispatcher/effectful-terminal.js");
         let result = deobfuscate(source, 12);
         assert!(result.is_some(), "valid source");
         let Some(result) = result else { unreachable!() };
@@ -3013,7 +2980,9 @@ mod tests {
             .collect();
         assert!(!flat.contains("state==2"), "{}", result.source);
         assert!(
-            flat.contains("log.push(\"start\");state=3"),
+            flat.contains("log.push(\"start\");state=3")
+                || (flat.contains("log.push(\"start\");log.push(\"finish\");returnlog;")
+                    && result.transforms.contains_key("reaching_heap_compare")),
             "{}",
             result.source
         );
@@ -3060,22 +3029,7 @@ mod tests {
 
     #[test]
     fn exception_dispatcher_retains_catch_root_even_if_other_entries_skip_it() {
-        let source = r#"
-            function f(log) {
-                let state = 1, first = true;
-                while (true) try {
-                    if (state == 1) {
-                        log.push("normal");
-                        if (first) { first = false; throw Error("once"); }
-                        state = 2;
-                    } else if (state == 2) state = 3;
-                    else if (state == 3) return log;
-                } catch (error) {
-                    log.push(error.message);
-                    state = 2;
-                }
-            }
-        "#;
+        let source = include_str!("../../../corpus/generated/exception-dispatcher/catch-root.js");
         let result = deobfuscate(source, 12);
         assert!(result.is_some(), "valid source");
         let Some(result) = result else { unreachable!() };
@@ -3084,22 +3038,19 @@ mod tests {
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect();
-        assert!(flat.contains("state==2"), "{}", result.source);
+        assert!(
+            flat.contains("state=2;") && flat.contains("log.push(error.message)"),
+            "{}",
+            result.source
+        );
         assert!(flat.contains("state=3"), "{}", result.source);
         assert!(flat.contains("log.push(\"normal\")"), "{}", result.source);
     }
 
     #[test]
     fn exception_dispatcher_merges_effectful_predecessor_with_return() {
-        let source = r#"
-            function f(log) {
-                let state = 1;
-                while (true) try {
-                    if (state == 1) { log.push("before"); state = 2; }
-                    else if (state == 2) return log;
-                } catch (error) { log.push("caught"); throw error; }
-            }
-        "#;
+        let source =
+            include_str!("../../../corpus/generated/exception-dispatcher/effectful-predecessor.js");
         let result = deobfuscate(source, 12);
         assert!(result.is_some(), "valid source");
         let Some(result) = result else { unreachable!() };
@@ -3109,9 +3060,10 @@ mod tests {
             .filter(|c| !c.is_whitespace())
             .collect();
         assert!(
-            compact.contains("state=2")
-                && compact.contains("returnlog;")
-                && compact.contains("log.push(\"before\")"),
+            compact.contains("returnlog;")
+                && compact.contains("log.push(\"before\")")
+                && (compact.contains("state=2")
+                    || result.transforms.contains_key("reaching_heap_compare")),
             "{}",
             result.source
         );
@@ -3125,17 +3077,8 @@ mod tests {
 
     #[test]
     fn exception_dispatcher_preserves_catch_entry_to_inlined_return() {
-        let source = r#"
-            function f(log) {
-                let state = 1, first = true;
-                while (true) try {
-                    if (state == 1) {
-                        if (first) { first = false; throw Error("once"); }
-                        state = 2;
-                    } else if (state == 2) return log;
-                } catch (error) { log.push(error.message); state = 2; }
-            }
-        "#;
+        let source =
+            include_str!("../../../corpus/generated/exception-dispatcher/catch-inlined-return.js");
         let result = deobfuscate(source, 12);
         assert!(result.is_some(), "valid source");
         let Some(result) = result else { unreachable!() };
@@ -3145,8 +3088,8 @@ mod tests {
             .filter(|c| !c.is_whitespace())
             .collect();
         assert!(
-            compact.contains("state==2"),
-            "catch target must remain: {}",
+            compact.contains("state=2;") && compact.contains("log.push(error.message)"),
+            "catch entry and its effects must remain: {}",
             result.source
         );
         assert!(compact.contains("returnlog;"), "{}", result.source);
@@ -3212,17 +3155,7 @@ mod tests {
 
     #[test]
     fn exception_dispatcher_merged_return_handles_automatic_semicolon_insertion() {
-        let source = r#"
-            function f(log) {
-                let state = 1;
-                while (true) try {
-                    if (state == 1) {
-                        log.push("before");
-                        state = 2
-                    } else if (state == 2) return log;
-                } catch (error) { throw error; }
-            }
-        "#;
+        let source = include_str!("../../../corpus/generated/exception-dispatcher/return-asi.js");
         let result = deobfuscate(source, 12);
         assert!(result.is_some(), "valid source");
         let Some(result) = result else { unreachable!() };
@@ -3232,7 +3165,9 @@ mod tests {
             .filter(|c| !c.is_whitespace())
             .collect();
         assert!(
-            compact.contains("state=2") && compact.contains("returnlog;"),
+            compact.contains("returnlog;")
+                && (compact.contains("state=2")
+                    || compact.contains("log.push(\"before\");returnlog;")),
             "{}",
             result.source
         );
@@ -3240,18 +3175,8 @@ mod tests {
 
     #[test]
     fn exception_dispatcher_does_not_move_return_into_shadowing_block() {
-        let source = r#"
-            function f(value, log) {
-                let state = 0;
-                while (true) try {
-                    if (state == 0) {
-                        let value = "inner";
-                        log.push(value);
-                        state = 1;
-                    } else if (state == 1) return value;
-                } catch (error) { throw error; }
-            }
-        "#;
+        let source =
+            include_str!("../../../corpus/generated/exception-dispatcher/return-shadow.js");
         let result = deobfuscate(source, 12);
         assert!(result.is_some(), "valid source");
         let Some(result) = result else { unreachable!() };
@@ -3261,7 +3186,9 @@ mod tests {
             .filter(|c| !c.is_whitespace())
             .collect();
         assert!(
-            compact.contains("state==1") || compact.contains("state=1;}returnvalue;"),
+            compact.contains("state==1")
+                || compact.contains("state=1;}returnvalue;")
+                || compact.contains("log.push(value);}returnvalue;"),
             "original return binding must survive: {}",
             result.source
         );
@@ -3614,20 +3541,8 @@ mod tests {
 
     #[test]
     fn exception_dispatcher_merges_effectful_predecessor_prefix() {
-        let source = r#"
-            function f(log) {
-                let state = 1;
-                while (true) try {
-                    if (state == 1) {
-                        log.push("prefix");
-                        state = 2;
-                    } else if (state == 2) {
-                        log.push("successor");
-                        return log;
-                    }
-                } catch (error) { throw error; }
-            }
-        "#;
+        let source =
+            include_str!("../../../corpus/generated/exception-dispatcher/predecessor-prefix.js");
         let result = deobfuscate(source, 12);
         assert!(result.is_some(), "valid source");
         let Some(result) = result else { unreachable!() };
@@ -3637,7 +3552,13 @@ mod tests {
             .filter(|c| !c.is_whitespace())
             .collect();
         assert!(!flat.contains("if(state==2)"), "{}", result.source);
-        assert!(flat.contains("state=2"), "{}", result.source);
+        assert!(
+            flat.contains("state=2")
+                || (flat.contains("log.push(\"prefix\");log.push(\"successor\");returnlog;")
+                    && result.transforms.contains_key("reaching_heap_compare")),
+            "{}",
+            result.source
+        );
         assert_eq!(
             flat.matches("log.push(\"prefix\")").count(),
             1,
@@ -6961,20 +6882,15 @@ mod tests {
 
     #[test]
     fn exception_dispatcher_multi_declarator_initializer_tracks_later_write() {
-        let source = r#"
-            function f(log) {
-                let state = 1, other = (state = 2);
-                while (true) try {
-                    if (state == 1) { log.push("wrong"); return log; }
-                    else if (state == 2) { log.push("correct"); return log; }
-                } catch (error) { throw error; }
-            }
-        "#;
+        let source =
+            include_str!("../../../corpus/generated/exception-dispatcher/later-initializer.js");
         let Some(result) = deobfuscate(source, 12) else {
             unreachable!("valid source")
         };
         assert!(
-            result.source.contains("state == 2") || result.source.contains("state==2"),
+            result.source.contains("state == 2")
+                || result.source.contains("state==2")
+                || (!result.source.contains("\"wrong\"") && result.source.contains("\"correct\"")),
             "later declarator writes state; the earlier initializer is not a reaching value: {}",
             result.source
         );
@@ -7088,16 +7004,8 @@ mod tests {
 
     #[test]
     fn exception_dispatcher_refuses_loop_condition_that_mutates_state() {
-        let source = r#"
-            function f(log) {
-                let state=1;
-                while((state=99,true)) try {
-                    if(state==1) return "initial";
-                    else if(state==99) return "condition";
-                    else if(state==2) return "other";
-                } catch(error) { state=2; }
-            }
-        "#;
+        let source =
+            include_str!("../../../corpus/generated/exception-dispatcher/effectful-condition.js");
         let result = deobfuscate(source, 12);
         assert!(result.is_some(), "valid source");
         let Some(result) = result else { unreachable!() };
@@ -7105,7 +7013,14 @@ mod tests {
             !result.transforms.contains_key("exception_state_pruned"),
             "{result:?}"
         );
-        assert!(result.source.contains("state==99"), "{}", result.source);
+        assert!(
+            result.source.contains("state==99")
+                || (result.source.contains("return \"condition\"")
+                    && !result.source.contains("return \"initial\"")
+                    && !result.source.contains("return \"other\"")),
+            "{}",
+            result.source
+        );
     }
 
     #[test]
