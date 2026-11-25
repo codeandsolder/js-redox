@@ -953,6 +953,32 @@ fn depythonify_safe_deob_callable_capture_runtime_equivalence() -> Result<()> {
 
 #[test]
 #[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_instance_cell_runtime_equivalence() -> Result<()> {
+    let sources = [
+        "let make=x=>()=>[x];let f=make(7),g=make(9);let a=f(),b=g();[a[0],b[0]];",
+        "let make=()=>{let x=0;return [()=>[x++],()=>[x]]};let pair=make();let a=pair[0](),b=pair[1]();[a[0],b[0]];",
+        "let fs=[null,null,null];for(let i=0;i<3;i++)fs[i]=()=>[i];let a=fs[0](),b=fs[1](),c=fs[2]();[a[0],b[0],c[0]];",
+        "function outer(){let fs=[null,null,null];for(var i=0;i<3;i++)fs[i]=()=>[i];let a=fs[0](),b=fs[1](),c=fs[2]();return [a[0],b[0],c[0]];}outer();",
+        "let make=()=>{let a=[7];return ()=>[a[0]++];};let f=make();let g=make();let a=f(),b=g(),c=f();[a[0],b[0],c[0]];",
+        "let f=()=>{let x=[7];return ()=>x;};let g=f();for(let i=0;i<256;i++){let garbage=[i];}let a=g();a[0];",
+        "let f=()=>{let x=[7];return [()=>x,()=>{x[0]=9}];};let pair=f();let a=pair[0]();pair[1]();a[0];",
+        "let f=()=>{let x=[7];return ()=>x;};let g=f();events.push(g);let a=g();a[0];",
+        "let f=()=>{let x=7;return ()=>[x];};let g=f();let a=g();let b=f()();[a[0],b[0]];",
+        "function outer(){function f(n){let a=[n];if(n){let b=f(n-1);return [a[0]+b[0]];}return a;}let r=f(3);return r[0];}outer();",
+        "let f=function self(n){return n?self(n-1):[7];};let a=f(2);a[0];",
+        "let f=n=>n?f(n-1):[7];let a=f(2);a[0];",
+        "function outer(){let a=[0];function f(n){if(n)g(n-1);a[0]++;}function g(n){if(n)f(n-1);a[0]++;}f(4);return a[0];}outer();",
+        "let make=x=>{let f=()=>[x];return [f,()=>{let a=make(x+1);return a[0]();}]};let a=make(7);let b=a[1]();let c=a[0]();[b[0],c[0]];",
+        "let f=n=>{let x=[n];if(n)f(n-1);return x;};let a=f(3);a[0];",
+        "let f=()=>{let x=7;return [()=>[x],v=>{x=v}];};let pair=f();let a=pair[0]();pair[1](9);let b=pair[0]();[a[0],b[0]];",
+        "function outer(flag){let f=(()=>{let x=[7];return ()=>x;})();if(flag){events.push(f);}let a=f();return a[0];}[outer(true),outer(false)];",
+        "let f=()=>{let x=[7];return ()=>x;};let a=f(),b=f();let c=a();c[0]=9;let d=b();[c[0],d[0]];",
+    ];
+    script_runtime_equivalence(&sources, "instance-cells", false)
+}
+
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
 fn depythonify_safe_deob_named_activation_runtime_equivalence() -> Result<()> {
     let sources = [
         "function outer(){function build(v){let a=[v];return a;}let r=build(7);return r[0];}outer();",

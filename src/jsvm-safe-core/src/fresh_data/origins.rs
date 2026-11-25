@@ -1,22 +1,22 @@
-//! Allocation existence on arbitrary reaching paths.
+//! Object and lexical-environment existence on arbitrary reaching paths.
 //!
 //! An absent descriptor alone cannot distinguish a branch-local allocation
 //! from a previously created object whose contents became unproved. The
 //! interpreter allocates monotonically numbered identities, so contiguous
 //! runs of births are represented by one interval rather than one tombstone
-//! per object. Track them only while an arbitrary return-path join is open.
-use super::heap::{charge, AllocationId};
+//! per identity. Track them only while an arbitrary return-path join is open.
+use super::heap::charge;
 use std::{ops::Range, rc::Rc};
 use work_budget::{BudgetExceeded, WorkBudget};
 
 #[derive(Clone)]
-pub(super) struct AllocationOrigins {
-    floor: AllocationId,
-    births: Rc<Vec<Range<AllocationId>>>,
+pub(super) struct IdentityOrigins {
+    floor: usize,
+    births: Rc<Vec<Range<usize>>>,
 }
 
-impl AllocationOrigins {
-    pub(super) fn new(floor: AllocationId) -> Self {
+impl IdentityOrigins {
+    pub(super) fn new(floor: usize) -> Self {
         Self {
             floor,
             births: Rc::default(),
@@ -24,7 +24,7 @@ impl AllocationOrigins {
     }
 
     /// Identities older than this history may have existed on every path.
-    pub(super) fn may_exist(&self, id: AllocationId) -> bool {
+    pub(super) fn may_exist(&self, id: usize) -> bool {
         if id < self.floor {
             return true;
         }
@@ -38,11 +38,7 @@ impl AllocationOrigins {
             .saturating_add(1)
     }
 
-    pub(super) fn record(
-        &mut self,
-        id: AllocationId,
-        budget: &WorkBudget,
-    ) -> Result<(), BudgetExceeded> {
+    pub(super) fn record(&mut self, id: usize, budget: &WorkBudget) -> Result<(), BudgetExceeded> {
         charge(budget, 1)?;
         if id < self.floor {
             return Ok(());
@@ -51,7 +47,7 @@ impl AllocationOrigins {
             charge(budget, self.births.len())?;
         }
         let births = Rc::make_mut(&mut self.births);
-        // The interpreter never reuses an allocation ID, including across
+        // The interpreter never reuses an identity, including across
         // discarded speculative paths and subsequent loop iterations.
         if let Some(last) = births.last_mut() {
             debug_assert!(id >= last.end);
@@ -72,7 +68,7 @@ impl AllocationOrigins {
         charge(budget, self.births.len().saturating_add(other.births.len()))?;
         let mut left = self.births.iter().peekable();
         let mut right = other.births.iter().peekable();
-        let mut merged = Vec::<Range<AllocationId>>::with_capacity(
+        let mut merged = Vec::<Range<usize>>::with_capacity(
             self.births.len().saturating_add(other.births.len()),
         );
         loop {
@@ -108,11 +104,11 @@ mod tests {
     fn origins_merge_path_births_without_inventing_intermediate_objects(
     ) -> Result<(), BudgetExceeded> {
         let budget = WorkBudget::unlimited("allocation-origins");
-        let mut left = AllocationOrigins::new(10);
+        let mut left = IdentityOrigins::new(10);
         for id in [10, 11, 14, 15, 18] {
             left.record(id, &budget)?;
         }
-        let mut right = AllocationOrigins::new(10);
+        let mut right = IdentityOrigins::new(10);
         for id in [11, 12, 14, 17, 18, 19] {
             right.record(id, &budget)?;
         }
@@ -134,7 +130,7 @@ mod tests {
     #[test]
     fn contiguous_births_are_compressed_and_work_is_charged() -> Result<(), BudgetExceeded> {
         let budget = WorkBudget::unlimited("allocation-origins");
-        let mut origins = AllocationOrigins::new(0);
+        let mut origins = IdentityOrigins::new(0);
         for id in 0..1024 {
             origins.record(id, &budget)?;
         }

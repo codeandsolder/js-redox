@@ -1,6 +1,6 @@
 //! Local invocation proofs share the ordinary statement/heap interpreter.
 //! The call itself remains in the output; only reaching facts cross its exit.
-use super::{Analyzer, Environment, Evaluation, Fact, Value};
+use super::{scope_instances::ClosureOrigin, Analyzer, Environment, Evaluation, Fact, Value};
 use oxc_ast::ast::{
     ArrowFunctionBody, ArrowFunctionExpression, BindingPattern, CallExpression, Expression,
     FormalParameters, Function, FunctionBody, FunctionType, Program, Statement,
@@ -175,6 +175,7 @@ struct Activation<'a> {
     reflective: bool,
     publish_context: bool,
     self_binding: Option<SymbolId>,
+    capture: Option<(ClosureOrigin, Fact)>,
 }
 
 impl<'a> Activation<'a> {
@@ -191,6 +192,7 @@ impl<'a> Activation<'a> {
                 reflective: false,
                 publish_context,
                 self_binding: None,
+                capture: None,
             },
             CallableNode::Arrow(_) => return None,
         };
@@ -227,6 +229,7 @@ impl<'a> Activation<'a> {
             self_binding: (function.r#type == FunctionType::FunctionExpression)
                 .then(|| function.id.as_ref().and_then(|id| id.symbol_id.get()))
                 .flatten(),
+            capture: None,
         })
     }
 }
@@ -266,11 +269,6 @@ impl<'ast> Analyzer<'_, 'ast> {
         arguments: Vec<Option<Fact>>,
         environment: &mut Environment,
     ) -> Option<()> {
-        self.heap_result(environment.retire_activation(
-            self.scoping,
-            activation.scope,
-            self.budget,
-        ))?;
         let cells = self.scoping.get_bindings(activation.scope).len();
         self.heap_result(
             self.budget
@@ -286,14 +284,20 @@ impl<'ast> Analyzer<'_, 'ast> {
                     .is_mapped_arguments_exposed(self.scoping, symbol)
             {
                 self.heap_result(environment.insert(
-                    symbol,
+                    self.cell_id(symbol)?,
                     Fact::Primitive(Value::Undefined),
                     self.budget,
                 ))?;
             }
         }
         if let Some(symbol) = activation.self_binding {
-            self.heap_result(environment.remove(symbol, self.budget))?;
+            let cell = self.cell_id(symbol)?;
+            if let Some((_, function)) = &activation.capture {
+                let value = self.heap_result(function.copy(self.budget))?;
+                self.heap_result(environment.insert(cell, value, self.budget))?;
+            } else {
+                self.heap_result(environment.remove(cell, self.budget))?;
+            }
         }
         let mut arguments = arguments.into_iter();
         for parameter in &activation.params.items {
@@ -301,6 +305,7 @@ impl<'ast> Analyzer<'_, 'ast> {
                 return None;
             };
             let symbol = identifier.symbol_id.get()?;
+            let cell = self.cell_id(symbol)?;
             let value = arguments
                 .next()
                 .unwrap_or(Some(Fact::Primitive(Value::Undefined)));
@@ -314,9 +319,9 @@ impl<'ast> Analyzer<'_, 'ast> {
                 continue;
             }
             if let Some(value) = value {
-                self.heap_result(environment.insert(symbol, value, self.budget))?;
+                self.heap_result(environment.insert(cell, value, self.budget))?;
             } else {
-                self.heap_result(environment.remove(symbol, self.budget))?;
+                self.heap_result(environment.remove(cell, self.budget))?;
             }
         }
         Some(())
@@ -344,26 +349,15 @@ impl<'ast> Analyzer<'_, 'ast> {
         if frame.unproved {
             return None;
         }
-        let mut summary = frame.summary?;
-        self.heap_result(summary.environment.retire_activation(
-            self.scoping,
-            activation.scope,
-            self.budget,
-        ))?;
-        Some(summary)
+        frame.summary
     }
 
-    /// Enter a fresh local activation. Semantic `SymbolId` values identify cells
-    /// only within one live instance of a lexical scope, so an overlapping
-    /// recursive activation must remain opaque until instance-indexed cells
-    /// are available. Bound native recursion independently of loop fuel.
-    fn can_enter(&self, scope: ScopeId) -> bool {
-        const MAX_ACTIVATION_DEPTH: usize = 64;
-        self.activation_scopes.len() < MAX_ACTIVATION_DEPTH
-            && !self
-                .scope_instances
-                .scopes()
-                .any(|active| active == scope || self.scoping.scope_is_descendant_of(active, scope))
+    /// Distinct environment instances have distinct cell identities.
+    /// Bound both native stack depth and the total speculative call tree.
+    fn can_enter(&self) -> bool {
+        const MAX_ACTIVATION_DEPTH: usize = 32;
+        self.activation_depth < MAX_ACTIVATION_DEPTH
+            && (self.activation_depth == 0 || self.activation_fuel > 0)
     }
 
     fn direct_activation<'a>(
@@ -405,11 +399,10 @@ impl<'ast> Analyzer<'_, 'ast> {
         environment: &Environment,
     ) -> Option<Activation<'ast>> {
         let origin = environment.callable_origin(fact)?;
-        if !self.heap_result(self.scope_instances.matches(&origin, self.budget))? {
-            return None;
-        }
         let node = *self.callables.nodes.get(&origin.scope)?;
-        Activation::from_node(node, self.scoping, false)
+        let mut activation = Activation::from_node(node, self.scoping, false)?;
+        activation.capture = Some((origin, self.heap_result(fact.copy(self.budget))?));
+        Some(activation)
     }
 
     /// Evaluate local calls with fresh activation cells. Resolve the callee
@@ -445,7 +438,7 @@ impl<'ast> Analyzer<'_, 'ast> {
             self.arguments(&call.arguments, environment);
             return self.barrier(environment);
         };
-        if !self.can_enter(activation.scope)
+        if !self.can_enter()
             || (activation.reflective && self.bindings.implicit_arguments_exposed(activation.scope))
         {
             self.arguments(&call.arguments, environment);
@@ -479,21 +472,52 @@ impl<'ast> Analyzer<'_, 'ast> {
                 }
             }
         }
+        self.run_activation(&activation, arguments, environment)
+    }
+
+    fn run_activation(
+        &mut self,
+        activation: &Activation<'_>,
+        arguments: Vec<Option<Fact>>,
+        environment: &mut Environment,
+    ) -> Evaluation {
+        const MAX_ACTIVATIONS: usize = 256;
+        if !self.can_enter() || self.heap_result(self.budget.consume(1)).is_none() {
+            return self.barrier(environment);
+        }
+        if self.activation_depth == 0 {
+            self.activation_fuel = MAX_ACTIVATIONS;
+        }
+        self.activation_fuel -= 1;
         let before_effect = self.opaque_generation;
         let mut candidate = environment.clone();
-        candidate.enter_activation(self.next_allocation);
+        candidate.enter_activation(self.next_identity);
+        let selected = activation.capture.as_ref().map_or_else(
+            || Ok(Vec::new()),
+            |(origin, _)| self.scope_instances.select(origin, self.budget),
+        );
+        let Some(selected) = self.heap_result(selected) else {
+            return self.barrier(environment);
+        };
         let previous_reads = std::mem::take(&mut self.reads);
         let previous_lists = std::mem::take(&mut self.visited_lists);
         let previous_frame = self
             .return_frame
             .replace(ReturnFrame::new(self.pending_disposals));
         let disposes = self.enter_resource_scope(Some(activation.scope));
-        self.activation_scopes.push(activation.scope);
-        let ticket = self.scope_instances.enter(activation.scope);
-        let summary = self.execute_activation(&activation, arguments, &mut candidate);
-        self.scope_instances.leave(&ticket);
-        self.activation_scopes.pop();
+        self.activation_depth += 1;
+        let ticket = self.enter_instance(Some(activation.scope), &mut candidate);
+        let summary = if ticket.is_some() {
+            self.execute_activation(activation, arguments, &mut candidate)
+        } else {
+            None
+        };
         self.leave_resource_scope(disposes, &mut candidate);
+        self.leave_instance(ticket, &mut candidate);
+        self.activation_depth -= 1;
+        for ticket in selected.into_iter().rev() {
+            let _ = self.scope_instances.leave(&ticket);
+        }
         self.return_frame = previous_frame;
         let observations = std::mem::replace(&mut self.reads, previous_reads);
         let visited = std::mem::replace(&mut self.visited_lists, previous_lists);
