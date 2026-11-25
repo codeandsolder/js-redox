@@ -828,7 +828,17 @@ fn depythonify_safe_deob_scalar_helper_cells_runtime_equivalence() -> Result<()>
         "function outer(){function f(x){var y=x+1;return (x=9)+y;}return [f(2),f(7)];}outer();",
         "function outer(){function f(x){let y=x;return y &&= 7;}return [f(0),f(2)];}outer();",
     ];
-    script_runtime_equivalence(&sources, "scalar-helper-cells", false)
+    script_runtime_equivalence(&sources, "scalar-helper-cells", false)?;
+    let heap_sources = [
+        "function outer(){function index(x){let y=x;return (x=9,y);}let a=[0,0];for(let i=0;i<2;i++){a[index(i)]=7;}return a[0]+a[1];}outer();",
+        "function outer(){function index(x,y){return x+y;}let a=[0,7];let i=0;index(i++,i++);return a[i-1];}outer();",
+        "function outer(){function index(x){return x;}let a=[7];index(a[0]=9);return a[0];}outer();",
+        "function outer(){function index(x){return x;}let a=[7];index(a);return a[0];}outer();",
+        "function index(x){return x;}let a=[7];globalThis.index=()=>{a[0]=9;};index(0);a[0];",
+        "function outer(flag){if(flag){function index(x){return x;}}let a=[7];index(0);return a[0];}try{outer(false)}catch(e){e.name;}",
+        "function outer(){function index(x){return x%2;}let a=[[],[]];for(let i=0;i<2;i++){a[index(i)]=a[0];}return a[0]===a[1];}outer();",
+    ];
+    script_runtime_equivalence(&heap_sources, "scalar-helper-heap", false)
 }
 
 #[test]

@@ -2026,8 +2026,14 @@ fn transform_once(
 
     let constants = ProvenConstantEnvironment::collect(&program, scoping);
     let arrays = static_readonly_arrays(&program, scoping, &constants.initialization);
-    let fresh_data =
-        fresh_data::FreshDataReads::analyze(&program, scoping, &constants.initialization, budget)?;
+    let pure_functions = collect_pure_functions(&program, scoping, &constants.initialization);
+    let fresh_data = fresh_data::FreshDataReads::analyze(
+        &program,
+        scoping,
+        &constants.initialization,
+        &pure_functions,
+        budget,
+    )?;
     budget.checkpoint()?;
     let reference_spans = collect_reference_spans(&program);
     budget.checkpoint()?;
@@ -2047,7 +2053,6 @@ fn transform_once(
     let shorthand_spans = collect_shorthand_spans(&program);
     let proxies = collect_proxy_objects(&program, scoping, &constants.initialization);
     budget.checkpoint()?;
-    let pure_functions = collect_pure_functions(&program, scoping, &constants.initialization);
     let from_char_code_aliases =
         collect_from_char_code_aliases(&program, scoping, &constants.initialization);
     budget.checkpoint()?;
