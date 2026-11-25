@@ -824,7 +824,7 @@ impl<'c> StateUseProbe<'c> {
 
     // Field keys and decorators execute during class definition; a non-static
     // initializer executes later, when an instance is constructed.
-    fn visit_field_initializer<'a>(&mut self, value: Option<&Expression<'a>>, is_static: bool) {
+    fn visit_field_initializer(&mut self, value: Option<&Expression<'_>>, is_static: bool) {
         if let Some(value) = value {
             let depth = usize::from(!is_static);
             self.deferred_depth += depth;
@@ -1016,6 +1016,7 @@ pub fn direct_assignment_name<'a>(
     }
 }
 
+#[derive(Clone, Copy)]
 struct ImmediateInvocation<'a> {
     body: &'a oxc_ast::ast::FunctionBody<'a>,
     reflective: bool,
@@ -1070,20 +1071,10 @@ fn assignment_location(
     env: &ArithmeticEnvironment<'_>,
     target: &oxc_ast::ast::AssignmentTarget<'_>,
 ) -> Option<ArithmeticLocation> {
-    match target {
-        oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(id) => {
-            let symbol = env.symbol(id)?;
-            env.trackable(symbol)
-                .then_some(ArithmeticLocation::Binding(symbol))
-        }
-        oxc_ast::ast::AssignmentTarget::ComputedMemberExpression(member) => {
-            env.member_location(member)
-        }
-        _ => None,
-    }
+    simple_assignment_location(env, target.as_simple_assignment_target()?)
 }
 
-fn update_location(
+fn simple_assignment_location(
     env: &ArithmeticEnvironment<'_>,
     target: &oxc_ast::ast::SimpleAssignmentTarget<'_>,
 ) -> Option<ArithmeticLocation> {
@@ -1169,7 +1160,7 @@ fn simulate_update(
     update: &oxc_ast::ast::UpdateExpression<'_>,
     env: &mut ArithmeticEnvironment<'_>,
 ) -> Option<ExpressionFlow> {
-    let Some(location) = update_location(env, &update.argument) else {
+    let Some(location) = simple_assignment_location(env, &update.argument) else {
         if env.opaque_state_access(|probe| probe.visit_simple_assignment_target(&update.argument)) {
             return None;
         }
@@ -1385,11 +1376,17 @@ fn simulate_expression(
     }
 }
 
+#[derive(Clone, Copy)]
+enum SwitchSelection {
+    Case(usize),
+    NoMatch,
+}
+
 /// Unknown selector evaluation and a proven no-match are distinct outcomes.
 fn select_switch_case(
     switch: &oxc_ast::ast::SwitchStatement<'_>,
     env: &ArithmeticEnvironment<'_>,
-) -> Option<Option<usize>> {
+) -> Option<SwitchSelection> {
     let discriminant = env.eval(&switch.discriminant)?;
     let mut default = None;
     for (index, case) in switch.cases.iter().enumerate() {
@@ -1398,10 +1395,10 @@ fn select_switch_case(
             continue;
         };
         if strict_primitive_equal(&discriminant, &env.eval(test)?) {
-            return Some(Some(index));
+            return Some(SwitchSelection::Case(index));
         }
     }
-    Some(default)
+    Some(default.map_or(SwitchSelection::NoMatch, SwitchSelection::Case))
 }
 
 fn simulate_switch(
@@ -1410,7 +1407,7 @@ fn simulate_switch(
 ) -> Option<StateFlow> {
     let scope = switch.scope_id.get()?;
     env.retire_scope(scope);
-    let Some(start) = select_switch_case(switch, env)? else {
+    let SwitchSelection::Case(start) = select_switch_case(switch, env)? else {
         return Some(StateFlow::Normal);
     };
     for case in switch.cases.iter().skip(start) {
@@ -1821,8 +1818,16 @@ fn render_block(chunks: &[String]) -> String {
     format!("{{\n{}\n}}", chunks.join("\n"))
 }
 
+struct ArithmeticEntry {
+    symbol: SymbolId,
+    initial: Value,
+    init_text: Option<String>,
+    per_iteration_binding: bool,
+}
+
 struct ArithmeticStateSetup<'a> {
     state_symbol: SymbolId,
+    per_iteration_binding: bool,
     state_var: String,
     completion_live: bool,
     hoisted: String,
@@ -2585,17 +2590,11 @@ impl Collector<'_, '_> {
         (text, rewritten)
     }
 
-    fn arithmetic_state_setup<'a>(
+    fn arithmetic_entry(
         &self,
-        it: &'a oxc_ast::ast::ForStatement<'a>,
-        completion_live: bool,
-    ) -> Option<ArithmeticStateSetup<'a>> {
-        if it.update.is_some() {
-            return None;
-        }
-        let test = it.test.as_ref()?;
-        let (tested_symbol, loop_termination) =
-            dispatcher_exit_test(test, self.scoping, &self.constants.initialization)?;
+        it: &oxc_ast::ast::ForStatement<'_>,
+        tested_symbol: SymbolId,
+    ) -> Option<ArithmeticEntry> {
         let (state_symbol, initial, init_text) = match it.init.as_ref() {
             Some(oxc_ast::ast::ForStatementInit::VariableDeclaration(init_decl)) => {
                 if !matches!(
@@ -2665,6 +2664,31 @@ impl Collector<'_, '_> {
         if activation.found {
             return None;
         }
+        Some(ArithmeticEntry {
+            symbol: state_symbol,
+            initial,
+            init_text,
+            per_iteration_binding,
+        })
+    }
+
+    fn arithmetic_state_setup<'a>(
+        &self,
+        it: &'a oxc_ast::ast::ForStatement<'a>,
+        completion_live: bool,
+    ) -> Option<ArithmeticStateSetup<'a>> {
+        if it.update.is_some() {
+            return None;
+        }
+        let test = it.test.as_ref()?;
+        let (tested_symbol, loop_termination) =
+            dispatcher_exit_test(test, self.scoping, &self.constants.initialization)?;
+        let ArithmeticEntry {
+            symbol: state_symbol,
+            initial,
+            init_text,
+            per_iteration_binding,
+        } = self.arithmetic_entry(it, tested_symbol)?;
         let Statement::BlockStatement(body) = &it.body else {
             return None;
         };
@@ -2696,6 +2720,7 @@ impl Collector<'_, '_> {
         };
         Some(ArithmeticStateSetup {
             state_symbol,
+            per_iteration_binding,
             state_var: self.scoping.symbol_name(state_symbol).to_owned(),
             completion_live,
             hoisted,
@@ -2847,7 +2872,7 @@ impl Collector<'_, '_> {
         if setup.completion_live {
             chunks.push("void 0;".to_owned());
         }
-        let Some(start) = select_switch_case(setup.switch, env)? else {
+        let SwitchSelection::Case(start) = select_switch_case(setup.switch, env)? else {
             return Some((ArithmeticCaseOutcome::Flow(StateFlow::Normal), rewritten));
         };
         let (outcome, reads) = self.simulate_arithmetic_case(setup.switch, start, env, chunks)?;
@@ -2925,13 +2950,11 @@ impl Collector<'_, '_> {
         None
     }
 
-    pub(super) fn arithmetic_state_replacement(
+    fn arithmetic_environment(
         &self,
-        it: &oxc_ast::ast::ForStatement<'_>,
-        completion_live: bool,
-    ) -> Option<(String, ArithmeticStateProof)> {
-        let setup = self.arithmetic_state_setup(it, completion_live)?;
-        let mut env = ArithmeticEnvironment {
+        setup: &ArithmeticStateSetup<'_>,
+    ) -> ArithmeticEnvironment<'_> {
+        ArithmeticEnvironment {
             scoping: self.scoping,
             bindings: &self.constants.initialization,
             state: setup.state_symbol,
@@ -2939,9 +2962,18 @@ impl Collector<'_, '_> {
             arrays: setup.register_arrays.clone(),
             slots: HashMap::new(),
             reflective_activation: false,
-            per_iteration_binding: matches!(it.init.as_ref(), Some(oxc_ast::ast::ForStatementInit::VariableDeclaration(decl)) if decl.kind == VariableDeclarationKind::Let),
+            per_iteration_binding: setup.per_iteration_binding,
             immediate_depth: 0,
-        };
+        }
+    }
+
+    pub(super) fn arithmetic_state_replacement(
+        &self,
+        it: &oxc_ast::ast::ForStatement<'_>,
+        completion_live: bool,
+    ) -> Option<(String, ArithmeticStateProof)> {
+        let setup = self.arithmetic_state_setup(it, completion_live)?;
+        let mut env = self.arithmetic_environment(&setup);
         let mut chunks = setup.init_text.iter().cloned().collect::<Vec<_>>();
         if !setup.hoisted.is_empty() {
             chunks.push(setup.hoisted.clone());

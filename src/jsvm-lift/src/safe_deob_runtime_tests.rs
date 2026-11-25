@@ -12,7 +12,7 @@ use tempfile::TempDir;
 use work_budget::{run_command, BudgetLimits, WorkBudget};
 
 const FIXTURE_DIR: &str = "corpus/generated/reversible-obfuscation";
-const MAIN_FIXTURES: [&str; 42] = [
+const MAIN_FIXTURES: &[&str] = &[
     "obscura-split-strings.js",
     "obscura-number-expressions.js",
     "obscura-unicode-escape.js",
@@ -1517,7 +1517,7 @@ console.log(JSON.stringify(run(false)));
 fn depythonify_safe_deob_generated_runtime_equivalence() -> Result<()> {
     let scratch = TempDir::new()?;
     let mut totals = BTreeMap::<String, usize>::new();
-    for file in MAIN_FIXTURES {
+    for &file in MAIN_FIXTURES {
         let ambient = deob_fixture(scratch.path(), file)?;
         // These fixtures exercise own-member transformations. The original
         // classic-script input is still checked for runtime equivalence.
