@@ -1050,7 +1050,7 @@ impl Analyzer<'_> {
         if let Some(initializer) = &statement.init {
             match initializer {
                 ForStatementInit::VariableDeclaration(declaration) => {
-                    self.declaration(declaration, environment)
+                    self.declaration(declaration, environment);
                 }
                 expression => {
                     self.expression(expression.as_expression()?, environment);
@@ -1268,11 +1268,11 @@ mod tests {
         assert_eq!(reads(changing)?, vec![("a[0]".into(), "3".into())]);
 
         let unknown = "let a=[7];let x=0;for(let i=0;i<3;i++){x=a[0];if(flag)a[0]=8;}x;";
-        assert!(reads(unknown)?.is_empty());
+        assert_eq!(reads(unknown)?, [] as [(String, String); 0]);
 
         let nested =
             "let a=[7];let x=0;for(let i=0;i<2;i++){for(let j=0;j<(i===0?1:flag);j++){x=a[0];}}x;";
-        assert!(reads(nested)?.is_empty());
+        assert_eq!(reads(nested)?, [] as [(String, String); 0]);
         Ok(())
     }
 
@@ -1288,7 +1288,7 @@ mod tests {
         );
 
         let changing = "let a=[[],[]];for(let i=0;i<2;i++){a[0]===a[1];a[1]=a[0];}";
-        assert!(observed(changing, true)?.is_empty());
+        assert_eq!(observed(changing, true)?, [] as [(String, String); 0]);
 
         let distinct = "let a=[[],[]];a[0]===a[1];a[0]!==a[1];";
         assert_eq!(
