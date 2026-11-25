@@ -598,10 +598,24 @@ impl BindingFacts {
         symbol: SymbolId,
         function_scope: ScopeId,
     ) -> bool {
+        self.instantiated_function_declaration(scoping, symbol, function_scope)
+            && self.binding_has_stable_value(scoping, symbol)
+    }
+
+    /// Ordinary declaration instantiation installs a function even if its
+    /// lexical binding is subsequently assigned. Stability is only needed
+    /// when resolving calls without a reaching cell value.
+    pub(crate) fn instantiated_function_declaration(
+        &self,
+        scoping: &Scoping,
+        symbol: SymbolId,
+        function_scope: ScopeId,
+    ) -> bool {
         self.statement_list_functions.get(&symbol) == Some(&function_scope)
             && scoping.scope_parent_id(function_scope) == Some(scoping.symbol_scope_id(symbol))
             && self.has_declarative_storage(scoping, symbol)
-            && self.binding_has_stable_value(scoping, symbol)
+            && scoping.symbol_redeclarations(symbol).is_empty()
+            && !self.is_mapped_arguments_exposed(scoping, symbol)
     }
 
     /// A hoisted declaration's statement is inert in a function body or
@@ -621,7 +635,7 @@ impl BindingFacts {
         let owner = scoping.symbol_scope_id(symbol);
         let flags = scoping.scope_flags(owner);
         (flags.is_function() || flags.is_strict_mode())
-            && self.hoisted_callable_declaration(scoping, symbol, scope)
+            && self.instantiated_function_declaration(scoping, symbol, scope)
     }
 
     /// Resolve an invocation to the already instantiated lexical function.

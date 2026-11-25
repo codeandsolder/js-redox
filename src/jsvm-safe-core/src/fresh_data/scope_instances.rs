@@ -26,6 +26,12 @@ pub(super) struct ScopeTicket {
     previous: Option<InstanceId>,
 }
 
+impl ScopeTicket {
+    pub(super) const fn scope(&self) -> ScopeId {
+        self.scope
+    }
+}
+
 #[derive(Default)]
 pub(super) struct ScopeInstances {
     active: HashMap<ScopeId, InstanceId>,
