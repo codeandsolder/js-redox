@@ -73,6 +73,7 @@ enum CellKind {
 struct Cell {
     value: Option<Value>,
     mutable: bool,
+    initialized: bool,
 }
 
 fn charge_value(value: &Value, budget: &WorkBudget) -> Option<()> {
@@ -93,6 +94,7 @@ impl CellKind {
                 Self::Let | Self::Const | Self::Arguments => None,
             },
             mutable: !matches!(self, Self::Const),
+            initialized: matches!(self, Self::Var | Self::Arguments),
         }
     }
 }
@@ -107,7 +109,7 @@ impl Cell {
     fn write(&mut self, value: Value, budget: &WorkBudget) -> Option<Value> {
         // Writes before lexical initialization and writes to immutable
         // bindings throw. The entire pure call proof must then fail.
-        if !self.mutable || self.value.is_none() {
+        if !self.mutable || !self.initialized {
             return None;
         }
         charge_value(&value, budget)?;
@@ -316,7 +318,11 @@ pub struct PureFunction {
 }
 
 impl PureFunction {
-    pub(super) fn evaluate(&self, args: &[Value], budget: &WorkBudget) -> Option<Value> {
+    pub(super) fn evaluate<'v>(
+        &self,
+        args: impl IntoIterator<Item = Option<&'v Value>>,
+        budget: &WorkBudget,
+    ) -> Option<Value> {
         budget
             .consume(u64::try_from(self.cells.len()).unwrap_or(u64::MAX))
             .ok()?;
@@ -325,16 +331,25 @@ impl PureFunction {
             .iter()
             .map(|kind| kind.create())
             .collect::<Vec<_>>();
-        for (position, &index) in self.parameters.iter().enumerate() {
-            let value = args.get(position).unwrap_or(&Value::Undefined);
-            charge_value(value, budget)?;
-            cells.get_mut(index)?.value = Some(value.clone());
+        let mut arguments = args.into_iter();
+        for &index in &self.parameters {
+            // Missing arguments are exactly undefined. An evaluated but
+            // unknown argument is an initialized cell, not a TDZ binding.
+            let value = arguments.next().unwrap_or(Some(&Value::Undefined));
+            if let Some(value) = value {
+                charge_value(value, budget)?;
+            }
+            let cell = cells.get_mut(index)?;
+            cell.initialized = true;
+            cell.value = value.cloned();
         }
         for step in &self.steps {
             match step {
                 Step::Initialize { index, value } => {
                     let value = value.eval(&mut cells, budget)?;
-                    cells.get_mut(*index)?.value = Some(value);
+                    let cell = cells.get_mut(*index)?;
+                    cell.initialized = true;
+                    cell.value = Some(value);
                 }
                 Step::Evaluate(expr) => {
                     expr.eval(&mut cells, budget)?;
@@ -342,6 +357,31 @@ impl PureFunction {
             }
         }
         self.expression.eval(&mut cells, budget)
+    }
+
+    /// Compile a selected return in the original function's semantic cells.
+    /// No body expression is relocated into the caller; references to
+    /// anything other than formal cells are deliberately unproved here.
+    pub(super) fn return_projection(
+        function: &Function<'_>,
+        expression: &Expression<'_>,
+        scoping: &Scoping,
+    ) -> Option<Self> {
+        let mut compiler = Compiler {
+            scoping,
+            indices: HashMap::new(),
+            cells: Vec::new(),
+        };
+        let parameters = declare_cells(function, &[], &mut compiler)?;
+        let expression = compiler.compile(expression)?;
+        Some(Self {
+            parameters,
+            cells: compiler.cells,
+            steps: Vec::new(),
+            expression,
+            declaration_span: function.span,
+            scope: function.scope_id.get()?,
+        })
     }
 
     pub(super) const fn declaration_span(&self) -> Span {
