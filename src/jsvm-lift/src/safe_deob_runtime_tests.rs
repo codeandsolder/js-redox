@@ -1008,6 +1008,14 @@ fn depythonify_safe_deob_completion_paths_runtime_equivalence() -> Result<()> {
         "let a=[0];outer:{switch(1){case 1:a[0]=7;break outer;}a[0]=9;}a[0];",
         "let a=[0];function f(flag){while(true){if(flag){a[0]=9;throw 1;}a[0]=7;return a;}}try{f(true)}catch(e){events.push(e)}f(false)[0];",
         "let a=[0];for(let i=0;i<2;i++){switch(i){case 0:let x=7;continue;case 1:let y=9;a[0]=y;}}a[0];",
+    ];
+    script_eval_runtime_equivalence(&sources, "completion-paths")
+}
+
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_exception_completion_runtime_equivalence() -> Result<()> {
+    let sources = [
         "try{7;}finally{9;}",
         "try{}finally{7;}",
         "try{throw 7;}catch(e){e;}",
@@ -1039,11 +1047,14 @@ fn depythonify_safe_deob_completion_paths_runtime_equivalence() -> Result<()> {
         "let a=[0];try{let x={get y(){a[0]=9;throw 7;}};x.y;}catch(e){events.push(e)}a[0];",
         "let f=()=>{try{throw [7];}finally{return [9];}};let r=f();r[0];",
         "function f(){var a=[9];try{throw [];}catch(a){var a=[7];events.push(a[0]);}return a[0];}f();",
-
     ];
+    script_eval_runtime_equivalence(&sources, "exception-completions")
+}
+
+fn script_eval_runtime_equivalence(sources: &[&str], suite: &str) -> Result<()> {
     let mut comparisons = Vec::with_capacity(sources.len() * 2);
     for (index, source) in sources.iter().enumerate() {
-        let label = format!("completion-paths-{index}");
+        let label = format!("{suite}-{index}");
         let result =
             deobfuscate_source(source, &label, SourceMode::Auto, 48, false, &budget(&label))?;
         comparisons.push(script_observations::Comparison {
@@ -1057,7 +1068,7 @@ fn depythonify_safe_deob_completion_paths_runtime_equivalence() -> Result<()> {
             rewritten: result.source,
         });
     }
-    script_observations::compare_pairs("completion-paths", &comparisons, false)
+    script_observations::compare_pairs(suite, &comparisons, false)
 }
 
 #[test]
