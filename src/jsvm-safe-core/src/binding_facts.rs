@@ -46,6 +46,7 @@ pub struct BindingFacts {
     simple_parameter_functions: HashSet<ScopeId>,
     arguments_references: Vec<ReferenceId>,
     mapped_arguments_exposed: HashSet<ScopeId>,
+    implicit_arguments_used: HashSet<ScopeId>,
     regions: HashMap<SymbolId, Vec<Span>>,
     node_spans: Vec<Span>,
     scope_entries: HashMap<ScopeId, u32>,
@@ -131,6 +132,7 @@ impl BindingFacts {
             simple_parameter_functions: HashSet::new(),
             arguments_references: Vec::new(),
             mapped_arguments_exposed: HashSet::new(),
+            implicit_arguments_used: HashSet::new(),
             regions: HashMap::new(),
             node_spans: Vec::new(),
             scope_entries: HashMap::new(),
@@ -182,11 +184,13 @@ impl BindingFacts {
                         .is_function_scoped_declaration()
             }) {
                 facts.mapped_arguments_exposed.insert(owner);
+                facts.implicit_arguments_used.insert(owner);
             }
         }
         for site in &facts.eval_sites {
             if let Some(owner) = arguments_owner(site.scope) {
                 facts.mapped_arguments_exposed.insert(owner);
+                facts.implicit_arguments_used.insert(owner);
             }
         }
         facts.mapped_arguments_exposed.retain(|scope| {
@@ -556,6 +560,43 @@ impl BindingFacts {
         self.mapped_arguments_exposed.contains(&scope)
     }
 
+    pub(crate) fn implicit_arguments_used(&self, scope: ScopeId) -> bool {
+        self.implicit_arguments_used.contains(&scope)
+    }
+
+    pub(crate) fn implicit_arguments_symbol(&self, scoping: &Scoping, symbol: SymbolId) -> bool {
+        let owner = scoping.symbol_scope_id(symbol);
+        let flags = scoping.scope_flags(owner);
+        let symbol_flags = scoping.symbol_flags(symbol);
+        scoping.symbol_name(symbol) == "arguments"
+            && flags.is_function()
+            && !flags.is_arrow()
+            && symbol_flags.is_function_scoped_declaration()
+            && !symbol_flags.is_function()
+            && !self.parameters.contains(&symbol)
+    }
+
+    pub(crate) fn implicit_arguments_owner(
+        &self,
+        scoping: &Scoping,
+        reference: ReferenceId,
+    ) -> Option<ScopeId> {
+        let reference = scoping.get_reference(reference);
+        if reference.symbol_id().is_some() {
+            return None;
+        }
+        for scope in scoping.scope_ancestors(reference.scope_id()) {
+            let flags = scoping.scope_flags(scope);
+            if flags.is_with() || self.sloppy_eval_var_scopes.contains(&scope) {
+                return None;
+            }
+            if flags.is_function() && !flags.is_arrow() {
+                return Some(scope);
+            }
+        }
+        None
+    }
+
     pub(crate) fn is_parameter(&self, symbol: SymbolId) -> bool {
         self.parameters.contains(&symbol)
     }
@@ -651,7 +692,6 @@ impl BindingFacts {
         self.statement_list_functions.get(&symbol) == Some(&function_scope)
             && scoping.scope_parent_id(function_scope) == Some(scoping.symbol_scope_id(symbol))
             && self.has_declarative_storage(scoping, symbol)
-            && !self.is_mapped_arguments_exposed(scoping, symbol)
     }
 
     /// A hoisted declaration's statement is inert in a function body or

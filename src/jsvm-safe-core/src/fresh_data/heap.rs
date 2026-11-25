@@ -163,19 +163,143 @@ fn join_value(left: Option<&Fact>, right: Option<&Fact>) -> Option<Fact> {
     left?.join_proven(right?)
 }
 
+/// All modeled data properties are writable. Enumerability is independent
+/// of presence and value, and a mapped argument descriptor stores a cell
+/// reference rather than a snapshot. Non-configurable opaque accessors
+/// (the unmapped arguments callee poison) are represented separately.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Enumerable {
+    Yes,
+    No,
+    Maybe,
+}
+
+impl Enumerable {
+    fn join(self, other: Self) -> Self {
+        if self == other {
+            self
+        } else {
+            Self::Maybe
+        }
+    }
+}
+
+#[derive(Clone)]
+enum DataStorage {
+    Value(Option<Fact>),
+    Cell(CellId),
+}
+
+#[derive(Clone)]
+struct DataDescriptor {
+    storage: DataStorage,
+    enumerable: Enumerable,
+}
+
+impl DataDescriptor {
+    const fn plain(value: Option<Fact>, enumerable: Enumerable) -> Self {
+        Self {
+            storage: DataStorage::Value(value),
+            enumerable,
+        }
+    }
+
+    const fn mapped(cell: CellId) -> Self {
+        Self {
+            storage: DataStorage::Cell(cell),
+            enumerable: Enumerable::Yes,
+        }
+    }
+
+    const fn fact(&self) -> Option<&Fact> {
+        match &self.storage {
+            DataStorage::Value(value) => value.as_ref(),
+            DataStorage::Cell(_) => None,
+        }
+    }
+
+    const fn cell(&self) -> Option<CellId> {
+        match self.storage {
+            DataStorage::Cell(cell) => Some(cell),
+            DataStorage::Value(_) => None,
+        }
+    }
+
+    fn value<'a>(&'a self, cells: &'a CellStore) -> Option<&'a Fact> {
+        match &self.storage {
+            DataStorage::Value(value) => value.as_ref(),
+            DataStorage::Cell(cell) => cells.get(*cell),
+        }
+    }
+
+    fn join(&self, other: &Self) -> Option<Self> {
+        let storage = match (&self.storage, &other.storage) {
+            (DataStorage::Value(left), DataStorage::Value(right)) => {
+                DataStorage::Value(join_value(left.as_ref(), right.as_ref()))
+            }
+            (DataStorage::Cell(left), DataStorage::Cell(right)) if left == right => {
+                DataStorage::Cell(*left)
+            }
+            _ => return None,
+        };
+        Some(Self {
+            storage,
+            enumerable: self.enumerable.join(other.enumerable),
+        })
+    }
+
+    fn into_enumerable(
+        self,
+        maybe_absent: bool,
+        cells: &CellStore,
+        budget: &WorkBudget,
+    ) -> Result<Property, BudgetExceeded> {
+        if self.enumerable == Enumerable::No {
+            return Ok(Property::Absent);
+        }
+        let maybe = maybe_absent || self.enumerable == Enumerable::Maybe;
+        let value = match self.storage {
+            DataStorage::Value(value) => value,
+            DataStorage::Cell(cell) => cells.get(cell).map(|fact| fact.copy(budget)).transpose()?,
+        };
+        let descriptor = Self::plain(value, Enumerable::Yes);
+        Ok(if maybe {
+            Property::MaybeData(descriptor)
+        } else {
+            Property::Data(descriptor)
+        })
+    }
+}
+
 #[derive(Clone)]
 enum Property {
     Absent,
-    Data(Option<Fact>),
-    MaybeData(Option<Fact>),
+    Data(DataDescriptor),
+    MaybeData(DataDescriptor),
     Opaque,
+    Restricted,
 }
 
 impl Property {
+    const fn data(value: Option<Fact>) -> Self {
+        Self::Data(DataDescriptor::plain(value, Enumerable::Yes))
+    }
+
+    const fn maybe_data(value: Option<Fact>) -> Self {
+        Self::MaybeData(DataDescriptor::plain(value, Enumerable::Yes))
+    }
+
     const fn fact(&self) -> Option<&Fact> {
         match self {
-            Self::Data(value) | Self::MaybeData(value) => value.as_ref(),
-            Self::Absent | Self::Opaque => None,
+            Self::Data(value) | Self::MaybeData(value) => value.fact(),
+            Self::Absent | Self::Opaque | Self::Restricted => None,
+        }
+    }
+
+    const fn mapped_cell(&self) -> Option<CellId> {
+        match self {
+            Self::Data(value) => value.cell(),
+            _ => None,
         }
     }
 
@@ -199,18 +323,43 @@ impl Property {
     fn join(&self, other: &Self) -> Self {
         match (self, other) {
             (Self::Absent, Self::Absent) => Self::Absent,
+            (Self::Restricted, Self::Restricted) => Self::Restricted,
             (Self::Data(left), Self::Data(right)) => {
-                Self::Data(join_value(left.as_ref(), right.as_ref()))
+                left.join(right).map_or(Self::Opaque, Self::Data)
             }
             (Self::Absent, Self::Data(value) | Self::MaybeData(value))
-            | (Self::Data(value) | Self::MaybeData(value), Self::Absent) => {
+            | (Self::Data(value) | Self::MaybeData(value), Self::Absent)
+                if value.cell().is_none() =>
+            {
                 Self::MaybeData(value.clone())
             }
             (Self::Data(left) | Self::MaybeData(left), Self::MaybeData(right))
             | (Self::MaybeData(left), Self::Data(right)) => {
-                Self::MaybeData(join_value(left.as_ref(), right.as_ref()))
+                left.join(right).map_or(Self::Opaque, Self::MaybeData)
             }
             _ => Self::Opaque,
+        }
+    }
+
+    fn assigned(&self, value: Option<Fact>) -> Self {
+        let enumerable = match self {
+            Self::Data(descriptor) => descriptor.enumerable,
+            Self::MaybeData(descriptor) => descriptor.enumerable.join(Enumerable::Yes),
+            _ => Enumerable::Yes,
+        };
+        Self::Data(DataDescriptor::plain(value, enumerable))
+    }
+
+    fn into_enumerable(
+        self,
+        cells: &CellStore,
+        budget: &WorkBudget,
+    ) -> Result<Self, BudgetExceeded> {
+        match self {
+            Self::Data(descriptor) => descriptor.into_enumerable(false, cells, budget),
+            Self::MaybeData(descriptor) => descriptor.into_enumerable(true, cells, budget),
+            Self::Absent | Self::Restricted => Ok(Self::Absent),
+            Self::Opaque => Ok(Self::Opaque),
         }
     }
 }
@@ -239,7 +388,7 @@ impl Property {
             Self::Absent => previous.clone(),
             Self::Data(value) => Self::Data(value.clone()),
             Self::MaybeData(value) => previous.join(&Self::Data(value.clone())),
-            Self::Opaque => Self::Opaque,
+            Self::Opaque | Self::Restricted => Self::Opaque,
         }
     }
 }
@@ -408,7 +557,23 @@ impl OwnData {
     }
 
     pub(super) fn define_data(&mut self, key: String, value: Option<Fact>) {
-        self.properties.insert(key, Property::Data(value));
+        self.properties.insert(key, Property::data(value));
+    }
+
+    pub(super) fn define_hidden_data(&mut self, key: String, value: Option<Fact>) {
+        self.properties.insert(
+            key,
+            Property::Data(DataDescriptor::plain(value, Enumerable::No)),
+        );
+    }
+
+    pub(super) fn define_mapped(&mut self, key: String, cell: CellId) {
+        self.properties
+            .insert(key, Property::Data(DataDescriptor::mapped(cell)));
+    }
+
+    pub(super) fn define_restricted(&mut self, key: String) {
+        self.properties.insert(key, Property::Restricted);
     }
 
     pub(super) fn define_accessor(&mut self, key: String) {
@@ -445,7 +610,7 @@ impl OwnData {
         budget: &WorkBudget,
     ) -> Result<(), BudgetExceeded> {
         let definition = if is_data {
-            Property::Data(value)
+            Property::data(value)
         } else {
             Property::Opaque
         };
@@ -455,7 +620,7 @@ impl OwnData {
     /// Array spread cannot overwrite any of the already created prefix
     /// elements. Unknown later indices are data or absent, never accessors.
     pub(super) fn unknown_array_tail(&mut self) {
-        self.properties.unlisted = Property::MaybeData(None);
+        self.properties.unlisted = Property::maybe_data(None);
     }
 
     fn property(&self, key: &str) -> &Property {
@@ -470,6 +635,7 @@ impl OwnData {
 
     fn enumerable_data(
         &self,
+        cells: &CellStore,
         excluded: &HashSet<String>,
         budget: &WorkBudget,
     ) -> Result<Option<Properties>, BudgetExceeded> {
@@ -486,6 +652,14 @@ impl OwnData {
         for key in excluded {
             charge(budget, key.len())?;
             properties.insert(key.clone(), Property::Absent);
+        }
+        for property in properties
+            .listed
+            .values_mut()
+            .chain(std::iter::once(&mut properties.unlisted))
+        {
+            *property =
+                std::mem::replace(property, Property::Absent).into_enumerable(cells, budget)?;
         }
         Ok(properties.data_only().then_some(properties))
     }
@@ -528,7 +702,7 @@ impl OwnData {
         let Property::Data(value) = self.property("length") else {
             return None;
         };
-        Self::length_value(value.as_ref())
+        Self::length_value(value.fact())
     }
 
     fn can_write(&self, key: &str, value: Option<&Fact>) -> bool {
@@ -542,6 +716,11 @@ impl OwnData {
         strength: Strength,
         budget: &WorkBudget,
     ) -> Result<(), BudgetExceeded> {
+        if self.property(key).mapped_cell().is_some() {
+            // The environment applies the cell write exactly once. Its
+            // mapped descriptor and attributes remain unchanged.
+            return Ok(());
+        }
         if self.is_length(key) {
             let Some(length) = Self::length_value(value.as_ref()) else {
                 return Ok(());
@@ -556,7 +735,7 @@ impl OwnData {
             }
             self.properties.replace(
                 key,
-                Property::Data(Some(Fact::Primitive(Value::Number(f64::from(length))))),
+                Property::data(Some(Fact::Primitive(Value::Number(f64::from(length))))),
                 strength,
                 budget,
             )
@@ -567,11 +746,11 @@ impl OwnData {
                         Fact::Primitive(Value::Number(f64::from(length.max(index + 1))))
                     });
                     self.properties
-                        .replace("length", Property::Data(length), strength, budget)?;
+                        .replace("length", Property::data(length), strength, budget)?;
                 }
             }
-            self.properties
-                .replace(key, Property::Data(value), strength, budget)
+            let replacement = self.property(key).assigned(value);
+            self.properties.replace(key, replacement, strength, budget)
         }
     }
 }
@@ -754,8 +933,12 @@ impl<'b> Reachability<'b> {
     }
 
     fn property(&mut self, property: &Property) -> Result<(), BudgetExceeded> {
-        if let Property::Data(Some(fact)) | Property::MaybeData(Some(fact)) = property {
+        if let Some(fact) = property.fact() {
             self.fact(fact)?;
+        }
+        if let Some(cell) = property.mapped_cell() {
+            self.charge(1)?;
+            self.mark_instance(cell.instance());
         }
         Ok(())
     }
@@ -1147,7 +1330,9 @@ impl Environment {
                     let Some(data) = self.allocations.get(id) else {
                         return Ok(None);
                     };
-                    let Some(properties) = data.enumerable_data(excluded, budget)? else {
+                    let Some(properties) =
+                        data.enumerable_data(&self.bindings, excluded, budget)?
+                    else {
                         return Ok(None);
                     };
                     if let Some(merged) = &mut merged {
@@ -1175,7 +1360,7 @@ impl Environment {
                             .map(|character| Fact::Primitive(Value::String(character.to_string())));
                         let key = index.to_string();
                         if !excluded.contains(&key) {
-                            properties.insert(key, Property::Data(fact));
+                            properties.insert(key, Property::data(fact));
                         }
                     }
                 }
@@ -1200,7 +1385,7 @@ impl Environment {
                 return Ok(false);
             };
             if let Property::Data(value) = data.property(key) {
-                visit(value.as_ref())?;
+                visit(value.value(&self.bindings))?;
                 return Ok(true);
             }
         }
@@ -1220,16 +1405,16 @@ impl Environment {
             charge(budget, key.len())?;
             match data.property(key) {
                 Property::Data(value) => {
-                    visit(value.as_ref())?;
+                    visit(value.value(&self.bindings))?;
                     found = true;
                     continue;
                 }
                 Property::MaybeData(value) => {
-                    visit(value.as_ref())?;
+                    visit(value.value(&self.bindings))?;
                     found = true;
                 }
                 Property::Absent => {}
-                Property::Opaque => return Ok(false),
+                Property::Opaque | Property::Restricted => return Ok(false),
             }
             match &data.prototype {
                 Prototype::Unknown => return Ok(false),
@@ -1290,6 +1475,45 @@ impl Environment {
         Ok(true)
     }
 
+    fn write_mapped_cells(
+        &mut self,
+        locations: &Locations,
+        key: &str,
+        value: Option<&Fact>,
+        budget: &WorkBudget,
+    ) -> Result<(), BudgetExceeded> {
+        let mut cells = HashSet::new();
+        let mut plain = false;
+        for id in locations.iter() {
+            charge(budget, 1)?;
+            let cell = self
+                .allocations
+                .get(id)
+                .and_then(|data| data.property(key).mapped_cell());
+            if let Some(cell) = cell {
+                cells.insert(cell);
+            } else {
+                plain = true;
+            }
+        }
+        let strong = !plain && cells.len() == 1;
+        for cell in cells {
+            let next = if strong {
+                value.map(|fact| fact.copy(budget)).transpose()?
+            } else if let (Some(old), Some(value)) = (self.bindings.get(cell), value) {
+                old.join(value, budget)?
+            } else {
+                None
+            };
+            if let Some(next) = next {
+                self.bindings.insert(cell, next, budget)?;
+            } else {
+                self.bindings.remove(cell, budget)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn write(
         &mut self,
         locations: &Locations,
@@ -1316,6 +1540,7 @@ impl Environment {
         }) {
             return Ok(false);
         }
+        self.write_mapped_cells(locations, key, value, budget)?;
         self.update(locations, budget, |data, strength| {
             if let Some(value) = value {
                 charge(budget, value.clone_weight())?;
@@ -1334,9 +1559,11 @@ impl Environment {
     ) -> Result<bool, BudgetExceeded> {
         charge(budget, locations.len())?;
         if !locations.iter().all(|id| {
-            self.allocations
-                .get(id)
-                .is_some_and(|data| data.kind != AllocationKind::Callable && !data.is_length(key))
+            self.allocations.get(id).is_some_and(|data| {
+                data.kind != AllocationKind::Callable
+                    && !data.is_length(key)
+                    && !matches!(data.property(key), Property::Restricted)
+            })
         }) {
             return Ok(false);
         }
@@ -1362,18 +1589,18 @@ mod tests {
             Property::Data(value) => (
                 1,
                 value
-                    .as_ref()
+                    .fact()
                     .and_then(Fact::primitive)
                     .and_then(Value::render),
             ),
             Property::MaybeData(value) => (
                 2,
                 value
-                    .as_ref()
+                    .fact()
                     .and_then(Fact::primitive)
                     .and_then(Value::render),
             ),
-            Property::Opaque => (3, None),
+            Property::Opaque | Property::Restricted => (3, None),
         }
     }
 

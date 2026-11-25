@@ -17,9 +17,10 @@ pub(super) type InstanceId = usize;
 pub(super) enum Binding {
     Symbol(SymbolId),
     This,
+    Arguments,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct CellId {
     instance: InstanceId,
     binding: Binding,
@@ -30,6 +31,17 @@ impl CellId {
         Self {
             instance,
             binding: Binding::Symbol(symbol),
+        }
+    }
+
+    pub(super) const fn instance(self) -> InstanceId {
+        self.instance
+    }
+
+    pub(super) const fn arguments(instance: InstanceId) -> Self {
+        Self {
+            instance,
+            binding: Binding::Arguments,
         }
     }
 

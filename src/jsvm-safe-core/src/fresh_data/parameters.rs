@@ -48,7 +48,7 @@ fn pattern_has_expression(pattern: &BindingPattern<'_>) -> bool {
     }
 }
 
-fn has_parameter_expressions(params: &FormalParameters<'_>) -> bool {
+pub(super) fn has_parameter_expressions(params: &FormalParameters<'_>) -> bool {
     params.items.iter().any(|parameter| {
         parameter.initializer.is_some() || pattern_has_expression(&parameter.pattern)
     }) || params
@@ -107,12 +107,6 @@ impl Analyzer<'_, '_> {
         match pattern {
             BindingPattern::BindingIdentifier(identifier) => {
                 let symbol = identifier.symbol_id.get()?;
-                if self
-                    .bindings
-                    .is_mapped_arguments_exposed(self.scoping, symbol)
-                {
-                    return Some(());
-                }
                 self.write_initialized(self.cell_id(symbol)?, value, environment)
             }
             BindingPattern::AssignmentPattern(pattern) => {
@@ -277,17 +271,22 @@ impl Analyzer<'_, '_> {
             None
         };
 
-        for (name, &symbol) in self.scoping.get_bindings(scope) {
+        for &symbol in self.scoping.get_bindings(scope).values() {
             self.heap_result(self.budget.consume(1))?;
             let flags = self.scoping.symbol_flags(symbol);
-            if (name.as_str() == "arguments"
-                && !self.bindings.is_parameter(symbol)
-                && !self.scoping.scope_flags(scope).is_arrow())
-                || flags.contains(SymbolFlags::FunctionExpression)
-                || self
-                    .bindings
-                    .is_mapped_arguments_exposed(self.scoping, symbol)
+            if flags.contains(SymbolFlags::FunctionExpression) {
+                continue;
+            }
+            if self
+                .bindings
+                .implicit_arguments_symbol(self.scoping, symbol)
             {
+                if let Some(instance) = parameter_instance {
+                    let value = self.heap_result(
+                        environment.read_binding(CellId::arguments(instance), self.budget),
+                    )?;
+                    self.write_initialized(self.cell_id(symbol)?, value, environment)?;
+                }
                 continue;
             }
             if flags.is_function() {
