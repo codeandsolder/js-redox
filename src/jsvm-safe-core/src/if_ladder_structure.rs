@@ -5130,7 +5130,10 @@ pub fn prune_exception_dispatcher(
 }
 
 /// Recover a while loop preceded by a numeric state initializer in the same
-/// lexical block. Both syntaxes share the same control-flow reconstruction.
+/// lexical block. Leave the initializer at its original statement position:
+/// moving a let/const declaration into the reconstructed loop's new block
+/// changes the binding identity and can break later reads or direct eval.
+/// Both while syntaxes share the same control-flow reconstruction.
 pub fn reconstruct_while_adjacent(
     init: &Statement<'_>,
     loop_stmt: &WhileStatement<'_>,
@@ -5186,16 +5189,8 @@ pub fn reconstruct_while_adjacent(
     if init_symbol != Some(symbol) {
         return None;
     }
-    let initial_text = fragment(source, init.span());
-    reconstruct_state_loop(
-        state,
-        initial,
-        &loop_stmt.test,
-        &loop_stmt.body,
-        initial_text,
-        source,
-    )
-    .map(|reconstructed| reconstructed.text)
+    reconstruct_state_loop(state, initial, &loop_stmt.test, &loop_stmt.body, "", source)
+        .map(|reconstructed| reconstructed.text)
 }
 
 /// A `var` declaration is function-scoped even inside a branch that the
@@ -6412,6 +6407,77 @@ function dispatch(input, log) {
             "{value:?}"
         );
         assert!(!value.source.contains("unmodelled()"), "{}", value.source);
+    }
+
+    #[test]
+    #[ignore = "requires Node; real differential for moved lexical bindings"]
+    fn node_confirms_adjacent_while_preserves_lexical_initializer_scope(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::process::Command;
+        let cases = [
+            "function run(){let s=1;while(s!=9)s==1?(s=9):s==9&&(s=9);return s;}run();",
+            "let s=1;while(s!=9)s==1?(s=9):s==9&&(s=9);s;",
+            "function run(){var s=1;while(s!=9)s==1?(s=9):s==9&&(s=9);return s;}run();",
+            "function run(){let s=1;while(s!=9)s==1?(s=9):s==9&&(s=9);const read=()=>s;return read();}run();",
+            "function run(){let s=1;while(s!=9)s==1?(s=9):s==9&&(s=9);return eval('s');}run();",
+        ];
+        let harness = r"
+const vm=require('node:vm');
+const source=process.argv[1],mode=process.argv[2];
+const code=mode==='eval'?'eval('+JSON.stringify(source)+')':source;
+const context=Object.create(null),options=Object.create(null);
+options.timeout=1000;
+try {
+ const value=vm.runInNewContext(code,context,options);
+ const observation=Object.create(null);
+ observation.kind=typeof value;
+ observation.result=value;
+ console.log(JSON.stringify(observation));
+} catch(error) {
+ const observation=Object.create(null);
+ observation.kind='throw';
+ observation.name=error.name;
+ console.log(JSON.stringify(observation));
+}
+";
+        for (index, source) in cases.iter().enumerate() {
+            let recovered = deobfuscate(
+                source,
+                12,
+                &WorkBudget::unlimited("adjacent-while-lexical-binding-lifetime"),
+            )?
+            .ok_or_else(|| std::io::Error::other("valid source must recover"))?;
+            if matches!(index, 0 | 2) {
+                assert!(
+                    recovered
+                        .transforms
+                        .get("if_ladder_structured")
+                        .is_some_and(|count| *count > 0),
+                    "supported adjacent while rewrite missing for case {index}: {}",
+                    recovered.source
+                );
+            }
+            for mode in ["script", "eval"] {
+                let observe = |input: &str| -> Result<String, Box<dyn std::error::Error>> {
+                    let out = Command::new("node")
+                        .arg("-e")
+                        .arg(harness)
+                        .arg(input)
+                        .arg(mode)
+                        .output()?;
+                    assert!(out.status.success(), "{out:?}");
+                    Ok(String::from_utf8(out.stdout)?.trim().to_owned())
+                };
+                let before = observe(source)?;
+                let after = observe(&recovered.source)?;
+                assert_eq!(
+                    before, after,
+                    "case {index} in {mode}: {}",
+                    recovered.source
+                );
+            }
+        }
+        Ok(())
     }
 
     #[test]

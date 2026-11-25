@@ -829,11 +829,9 @@ impl Collector<'_, '_> {
                     self.source,
                     self.scoping,
                 ) {
-                    self.push(
-                        Span::new(initial.span().start, loop_stmt.span.end),
-                        code,
-                        "if_ladder_structured",
-                    );
+                    // The paired initializer remains in its original lexical
+                    // environment; only the loop is reconstructed.
+                    self.push(loop_stmt.span, code, "if_ladder_structured");
                 }
             }
         }
