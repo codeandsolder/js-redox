@@ -333,7 +333,7 @@ impl<'ast> Analyzer<'_, 'ast> {
     fn summarize_activation(
         &mut self,
         mut flow: super::flow::Flow,
-        environment: &mut Environment,
+        environment: &Environment,
     ) -> Option<ReturnSummary> {
         use super::flow::{CompletionValue, Transfer};
         if flow.unproved {
@@ -658,7 +658,7 @@ impl<'ast> Analyzer<'_, 'ast> {
         };
         let summary = flow.and_then(|mut flow| {
             self.dispose_paths(disposes, &mut flow, &mut candidate);
-            self.summarize_activation(flow, &mut candidate)
+            self.summarize_activation(flow, &candidate)
         });
         self.leave_instance(ticket, &mut candidate);
         self.activation_depth -= 1;

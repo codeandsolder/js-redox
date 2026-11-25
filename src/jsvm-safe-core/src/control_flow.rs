@@ -381,12 +381,19 @@ fn statement_mentions(stmt: &Statement<'_>, name: &str) -> bool {
     collector.names.contains(name)
 }
 
+#[derive(Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum JumpSummary {
+    #[default]
+    None,
+    InternalLabel,
+    External,
+}
+
 #[derive(Default)]
-pub(crate) struct StatementTransfers {
-    pub(crate) external_jump: bool,
-    pub(crate) labelled_jump: bool,
-    pub(crate) returns: bool,
-    pub(crate) throws: bool,
+pub struct StatementTransfers {
+    pub jumps: JumpSummary,
+    pub returns: bool,
+    pub throws: bool,
 }
 
 #[derive(Default)]
@@ -410,21 +417,27 @@ impl LoopControlDetector {
 impl<'a> Visit<'a> for LoopControlDetector {
     fn visit_break_statement(&mut self, it: &oxc_ast::ast::BreakStatement<'a>) {
         if let Some(label) = &it.label {
-            self.summary.labelled_jump = true;
-            self.summary.external_jump |=
-                !self.labels.iter().any(|name| name == label.name.as_str());
-        } else {
-            self.summary.external_jump |= self.break_depth == 0;
+            let jump = if self.labels.iter().any(|name| name == label.name.as_str()) {
+                JumpSummary::InternalLabel
+            } else {
+                JumpSummary::External
+            };
+            self.summary.jumps = std::mem::take(&mut self.summary.jumps).max(jump);
+        } else if self.break_depth == 0 {
+            self.summary.jumps = JumpSummary::External;
         }
     }
 
     fn visit_continue_statement(&mut self, it: &oxc_ast::ast::ContinueStatement<'a>) {
         if let Some(label) = &it.label {
-            self.summary.labelled_jump = true;
-            self.summary.external_jump |=
-                !self.labels.iter().any(|name| name == label.name.as_str());
-        } else {
-            self.summary.external_jump |= self.continue_depth == 0;
+            let jump = if self.labels.iter().any(|name| name == label.name.as_str()) {
+                JumpSummary::InternalLabel
+            } else {
+                JumpSummary::External
+            };
+            self.summary.jumps = std::mem::take(&mut self.summary.jumps).max(jump);
+        } else if self.continue_depth == 0 {
+            self.summary.jumps = JumpSummary::External;
         }
     }
 
@@ -481,7 +494,7 @@ impl<'a> Visit<'a> for LoopControlDetector {
     }
 }
 
-pub(crate) fn statement_transfers(stmt: &Statement<'_>) -> StatementTransfers {
+pub fn statement_transfers(stmt: &Statement<'_>) -> StatementTransfers {
     let mut detector = LoopControlDetector::default();
     detector.visit_statement(stmt);
     detector.summary
@@ -491,7 +504,7 @@ pub fn statement_has_loop_control(stmt: &Statement<'_>) -> bool {
     let summary = statement_transfers(stmt);
     // Existing relocation proofs reject all labelled transfers, including
     // labels wholly contained by the relocated statement.
-    summary.external_jump || summary.labelled_jump
+    summary.jumps != JumpSummary::None
 }
 
 pub fn direct_assignment_name<'a>(

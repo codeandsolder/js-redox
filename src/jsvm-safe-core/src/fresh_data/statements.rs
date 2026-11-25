@@ -10,12 +10,12 @@ use oxc_span::GetSpan;
 /// region. Do not reinterpret that path as a normal completion.
 pub(super) fn unmodeled_transfer(statement: &Statement<'_>) -> bool {
     let summary = crate::control_flow::statement_transfers(statement);
-    summary.returns || summary.external_jump
+    summary.returns || summary.jumps == crate::control_flow::JumpSummary::External
 }
 
 pub(super) fn may_exit_loop(body: &Statement<'_>) -> bool {
     let summary = crate::control_flow::statement_transfers(body);
-    summary.returns || summary.throws || summary.external_jump
+    summary.returns || summary.throws || summary.jumps == crate::control_flow::JumpSummary::External
 }
 
 impl Analyzer<'_, '_> {
@@ -232,7 +232,7 @@ impl Analyzer<'_, '_> {
         self.heap_result(self.budget.consume(1))?;
         match statement {
             Statement::VariableDeclaration(declaration) => {
-                self.declaration(declaration, environment)
+                self.declaration(declaration, environment);
             }
             Statement::ExportDeclaration(export) => {
                 if let Declaration::VariableDeclaration(declaration) = &export.declaration {

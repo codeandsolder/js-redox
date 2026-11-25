@@ -27,14 +27,14 @@ impl<'a, 'ast> Loop<'a, 'ast> {
         }
     }
 
-    fn scope(self) -> Option<ScopeId> {
+    const fn scope(self) -> Option<ScopeId> {
         match self {
             Self::For(statement) => statement.scope_id.get(),
             Self::While(_) | Self::DoWhile(_) => None,
         }
     }
 
-    fn body(self) -> &'a Statement<'ast> {
+    const fn body(self) -> &'a Statement<'ast> {
         match self {
             Self::For(statement) => &statement.body,
             Self::While(statement) => &statement.body,
@@ -42,7 +42,7 @@ impl<'a, 'ast> Loop<'a, 'ast> {
         }
     }
 
-    fn test(self) -> Option<&'a Expression<'ast>> {
+    const fn test(self) -> Option<&'a Expression<'ast>> {
         match self {
             Self::For(statement) => statement.test.as_ref(),
             Self::While(statement) => Some(&statement.test),
@@ -142,7 +142,7 @@ impl Analyzer<'_, '_> {
         if let Some(initializer) = &statement.init {
             match initializer {
                 ForStatementInit::VariableDeclaration(declaration) => {
-                    self.declaration(declaration, environment)
+                    self.declaration(declaration, environment);
                 }
                 expression => {
                     self.expression(expression.as_expression()?, environment);

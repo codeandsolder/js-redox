@@ -1,6 +1,6 @@
 //! ECMAScript completion values and reaching abrupt paths.
 //!
-//! Empty and an explicit unknown value are different: UpdateEmpty uses
+//! Empty and an explicit unknown value are different: `UpdateEmpty` uses
 //! the prior completion only for the former. The normal heap remains in
 //! the caller; abrupt paths own their snapshots until their target consumes
 //! them. A value carried by a return is never reconstructed from the heap.
@@ -114,7 +114,7 @@ pub(super) struct Path {
 }
 
 impl Path {
-    pub(super) fn join(&mut self, other: Self, budget: &WorkBudget) -> Result<(), BudgetExceeded> {
+    pub(super) fn join(&mut self, other: &Self, budget: &WorkBudget) -> Result<(), BudgetExceeded> {
         self.environment.join_returns(&other.environment, budget)?;
         self.value = std::mem::replace(&mut self.value, CompletionValue::Empty)
             .join(&other.value, budget)?;
@@ -127,7 +127,7 @@ impl Path {
         budget: &WorkBudget,
     ) -> Result<(), BudgetExceeded> {
         if let Some(previous) = slot {
-            previous.join(path, budget)
+            previous.join(&path, budget)
         } else {
             *slot = Some(path);
             Ok(())
@@ -189,7 +189,7 @@ impl Flow {
             budget.consume(1)?;
             match self.abrupt.entry(kind) {
                 std::collections::hash_map::Entry::Occupied(mut entry) => {
-                    entry.get_mut().join(path, budget)?
+                    entry.get_mut().join(&path, budget)?;
                 }
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     entry.insert(path);
@@ -199,7 +199,7 @@ impl Flow {
         Ok(())
     }
 
-    /// Compose StatementListEvaluation: abrupt Empty values inherit the
+    /// Compose `StatementListEvaluation`: abrupt Empty values inherit the
     /// preceding normal value just as normal Empty completions do.
     pub(super) fn update_empty(
         &mut self,
