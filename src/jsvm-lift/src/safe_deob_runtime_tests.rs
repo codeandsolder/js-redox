@@ -954,6 +954,82 @@ fn depythonify_safe_deob_callable_capture_runtime_equivalence() -> Result<()> {
 
 #[test]
 #[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_completion_paths_runtime_equivalence() -> Result<()> {
+    let sources = [
+        "7; outer:{break outer;}",
+        "outer:{7;break outer;}",
+        "7; while(false){}",
+        "let i=0;while(i++<2){i;}",
+        "let i=0;while(i++<2){if(i===1){3;}else{}}",
+        "do{3;break;}while(false);",
+        "for(let i=0;i<2;i++){3;continue;}",
+        "for(let i=0;i<2;i++){3;if(i===1)continue;}",
+        "switch(1){case 1:3;case 2:break;}",
+        "7;switch(3){case 1:3;case 2:break;}",
+        "7;switch(1){case 1:break;}",
+        "outer:for(;;){7;break outer;}",
+        "let i=0;outer:inner:while(i++<2){5;continue outer;}",
+        "let i=0;while(i++<2){switch(i){case 1:3;break;case 2:break;}}",
+        "for(let i=0;i<2;i++){if(i===0){3;}else{;}}",
+        "for(let i=0;i<2;i++){{let x;}}",
+        "let i=0;for(;i<2;99){i++;i;}",
+        "let i=0;do{i++;i;}while(i<3);",
+        "outer:{switch(1){case 1:9;break outer;}}",
+        "let a=[0],i=0;while(i<3){a[0]+=2;i++;}a[0];",
+        "let a=[0],i=0;do{a[0]+=2;i++;}while(i<3);a[0];",
+        "let a=[0];for(;;){a[0]=7;break;}a[0];",
+        "let a=[0];for(let i=0;i<4;i++){if(i===1)continue;a[0]+=i;}a[0];",
+        "let a=[0];do{a[0]=7;break;}while((a[0]=9,true));a[0];",
+        "let a=[0],i=0;outer:while(i<3){i++;for(let j=0;j<3;j++){if(j===1)continue outer;a[0]++;}a[0]=99;}a[0];",
+        "let a=[0];outer:{a[0]=7;break outer;a[0]=9;}a[0];",
+        "let a=[0];outer:inner:for(let i=0;i<3;i++){a[0]++;continue outer;}a[0];",
+        "let a=[0];outer:for(let i=0;i<3;i++){for(;;){a[0]=7;break outer;}a[0]=9;}a[0];",
+        "function f(flag){let a=[0];for(let i=0;i<1;i++){a[0]=7;if(flag)break;}return a[0];}[f(true),f(false)];",
+        "function f(flag){let a=[0];for(let i=0;i<1;i++){if(flag){a[0]=7;break;}a[0]=9;}return a[0];}[f(true),f(false)];",
+        "function f(flag){let a=[0];for(let i=0;i<2;i++){a[0]=7;if(flag)continue;a[0]=7;}return a[0];}[f(true),f(false)];",
+        "let a=[0];switch(2){case (a[0]=1,1):a[0]=99;break;default:a[0]=99;break;case (a[0]=2,2):a[0]=7;break;}a[0];",
+        "let a=[0];switch(1){case 1:a[0]=7;case 2:a[0]+=2;break;default:a[0]=99;}a[0];",
+        "let a=[0];for(let i=0;i<3;i++){switch(i){case 0:continue;case 1:a[0]+=7;break;default:a[0]+=9;}a[0]++;}a[0];",
+        "let a=[0];switch(3){case 1:a[0]=9;break;}a[0];",
+        "let f=()=>{let a=[0];while(true){a[0]=7;return a;}};let r=f();r[0];",
+        "function outer(flag){function f(){let a=[0];for(let i=0;i<1;i++){if(flag)return [7];a[0]=7;}return a;}let r=f();return r[0];}[outer(true),outer(false)];",
+        "function outer(flag){function f(){let a=[0];for(let i=0;i<1;i++){if(flag)return [9];a[0]=7;}return a;}let r=f();return r[0];}[outer(true),outer(false)];",
+        "function outer(flag){let escaped;let f=()=>{let a=[0];escaped=a;if(flag)return [7];a[0]=7;return a;};let r=f();return [r[0],escaped[0]];}[outer(true),outer(false)];",
+        "function outer(flag){let f=()=>{let a=[0];if(flag)return [7];a[0]=7;return a;};let r=f();return r[0];}[outer(true),outer(false)];",
+        "function outer(flag){let f=()=>{let a=[0],g=()=>a[0];if(flag)return ()=>7;a[0]=7;return g;};let g=f();let r=[g()];return r[0];}[outer(true),outer(false)];",
+        "function outer(flag){let make=()=>()=>7;let f=()=>{let a=[0],g=()=>a[0];if(flag)return make();a[0]=7;return g;};let g=f();let r=[g()];return r[0];}[outer(true),outer(false)];",
+        "function outer(flag){let a=[0];let f=()=>{if(flag)return [7];a[0]=7;return a;};let r=f();return [r[0],a[0]];}[outer(true),outer(false)];",
+
+        "let g;for(let i=0;i<3;i++){if(i===1){g=()=>[i];continue;}}let r=g();r[0];",
+        "let a=[7];while(true){try{break;}finally{a[0]=9;}}a[0];",
+        "function f(flag){let a=[7];switch(flag){case 1:a[0]=9;}return a[0];}[f(1),f(2)];",
+        "let a=[0];try{outer:while(true){try{a[0]=7;break outer;}finally{a[0]=9;throw 1}}}catch(e){events.push(e)}a[0];",
+        "let a=[0];let i=0;do{events.push(i);i++;if(i===1)continue;a[0]++;}while(i<3);a[0];",
+        "let a=[0];outer:{switch(1){case 1:a[0]=7;break outer;}a[0]=9;}a[0];",
+        "let a=[0];function f(flag){while(true){if(flag){a[0]=9;throw 1;}a[0]=7;return a;}}try{f(true)}catch(e){events.push(e)}f(false)[0];",
+        "let a=[0];for(let i=0;i<2;i++){switch(i){case 0:let x=7;continue;case 1:let y=9;a[0]=y;}}a[0];",
+    ];
+    let mut comparisons = Vec::with_capacity(sources.len() * 2);
+    for (index, source) in sources.iter().enumerate() {
+        let label = format!("completion-paths-{index}");
+        let result =
+            deobfuscate_source(source, &label, SourceMode::Auto, 48, false, &budget(&label))?;
+        comparisons.push(script_observations::Comparison {
+            label: format!("{label}-eval"),
+            original: format!("eval({})", serde_json::to_string(source)?),
+            rewritten: format!("eval({})", serde_json::to_string(&result.source)?),
+        });
+        comparisons.push(script_observations::Comparison {
+            label,
+            original: (*source).to_owned(),
+            rewritten: result.source,
+        });
+    }
+    script_observations::compare_pairs("completion-paths", &comparisons, false)
+}
+
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
 fn depythonify_safe_deob_string_own_runtime_equivalence() -> Result<()> {
     let sources = [
         "let s='abc';[s.length,s[0],s[2]];",
