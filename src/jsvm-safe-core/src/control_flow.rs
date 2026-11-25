@@ -1237,10 +1237,10 @@ fn simulate_immediate_invocation(
     }
 }
 
-fn join_expression_paths(
-    env: &mut ArithmeticEnvironment<'_>,
+fn join_expression_paths<'c>(
+    env: &mut ArithmeticEnvironment<'c>,
     left: ExpressionFlow,
-    alternate: ArithmeticEnvironment<'_>,
+    alternate: ArithmeticEnvironment<'c>,
     right: ExpressionFlow,
 ) -> Option<ExpressionFlow> {
     match (left.0, right.0) {
