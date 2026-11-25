@@ -207,6 +207,7 @@ mod tests {
             load_artifact, BUNDLES, GENERATED_RECOVERY, JSVM_INDEX, JS_REFERENCES, SOURCEMAPS,
             SOURCE_GRAPH,
         },
+        capture_import::import_capture_project,
         capture_project::read_manifest,
     };
     use anyhow::Context;
