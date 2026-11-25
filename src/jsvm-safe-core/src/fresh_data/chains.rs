@@ -1,6 +1,6 @@
 //! Ordered optional-chain evaluation. Short circuit is a control result,
 //! not an undefined value that later links are allowed to dereference.
-use super::{Analyzer, Environment, Evaluation, Fact, Reference, Value};
+use super::{Analyzer, Environment, Evaluation, Fact, Value};
 use oxc_ast::ast::{CallExpression, ChainElement, ChainExpression, Expression, MemberExpression};
 use oxc_span::GetSpan;
 
@@ -25,7 +25,7 @@ impl ChainState {
         }
     }
 
-    fn ordinary(value: Evaluation) -> Self {
+    const fn ordinary(value: Evaluation) -> Self {
         Self::Reached {
             value,
             receiver: Some(Fact::Primitive(Value::Undefined)),
@@ -127,7 +127,7 @@ impl Analyzer<'_, '_> {
         let state = self.chain_operand(member.object(), environment)?;
         let object = match state {
             ChainState::Reached { value, .. } => value,
-            state => {
+            state @ ChainState::ShortCircuited { .. } => {
                 self.unobserved(member.span());
                 return Some(state);
             }
@@ -170,7 +170,7 @@ impl Analyzer<'_, '_> {
         let state = self.chain_operand(&call.callee, environment)?;
         let (value, receiver) = match state {
             ChainState::Reached { value, receiver } => (value, receiver),
-            state => {
+            state @ ChainState::ShortCircuited { .. } => {
                 self.unobserved(call.span);
                 return Some(state);
             }
