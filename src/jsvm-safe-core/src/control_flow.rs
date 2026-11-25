@@ -1121,7 +1121,7 @@ fn simulate_assignment(
         .strip_suffix('=')
         .filter(|op| matches!(*op, "&&" | "||" | "??"))
     {
-        let Some(old) = old else {
+        let Some(old) = old.as_ref() else {
             if env.opaque_state_access(|probe| probe.visit_expression(&assign.right)) {
                 return None;
             }
@@ -1132,7 +1132,7 @@ fn simulate_assignment(
             }
             return Some((StateFlow::Normal, None));
         };
-        match eval_logical_left(logical, old)? {
+        match eval_logical_left(logical, old.clone())? {
             LogicalStep::Value(value) => return Some((StateFlow::Normal, Some(value))),
             LogicalStep::EvaluateRight => {}
         }
