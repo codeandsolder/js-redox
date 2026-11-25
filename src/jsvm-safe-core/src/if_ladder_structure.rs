@@ -1557,13 +1557,20 @@ pub fn reconstruct_for(
     )
 }
 
+fn initializer_number(expression: &Expression<'_>) -> Option<f64> {
+    let Value::Number(value) = eval(expression)? else {
+        return None;
+    };
+    (value.is_finite() && value.fract() == 0.0).then_some(value)
+}
+
 /// Enumerate numeric initializers by exact lexical binding and *individual*
 /// declarator span. An entire multi-declarator statement is not a safe
 /// initializer region: subsequent declarators may write the same symbol.
 pub fn state_initializers<'a>(
     stmt: &'a Statement<'a>,
     scoping: &Scoping,
-) -> Vec<(SymbolId, &'a str, u64, Span)> {
+) -> Vec<(SymbolId, &'a str, f64, Span)> {
     match stmt {
         Statement::ExpressionStatement(expression) => {
             let Expression::AssignmentExpression(assignment) = &expression.expression else {
@@ -1581,26 +1588,35 @@ pub fn state_initializers<'a>(
             let Some(symbol) = crate::statically_resolved_symbol(scoping, reference) else {
                 return Vec::new();
             };
-            let Some(value) = number(&assignment.right) else {
+            let Some(value) = initializer_number(&assignment.right) else {
                 return Vec::new();
             };
             vec![(symbol, id.name.as_str(), value, assignment.span)]
         }
-        Statement::VariableDeclaration(declaration) => declaration
-            .declarations
-            .iter()
-            .filter_map(|item| {
-                let BindingPattern::BindingIdentifier(binding) = &item.id else {
-                    return None;
-                };
-                Some((
-                    binding.symbol_id.get()?,
-                    binding.name.as_str(),
-                    number(item.init.as_ref()?)?,
-                    item.span,
-                ))
-            })
-            .collect(),
+        Statement::VariableDeclaration(declaration)
+            if matches!(
+                declaration.kind,
+                VariableDeclarationKind::Var
+                    | VariableDeclarationKind::Let
+                    | VariableDeclarationKind::Const
+            ) =>
+        {
+            declaration
+                .declarations
+                .iter()
+                .filter_map(|item| {
+                    let BindingPattern::BindingIdentifier(binding) = &item.id else {
+                        return None;
+                    };
+                    Some((
+                        binding.symbol_id.get()?,
+                        binding.name.as_str(),
+                        initializer_number(item.init.as_ref()?)?,
+                        item.span,
+                    ))
+                })
+                .collect()
+        }
         _ => Vec::new(),
     }
 }
@@ -5160,7 +5176,14 @@ pub fn reconstruct_while_adjacent(
     let (_, _, initial, _) = state_initializers(init, scoping)
         .into_iter()
         .find(|(candidate, _, _, span)| *candidate == symbol && *span == final_span)?;
-    reconstruct_while_with_known_state(loop_stmt, state, initial, source, scoping, completion_live)
+    reconstruct_while_with_known_state(
+        loop_stmt,
+        state,
+        exact_u64(initial)?,
+        source,
+        scoping,
+        completion_live,
+    )
 }
 
 /// A `var` declaration is function-scoped even inside a branch that the

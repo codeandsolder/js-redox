@@ -328,62 +328,6 @@ fn collect_stable_var_numbers(
     collector.candidates
 }
 
-#[derive(Debug, Clone, Copy)]
-struct VarNumberInitializer {
-    value: f64,
-    available_after: u32,
-}
-
-#[derive(Default)]
-struct VarNumberInitializerCollector {
-    candidates: HashMap<SymbolId, VarNumberInitializer>,
-    seen: HashSet<SymbolId>,
-}
-
-impl<'a> Visit<'a> for VarNumberInitializerCollector {
-    fn visit_variable_declaration(&mut self, it: &oxc_ast::ast::VariableDeclaration<'a>) {
-        if it.kind == VariableDeclarationKind::Var {
-            for declaration in &it.declarations {
-                let BindingPattern::BindingIdentifier(id) = &declaration.id else {
-                    continue;
-                };
-                let Some(symbol) = id.symbol_id.get() else {
-                    continue;
-                };
-                if !self.seen.insert(symbol) {
-                    self.candidates.remove(&symbol);
-                    continue;
-                }
-                let Some(init) = &declaration.init else {
-                    continue;
-                };
-                let Some(Value::Number(number)) = eval(init) else {
-                    continue;
-                };
-                if !number.is_finite() || number.fract() != 0.0 {
-                    continue;
-                }
-                self.candidates.insert(
-                    symbol,
-                    VarNumberInitializer {
-                        value: number,
-                        available_after: declaration.span.end,
-                    },
-                );
-            }
-        }
-        walk::walk_variable_declaration(self, it);
-    }
-}
-
-fn collect_var_number_initializers(
-    program: &oxc_ast::ast::Program<'_>,
-) -> HashMap<SymbolId, VarNumberInitializer> {
-    let mut collector = VarNumberInitializerCollector::default();
-    collector.visit_program(program);
-    collector.candidates
-}
-
 pub(crate) fn expression_integer(expr: &Expression<'_>) -> Option<i64> {
     let Value::Number(number) = eval(expr)? else {
         return None;
@@ -657,7 +601,7 @@ struct Collector<'s, 'c> {
     standard_numeric_builtins: bool,
     reference_identity_tables: &'c HashMap<SymbolId, ReferenceIdentityTable>,
     selector_dispatchers: &'c HashMap<SymbolId, SelectorDispatcher>,
-    var_number_initializers: &'c HashMap<SymbolId, VarNumberInitializer>,
+    external_arithmetic_entries: HashMap<Span, (SymbolId, f64)>,
     reference_spans: &'c HashMap<ReferenceId, Span>,
     protected_spans: &'c [(usize, usize)],
     may_remove_dead_numeric_writes: bool,
@@ -839,8 +783,8 @@ impl Collector<'_, '_> {
     /// Preserve a numeric state initialized before arbitrary intervening
     /// statements or an enclosing block. The real proof obligation is on
     /// the same semantic binding, not adjacency of source statements.
-    fn reconstruct_reaching_while(&mut self, statements: &[Statement<'_>]) {
-        self.reconstruct_reaching_while_with(statements, &HashMap::<SymbolId, (u64, Span)>::new());
+    fn reconstruct_reaching_states(&mut self, statements: &[Statement<'_>]) {
+        self.reconstruct_reaching_states_with(statements, &HashMap::<SymbolId, (f64, Span)>::new());
     }
 
     /// Apply statement-list-local rewrites without changing AST traversal.
@@ -856,7 +800,7 @@ impl Collector<'_, '_> {
         self.lower_sibling_expression_statements(statements);
         self.fold_sibling_state_guards(statements);
         self.reconstruct_while_pairs(statements);
-        self.reconstruct_reaching_while(statements);
+        self.reconstruct_reaching_states(statements);
         if self.allow_effect_statements
             && self.function_context.depth > 0
             && self.may_remove_dead_numeric_writes
@@ -909,14 +853,13 @@ impl Collector<'_, '_> {
                 }))
     }
 
-    fn reconstruct_reaching_while_with(
+    fn reconstruct_reaching_states_with(
         &mut self,
         statements: &[Statement<'_>],
-        inherited: &HashMap<SymbolId, (u64, Span)>,
+        inherited: &HashMap<SymbolId, (f64, Span)>,
     ) {
-        if !self.may_remove_dead_numeric_writes && !self.function_context.numeric_safe {
-            return;
-        }
+        let while_allowed =
+            self.may_remove_dead_numeric_writes || self.function_context.numeric_safe;
         let mut reaching = inherited.clone();
         for (index, stmt) in statements.iter().enumerate() {
             if let Statement::WhileStatement(loop_stmt) = stmt {
@@ -933,7 +876,9 @@ impl Collector<'_, '_> {
                         .any(|(other, _, _, _)| *other == symbol);
                     if !immediately_preceded && self.safe_numeric_state_binding(symbol) {
                         if let Some(&(initial, init_span)) = reaching.get(&symbol) {
-                            if self.reaching_state_is_stable(symbol, init_span, loop_stmt.span) {
+                            if let Some(initial) = exact_u64(initial).filter(|_| {
+                                self.reaching_state_is_stable(symbol, init_span, loop_stmt.span)
+                            }) {
                                 if let Some(code) =
                                     if_ladder_structure::reconstruct_while_with_known_state(
                                         loop_stmt,
@@ -950,13 +895,22 @@ impl Collector<'_, '_> {
                         }
                     }
                 }
-                if !live {
-                    self.reconstruct_exception_reaching_while(loop_stmt, &reaching);
+                if while_allowed && !live {
+                    let unsigned = reaching
+                        .iter()
+                        .filter_map(|(&symbol, &(value, span))| {
+                            Some((symbol, (exact_u64(value)?, span)))
+                        })
+                        .collect();
+                    self.reconstruct_exception_reaching_while(loop_stmt, &unsigned);
                 }
+            }
+            if let Statement::ForStatement(loop_stmt) = stmt {
+                self.record_external_arithmetic_entry(loop_stmt, &reaching);
             }
             match stmt {
                 Statement::BlockStatement(block) => {
-                    self.reconstruct_reaching_while_with(&block.body, &reaching);
+                    self.reconstruct_reaching_states_with(&block.body, &reaching);
                 }
                 Statement::IfStatement(branch) => {
                     self.reconstruct_nested_reaching(&branch.consequent, &reaching);
@@ -975,7 +929,15 @@ impl Collector<'_, '_> {
                 if self.scoping.symbol_flags(symbol).is_variable()
                     && !self.scoping.symbol_flags(symbol).is_const_variable()
                     && self.scoping.symbol_scope_id(symbol) != self.scoping.root_scope_id()
-                    && self.safe_numeric_state_binding(symbol)
+                    && self
+                        .constants
+                        .initialization
+                        .binding_unmodified_by_eval(self.scoping, symbol)
+                    && !self
+                        .constants
+                        .initialization
+                        .is_mapped_arguments_exposed(self.scoping, symbol)
+                    && self.scoping.symbol_redeclarations(symbol).is_empty()
                 {
                     reaching.insert(symbol, (initial, init_span));
                 }
@@ -1050,12 +1012,12 @@ impl Collector<'_, '_> {
     fn reconstruct_nested_reaching(
         &mut self,
         stmt: &Statement<'_>,
-        reaching: &HashMap<SymbolId, (u64, Span)>,
+        reaching: &HashMap<SymbolId, (f64, Span)>,
     ) {
         if let Statement::BlockStatement(block) = stmt {
-            self.reconstruct_reaching_while_with(&block.body, reaching);
+            self.reconstruct_reaching_states_with(&block.body, reaching);
         } else {
-            self.reconstruct_reaching_while_with(std::slice::from_ref(stmt), reaching);
+            self.reconstruct_reaching_states_with(std::slice::from_ref(stmt), reaching);
         }
     }
 
@@ -1079,6 +1041,7 @@ impl Collector<'_, '_> {
         self.scoping.symbol_flags(symbol).is_variable()
             && !self.scoping.symbol_flags(symbol).is_const_variable()
             && self.scoping.symbol_scope_id(symbol) != self.scoping.root_scope_id()
+            && self.scoping.symbol_redeclarations(symbol).is_empty()
             && self
                 .scoping
                 .get_resolved_reference_ids(symbol)
@@ -1416,6 +1379,7 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
         self.lower_if_test_statements(&program.body);
         self.lower_sibling_expression_statements(&program.body);
         self.reconstruct_while_pairs(&program.body);
+        self.reconstruct_reaching_states(&program.body);
         walk::walk_program(self, program);
     }
 
@@ -2185,7 +2149,6 @@ fn transform_once(
             .map(|table| (table.construction_start, table.construction_end)),
     );
     let stable_var_numbers = collect_stable_var_numbers(&program, scoping);
-    let var_number_initializers = collect_var_number_initializers(&program);
     let selector_dispatchers = collect_selector_dispatchers(&program, scoping, &stable_var_numbers);
     budget.checkpoint()?;
     let numeric_state_risks = NumericStateAliasRisks::analyze(&program);
@@ -2215,7 +2178,7 @@ fn transform_once(
         standard_numeric_builtins,
         reference_identity_tables: &reference_identity_tables,
         selector_dispatchers: &selector_dispatchers,
-        var_number_initializers: &var_number_initializers,
+        external_arithmetic_entries: HashMap::new(),
         reference_spans: &reference_spans,
         protected_spans: &protected_spans,
         // Only dynamic scopes or arguments aliases in the *relevant lexical

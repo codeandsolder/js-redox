@@ -1210,7 +1210,7 @@ fn resolved_refs_within(
     scoping: &Scoping,
     reference_spans: &HashMap<ReferenceId, Span>,
     symbol: SymbolId,
-    span: Span,
+    spans: &[Span],
 ) -> bool {
     scoping
         .get_resolved_reference_ids(symbol)
@@ -1219,7 +1219,9 @@ fn resolved_refs_within(
             reference_spans
                 .get(reference_id)
                 .is_some_and(|reference_span| {
-                    reference_span.start >= span.start && reference_span.end <= span.end
+                    spans.iter().any(|span| {
+                        reference_span.start >= span.start && reference_span.end <= span.end
+                    })
                 })
         })
 }
@@ -1805,7 +1807,7 @@ impl Collector<'_, '_> {
             ));
         }
         let (state_index, state_symbol, state_var, table_symbol, current) = state?;
-        if !resolved_refs_within(self.scoping, self.reference_spans, state_symbol, it.span) {
+        if !resolved_refs_within(self.scoping, self.reference_spans, state_symbol, &[it.span]) {
             return None;
         }
         if init_decl.declarations.iter().any(|declaration| {
@@ -1988,39 +1990,81 @@ impl Collector<'_, '_> {
         self.simulate_reference_state(prefix, switch, &cases, setup)
     }
 
-    fn external_arithmetic_state(
+    /// Record an entry fact only when the same statement-list traversal that
+    /// proves while initialization reaches this loop. Textual precedence
+    /// alone says nothing about a conditional initializer or a later entry
+    /// from an enclosing repeated region.
+    pub(super) fn record_external_arithmetic_entry(
+        &mut self,
+        it: &oxc_ast::ast::ForStatement<'_>,
+        reaching: &HashMap<SymbolId, (f64, Span)>,
+    ) {
+        if let Some((symbol, value)) = self.prove_external_arithmetic_entry(it, reaching) {
+            self.external_arithmetic_entries
+                .insert(it.span, (symbol, value));
+        }
+    }
+
+    fn prove_external_arithmetic_entry(
         &self,
-        test: &Expression<'_>,
-        loop_span: Span,
-    ) -> Option<(String, f64)> {
-        let Expression::BinaryExpression(binary) = test else {
+        it: &oxc_ast::ast::ForStatement<'_>,
+        reaching: &HashMap<SymbolId, (f64, Span)>,
+    ) -> Option<(SymbolId, f64)> {
+        if it.init.is_some() || it.update.is_some() {
+            return None;
+        }
+        let Expression::BinaryExpression(binary) = it.test.as_ref()?.without_parentheses() else {
             return None;
         };
         if !matches!(binary.operator.as_str(), "!=" | "!==") {
             return None;
         }
-
-        let (state_expr, terminal_expr) = match (
-            direct_identifier_name(&binary.left),
-            direct_identifier_name(&binary.right),
-        ) {
-            (Some(_), None) => (&binary.left, &binary.right),
-            (None, Some(_)) => (&binary.right, &binary.left),
+        let (state, terminal) = match (&binary.left, &binary.right) {
+            (Expression::Identifier(state), terminal)
+            | (terminal, Expression::Identifier(state)) => (state, terminal),
             _ => return None,
         };
-        let state_var = direct_identifier_name(state_expr)?.to_string();
-        let state_symbol = symbol_of(self.scoping, state_expr)?;
-        let initializer = self.var_number_initializers.get(&state_symbol)?;
-        if initializer.available_after > loop_span.start
-            || !matches!(
-                eval(terminal_expr),
-                Some(Value::Number(number)) if number.is_finite() && number.fract() == 0.0
-            )
-            || !resolved_refs_within(self.scoping, self.reference_spans, state_symbol, loop_span)
+        if !matches!(eval(terminal), Some(Value::Number(number)) if number.is_finite() && number.fract() == 0.0)
         {
             return None;
         }
-        Some((state_var, initializer.value))
+        let symbol = self
+            .constants
+            .initialization
+            .resolved_symbol(self.scoping, state.reference_id.get()?)?;
+        let &(value, init_span) = reaching.get(&symbol)?;
+        if !self.reaching_state_is_stable(symbol, init_span, it.span)
+            || !resolved_refs_within(
+                self.scoping,
+                self.reference_spans,
+                symbol,
+                &[init_span, it.span],
+            )
+            || self
+                .scoping
+                .get_resolved_reference_ids(symbol)
+                .iter()
+                .any(|&reference| {
+                    if self
+                        .constants
+                        .initialization
+                        .resolved_symbol(self.scoping, reference)
+                        != Some(symbol)
+                    {
+                        return true;
+                    }
+                    let reference = self.scoping.get_reference(reference);
+                    reference.is_write()
+                        && !Self::same_function_or_descendant_block_scope(
+                            self.scoping,
+                            reference.scope_id(),
+                            self.scoping.symbol_scope_id(symbol),
+                        )
+                })
+        {
+            return None;
+        }
+        Some((symbol, value))
     }
 
     fn confined_register_arrays(&self, it: &oxc_ast::ast::ForStatement<'_>) -> HashSet<String> {
@@ -2116,7 +2160,7 @@ impl Collector<'_, '_> {
                         self.scoping,
                         self.reference_spans,
                         state_symbol,
-                        it.span,
+                        &[it.span],
                     )
                 {
                     return None;
@@ -2129,8 +2173,13 @@ impl Collector<'_, '_> {
                 )
             }
             None => {
-                let (state_var, initial_number) = self.external_arithmetic_state(test, it.span)?;
-                (state_var, initial_number, None, "loop_test")
+                let &(symbol, initial_number) = self.external_arithmetic_entries.get(&it.span)?;
+                (
+                    self.scoping.symbol_name(symbol).to_owned(),
+                    initial_number,
+                    None,
+                    "loop_test",
+                )
             }
             _ => return None,
         };
@@ -2207,7 +2256,7 @@ impl Collector<'_, '_> {
     ) -> Option<(ArithmeticCaseOutcome, usize)> {
         let mut flow = StateFlow::Normal;
         let mut register_reads_rewritten = 0;
-        'cases: for case in switch.cases.iter().skip(start) {
+        'cases: for (case_index, case) in switch.cases.iter().enumerate().skip(start) {
             for (statement_index, stmt) in case.consequent.iter().enumerate() {
                 match stmt {
                     Statement::BreakStatement(brk) if brk.label.is_none() => {
@@ -2224,7 +2273,7 @@ impl Collector<'_, '_> {
                             let tail = &case.consequent[statement_index + 1..];
                             if !tail.iter().all(|tail_stmt| {
                                 matches!(tail_stmt, Statement::BreakStatement(brk) if brk.label.is_none())
-                            }) {
+                            }) || (tail.is_empty() && case_index + 1 < switch.cases.len()) {
                                 return None;
                             }
                             return Some((
@@ -2457,5 +2506,89 @@ impl Collector<'_, '_> {
             env.get(&setup.state_var)?.render()?;
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod arithmetic_entry_tests {
+    use crate::{deobfuscate, SafeTransformResult};
+    use work_budget::WorkBudget;
+
+    // The containing function discards loop Completion; these fixtures isolate
+    // entry and switch-control proofs from the separate live-value question.
+    const CASES: &[(&str, &str, bool)] = &[
+        ("direct", "var s=2;for(;s!==5;){switch(s){case 2:out.push('A');s=4;break;case 4:out.push('B');s=5;break;}}", true),
+        ("assignment", "let s;s=-2;for(;s!==5;){switch(s){case -2:out.push('A');s=5;break;}}", true),
+        ("conditional", "if(flag)var s=2;for(;s!==5;){switch(s){case 2:out.push('A');s=5;break;default:out.push('U');s=5;break;}}", false),
+        ("repeated", "var s=2;for(let i=0;i<2;i++){for(;s!==5;){switch(s){case 2:out.push('A');s=5;break;}}}", false),
+        ("reset", "for(let i=0;i<2;i++){var s=2;for(;s!==5;){switch(s){case 2:out.push('A');s=5;break;}}}", true),
+        ("nested", "var s=2;out.push('before');{for(;s!==5;){switch(s){case 2:out.push('A');s=5;break;}}}", true),
+        ("fallthrough", "var s=2;for(;s!==5;){switch(s){case 2:s=flag?3:4;case 3:out.push('fall');s=5;break;case 4:out.push('wrong');s=5;break;}}", false),
+        ("last_case", "var s=2;for(;s!==5;){switch(s){case 3:out.push('A');s=5;break;case 4:out.push('B');s=5;break;case 2:s=flag?3:4;}}", true),
+        ("arguments", "var s=2;out.push(arguments[0]);for(;s!==5;){switch(s){case 2:out.push('A');s=5;break;}}", true),
+        ("redeclared", "var s=2;var s=flag?3:2;for(;s!==5;){switch(s){case 2:out.push('A');s=5;break;case 3:out.push('B');s=5;break;}}", false),
+    ];
+
+    fn recover_case(
+        body: &str,
+        expected: bool,
+    ) -> Result<(String, SafeTransformResult), Box<dyn std::error::Error>> {
+        let source =
+            format!("function run(flag){{let out=[];{body}return out.join(',');}}run(flag);");
+        let recovered = deobfuscate(
+            &source,
+            12,
+            &WorkBudget::unlimited("arithmetic-entry-proof"),
+        )?
+        .ok_or_else(|| std::io::Error::other("valid source not recovered"))?;
+        assert_eq!(
+            recovered
+                .transforms
+                .contains_key("arithmetic_state_unflatten"),
+            expected,
+            "{source}: {:?}: {}",
+            recovered.transforms,
+            recovered.source
+        );
+        Ok((source, recovered))
+    }
+
+    #[test]
+    fn arithmetic_dispatch_requires_reaching_entry_and_no_unmodeled_fallthrough(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for &(_, body, expected) in CASES {
+            recover_case(body, expected)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires Node; compare arithmetic entry and fallthrough semantics"]
+    fn node_confirms_arithmetic_entry_and_fallthrough() -> Result<(), Box<dyn std::error::Error>> {
+        use std::process::Command;
+        let harness = r"
+const vm=require('node:vm');
+const source=process.argv[1];
+for(const flag of [false,true]){
+  for(const code of [source,'eval('+JSON.stringify(source)+')']){
+    console.log(JSON.stringify(vm.runInNewContext(code,{flag},{timeout:1500})));
+  }
+}
+";
+        for &(name, body, expected) in CASES {
+            let (source, recovered) = recover_case(body, expected)?;
+            let observe = |code: &str| -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+                let output = Command::new("node").args(["-e", harness, code]).output()?;
+                assert!(output.status.success(), "{name}: {output:?}");
+                Ok(output.stdout)
+            };
+            assert_eq!(
+                observe(&source)?,
+                observe(&recovered.source)?,
+                "{name}: {}",
+                recovered.source
+            );
+        }
+        Ok(())
     }
 }
