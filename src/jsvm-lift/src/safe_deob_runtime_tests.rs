@@ -801,6 +801,28 @@ fn depythonify_safe_deob_script_completion_runtime_equivalence() -> Result<()> {
 
 #[test]
 #[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_declarative_var_runtime_equivalence() -> Result<()> {
+    let sources = [
+        "function f(){var a=[7];var b=a;b[0]=9;return a[0];}f();",
+        "function f(){var a=[7];var a;return a[0];}f();",
+        "function f(){var a=[7];{var b=a;}b[0]++;return a[0];}f();",
+        "function f(){var a=[1];for(var i=0;i<2;i++){a[0]++;}return a[0];}f();",
+        "function f(p){'use strict';var p=[7];arguments[0]=[9];return p[0];}f([]);",
+        "function f(p){var p=[7];arguments[0]=[9];return p[0];}f([]);",
+        "function f(p){p=[7];arguments[0]=[9];return p[0];}f([]);",
+        "function f(p){var p=[7];var args=arguments;args[0]=[9];return p[0];}f([]);",
+        "function f(){var a=[7];with({a:[2]}){var a=[9];events.push(a[0]);}return a[0];}f();",
+        "function f(){var a=[7];with(new Proxy({},{has(t,k){if(k==='b')a[0]=9;return false;}})){var b=a[0];return b;}}f();",
+        "function f(){var a=[9];try{throw [];}catch(a){var a=[7];events.push(a[0]);}return a[0];}f();",
+        "function f(){var a=[7];function mutate(){a[0]=9;}mutate();return a[0];}f();",
+        "function f(){var a=[7];eval('a=[9]');return a[0];}f();",
+        "Object.defineProperty(globalThis,'a',{get(){return [9]},set(value){events.push(value[0])},configurable:true});var a=[7];a[0];",
+    ];
+    script_runtime_equivalence(&sources, "declarative-var", false)
+}
+
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
 fn depythonify_safe_deob_direct_decoder_runtime_equivalence() -> Result<()> {
     let sources = [
         "const t=['YQ==','Yg=='];function d(i){return atob(t[i])}Array.prototype['00']='Yw==';Array.prototype['0x0']='ZA==';[d(0),d('1'),d(-0),d(1n),d('00'),d('0x0')];",
