@@ -1757,7 +1757,9 @@ mod tests {
             ("let a=[7];let old=a;a[(()=>{a=[9];return 0;})()]=11;old[0];a[0];", vec![("old[0]", "11"),("a[0]", "9")]),
             ("let a=[[7],(()=>{let b=[8];return b;})()];a[0][0];a[1][0];", vec![("a[0][0]", "7"),("a[1][0]", "8")]),
             ("let result=[0,0];for(let i=0;i<2;i++){result[i]=(x=>{let a=[x];return a[0];})(i);}result[0];result[1];", vec![("result[0]", "0"),("result[1]", "1")]),
-            ("let outer=[7];let escaped=(function(){var arguments;return [arguments,outer[0]];})();outer[0]=9;escaped[0].callee()[1];", vec![("escaped[0].callee()[1]", "9")]),
+            // Do not erase the invocation in the receiver of a member read.
+            ("let outer=[7];let escaped=(function(){var arguments;return [arguments,outer[0]];})();outer[0]=9;escaped[0].callee()[1];", vec![]),
+            ("let outer=[7];let escaped=(function(){var arguments;return [arguments,outer[0]];})();outer[0]=9;let result=escaped[0].callee();result[1];", vec![("result[1]", "9")]),
         ] {
             let expected = expected.into_iter().map(|(source, value)| (source.to_owned(), value.to_owned())).collect::<Vec<_>>();
             assert_eq!(reads(source)?, expected, "{source}");

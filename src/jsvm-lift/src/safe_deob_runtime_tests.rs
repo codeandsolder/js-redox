@@ -986,6 +986,7 @@ fn depythonify_safe_deob_arguments_objects_runtime_equivalence() -> Result<()> {
         "let f=function(a){arguments.length=99;return arguments};let r=f(7);[r.length,r[0]];",
         "let f=function(a){delete arguments.length;arguments.length=99;return {...arguments}};let r=f(7);[r.length,r[0]];",
         "let outer=[7];let escaped=(function(){var arguments;return [arguments,outer[0]];})();outer[0]=9;escaped[0].callee()[1];",
+        "let outer=[7];let escaped=(function(){var arguments;return [arguments,outer[0]];})();outer[0]=9;let result=escaped[0].callee();result[1];",
     ];
     script_runtime_equivalence(&sources, "arguments-objects", false)
 }
