@@ -57,3 +57,5 @@ jobs:
         node tools/cloak-recorder/check-nested-cdp-session.mjs
         cargo +1.100.0 test -p jsvm-lift --lib depythonify_safe_deob_ -- --ignored --nocapture
         cargo +1.100.0 test -p jsvm-lift --lib node_confirms_ -- --ignored --nocapture
+        cargo +1.100.0 test -p jsvm-safe-core --lib node_confirms_ -- --ignored --nocapture
+        cargo +1.100.0 test -p jsvm-safe-core --lib global_accessor_after_state_write_keeps_real_successor -- --ignored --nocapture

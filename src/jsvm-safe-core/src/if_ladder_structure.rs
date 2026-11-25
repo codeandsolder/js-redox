@@ -1484,13 +1484,13 @@ fn while_state_transitions_proven(
 /// the same graph may be safe inside a function but not as the final script
 /// statement, where its Completion value is observable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum NumericForCompletion {
+enum NumericLoopCompletion {
     Undefined,
     Number(u64),
     NegativeZero,
 }
 
-impl NumericForCompletion {
+impl NumericLoopCompletion {
     fn expression(self) -> String {
         match self {
             Self::Undefined => "void 0".to_owned(),
@@ -1546,30 +1546,15 @@ pub fn reconstruct_for(
     }
 
     let init_text = format!("{};", fragment(source, init.span()));
-    let mut reconstructed = reconstruct_state_loop(
+    reconstruct_state_loop(
         state,
         initial,
         it.test.as_ref()?,
         &it.body,
         &init_text,
         source,
-    )?;
-    if completion_live {
-        let completion = reconstructed.normal_completion?;
-        // Appending to the same emitted block preserves the environment
-        // structure and only affects normal completion. Abrupt returns and
-        // throws bypass this suffix.
-        if reconstructed.text.pop()? != '}' {
-            return None;
-        }
-        write!(
-            &mut reconstructed.text,
-            "\n{};\n}}",
-            completion.expression()
-        )
-        .ok()?;
-    }
-    Some(reconstructed.text)
+    )?
+    .render(completion_live)
 }
 
 /// Enumerate numeric initializers by exact lexical binding and *individual*
@@ -1651,13 +1636,13 @@ pub fn reconstruct_while_with_known_state(
     initial: u64,
     source: &str,
     scoping: &Scoping,
+    completion_live: bool,
 ) -> Option<String> {
     let (symbol, actual_name) = while_state_binding(it, scoping)?;
     if state != actual_name || !while_state_transitions_proven(it, scoping, symbol, state) {
         return None;
     }
-    reconstruct_state_loop(state, initial, &it.test, &it.body, "", source)
-        .map(|reconstructed| reconstructed.text)
+    reconstruct_state_loop(state, initial, &it.test, &it.body, "", source)?.render(completion_live)
 }
 
 /// Track every write to the dispatcher's original lexical state symbol,
@@ -5153,58 +5138,21 @@ pub fn reconstruct_while_adjacent(
     loop_stmt: &WhileStatement<'_>,
     source: &str,
     scoping: &Scoping,
+    completion_live: bool,
 ) -> Option<String> {
-    let (state, initial) = match init {
-        Statement::ExpressionStatement(stmt) => {
-            let Expression::AssignmentExpression(assign) = &stmt.expression else {
-                return None;
-            };
-            if assign.operator.as_str() != "=" {
-                return None;
-            }
-            (
-                direct_assignment_name(&assign.left)?,
-                number(&assign.right)?,
-            )
-        }
-        Statement::VariableDeclaration(decl) if decl.declarations.len() == 1 => {
-            let declaration = &decl.declarations[0];
-            let BindingPattern::BindingIdentifier(binding) = &declaration.id else {
-                return None;
-            };
-            (binding.name.as_str(), number(declaration.init.as_ref()?)?)
-        }
+    let (symbol, state) = while_state_binding(loop_stmt, scoping)?;
+    // A later declarator may call user code and invalidate the initial state.
+    // The final declarator (or single assignment) is immediately before the
+    // loop test, so no additional intervening-effect proof is needed.
+    let final_span = match init {
+        Statement::VariableDeclaration(decl) => decl.declarations.last()?.span,
+        Statement::ExpressionStatement(stmt) => stmt.expression.span(),
         _ => return None,
     };
-    let (symbol, actual_name) = while_state_binding(loop_stmt, scoping)?;
-    if state != actual_name || !while_state_transitions_proven(loop_stmt, scoping, symbol, state) {
-        return None;
-    }
-    let init_symbol = match init {
-        Statement::ExpressionStatement(stmt) => {
-            let Expression::AssignmentExpression(assign) = &stmt.expression else {
-                return None;
-            };
-            let AssignmentTarget::AssignmentTargetIdentifier(id) = &assign.left else {
-                return None;
-            };
-            id.reference_id
-                .get()
-                .and_then(|reference| crate::statically_resolved_symbol(scoping, reference))
-        }
-        Statement::VariableDeclaration(decl) => {
-            let BindingPattern::BindingIdentifier(id) = &decl.declarations.first()?.id else {
-                return None;
-            };
-            id.symbol_id.get()
-        }
-        _ => None,
-    };
-    if init_symbol != Some(symbol) {
-        return None;
-    }
-    reconstruct_state_loop(state, initial, &loop_stmt.test, &loop_stmt.body, "", source)
-        .map(|reconstructed| reconstructed.text)
+    let (_, _, initial, _) = state_initializers(init, scoping)
+        .into_iter()
+        .find(|(candidate, _, _, span)| *candidate == symbol && *span == final_span)?;
+    reconstruct_while_with_known_state(loop_stmt, state, initial, source, scoping, completion_live)
 }
 
 /// A `var` declaration is function-scoped even inside a branch that the
@@ -5263,7 +5211,23 @@ impl<'a> Visit<'a> for HoistedVars {
 
 struct ReconstructedStateLoop {
     text: String,
-    normal_completion: Option<NumericForCompletion>,
+    normal_completion: Option<NumericLoopCompletion>,
+}
+
+impl ReconstructedStateLoop {
+    fn render(mut self, completion_live: bool) -> Option<String> {
+        if completion_live {
+            let completion = self.normal_completion?;
+            // The common normal result restores the loop accumulator without
+            // moving the initializer or creating an observable binding.
+            // Abrupt completions bypass the suffix.
+            if self.text.pop()? != '}' {
+                return None;
+            }
+            write!(&mut self.text, "\n{};\n}}", completion.expression()).ok()?;
+        }
+        Some(self.text)
+    }
 }
 
 /// The control-flow graph merges both zero signs for equality and routing,
@@ -5278,16 +5242,16 @@ enum LoopAccumulator {
 }
 
 impl LoopAccumulator {
-    const fn certified(self) -> NumericForCompletion {
+    const fn certified(self) -> NumericLoopCompletion {
         match self {
-            Self::Undefined => NumericForCompletion::Undefined,
-            Self::Number(value) => NumericForCompletion::Number(value),
-            Self::NegativeZero => NumericForCompletion::NegativeZero,
+            Self::Undefined => NumericLoopCompletion::Undefined,
+            Self::Number(value) => NumericLoopCompletion::Number(value),
+            Self::NegativeZero => NumericLoopCompletion::NegativeZero,
         }
     }
 }
 
-/// ECMAScript `ForBodyEvaluation` maintains V, initially undefined. Each
+/// ECMAScript `ForBodyEvaluation` and `WhileLoopEvaluation` maintain V, initially undefined. Each
 /// ordinary body result with a non-Empty value *replaces* V; Empty preserves
 /// the prior value. A fixed-point over (state,V) models all normal paths,
 /// including cycles, rather than requiring a literal value on every exit
@@ -5299,9 +5263,9 @@ fn proven_normal_exit_completion(
     exit: u64,
     graph: &BTreeMap<u64, Route>,
     reachable: &BTreeSet<u64>,
-) -> Option<NumericForCompletion> {
+) -> Option<NumericLoopCompletion> {
     if initial == exit {
-        return Some(NumericForCompletion::Undefined);
+        return Some(NumericLoopCompletion::Undefined);
     }
 
     let mut transitions = BTreeMap::new();
@@ -5427,7 +5391,7 @@ fn reconstruct_state_loop(
 mod tests {
     use super::{
         closed_exception_dag_region, ordered_natural_loop_side, proven_normal_exit_completion,
-        reconstruct_for, ExceptionEntryProof, Next, NumericForCompletion, Route, RouteCompletion,
+        reconstruct_for, ExceptionEntryProof, Next, NumericLoopCompletion, Route, RouteCompletion,
     };
     use crate::deobfuscate;
     use oxc_allocator::Allocator;
@@ -5675,7 +5639,7 @@ try{
     fn fixed_point_proof(
         initial: u64,
         routes: &BTreeMap<u64, Route>,
-    ) -> Option<NumericForCompletion> {
+    ) -> Option<NumericLoopCompletion> {
         let reachable = routes.keys().copied().collect();
         proven_normal_exit_completion(initial, 9, routes, &reachable)
     }
@@ -5684,7 +5648,7 @@ try{
     fn loop_completion_preserves_empty_and_handles_multiple_paths() {
         assert_eq!(
             fixed_point_proof(9, &BTreeMap::new()),
-            Some(NumericForCompletion::Undefined)
+            Some(NumericLoopCompletion::Undefined)
         );
         assert_eq!(
             fixed_point_proof(
@@ -5694,7 +5658,7 @@ try{
                     (3, fixed_point_edge(9, RouteCompletion::Empty)),
                 ])
             ),
-            Some(NumericForCompletion::Number(3)),
+            Some(NumericLoopCompletion::Number(3)),
         );
         assert_eq!(
             fixed_point_proof(
@@ -5704,7 +5668,7 @@ try{
                     (3, fixed_point_edge(9, RouteCompletion::Undefined)),
                 ])
             ),
-            Some(NumericForCompletion::Undefined),
+            Some(NumericLoopCompletion::Undefined),
         );
         assert_eq!(
             fixed_point_proof(
@@ -5720,7 +5684,7 @@ try{
                     (3, fixed_point_edge(9, RouteCompletion::Empty)),
                 ])
             ),
-            Some(NumericForCompletion::Number(9)),
+            Some(NumericLoopCompletion::Number(9)),
         );
         assert_eq!(
             fixed_point_proof(
@@ -5749,7 +5713,7 @@ try{
                     )
                 )])
             ),
-            Some(NumericForCompletion::Number(9)),
+            Some(NumericLoopCompletion::Number(9)),
         );
     }
 
@@ -5779,21 +5743,21 @@ try{
                     )
                 )])
             ),
-            Some(NumericForCompletion::Number(9)),
+            Some(NumericLoopCompletion::Number(9)),
         );
         assert_eq!(
             fixed_point_proof(
                 1,
                 &BTreeMap::from([(1, fixed_point_edge(9, RouteCompletion::Number(0)))])
             ),
-            Some(NumericForCompletion::Number(0)),
+            Some(NumericLoopCompletion::Number(0)),
         );
         assert_eq!(
             fixed_point_proof(
                 1,
                 &BTreeMap::from([(1, fixed_point_edge(9, RouteCompletion::NegativeZero))])
             ),
-            Some(NumericForCompletion::NegativeZero),
+            Some(NumericLoopCompletion::NegativeZero),
         );
         assert_eq!(
             fixed_point_proof(
@@ -5816,7 +5780,7 @@ try{
                     (0, fixed_point_edge(9, RouteCompletion::Number(9))),
                 ])
             ),
-            Some(NumericForCompletion::Number(9)),
+            Some(NumericLoopCompletion::Number(9)),
         );
     }
 
@@ -5830,7 +5794,7 @@ try{
                     (0, fixed_point_edge(9, RouteCompletion::Empty)),
                 ])
             ),
-            Some(NumericForCompletion::Number(0)),
+            Some(NumericLoopCompletion::Number(0)),
         );
         assert_eq!(
             fixed_point_proof(
@@ -5840,7 +5804,7 @@ try{
                     (0, fixed_point_edge(9, RouteCompletion::Empty)),
                 ])
             ),
-            Some(NumericForCompletion::NegativeZero),
+            Some(NumericLoopCompletion::NegativeZero),
         );
         assert_eq!(
             fixed_point_proof(
@@ -5850,7 +5814,7 @@ try{
                     (0, fixed_point_edge(9, RouteCompletion::Number(9))),
                 ])
             ),
-            Some(NumericForCompletion::Number(9)),
+            Some(NumericLoopCompletion::Number(9)),
         );
         assert_eq!(
             fixed_point_proof(
@@ -6398,11 +6362,122 @@ try{
         }
     }
 
+    /// Each fixture exercises the same recovered Completion proof as the
+    /// for-loop path, but with a lexical or reaching while-loop initializer.
+    const LIVE_WHILE_CASES: &[(&str, bool)] = &[
+        ("let s=1;while(s!=9)s==1?(s=9):s==9&&(s=9);", true),
+        ("let s;s=1;while(s!=9)s==1?(s=3):s==3?(s=9):s==9&&(s=9);", true),
+        ("let s=1;while(s!=9)s==1?(push('A'),s=3):s==3?(push('B'),s=9):s==9&&(s=9);", true),
+        ("let s=1;while(s!=9)s==1?(s=flag?9:3):s==3?(push('B'),s=9):s==9&&(s=9);", true),
+        ("7;let s=9;while(s!=9)s==1?(push('NEVER'),s=9):s==9&&(s=9);", true),
+        ("let s=1;while(s!=0)s==1?(s=-0):s==0&&(s=0);", true),
+        ("let s=1;while(s!=0)s==1?(s=0):s==0&&(s=0);", true),
+        ("let s=1;while(s!=9)if(s==1){let x=(s=9,[]);}else if(s==9){s=9;}", true),
+        ("let s=1;while(s!=9)if(s==1){let x=(s=3,[]);}else if(s==3){let y=(s=9,[]);}else if(s==9){s=9;}", true),
+        ("{let s=1;push('before');while(s!=9)s==1?(s=9):s==9&&(s=9);}", true),
+        ("{let s=1;push('before');{while(s!=9)s==1?(s=9):s==9&&(s=9);}}", true),
+        ("let other=push('before'),s=1;while(s!=9)s==1?(s=9):s==9&&(s=9);", true),
+        // Different normal exit values cannot share one constant suffix.
+        ("let s=1;while(s!=9)if(s==1){s=flag?9:3;}else if(s==3){let x=(s=9,[]);}else if(s==9){s=9;}", false),
+        // A later initializer may change the state before the first test.
+        ("let s=1,later=(()=>{s=3;return 0;})();while(s!=9)s==1?(push('wrong'),s=9):s==3?(push('right'),s=9):s==9&&(s=9);", false),
+        // Classic-script var may be backed by an accessor.
+        ("var s=1;while(s!=9)s==1?(s=9):s==9&&(s=9);", false),
+        ("let s=1;while(s!=9)s==1?(eval('0'),s=9):s==9&&(s=9);", false),
+    ];
+
+    fn recover_live_loop(
+        source: &str,
+        should_structure: bool,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let recovered = deobfuscate(
+            source,
+            12,
+            &WorkBudget::unlimited("live-loop-runtime-oracle"),
+        )?
+        .ok_or_else(|| std::io::Error::other("valid source not recovered"))?;
+        assert_eq!(
+            recovered.transforms.contains_key("if_ladder_structured"),
+            should_structure,
+            "{source}: {:?}: {}",
+            recovered.transforms,
+            recovered.source
+        );
+        Ok(recovered.source)
+    }
+
+    #[test]
+    fn live_while_dispatchers_require_a_common_completion_certificate(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for &(source, should_structure) in LIVE_WHILE_CASES {
+            recover_live_loop(source, should_structure)?;
+        }
+        Ok(())
+    }
+
+    fn compare_live_loop_runtime(
+        source: &str,
+        should_structure: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::process::Command;
+        let recovered = recover_live_loop(source, should_structure)?;
+        let harness = r"
+const vm=require('node:vm');
+const source=process.argv[1], flag=process.argv[2]==='true';
+const mode=process.argv[3];
+const effects=[];
+const context={flag, push(v){effects.push(v);return v.length}};
+const script=mode==='eval'?'eval('+JSON.stringify(source)+')':source;
+const options={};options.timeout=1500;
+try {
+  const value=vm.runInNewContext(script,context,options);
+  console.log(JSON.stringify({
+    type:value===undefined?'undefined':typeof value,
+    value:value===undefined?null:value,
+    negativeZero:Object.is(value,-0),
+    effects
+  }));
+} catch(error) {
+  console.log(JSON.stringify({type:'throw',name:error.name,effects}));
+}
+";
+        for flag in [false, true] {
+            for mode in ["script", "eval"] {
+                let observe =
+                    |code: &str| -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+                        let result = Command::new("node")
+                            .arg("-e")
+                            .arg(harness)
+                            .arg(code)
+                            .arg(if flag { "true" } else { "false" })
+                            .arg(mode)
+                            .output()?;
+                        assert!(result.status.success(), "{result:?}");
+                        Ok(serde_json::from_slice(&result.stdout)?)
+                    };
+                assert_eq!(
+                    observe(source)?,
+                    observe(&recovered)?,
+                    "{source} -> {recovered} (flag={flag}, mode={mode})"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires Node; compare while dispatchers in script and direct eval"]
+    fn node_confirms_live_while_dispatcher_completions() -> Result<(), Box<dyn std::error::Error>> {
+        for &(source, should_structure) in LIVE_WHILE_CASES {
+            compare_live_loop_runtime(source, should_structure)?;
+        }
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires Node; compare live script and direct-eval Completion Records"]
     fn node_confirms_recovered_live_numeric_loops_and_zero_iterations(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        use std::process::Command;
         let source_cases = [
             "let s;for(s=1;s!=9;)s==1?(s=9):s==9&&(s=9);",
             "let s;for(s=1;s!=9;)s==1?(s=3):s==3?(s=9):s==9&&(s=9);",
@@ -6416,69 +6491,9 @@ try{
             "let s;for(s=1;s!=9;)if(s==1){let x=(s=9,[]);}else if(s==9){s=9;}",
             "let s;for(s=1;s!=9;)if(s==1){let x=(s=3,[]);}else if(s==3){let y=(s=9,[]);}else if(s==9){s=9;}",
         ];
-        let mut transformed = 0;
-        let mut tests = 0;
         for source in source_cases {
-            let recovered = deobfuscate(
-                source,
-                12,
-                &WorkBudget::unlimited("live-loop-runtime-oracle"),
-            )?
-            .ok_or_else(|| std::io::Error::other("valid source not recovered"))?;
-            transformed += recovered
-                .transforms
-                .get("if_ladder_structured")
-                .copied()
-                .unwrap_or(0);
-            for flag in [false, true] {
-                for mode in ["script", "eval"] {
-                    let harness = r"
-const vm=require('node:vm');
-const source=process.argv[1], flag=process.argv[2]==='true';
-const mode=process.argv[3];
-const effects=[];
-const context={flag, push(v){effects.push(v);return v.length}};
-const script=mode==='eval'?'eval('+JSON.stringify(source)+')':source;
-const options={};options.timeout=1500;
-try {
-  const value=vm.runInNewContext(script,context,options);
-  console.log(JSON.stringify({
-    type:value===undefined?'undefined':typeof value,
-    value:value===undefined?null:value,
-    effects
-  }));
-} catch(error) {
-  console.log(JSON.stringify({type:'throw',name:error.name,effects}));
-}
-";
-                    let observe =
-                        |code: &str| -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-                            let result = Command::new("node")
-                                .arg("-e")
-                                .arg(harness)
-                                .arg(code)
-                                .arg(if flag { "true" } else { "false" })
-                                .arg(mode)
-                                .output()?;
-                            assert!(result.status.success(), "{result:?}");
-                            Ok(serde_json::from_slice(&result.stdout)?)
-                        };
-                    let before = observe(source)?;
-                    let after = observe(&recovered.source)?;
-                    assert_eq!(
-                        before, after,
-                        "{source} -> {} (flag={flag}, mode={mode})",
-                        recovered.source
-                    );
-                    tests += 1;
-                }
-            }
+            compare_live_loop_runtime(source, true)?;
         }
-        assert!(
-            transformed >= source_cases.len(),
-            "{transformed} transformations"
-        );
-        assert_eq!(tests, 44);
         Ok(())
     }
 

@@ -820,14 +820,13 @@ impl Collector<'_, '_> {
     fn reconstruct_while_pairs(&mut self, statements: &[Statement<'_>]) {
         for pair in statements.windows(2) {
             if let [initial, Statement::WhileStatement(loop_stmt)] = pair {
-                if self.completion.needs_value(loop_stmt.span) {
-                    continue;
-                }
+                let live = self.completion.needs_value(loop_stmt.span);
                 if let Some(code) = if_ladder_structure::reconstruct_while_adjacent(
                     initial,
                     loop_stmt,
                     self.source,
                     self.scoping,
+                    live,
                 ) {
                     // The paired initializer remains in its original lexical
                     // environment; only the loop is reconstructed.
@@ -921,36 +920,37 @@ impl Collector<'_, '_> {
         let mut reaching = inherited.clone();
         for (index, stmt) in statements.iter().enumerate() {
             if let Statement::WhileStatement(loop_stmt) = stmt {
-                if !self.completion.needs_value(loop_stmt.span) {
-                    if let Some((symbol, name)) =
-                        if_ladder_structure::while_state_binding(loop_stmt, self.scoping)
-                    {
-                        let immediately_preceded = index > 0
-                            && if_ladder_structure::state_initializers(
-                                &statements[index - 1],
-                                self.scoping,
-                            )
-                            .iter()
-                            .any(|(other, _, _, _)| *other == symbol);
-                        if !immediately_preceded && self.safe_numeric_state_binding(symbol) {
-                            if let Some(&(initial, init_span)) = reaching.get(&symbol) {
-                                if self.reaching_state_is_stable(symbol, init_span, loop_stmt.span)
+                let live = self.completion.needs_value(loop_stmt.span);
+                if let Some((symbol, name)) =
+                    if_ladder_structure::while_state_binding(loop_stmt, self.scoping)
+                {
+                    let immediately_preceded = index > 0
+                        && if_ladder_structure::state_initializers(
+                            &statements[index - 1],
+                            self.scoping,
+                        )
+                        .iter()
+                        .any(|(other, _, _, _)| *other == symbol);
+                    if !immediately_preceded && self.safe_numeric_state_binding(symbol) {
+                        if let Some(&(initial, init_span)) = reaching.get(&symbol) {
+                            if self.reaching_state_is_stable(symbol, init_span, loop_stmt.span) {
+                                if let Some(code) =
+                                    if_ladder_structure::reconstruct_while_with_known_state(
+                                        loop_stmt,
+                                        name,
+                                        initial,
+                                        self.source,
+                                        self.scoping,
+                                        live,
+                                    )
                                 {
-                                    if let Some(code) =
-                                        if_ladder_structure::reconstruct_while_with_known_state(
-                                            loop_stmt,
-                                            name,
-                                            initial,
-                                            self.source,
-                                            self.scoping,
-                                        )
-                                    {
-                                        self.push(loop_stmt.span, code, "if_ladder_structured");
-                                    }
+                                    self.push(loop_stmt.span, code, "if_ladder_structured");
                                 }
                             }
                         }
                     }
+                }
+                if !live {
                     self.reconstruct_exception_reaching_while(loop_stmt, &reaching);
                 }
             }
@@ -1415,6 +1415,7 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
         // proof instead of excluding the entire top level.
         self.lower_if_test_statements(&program.body);
         self.lower_sibling_expression_statements(&program.body);
+        self.reconstruct_while_pairs(&program.body);
         walk::walk_program(self, program);
     }
 
