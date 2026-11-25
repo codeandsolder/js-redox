@@ -14,6 +14,7 @@ use oxc_ast::ast::{
     Argument, ArrayExpressionElement, BindingPattern, Declaration, Expression, ForStatement,
     ForStatementInit, IdentifierReference, MemberExpression, ObjectPropertyKind, Program,
     PropertyKind, SimpleAssignmentTarget, Statement, VariableDeclaration, VariableDeclarationKind,
+    VariableDeclarator,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::Scoping;
@@ -167,7 +168,6 @@ impl FreshDataReads {
         let mut analyzer = Analyzer {
             scoping,
             bindings,
-            ambient_root: !program.source_type.is_module(),
             reads: Self::default(),
             visited_lists: HashSet::new(),
             budget,
@@ -239,7 +239,6 @@ impl FreshDataReads {
 struct Analyzer<'c> {
     scoping: &'c Scoping,
     bindings: &'c BindingFacts,
-    ambient_root: bool,
     reads: FreshDataReads,
     visited_lists: HashSet<(u32, u32)>,
     budget: &'c WorkBudget,
@@ -310,9 +309,10 @@ impl Analyzer<'_> {
     fn lexical_reference(&self, identifier: &IdentifierReference<'_>) -> Option<SymbolId> {
         let reference = identifier.reference_id.get()?;
         let symbol = crate::statically_resolved_symbol(self.scoping, reference)?;
-        if self.ambient_root
-            && self.scoping.symbol_scope_id(symbol) == self.scoping.root_scope_id()
-            && !self.scoping.symbol_flags(symbol).is_block_scoped()
+        if !self.bindings.has_declarative_storage(self.scoping, symbol)
+            || self
+                .bindings
+                .is_mapped_arguments_exposed(self.scoping, symbol)
         {
             return None;
         }
@@ -462,7 +462,7 @@ impl Analyzer<'_> {
         if let SimpleAssignmentTarget::AssignmentTargetIdentifier(identifier) = target {
             let symbol = self.lexical_reference(identifier)?;
             let flags = self.scoping.symbol_flags(symbol);
-            return (flags.is_block_scoped() && !flags.is_const_variable())
+            return (flags.is_variable() && !flags.is_const_variable())
                 .then_some(Reference::Binding(symbol));
         }
         self.member_reference(target.as_member_expression()?, environment)
@@ -1014,43 +1014,58 @@ impl Analyzer<'_> {
         }
     }
 
+    fn declaration_symbol(
+        &self,
+        declarator: &VariableDeclarator<'_>,
+        kind: VariableDeclarationKind,
+    ) -> Option<SymbolId> {
+        let symbol = match kind {
+            VariableDeclarationKind::Var => self
+                .bindings
+                .var_initializer_target(self.scoping, declarator)?,
+            VariableDeclarationKind::Let | VariableDeclarationKind::Const => {
+                let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
+                    return None;
+                };
+                identifier.symbol_id.get()?
+            }
+            _ => return None,
+        };
+        (!self
+            .bindings
+            .is_mapped_arguments_exposed(self.scoping, symbol))
+        .then_some(symbol)
+    }
+
     fn declaration(
         &mut self,
         declaration: &VariableDeclaration<'_>,
         environment: &mut Environment,
     ) {
         for declarator in &declaration.declarations {
-            if declaration.kind == VariableDeclarationKind::Var {
-                // ResolveBinding for var initialization precedes its RHS;
-                // a with-environment or ambient global can be observable.
-                // Do not carry allocation facts across that lookup.
-                if declarator.init.is_none() {
-                    continue;
-                }
+            let kind = declaration.kind;
+            if kind == VariableDeclarationKind::Var && declarator.init.is_none() {
+                // Instantiation hoists the binding. Executing a bare var
+                // declaration never writes undefined to an existing cell.
+                continue;
+            }
+            let symbol = self.declaration_symbol(declarator, kind);
+            if kind == VariableDeclarationKind::Var && symbol.is_none() {
+                // ResolveBinding for var initialization precedes its RHS.
+                // An unproved lookup may be observable even before GetValue.
                 environment.clear();
             }
             let value = declarator.init.as_ref().map_or_else(
                 || Evaluation::primitive(Value::Undefined, true),
                 |init| self.expression(init, environment),
             );
-            let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
-                self.unobserved(declarator.id.span());
+            let Some(symbol) = symbol else {
+                if !matches!(declarator.id, BindingPattern::BindingIdentifier(_)) {
+                    self.unobserved(declarator.id.span());
+                }
                 environment.clear();
                 continue;
             };
-            let Some(symbol) = identifier.symbol_id.get() else {
-                environment.clear();
-                continue;
-            };
-            if !matches!(
-                declaration.kind,
-                VariableDeclarationKind::Let | VariableDeclarationKind::Const
-            ) {
-                // Var initialization can write through global accessors or
-                // mapped arguments. It is not a lexical allocation proof.
-                environment.clear();
-                continue;
-            }
             if let Some(fact) = value.fact {
                 if self
                     .heap_result(environment.insert(symbol, fact, self.budget))
@@ -1363,6 +1378,55 @@ mod tests {
                 ))
             })
             .collect())
+    }
+
+    #[test]
+    fn declarative_var_initializers_preserve_reaching_heap_facts() -> Result<(), BudgetExceeded> {
+        for (source, expected) in [
+            (
+                "function f(){var a=[7];var b=a;b[0]=9;return a[0];}",
+                vec![("a[0]", "9")],
+            ),
+            (
+                "function f(){var a=[7];var a;return a[0];}",
+                vec![("a[0]", "7")],
+            ),
+            (
+                "function f(){var a=[7];{var b=a;}b[0]++;return a[0];}",
+                vec![("a[0]", "8")],
+            ),
+            (
+                "function f(){var a=[1];for(var i=0;i<2;i++){a[0]++;}return a[0];}",
+                vec![("a[0]", "3")],
+            ),
+            (
+                "function f(p){'use strict';var p=[7];return p[0];}",
+                vec![("p[0]", "7")],
+            ),
+            ("function f(p){var p=[7];return p[0];}", vec![("p[0]", "7")]),
+            (
+                "function f(p){var p=[7];arguments[0]=[9];return p[0];}",
+                vec![],
+            ),
+            ("function f(p){p=[7];return p[0];}", vec![("p[0]", "7")]),
+            ("function f(p){p=[7];arguments[0]=[9];return p[0];}", vec![]),
+            (
+                "function f(){var a=[7];with(o){var a=[9];a[0];}return a[0];}",
+                vec![],
+            ),
+            (
+                "function f(){var a=[9];try{throw [];}catch(a){var a=[7];a[0];}return a[0];}",
+                vec![("a[0]", "7")],
+            ),
+            ("var a=[7];a[0];", vec![]),
+        ] {
+            let expected = expected
+                .into_iter()
+                .map(|(s, v)| (s.to_owned(), v.to_owned()))
+                .collect::<Vec<_>>();
+            assert_eq!(reads(source)?, expected, "{source}");
+        }
+        Ok(())
     }
 
     #[test]

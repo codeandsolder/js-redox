@@ -6,7 +6,7 @@ use oxc_ast::ast::{
     ExportDeclaration, ExportDefaultDeclaration, ExportDefaultDeclarationKind,
     ExportNamedDeclaration, Expression, ForInStatement, ForOfStatement, ForStatement,
     ForStatementInit, ForStatementLeft, FormalParameters, Function, FunctionType, ModuleExportName,
-    Statement, VariableDeclaration, VariableDeclarationKind,
+    Statement, VariableDeclaration, VariableDeclarationKind, VariableDeclarator,
 };
 use oxc_ast::AstKind;
 use oxc_ast_visit::{walk, Visit};
@@ -40,6 +40,7 @@ struct EvalSite {
 #[derive(Debug)]
 pub struct BindingFacts {
     hoisted_vars: HashSet<SymbolId>,
+    var_initializer_scopes: HashMap<Span, ScopeId>,
     parameters: HashSet<SymbolId>,
     simple_parameter_functions: HashSet<ScopeId>,
     arguments_references: Vec<ReferenceId>,
@@ -121,6 +122,7 @@ impl BindingFacts {
     pub fn analyze(program: &oxc_ast::ast::Program<'_>, scoping: &Scoping) -> Self {
         let mut facts = Self {
             hoisted_vars: HashSet::new(),
+            var_initializer_scopes: HashMap::new(),
             parameters: HashSet::new(),
             simple_parameter_functions: HashSet::new(),
             arguments_references: Vec::new(),
@@ -262,6 +264,38 @@ impl BindingFacts {
         self.resolve_scope(scoping, scope, Some(symbol)) == ReferenceIdentity::Lexical(symbol)
     }
 
+    /// Declarative bindings have no accessor-backed `ResolveBinding` step.
+    /// A script's object-backed global variables are not such bindings.
+    pub(crate) fn has_declarative_storage(&self, scoping: &Scoping, symbol: SymbolId) -> bool {
+        !self.ambient_root
+            || scoping.symbol_scope_id(symbol) != scoping.root_scope_id()
+            || scoping.symbol_flags(symbol).intersects(
+                oxc_semantic::SymbolFlags::BlockScoped | oxc_semantic::SymbolFlags::Import,
+            )
+    }
+
+    /// The declarator's binding identifier denotes the declaration, but
+    /// a var initializer resolves its assignment target in the executing
+    /// lexical environment. In particular with and simple catch parameters
+    /// can affect that lookup. Establish the target before evaluating the RHS.
+    pub(crate) fn var_initializer_target(
+        &self,
+        scoping: &Scoping,
+        declarator: &VariableDeclarator<'_>,
+    ) -> Option<SymbolId> {
+        let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
+            return None;
+        };
+        let scope = *self.var_initializer_scopes.get(&declarator.span)?;
+        let symbol = scoping
+            .scope_ancestors(scope)
+            .find_map(|ancestor| scoping.get_binding(ancestor, identifier.name))?;
+        (identifier.symbol_id.get() == Some(symbol)
+            && self.has_declarative_storage(scoping, symbol)
+            && self.proves_reference_identity(scoping, symbol, scope))
+        .then_some(symbol)
+    }
+
     /// Prove that resolving this identifier to an assignment Reference
     /// commutes with arbitrary RHS evaluation. A declarative binding's
     /// environment record does not become a different record just because
@@ -284,15 +318,8 @@ impl BindingFacts {
         {
             return None;
         }
-        if self.ambient_root
-            && scoping.symbol_scope_id(symbol) == scoping.root_scope_id()
-            && !scoping.symbol_flags(symbol).intersects(
-                oxc_semantic::SymbolFlags::BlockScoped | oxc_semantic::SymbolFlags::Import,
-            )
-        {
-            return None;
-        }
-        Some(symbol)
+        self.has_declarative_storage(scoping, symbol)
+            .then_some(symbol)
     }
 
     /// Immutable bindings can be read by a later-created closure: once
@@ -740,6 +767,13 @@ impl<'a> Visit<'a> for BindingFacts {
     fn visit_variable_declaration(&mut self, declaration: &VariableDeclaration<'a>) {
         if declaration.kind == VariableDeclarationKind::Var {
             for declarator in &declaration.declarations {
+                if declarator.init.is_some()
+                    && matches!(declarator.id, BindingPattern::BindingIdentifier(_))
+                {
+                    if let Some(Some(scope)) = self.scopes.last() {
+                        self.var_initializer_scopes.insert(declarator.span, *scope);
+                    }
+                }
                 self.hoisted_vars.extend(
                     declarator
                         .id
