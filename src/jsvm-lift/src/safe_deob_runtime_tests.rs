@@ -1540,7 +1540,9 @@ fn depythonify_safe_deob_generated_runtime_equivalence() -> Result<()> {
         };
         let expected_changed = !matches!(
             file,
-            "static-alias-installer-calls.js" | "static-alias-live-forwarding.js"
+            "static-alias-installer-calls.js"
+                | "static-alias-live-forwarding.js"
+                | "arithmetic-state.js"
         );
         assert_eq!(outcome.report.changed, expected_changed, "{file}");
         assert_main_contract(file, &outcome);
