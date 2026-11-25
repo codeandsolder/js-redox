@@ -688,17 +688,40 @@ impl Collector<'_, '_> {
         }
     }
 
+    /// The reaching interpreter can certify a common normal exit for any
+    /// fully modeled loop, independently of its numeric dispatcher shape.
+    /// Otherwise retain the graph's own route-sensitive completion proof.
+    fn reconstruct_loop_completion(
+        &self,
+        span: Span,
+        reconstruct: impl FnOnce(bool) -> Option<String>,
+    ) -> Option<String> {
+        let live = self.completion.needs_value(span);
+        let suffix = live
+            .then(|| self.fresh_data.loop_completion(span)?.render())
+            .flatten();
+        if let Some(value) = suffix {
+            // Parenthesize the primitive so a string cannot become a
+            // directive. Abrupt transfers bypass this normal-exit suffix.
+            let code = reconstruct(false)?;
+            Some(format!("{{\n{code}\n;\n({value});\n}}"))
+        } else {
+            reconstruct(live)
+        }
+    }
+
     fn reconstruct_while_pairs(&mut self, statements: &[Statement<'_>]) {
         for pair in statements.windows(2) {
             if let [initial, Statement::WhileStatement(loop_stmt)] = pair {
-                let live = self.completion.needs_value(loop_stmt.span);
-                if let Some(code) = if_ladder_structure::reconstruct_while_adjacent(
-                    initial,
-                    loop_stmt,
-                    self.source,
-                    self.scoping,
-                    live,
-                ) {
+                if let Some(code) = self.reconstruct_loop_completion(loop_stmt.span, |live| {
+                    if_ladder_structure::reconstruct_while_adjacent(
+                        initial,
+                        loop_stmt,
+                        self.source,
+                        self.scoping,
+                        live,
+                    )
+                }) {
                     // The paired initializer remains in its original lexical
                     // environment; only the loop is reconstructed.
                     self.push(loop_stmt.span, code, "if_ladder_structured");
@@ -807,14 +830,16 @@ impl Collector<'_, '_> {
                                 self.reaching_state_is_stable(symbol, init_span, loop_stmt.span)
                             }) {
                                 if let Some(code) =
-                                    if_ladder_structure::reconstruct_while_with_known_state(
-                                        loop_stmt,
-                                        name,
-                                        initial,
-                                        self.source,
-                                        self.scoping,
-                                        live,
-                                    )
+                                    self.reconstruct_loop_completion(loop_stmt.span, |live| {
+                                        if_ladder_structure::reconstruct_while_with_known_state(
+                                            loop_stmt,
+                                            name,
+                                            initial,
+                                            self.source,
+                                            self.scoping,
+                                            live,
+                                        )
+                                    })
                                 {
                                     self.push(loop_stmt.span, code, "if_ladder_structured");
                                 }
@@ -1476,9 +1501,9 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
             self.push(it.span, text, "ordered_switch_unflatten");
             return;
         }
-        if let Some(text) =
+        if let Some(text) = self.reconstruct_loop_completion(it.span, |live| {
             if_ladder_structure::reconstruct_for(it, self.source, Some(self.scoping), live)
-        {
+        }) {
             self.push(it.span, text, "if_ladder_structured");
             return;
         }
@@ -7262,6 +7287,24 @@ mod tests {
             assert!(output.source.contains("eval(input)"), "{}", output.source);
             assert!(output.source.contains("log(\"item\")"), "{}", output.source);
         }
+    }
+
+    #[test]
+    fn shared_completion_certificate_extends_numeric_reconstruction(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // The graph's independent effect proof permits these routes, but
+        // its numeric-only Completion domain cannot represent their values.
+        for expression in ["'done'", "-1.25", "true", "null", "a[0]"] {
+            let source = format!("let a=[7];let state=1;while(state!==9){{if(state===1){{{expression};let ignored=(state=9,0);}}}}");
+            let result = deobfuscate(&source, 1).ok_or("missing result")?;
+            assert!(
+                result.transforms.contains_key("if_ladder_structured"),
+                "{source}: {} {:?}",
+                result.source,
+                result.transforms
+            );
+        }
+        Ok(())
     }
 
     #[test]

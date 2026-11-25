@@ -1014,6 +1014,23 @@ fn depythonify_safe_deob_completion_paths_runtime_equivalence() -> Result<()> {
 
 #[test]
 #[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_shared_loop_certificate_runtime_equivalence() -> Result<()> {
+    let sources = [
+        "let state=1;while(state!==9){if(state===1){'done';let unused=(state=9,0);}}",
+        "let state=1;while(state!==9){if(state===1){-1.25;let unused=(state=9,0);}}",
+        "let state=1;while(state!==9){if(state===1){true;let unused=(state=9,0);}}",
+        "let a=[7];let state=1;while(state!==9){if(state===1){a[0];let unused=(state=9,0);}}",
+        "let state=1;while(state!==9){if(state===1){null;let unused=(state=9,0);}}",
+        "let state=1;while(state!==9){if(state===1){-0;let unused=(state=9,0);}}",
+        "let state=1;while(state!==9){if(state===1){events.push(7);let unused=(state=9,0);}}",
+        "for(let i=0;i<2;i++){let state=1;while(state!==9){if(state===1){i;let unused=(state=9,0);}}}",
+        "outer:while(true){7;break outer;}",
+    ];
+    script_eval_runtime_equivalence(&sources, "shared-loop-certificate")
+}
+
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
 fn depythonify_safe_deob_exception_completion_runtime_equivalence() -> Result<()> {
     let sources = [
         "try{7;}finally{9;}",

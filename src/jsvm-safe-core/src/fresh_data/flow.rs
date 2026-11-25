@@ -177,6 +177,24 @@ impl Flow {
         }
     }
 
+    /// A normal-exit suffix cannot repair the completion carried by an
+    /// external break/continue. Return and throw bypass it and are preserved
+    /// by the independent control/effect proof.
+    pub(super) fn exact_normal_primitive(&self) -> Option<&Value> {
+        if self.unproved
+            || self
+                .abrupt
+                .keys()
+                .any(|kind| matches!(kind, Transfer::Break(_) | Transfer::Continue(_)))
+        {
+            return None;
+        }
+        match self.normal.as_ref()? {
+            CompletionValue::Value(NonEmpty::Known(fact)) => fact.primitive(),
+            _ => None,
+        }
+    }
+
     pub(super) const fn no_paths() -> Self {
         Self {
             normal: None,
