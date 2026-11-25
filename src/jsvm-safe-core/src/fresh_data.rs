@@ -1038,7 +1038,7 @@ impl Analyzer<'_, '_> {
         evaluation
     }
 
-    /// GetValue on a callee retains its reference receiver until after
+    /// `GetValue` on a callee retains its reference receiver until after
     /// argument evaluation. Parentheses preserve a reference; sequences,
     /// assignments and conditional expressions produce ordinary values.
     fn evaluate_callee(
@@ -1898,8 +1898,8 @@ mod tests {
             ("let o={x:7,f:function(){return [this.x]}};let a=o.f();a[0];", vec![("a[0]", "7")]),
             ("let o={x:7,f(){return [this.x]}};let a=o.f();a[0];", vec![("a[0]", "7")]),
             ("let o={x:7,f(){this.x++;return this;}};let a=o.f();a.x;o.x;", vec![("a.x", "8"),("o.x", "8")]),
-            ("let o={x:7,f(){return [this.x]}};let a=o.f((o={x:9},0));a[0];", vec![("a[0]", "7")]),
-            ("let o={x:7,f(){return [this.x]}};let a=o[(o={x:9},'f')]();a[0];", vec![("a[0]", "7")]),
+            ("let o={x:7,f(){return [this.x]}};let a=o.f((o={x: 9},0));a[0];", vec![("a[0]", "7")]),
+            ("let o={x:7,f(){return [this.x]}};let a=o[(o={x: 9},'f')]();a[0];", vec![("a[0]", "7")]),
             ("let o={x:7,f(){return [this.x]}};let a=(o.f)();a[0];", vec![("a[0]", "7")]),
             ("let f=function(){'use strict';return [this===void 0]};let a=f();a[0];", vec![("a[0]", "true")]),
             ("let o={x:7,f(){'use strict';return [this===void 0]}};let a=(0,o.f)();a[0];", vec![("a[0]", "true")]),
@@ -1921,7 +1921,7 @@ mod tests {
             ("let o={x:7,f(){return ()=>[this.x]}};let g=o.f();o.x=9;let a=g();a[0];", vec![("a[0]", "9")]),
             ("let o={x:7,f(){return {x:9,g:()=>[this.x]}}};let p=o.f();let a=p.g();a[0];", vec![("a[0]", "7")]),
             ("let o={x:7,f(){return ()=>[this.x]}};let p={x:9,f:o.f};let g=o.f(),h=p.f();let a=g(),b=h();a[0];b[0];", vec![("a[0]", "7"),("b[0]", "9")]),
-            ("let o={x:7,f(){return ()=>[this.x]}};let g=o.f();o={x:9};for(let i=0;i<256;i++){let a=[i];}let a=g();a[0];", vec![("a[0]", "7")]),
+            ("let o={x:7,f(){return ()=>[this.x]}};let g=o.f();o={x: 9};for(let i=0;i<256;i++){let a=[i];}let a=g();a[0];", vec![("a[0]", "7")]),
             ("let o={x:7,f(){return [()=>this.x,()=>{this.x=9}]}};let p=o.f();p[1]();let a=[p[0]()];a[0];", vec![("a[0]", "9")]),
             ("let o={x:7,f(){return ()=>[this.x]}};let g=o.f();unknown(g);let a=g();a[0];", vec![]),
             ("let o={x:7,f:()=>[this.x]};let a=o.f();a[0];", vec![]),
@@ -2191,7 +2191,7 @@ mod tests {
         );
         assert_eq!(reads(&source)?, vec![("holder.x".into(), "7".into())]);
         let temporaries = "({ x:1 }),".repeat(256);
-        let source = format!("let a={{x:7}};let b=a; b.x=({temporaries}a={{x:9}},8);b.x;a.x;");
+        let source = format!("let a={{x:7}};let b=a; b.x=({temporaries}a={{x: 9}},8);b.x;a.x;");
         assert_eq!(
             reads(&source)?,
             vec![("b.x".into(), "8".into()), ("a.x".into(), "9".into())]
@@ -2307,7 +2307,7 @@ mod tests {
             ("let a=[7,8,9];a.length='1';a[0];a.length;",vec![("a[0]","7"),("a.length","1")]),
             ("let a=[7,8,9];delete a[1];a[0];a[2];a.length;",vec![("a[0]","7"),("a[2]","9"),("a.length","3")]),
             ("let a={x:null};a.x=a;a.x.x.x===a;a.x.x.x.x.x.x.x.x;",vec![]),
-            ("let a={x:7};let b={x:9};let c=true?a:b;c.x=8;a.x;b.x;",vec![("a.x","8"),("b.x","9")]),
+            ("let a={x:7};let b={x: 9};let c=true?a:b;c.x=8;a.x;b.x;",vec![("a.x","8"),("b.x","9")]),
             ("function f(flag){let a={x:7};let b={x:8};let c=flag?a:b;c.x=9;a.x;b.x;}",vec![]),
             ("function f(flag){let a={x:7,y:8};let b={x:7,y:9};let c=flag?a:b;c.x=9;c.y;a.y;b.y;}",vec![("a.y","8"),("b.y","9")]),
             ("function f(flag){let a={x:7};if(flag)a.x=9;else a.x=9;return a.x;}",vec![("a.x","9")]),
@@ -2359,7 +2359,7 @@ mod tests {
             ("function f(flag){let p={x:7};let a={__proto__:p};if(flag)a.x=7;a.x;}",vec![("a.x","7")]),
             ("function f(flag){let p={x:7};let a={__proto__:p,x:7};if(flag)delete a.x;a.x;}",vec![("a.x","7")]),
             ("function f(flag){let p=flag?{x:7}:{x:7};let a={__proto__:p};a.x;}",vec![("a.x","7")]),
-            ("function f(flag){let p=flag?{x:7}:{x:9};let a={__proto__:p};a.x;}",vec![]),
+            ("function f(flag){let p=flag?{x:7}:{x: 9};let a={__proto__:p};a.x;}",vec![]),
             ("function f(flag){let a={__proto__:null};let b={__proto__:null};let c=flag?a:b;c.x=7;c.x=9;}",vec![]),
             ("function f(k){let a={x:7,[k]:9};a.x=8;a.x;}",vec![("a.x","8")]),
             ("function f(k){let a={__proto__:null,[k]:9};a.x=8;a.x;}",vec![("a.x","8")]),
