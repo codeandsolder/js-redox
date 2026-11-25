@@ -338,7 +338,7 @@ impl Analyzer<'_, '_> {
         Some(summary)
     }
 
-    /// Enter a fresh local activation. Semantic SymbolIds identify cells
+    /// Enter a fresh local activation. Semantic `SymbolId` values identify cells
     /// only within one live instance of a lexical scope, so an overlapping
     /// recursive activation must remain opaque until instance-indexed cells
     /// are available. Bound native recursion independently of loop fuel.
