@@ -86,3 +86,10 @@ oxc_span = { git = "https://github.com/codeandsolder/oxc.git", rev = "e06236d72f
 oxc_str = { git = "https://github.com/codeandsolder/oxc.git", rev = "e06236d72ffefb736a9e68143c5a4807a576bef9" }
 oxc_syntax = { git = "https://github.com/codeandsolder/oxc.git", rev = "e06236d72ffefb736a9e68143c5a4807a576bef9" }
 zlib-rs = { git = "https://github.com/codeandsolder/zlib-rs-fast.git", rev = "1ec3a5612ee28803a7756fa52bd013389507a2db" }
+# Shared reviewed registry patch queues; Cargo.lock pins the generated snapshots.
+compact_str = { git = "https://github.com/codeandsolder/cargo-patches.git", branch = "generated/js-redox-deps" }
+oxc_sourcemap = { git = "https://github.com/codeandsolder/cargo-patches.git", branch = "generated/js-redox-deps" }
+petgraph = { git = "https://github.com/codeandsolder/cargo-patches.git", branch = "generated/js-redox-deps" }
+phf_macros = { git = "https://github.com/codeandsolder/cargo-patches.git", branch = "generated/js-redox-deps" }
+compression-codecs = { git = "https://github.com/codeandsolder/cargo-patches.git", branch = "generated/compression-backend" }
+oxc-browserslist = { git = "https://github.com/codeandsolder/cargo-patches.git", branch = "generated/compression-backend" }
