@@ -9,13 +9,40 @@ use super::{
 use oxc_ast::ast::{BlockStatement, CatchClause, TryStatement};
 
 impl Analyzer<'_, '_> {
-    fn protected_region(
+    /// A statement or speculative attempt owns its expression exception
+    /// edges until it has established a usable completion. Nested statement
+    /// flows already own their edges. Abandoned speculation must not leak
+    /// exceptional heaps into a different attempt.
+    pub(super) fn capture_expression_exceptions(
+        &mut self,
+        environment: &mut Environment,
+        evaluate: impl FnOnce(&mut Self, &mut Environment) -> Option<Flow>,
+    ) -> Option<Flow> {
+        let outer = std::mem::replace(&mut self.expression_exceptions, Flow::no_paths());
+        let flow = evaluate(self, environment);
+        let exceptions = std::mem::replace(&mut self.expression_exceptions, outer);
+        let mut flow = flow?;
+        if !environment.reachable() {
+            flow.normal = None;
+        }
+        self.heap_result(flow.merge_abrupt(exceptions, self.budget))?;
+        Some(flow)
+    }
+
+    pub(super) fn record_expression_throws(&mut self, paths: Vec<Path>) -> Option<()> {
+        let result = self
+            .expression_exceptions
+            .extend_abrupt(Transfer::Throw, paths, self.budget);
+        self.heap_result(result)
+    }
+
+    pub(super) fn protected_region(
         &mut self,
         environment: &mut Environment,
         evaluate: impl FnOnce(&mut Self, &mut Environment) -> Option<Flow>,
     ) -> Option<Flow> {
         let before = self.exception_generation;
-        let flow = evaluate(self, environment);
+        let flow = self.capture_expression_exceptions(environment, evaluate);
         let uncertain = self.exception_generation != before;
         // Explicit exceptional paths now represent this region's failures.
         self.exception_generation = before;

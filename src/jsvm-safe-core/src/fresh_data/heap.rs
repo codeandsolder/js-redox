@@ -913,6 +913,7 @@ pub(super) const MIN_COLLECTION_SIZE: usize = 64;
 
 #[derive(Clone)]
 pub(super) struct Environment {
+    reachable: bool,
     bindings: CellStore,
     allocations: Rc<HashMap<AllocationId, Rc<OwnData>>>,
     collection_threshold: usize,
@@ -924,6 +925,7 @@ pub(super) struct Environment {
 impl Default for Environment {
     fn default() -> Self {
         Self {
+            reachable: true,
             bindings: CellStore::default(),
             allocations: Rc::default(),
             collection_threshold: MIN_COLLECTION_SIZE,
@@ -1044,6 +1046,17 @@ impl Environment {
         Self::default()
     }
 
+    /// This heap is the state of the ordinary continuation. An expression
+    /// whose every modeled outcome throws has no such continuation; its
+    /// exceptional snapshots are owned by the surrounding completion flow.
+    pub(super) const fn reachable(&self) -> bool {
+        self.reachable
+    }
+
+    pub(super) const fn terminate(&mut self) {
+        self.reachable = false;
+    }
+
     /// Recognize a repeated abstract state cheaply. This is only a
     /// speculation stop condition, never a proof that the concrete loop
     /// diverges. Ignore allocation-birth history and collector bookkeeping.
@@ -1082,6 +1095,7 @@ impl Environment {
     /// descriptor or binding fact can be carried across it.
     pub(super) fn unknown_exception(&self, next_identity: usize) -> Self {
         let mut environment = self.clone();
+        environment.reachable = true;
         environment.clear();
         environment.origins = Some(IdentityOrigins::new(next_identity));
         environment
@@ -1346,7 +1360,14 @@ impl Environment {
         first_new: AllocationId,
         budget: &WorkBudget,
     ) -> Result<(), BudgetExceeded> {
-        self.join_paths(other, Some(first_new), None, budget)
+        match (self.reachable, other.reachable) {
+            (true, true) => self.join_paths(other, Some(first_new), None, budget),
+            (false, true) => {
+                *self = other.clone();
+                Ok(())
+            }
+            (_, false) => Ok(()),
+        }
     }
 
     /// Return paths may diverge at different points in a function or loop.

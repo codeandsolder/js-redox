@@ -393,7 +393,6 @@ pub enum JumpSummary {
 pub struct StatementTransfers {
     pub jumps: JumpSummary,
     pub returns: bool,
-    pub throws: bool,
 }
 
 #[derive(Default)]
@@ -448,10 +447,6 @@ impl<'a> Visit<'a> for LoopControlDetector {
 
     fn visit_return_statement(&mut self, _: &oxc_ast::ast::ReturnStatement<'a>) {
         self.summary.returns = true;
-    }
-
-    fn visit_throw_statement(&mut self, _: &oxc_ast::ast::ThrowStatement<'a>) {
-        self.summary.throws = true;
     }
 
     fn visit_switch_statement(&mut self, it: &oxc_ast::ast::SwitchStatement<'a>) {

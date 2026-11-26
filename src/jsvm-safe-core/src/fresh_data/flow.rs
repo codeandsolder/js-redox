@@ -254,6 +254,9 @@ impl Flow {
         // Retain disjoint abrupt paths until their target consumes them.
         // Bound snapshots per target, with an ordinary sound join on overflow.
         const MAX_PATHS_PER_TARGET: usize = 64;
+        if incoming.is_empty() {
+            return Ok(());
+        }
         super::heap::charge(budget, incoming.len())?;
         let paths = self.abrupt.entry(kind).or_default();
         paths.append(&mut incoming);

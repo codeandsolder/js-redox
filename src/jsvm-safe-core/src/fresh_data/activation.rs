@@ -25,6 +25,11 @@ struct ReturnSummary {
     environment: Environment,
 }
 
+struct ActivationSummary {
+    normal: Option<ReturnSummary>,
+    throws: Vec<super::flow::Path>,
+}
+
 /// References to arena-owned declaration nodes, indexed by semantic
 /// identity rather than spelling. The binding proof is checked at each call.
 #[derive(Clone, Copy)]
@@ -305,6 +310,9 @@ impl<'ast> Analyzer<'_, 'ast> {
             )?;
         }
         self.initialize_parameters(activation.params, arguments, environment)?;
+        if !environment.reachable() {
+            return Some(());
+        }
         self.initialize_body_environment(activation.scope, activation.params, environment)?;
         self.initialize_hoisted_callables(activation.scope, environment)
     }
@@ -317,10 +325,17 @@ impl<'ast> Analyzer<'_, 'ast> {
         environment: &mut Environment,
     ) -> Option<super::flow::Flow> {
         use super::flow::{CompletionValue, Flow, Transfer};
-        self.initialize_activation(activation, arguments, receiver, environment)?;
+        let initialized = self.initialize_activation(activation, arguments, receiver, environment);
+        if !environment.reachable() {
+            return Some(Flow::no_paths());
+        }
+        initialized?;
         match activation.body {
             Body::Expression(expression) => {
                 let result = self.expression(expression, environment);
+                if !environment.reachable() {
+                    return Some(Flow::no_paths());
+                }
                 Some(Flow::abrupt(
                     Transfer::Return,
                     CompletionValue::value(result.fact),
@@ -336,7 +351,7 @@ impl<'ast> Analyzer<'_, 'ast> {
         mut flow: super::flow::Flow,
         environment: &Environment,
         entry: usize,
-    ) -> Option<ReturnSummary> {
+    ) -> Option<ActivationSummary> {
         use super::flow::{CompletionValue, Transfer};
         if flow.unproved {
             return None;
@@ -351,21 +366,23 @@ impl<'ast> Analyzer<'_, 'ast> {
             };
             returned.push(path);
         }
-        if flow.abrupt.keys().any(|kind| *kind != Transfer::Throw) {
+        let throws = flow.abrupt.remove(&Transfer::Throw).unwrap_or_default();
+        if !flow.abrupt.is_empty() {
             return None;
         }
-        if flow.abrupt.contains_key(&Transfer::Throw) {
-            self.note_exception();
-        }
         let mut returned = returned.into_iter();
-        let mut summary = returned.next()?;
-        for path in returned {
-            self.heap_result(summary.join_at_activation_exit(&path, entry, self.budget))?;
-        }
-        Some(ReturnSummary {
-            value: self.heap_result(summary.value.into_fact(self.budget))?,
-            environment: summary.environment,
-        })
+        let normal = if let Some(mut summary) = returned.next() {
+            for path in returned {
+                self.heap_result(summary.join_at_activation_exit(&path, entry, self.budget))?;
+            }
+            Some(ReturnSummary {
+                value: self.heap_result(summary.value.into_fact(self.budget))?,
+                environment: summary.environment,
+            })
+        } else {
+            None
+        };
+        Some(ActivationSummary { normal, throws })
     }
 
     /// Distinct environment instances have distinct cell identities.
@@ -522,6 +539,9 @@ impl<'ast> Analyzer<'_, 'ast> {
         receiver: Option<Fact>,
         environment: &mut Environment,
     ) -> Evaluation {
+        if !environment.reachable() {
+            return Evaluation::default();
+        }
         let Some((activations, named)) = resolved else {
             self.arguments(&call.arguments, environment);
             return self.barrier(environment);
@@ -547,6 +567,9 @@ impl<'ast> Analyzer<'_, 'ast> {
                 return self.barrier(environment);
             };
             let result = self.expression(expression, environment);
+            if !environment.reachable() {
+                return Evaluation::default();
+            }
             inert &= result.inert;
             arguments.push(result.fact);
         }
@@ -609,6 +632,9 @@ impl<'ast> Analyzer<'_, 'ast> {
                 receiver.cloned(),
                 &mut alternative,
             );
+            if !alternative.reachable() {
+                continue;
+            }
             if let Some(previous) = &mut result {
                 if !self.join_heap(environment, &alternative, first_new) {
                     return self.barrier(environment);
@@ -624,6 +650,9 @@ impl<'ast> Analyzer<'_, 'ast> {
                 result = Some(next);
             }
         }
+        if result.is_none() {
+            environment.terminate();
+        }
         result.unwrap_or_default()
     }
 
@@ -634,6 +663,9 @@ impl<'ast> Analyzer<'_, 'ast> {
         receiver: Option<Fact>,
         environment: &mut Environment,
     ) -> Evaluation {
+        if !environment.reachable() {
+            return Evaluation::default();
+        }
         if !self.can_enter()
             || self.activation_fuel == 0
             || self.heap_result(self.budget.consume(1)).is_none()
@@ -657,14 +689,16 @@ impl<'ast> Analyzer<'_, 'ast> {
         self.activation_depth += 1;
         let ticket = self.enter_empty_instance(activation.scope, &mut candidate);
         let flow = if ticket.is_some() {
-            self.execute_activation(activation, arguments, receiver, &mut candidate)
+            self.protected_region(&mut candidate, |analyzer, environment| {
+                let mut flow =
+                    analyzer.execute_activation(activation, arguments, receiver, environment)?;
+                analyzer.dispose_paths(disposes, &mut flow, environment);
+                Some(flow)
+            })
         } else {
             None
         };
-        let summary = flow.and_then(|mut flow| {
-            self.dispose_paths(disposes, &mut flow, &mut candidate);
-            self.summarize_activation(flow, &candidate, entry)
-        });
+        let summary = flow.and_then(|flow| self.summarize_activation(flow, &candidate, entry));
         self.leave_instance(ticket, &mut candidate);
         self.activation_depth -= 1;
         for ticket in selected.into_iter().rev() {
@@ -682,13 +716,23 @@ impl<'ast> Analyzer<'_, 'ast> {
             return self.barrier(environment);
         }
         if let Some(mut summary) = summary {
-            summary.environment.leave_activation(environment);
-            *environment = summary.environment;
-            // Do not erase the invocation, even when its result is known.
-            return Evaluation {
-                fact: summary.value,
-                inert: false,
-            };
+            for path in &mut summary.throws {
+                path.environment.leave_activation(environment);
+            }
+            if self.record_expression_throws(summary.throws).is_none() {
+                return self.barrier(environment);
+            }
+            if let Some(mut normal) = summary.normal {
+                normal.environment.leave_activation(environment);
+                *environment = normal.environment;
+                // Do not erase an invocation even when its result is known.
+                return Evaluation {
+                    fact: normal.value,
+                    inert: false,
+                };
+            }
+            environment.terminate();
+            return Evaluation::default();
         }
         if activation.publish_context {
             self.unobserved(match activation.body {

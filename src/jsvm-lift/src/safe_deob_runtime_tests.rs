@@ -1177,6 +1177,56 @@ fn depythonify_safe_deob_exception_dispatcher_reaching_runtime_equivalence() -> 
     script_observations::compare_pairs("exception-dispatcher-reaching", &comparisons, false)
 }
 
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_interprocedural_exception_runtime_equivalence() -> Result<()> {
+    let sources = [
+        "let a=[0],f=()=>{a[0]=7;throw a;};try{f();a[0]=9;}catch(e){events.push(e[0]);}a[0];",
+        "let a=[0],f=()=>{throw 7;};try{a[0]=f();a[0]=9;}catch(e){a[0]=e;}a[0];",
+        "let f=()=>{throw [7];},a;try{f();}catch(e){a=e;}a[0];",
+        "let f=()=>{throw [7];},g=()=>f();let a;try{g();}catch(e){a=e;}a[0];",
+        "let a=[7],f=()=>{throw 1;};try{(f(),a[0]=9);}catch{}a[0];",
+        "let a=[7],f=()=>{throw 1;};try{f()+ (a[0]=9);}catch{}a[0];",
+        "let a=[7],f=()=>{throw 1;};try{f()[a[0]=9];}catch{}a[0];",
+        "let a=[7],f=()=>{throw 1;};try{f()?.[a[0]=9];}catch{}a[0];",
+        "let a=[7],f=()=>{throw 1;},g=()=>{a[0]=9;};try{g(f(),a[0]=8);}catch{}a[0];",
+        "let a=[7],f=()=>{throw 1;};try{[f(),a[0]=9];}catch{}a[0];",
+        "let a=[7],f=()=>{throw 1;};try{({[f()]:a[0]=9});}catch{}a[0];",
+        "let a=[7],f=()=>{throw 1;};try{let x=f(),y=(a[0]=9);}catch{}a[0];",
+        "let a=[7],f=()=>{throw 1;};try{if(f())a[0]=9;else a[0]=8;}catch{}a[0];",
+        "let a=[7],f=()=>{throw 1;};try{switch(f()){case 1:a[0]=9;}}catch{}a[0];",
+        "let a=[7],f=()=>{throw 1;};try{switch(1){case f():a[0]=9;default:a[0]=8;}}catch{}a[0];",
+        "let a=[7],f=()=>{throw 1;};try{for(let i=f();;){a[0]=9;break;}}catch{}a[0];",
+        "let a=[7],f=()=>{throw 1;};try{while(f()){a[0]=9;}}catch{}a[0];",
+        "let a=[0],f=()=>{throw 1;};try{do{a[0]=7;}while(f());}catch{}a[0];",
+        "let a=[0],f=()=>{throw 1;};try{for(let i=0;i<3;f()){a[0]=7;i++;}}catch{}a[0];",
+        "let a=[7],f=()=>{throw 1;},g=(x=f(),y=(a[0]=9))=>{a[0]=8;};try{g();}catch{}a[0];",
+        "let a=[7],f=()=>{throw 1;},g=()=>{try{return f();}finally{a[0]=9;}};try{g();}catch{}a[0];",
+        "let f=()=>{throw [7];},g=()=>{try{f();}finally{return [9];}};let a=g();a[0];",
+        "function outer(flag){let a=[0],f=()=>{a[0]=7;throw 1;};try{flag?f():(a[0]=7);}catch{}return a[0];}[outer(true),outer(false)];",
+        "function outer(flag){let a=[0],f=()=>{a[0]=9;throw 1;};try{flag?f():(a[0]=7);}catch{}return a[0];}[outer(true),outer(false)];",
+        "function outer(flag){let f=()=>{throw 1;};try{let a=flag?f():[7];return a[0];}catch{return 0;}}[outer(true),outer(false)];",
+        "function outer(flag){let f=()=>{throw 1;},g=()=>[7];let h=flag?f:g;try{let a=h();return a[0];}catch{return 0;}}[outer(true),outer(false)];",
+        "function outer(flag){let a=[7],f=()=>{throw 1;};try{flag&&f();}catch{}return a[0];}[outer(true),outer(false)];",
+        "function outer(flag){let a=[7],f=()=>{throw 1;};try{flag||f();}catch{}return a[0];}[outer(true),outer(false)];",
+        "let a=[7],f=()=>{throw 1;};try{throw f();}catch(e){a[0]=e;}a[0];",
+        "let a=[7],f=()=>{throw 1;};try{f();}catch{a[0]=9;}a[0];",
+        "let a=[7],f=()=>{unknown();throw 1;};try{f();}catch{}a[0];",
+        "let a=[7],f=()=>{throw 1;};try{f();}finally{events.push(a[0]);}",
+        "let a=[0],f=()=>{a[0]=7;throw a;};try{try{f();}finally{a[0]=9;}}catch(e){e[0];}",
+        "let a=[7],f=()=>{throw 1;};try{new (f())(a[0]=9);}catch{}a[0];",
+        "let a=[7],f=()=>{throw 1;};try{let {x=f(),y=(a[0]=9)}={x:void 0,y:void 0};}catch{}a[0];",
+        "let a=[7],f=()=>{throw 1;};try{try{throw {x:void 0};}catch({x=f()}){a[0]=9;}}catch{}a[0];",
+        "let a=[0],f=()=>{a[0]=7;throw 1;};try{while(true){f();}}catch{}a[0];",
+        "let a=[0],f=()=>{a[0]=7;throw 1;};try{for(;;){f();}}catch{}a[0];",
+        "let a=[7],f=()=>{throw 1;};try{({}=f());}catch{}a[0];",
+        "let a=[7],f=()=>{throw 1;};try{let {[f()]:x,...rest}={};}catch{}a[0];",
+        "let a=[7],f=()=>{throw 1;};try{({[f()]:a[0]}={});}catch{}a[0];",
+        "let a=[7],f=()=>{throw 1;};try{({x:a[f()],...a[0]}={x:9});}catch{}a[0];",
+    ];
+    script_eval_runtime_equivalence(&sources, "interprocedural-exceptions")
+}
+
 fn script_eval_runtime_equivalence(sources: &[&str], suite: &str) -> Result<()> {
     let mut comparisons = Vec::with_capacity(sources.len() * 2);
     for (index, source) in sources.iter().enumerate() {

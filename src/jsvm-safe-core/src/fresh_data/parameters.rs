@@ -101,6 +101,9 @@ impl Analyzer<'_, '_> {
         value: Option<Fact>,
         environment: &mut Environment,
     ) -> Option<()> {
+        if !environment.reachable() {
+            return Some(());
+        }
         self.heap_result(self.budget.consume(1))?;
         match pattern {
             BindingPattern::BindingIdentifier(identifier) => {
@@ -132,10 +135,19 @@ impl Analyzer<'_, '_> {
     ) -> Option<()> {
         let mut source = ObjectPatternSource::new(self, source, pattern.rest.is_some());
         for property in &pattern.properties {
+            if !environment.reachable() {
+                return Some(());
+            }
             let key = self.pattern_key(&property.key, property.computed, environment);
+            if !environment.reachable() {
+                return Some(());
+            }
             source.record_key(self, &key)?;
             let value = source.read(self, &key, environment)?.fact;
             self.bind_pattern(&property.value, value, environment)?;
+        }
+        if !environment.reachable() {
+            return Some(());
         }
         if let Some(rest) = &pattern.rest {
             let value = source.rest(self, environment)?.fact;
@@ -186,6 +198,9 @@ impl Analyzer<'_, '_> {
     ) -> Option<()> {
         let mut arguments = arguments.into_iter();
         for parameter in &params.items {
+            if !environment.reachable() {
+                return Some(());
+            }
             let mut value = arguments
                 .next()
                 .unwrap_or(Some(Fact::Primitive(Value::Undefined)));
@@ -193,6 +208,9 @@ impl Analyzer<'_, '_> {
                 value = self.apply_default(value, initializer, environment);
             }
             self.bind_pattern(&parameter.pattern, value, environment)?;
+        }
+        if !environment.reachable() {
+            return Some(());
         }
         if let Some(rest) = &params.rest {
             // Rest parameters construct an ordinary fresh array directly;
