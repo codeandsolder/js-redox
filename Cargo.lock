@@ -217,12 +217,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "175812e0be2bccb6abe50bb8d566126198344f707e304f45c648fd8f2cc0365e"
 
 [[package]]
-name = "byteorder"
-version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
-
-[[package]]
 name = "bytes"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -670,15 +664,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fxhash"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c31b6d751ae2c7f11320402d34e41349dd1016f8d5d45e48c4312bc8625af50c"
-dependencies = [
- "byteorder",
-]
-
-[[package]]
 name = "getrandom"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1019,7 +1004,7 @@ dependencies = [
  "tokio",
  "url",
  "wasm-redox",
- "wasmparser 0.263.0",
+ "wasmparser",
  "work-budget",
  "wreq",
 ]
@@ -1045,6 +1030,22 @@ dependencies = [
  "sha2",
  "string_wizard",
  "work-budget",
+]
+
+[[package]]
+name = "knitsail-ast-site-probe"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "oxc_allocator",
+ "oxc_ast",
+ "oxc_ast_visit",
+ "oxc_parser",
+ "oxc_semantic",
+ "oxc_span",
+ "oxc_syntax",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1950,15 +1951,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sourcemap-compose"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "jsvm-lift",
-]
-
-[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2297,14 +2289,14 @@ checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
 [[package]]
 name = "waffle"
 version = "0.4.0"
-source = "git+https://github.com/codeandsolder/waffle.git?rev=fad16a81f00657ee87f45cf9e668a138c2bd596a#fad16a81f00657ee87f45cf9e668a138c2bd596a"
+source = "git+https://github.com/codeandsolder/waffle.git?rev=840b3a674987311f8cb0fcd5cec60f355f0776b1#840b3a674987311f8cb0fcd5cec60f355f0776b1"
 dependencies = [
  "anyhow",
- "fxhash",
  "log",
+ "rustc-hash",
  "smallvec",
- "wasm-encoder 0.248.0",
- "wasmparser 0.248.0",
+ "wasm-encoder",
+ "wasmparser",
 ]
 
 [[package]]
@@ -2368,21 +2360,12 @@ dependencies = [
 
 [[package]]
 name = "wasm-encoder"
-version = "0.248.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac92cf547bc18d27ecc521015c08c353b4f18b84ab388bb6d1b6b682c620d9b6"
-dependencies = [
- "leb128fmt",
-]
-
-[[package]]
-name = "wasm-encoder"
 version = "0.263.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b883a26aea02eaabe2d2c3fba7eb039ef5cdcb5d5201ae5551e73d5e251a81f"
 dependencies = [
  "leb128fmt",
- "wasmparser 0.263.0",
+ "wasmparser",
 ]
 
 [[package]]
@@ -2395,20 +2378,10 @@ dependencies = [
  "serde_json",
  "sha2",
  "waffle",
- "wasmparser 0.263.0",
+ "wasmparser",
  "wasmprinter",
  "wat",
  "work-budget",
-]
-
-[[package]]
-name = "wasmparser"
-version = "0.248.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aa4439c5eee9df71ee0c6efb37f63b1fcb1fec38f85f5142c54e7ed05d33091a"
-dependencies = [
- "bitflags",
- "indexmap",
 ]
 
 [[package]]
@@ -2432,7 +2405,7 @@ checksum = "b40c3aedc383a68866a7bae302578765c3f05c9e11ea6d242e5cc450f8300a26"
 dependencies = [
  "anyhow",
  "termcolor",
- "wasmparser 0.263.0",
+ "wasmparser",
 ]
 
 [[package]]
@@ -2445,7 +2418,7 @@ dependencies = [
  "leb128fmt",
  "memchr",
  "unicode-width",
- "wasm-encoder 0.263.0",
+ "wasm-encoder",
 ]
 
 [[package]]

@@ -39,7 +39,6 @@ composer_args=()
 if [[ "$profile" == "release" ]]; then
   composer_args+=(--release)
 fi
-"$cargo_bin" build -j "$jobs" -p sourcemap-compose "${composer_args[@]}"
 "$cargo_bin" build -j "$jobs" -p wasm-redox --bin wasm-redox --bin fresh-eval "${composer_args[@]}"
 
 # Site-wrapper target is a disposable compile cache; durable executables are published below.

@@ -21,7 +21,7 @@ node scripts/replay-captured-html.cjs inputs/archived.html \
   > inputs/runtime-report.json 2> inputs/replay.stderr
 
 export CARGO_TARGET_DIR="$PWD/inputs/build"
-cargo +1.99.0 build --manifest-path ast-site-probe/Cargo.toml
+cargo build --manifest-path ast-site-probe/Cargo.toml
 node scripts/export-runtime-eval.mjs \
   inputs/runtime-report.json inputs/eval inputs/observed \
   /path/to/deobfuscate-safe
@@ -34,7 +34,7 @@ node scripts/link-runtime-source-tree.mjs \
 
 node --test tests/runtime-eval-export.test.mjs \
   tests/runtime-source-tree-link.test.mjs
-cargo +1.99.0 test --manifest-path ast-site-probe/Cargo.toml
+cargo test --manifest-path ast-site-probe/Cargo.toml
 ```
 
 The exporter **requires v2** `sourceProvenance`, retaining both

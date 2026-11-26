@@ -2,7 +2,7 @@
 members = [
     "src/jsvm-lift",
     "src/jsvm-safe-core",
-    "src/sourcemap-compose",
+    "prototypes/zipp-knitsail/ast-site-probe",
     "src/wasm-redox",
     "src/work-budget",
 ]
@@ -63,7 +63,7 @@ futures-util = { version = "0.3", default-features = false }
 rustls-native-certs = "0.8"
 wasmparser = "0.263.0"
 wasmprinter = "0.263.0"
-waffle = { git = "https://github.com/codeandsolder/waffle.git", rev = "fad16a81f00657ee87f45cf9e668a138c2bd596a" }
+waffle = { git = "https://github.com/codeandsolder/waffle.git", rev = "840b3a674987311f8cb0fcd5cec60f355f0776b1" }
 work-budget = { path = "src/work-budget" }
 
 [patch.crates-io]

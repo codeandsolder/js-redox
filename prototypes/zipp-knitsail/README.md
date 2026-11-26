@@ -50,7 +50,7 @@ All 785 static JS/manifest files remain byte-identical in the combined tree.
   outer/inner source capture and observed eval inputs/outcomes.
 - `scripts/export-runtime-eval.mjs`: v2 loader and v3 direct manifests,
   exact deduplicated raw source and independent readable formatting.
-- `ast-site-probe/`: Rust 1.99 / OXC AST and semantic resolver.
+- `ast-site-probe/`: Workspace-pinned nightly / OXC AST and semantic resolver.
 - `scripts/link-runtime-source-tree.mjs`: verifiable multi-capture overlay
   with bidirectional AST-linked navigation.
 - `tests/`: focused regression coverage for integrity, failures and cleanup.
