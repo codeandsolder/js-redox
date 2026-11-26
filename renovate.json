@@ -15,8 +15,7 @@
         "https://github.com/codeandsolder/oxc.git",
         "codeandsolder/oxc"
       ],
-      "groupName": "Oxc and Rolldown",
-      "automerge": false
+      "groupName": "Oxc and Rolldown"
     },
     {
       "description": "Coordinate all Oxc crates and both Rolldown Git pins as one type universe",
@@ -27,8 +26,7 @@
         "rolldown_redox",
         "string_wizard"
       ],
-      "groupName": "Oxc and Rolldown",
-      "automerge": false
+      "groupName": "Oxc and Rolldown"
     },
     {
       "description": "Group wasmparser and wasmprinter lockstep updates",
@@ -39,8 +37,7 @@
         "wasmparser",
         "wasmprinter"
       ],
-      "groupName": "Wasm parser and printer",
-      "automerge": false
+      "groupName": "Wasm parser and printer"
     },
     {
       "description": "Self-hosted runner labels are infrastructure, not hosted runner dependencies",
@@ -48,14 +45,6 @@
         "github-runners"
       ],
       "enabled": false
-    },
-    {
-      "description": "Review Rust compiler upgrades through Renovate's built-in toolchain manager",
-      "matchManagers": [
-        "rust-toolchain"
-      ],
-      "groupName": "Rust toolchain",
-      "automerge": false
     },
     {
       "description": "Preserve pinned Rust 1.99/ZIPP Knitsail research harness dependency versions",
