@@ -13,16 +13,13 @@ permissions:
   contents: read
 
 jobs:
-  strict-rust:
-    name: Shared strict Rust policy
-    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@4f29271a2aa27bef1f34bd70407b0db3d39904a9 # main
-
   rust:
     name: Rust quality gate
     uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@5991b873ab28ec8fae36c2c8ef944a3f67f5f9b3 # main
     with:
       rust-components: "rustfmt clippy"
-      timeout-minutes: 20
+      node-version: "26.13.1"
+      timeout-minutes: 40
       command: |
         python_files="$(git ls-files '*.py' '*.pyw' '*.pyi')"
         python_shebang_files="$(
@@ -39,21 +36,15 @@ jobs:
             "$python_files" "$python_shebang_files"
           exit 1
         fi
-        cargo fmt --all -- --check
         bash scripts/check-oxc-source.sh
-        cargo test --locked --workspace
-        cargo clippy --locked --workspace --all-targets -- -D warnings
-
-  semantic:
-    name: Semantic/runtime regressions
-    needs: rust
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@5991b873ab28ec8fae36c2c8ef944a3f67f5f9b3 # main
-    with:
-      node-version: "26.13.1"
-      timeout-minutes: 20
-      command: |
         node tools/cloak-recorder/check-nested-cdp-session.mjs
-        cargo test -p jsvm-lift --lib depythonify_safe_deob_ -- --ignored --nocapture
-        cargo test -p jsvm-lift --lib node_confirms_ -- --ignored --nocapture
-        cargo test -p jsvm-safe-core --lib node_confirms_ -- --ignored --nocapture
-        cargo test -p jsvm-safe-core --lib global_accessor_after_state_write_keeps_real_successor -- --ignored --nocapture
+      strict-suites: |
+        [
+          {"name":"workspace"}
+        ]
+      test-suites: |
+        [
+          {"name":"workspace","cargo":["--locked","--workspace"],"doctests":["--locked","--workspace"]},
+          {"name":"lift-runtime","cargo":["-p","jsvm-lift","--lib"],"nextest":["--run-ignored","only","-E","test(depythonify_safe_deob_) | test(node_confirms_)"]},
+          {"name":"safe-core-runtime","cargo":["-p","jsvm-safe-core","--lib"],"nextest":["--run-ignored","only","-E","test(node_confirms_) | test(global_accessor_after_state_write_keeps_real_successor)"]}
+        ]
