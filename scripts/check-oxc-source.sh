@@ -12,7 +12,8 @@ cargo metadata --locked --format-version 1 | jq -e '
   ($crates | map(.name) | length == (unique | length)) and
   (.packages as $packages |
     {"js-redox-deps": ["compact_str", "oxc_sourcemap", "petgraph", "phf_macros"],
-     "compression-backend": ["compression-codecs", "oxc-browserslist"]} |
+     "compression-backend": ["compression-codecs", "oxc-browserslist"],
+     "openssl-macros": ["openssl-macros"]} |
     to_entries | all(. as $family |
       ($family.value | all(. as $name |
         [$packages[] | select(.name == $name)] as $matches |
