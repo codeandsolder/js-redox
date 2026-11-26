@@ -93,3 +93,6 @@ petgraph = { git = "https://github.com/codeandsolder/cargo-patches.git", branch 
 phf_macros = { git = "https://github.com/codeandsolder/cargo-patches.git", branch = "generated/js-redox-deps" }
 compression-codecs = { git = "https://github.com/codeandsolder/cargo-patches.git", branch = "generated/compression-backend" }
 oxc-browserslist = { git = "https://github.com/codeandsolder/cargo-patches.git", branch = "generated/compression-backend" }
+
+openssl-macros = { git = "https://github.com/codeandsolder/cargo-patches.git", branch = "generated/openssl-macros" }
+cow-utils = { git = "https://github.com/codeandsolder/cargo-patches.git", branch = "generated/cow-utils" }
