@@ -254,15 +254,20 @@ fn main() -> Result<()> {
         None
     };
     let http_summary = if let Some(temp) = &temp_capture {
-        Some(capture_url_to_har(
-            &args.capture,
-            &temp.path().join("capture.har"),
-            HttpCaptureLimits {
-                resources: args.http_max_resources,
-                per_resource_bytes: args.http_max_resource_mib.saturating_mul(1024 * 1024),
-                total_bytes: args.http_max_total_mib.saturating_mul(1024 * 1024),
-            },
-        )?)
+        Some(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(capture_url_to_har(
+                    &args.capture,
+                    &temp.path().join("capture.har"),
+                    HttpCaptureLimits {
+                        resources: args.http_max_resources,
+                        per_resource_bytes: args.http_max_resource_mib.saturating_mul(1024 * 1024),
+                        total_bytes: args.http_max_total_mib.saturating_mul(1024 * 1024),
+                    },
+                ))?,
+        )
     } else {
         None
     };

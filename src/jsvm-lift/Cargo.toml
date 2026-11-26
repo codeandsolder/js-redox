@@ -33,7 +33,10 @@ serde_json.workspace = true
 tempfile.workspace = true
 sha2.workspace = true
 url.workspace = true
-reqwest.workspace = true
+wreq.workspace = true
+tokio.workspace = true
+futures-util.workspace = true
+rustls-native-certs.workspace = true
 wasmparser.workspace = true
 wasm-redox = { path = "../wasm-redox" }
 
