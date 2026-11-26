@@ -322,12 +322,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parameter_binding_and_outer_wrapper_normalization() {
+    fn parameter_binding_and_outer_wrapper_normalization() -> Result<()> {
         let original =
             "(function(){const oU=function(A,D){return function(D){return eval(D)}}})();";
         let extracted = "const oU = function(A, D) { return function(D) { return eval ( D ); }; };";
-        let original_site = parse_sites(original).expect("parse original");
-        let extracted_site = parse_sites(extracted).expect("parse extracted");
+        let original_site = parse_sites(original)?;
+        let extracted_site = parse_sites(extracted)?;
         assert_eq!(original_site.len(), 1);
         assert_eq!(extracted_site.len(), 1);
         assert!(original_site[0].eval_is_unresolved);
@@ -336,29 +336,41 @@ mod tests {
             &original_site[0],
             &extracted_site[0]
         ));
+        Ok(())
     }
 
     #[test]
-    fn shadowed_eval_or_unbound_argument_is_not_a_match() {
+    fn shadowed_eval_or_unbound_argument_is_not_a_match() -> Result<()> {
         let canonical = "const oU=function(D){return eval(D)}";
         let shadowed_eval = "const oU=function(D){const eval=(x)=>x;return eval(D)}";
         let shadowed_arg = "const oU=function(D){const E=D;return eval(E)}";
-        let original = parse_sites(canonical).unwrap().remove(0);
-        let evil = parse_sites(shadowed_eval).unwrap().remove(0);
+        let original = parse_sites(canonical)?
+            .into_iter()
+            .next()
+            .context("missing canonical site")?;
+        let evil = parse_sites(shadowed_eval)?
+            .into_iter()
+            .next()
+            .context("missing shadowed eval site")?;
         assert!(!evil.eval_is_unresolved);
         assert!(!same_lexical_structure(&original, &evil));
-        let alias = parse_sites(shadowed_arg).unwrap().remove(0);
+        let alias = parse_sites(shadowed_arg)?
+            .into_iter()
+            .next()
+            .context("missing shadowed argument site")?;
         assert!(!alias.argument_is_bound_to_nearest_parameter);
         assert!(!same_lexical_structure(&original, &alias));
+        Ok(())
     }
 
     #[test]
-    fn utf16_offsets_are_not_assumed_to_be_utf8_byte_offsets() {
+    fn utf16_offsets_are_not_assumed_to_be_utf8_byte_offsets() -> Result<()> {
         let text = "a💡eval(D)";
-        assert_eq!(utf16_to_bytes(text, 0).unwrap(), 0);
-        assert_eq!(utf16_to_bytes(text, 1).unwrap(), 1);
+        assert_eq!(utf16_to_bytes(text, 0)?, 0);
+        assert_eq!(utf16_to_bytes(text, 1)?, 1);
         assert!(utf16_to_bytes(text, 2).is_err());
-        assert_eq!(utf16_to_bytes(text, 3).unwrap(), 5);
-        assert_eq!(utf16_to_bytes(text, 10).unwrap(), 12);
+        assert_eq!(utf16_to_bytes(text, 3)?, 5);
+        assert_eq!(utf16_to_bytes(text, 10)?, 12);
+        Ok(())
     }
 }
