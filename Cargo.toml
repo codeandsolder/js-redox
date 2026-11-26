@@ -95,3 +95,4 @@ compression-codecs = { git = "https://github.com/codeandsolder/cargo-patches.git
 oxc-browserslist = { git = "https://github.com/codeandsolder/cargo-patches.git", branch = "generated/compression-backend" }
 
 openssl-macros = { git = "https://github.com/codeandsolder/cargo-patches.git", branch = "generated/openssl-macros" }
+cow-utils = { git = "https://github.com/codeandsolder/cargo-patches.git", branch = "generated/cow-utils" }

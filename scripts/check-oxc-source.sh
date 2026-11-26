@@ -13,7 +13,8 @@ cargo metadata --locked --format-version 1 | jq -e '
   (.packages as $packages |
     {"js-redox-deps": ["compact_str", "oxc_sourcemap", "petgraph", "phf_macros"],
      "compression-backend": ["compression-codecs", "oxc-browserslist"],
-     "openssl-macros": ["openssl-macros"]} |
+     "openssl-macros": ["openssl-macros"],
+     "cow-utils": ["cow-utils"]} |
     to_entries | all(. as $family |
       ($family.value | all(. as $name |
         [$packages[] | select(.name == $name)] as $matches |
