@@ -61,24 +61,19 @@ impl Reference {
     fn read(
         &self,
         analyzer: &mut Analyzer<'_, '_>,
-        environment: &mut Environment,
-    ) -> Option<Option<Fact>> {
+        environment: &Environment,
+    ) -> Option<heap::Lookup> {
         if !environment.reachable() {
             return None;
         }
         match self {
-            Self::Binding(symbol) => {
-                analyzer.heap_result(environment.read_binding(*symbol, analyzer.budget))
-            }
+            Self::Binding(symbol) => analyzer
+                .heap_result(environment.read_binding(*symbol, analyzer.budget))
+                .map(Access::Normal),
             Self::Member { locations, key } => {
-                let access =
-                    analyzer.heap_result(environment.read(locations, key, analyzer.budget))?;
-                analyzer.access_normal(access, environment)
+                analyzer.heap_result(environment.read(locations, key, analyzer.budget))
             }
-            Self::NullishMember => {
-                analyzer.intrinsic_throw(environment)?;
-                None
-            }
+            Self::NullishMember => Some(Access::Throw),
         }
     }
 
@@ -756,7 +751,10 @@ impl Analyzer<'_, '_> {
             };
         }
 
-        let Some(previous) = reference.read(self, environment) else {
+        let Some(previous) = reference
+            .read(self, environment)
+            .and_then(|access| self.access_normal(access, environment))
+        else {
             self.unobserved(assignment.right.span());
             return self.barrier(environment);
         };
@@ -833,6 +831,7 @@ impl Analyzer<'_, '_> {
         };
         let Some(previous) = reference
             .read(self, environment)
+            .and_then(|access| self.access_normal(access, environment))
             .flatten()
             .and_then(|fact| Some(fact.primitive()?.number()))
         else {
