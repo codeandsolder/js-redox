@@ -214,13 +214,10 @@ fn configure_process_group(_command: &mut Command) {}
 
 #[cfg(unix)]
 fn kill_process_group(child: &Child) {
-    use nix::{
-        sys::signal::{killpg, Signal},
-        unistd::Pid,
-    };
+    use rustix::process::{kill_process_group, Pid, Signal};
 
-    if let Ok(pid) = i32::try_from(child.id()) {
-        let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
+    if let Some(pid) = i32::try_from(child.id()).ok().and_then(Pid::from_raw) {
+        let _ = kill_process_group(pid, Signal::KILL);
     }
 }
 
