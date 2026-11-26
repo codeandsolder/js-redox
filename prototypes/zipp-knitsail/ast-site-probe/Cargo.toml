@@ -16,3 +16,6 @@ oxc_span.workspace = true
 oxc_syntax.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[lints]
+workspace = true
