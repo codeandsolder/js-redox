@@ -37,6 +37,7 @@ mod dispatch;
 mod exceptions;
 mod flow;
 mod heap;
+mod iterators;
 mod loops;
 mod origins;
 mod parameters;
@@ -1026,8 +1027,13 @@ impl Analyzer<'_, '_> {
             match element {
                 ArrayExpressionElement::Elision(_) => {}
                 ArrayExpressionElement::SpreadElement(spread) => {
-                    self.expression(&spread.argument, environment);
-                    self.invalidate(environment);
+                    let source = self.expression(&spread.argument, environment);
+                    if self
+                        .consume_iterable(source.fact.as_ref(), environment)
+                        .is_none()
+                    {
+                        return self.barrier(environment);
+                    }
                     known_index = false;
                     data.unknown_array_tail();
                     inert = false;
@@ -1321,8 +1327,14 @@ impl Analyzer<'_, '_> {
     fn arguments(&mut self, arguments: &[Argument<'_>], environment: &mut Environment) {
         for argument in arguments {
             if let Argument::SpreadElement(spread) = argument {
-                self.expression(&spread.argument, environment);
-                self.invalidate(environment);
+                let source = self.expression(&spread.argument, environment);
+                if self
+                    .consume_iterable(source.fact.as_ref(), environment)
+                    .is_none()
+                {
+                    self.invalidate(environment);
+                    return;
+                }
             } else if let Some(expression) = argument.as_expression() {
                 self.expression(expression, environment);
             }
@@ -1722,6 +1734,41 @@ mod tests {
         ] {
             let expected = expected.into_iter().map(|(source,value)| (source.to_owned(),value.to_owned())).collect::<Vec<_>>();
             assert_eq!(reads(source)?, expected, "{source}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn iterator_paths_preserve_acquisition_order_and_fresh_rest_arrays(
+    ) -> Result<(), BudgetExceeded> {
+        for (source, expected) in [
+            ("let a=[7];try{let []=null;}catch{}a[0];", vec![("a[0]","7")]),
+            ("let a=[7];try{let [x]=void 0;}catch{}a[0];", vec![("a[0]","7")]),
+            ("let a=[7];try{[a[0]]=null;}catch{}a[0];", vec![("a[0]","7")]),
+            ("let a=[7];try{[...null,a[0]=9];}catch{}a[0];", vec![("a[0]","7")]),
+            ("let a=[7];try{(()=>{})(...null,a[0]=9);}catch{}a[0];", vec![("a[0]","7")]),
+            ("let a=[7];try{new (function(){}) (...null,a[0]=9);}catch{}a[0];", vec![("a[0]","7")]),
+            ("let a=[7];try{let []={__proto__:null};}catch{}a[0];", vec![("a[0]","7")]),
+            ("let a=[7];try{let []={__proto__:{__proto__:null}};}catch{}a[0];", vec![("a[0]","7")]),
+            ("function f(flag){let a=[7];let o=flag?{__proto__:null}:{__proto__:{__proto__:null}};try{let []=o;}catch{}return a[0];}", vec![("a[0]","7")]),
+            ("let [...r]=[1,2];r.length=0;r.length;", vec![("r.length","0")]),
+            ("let r;[...r]=[1,2];r.length=0;r.length;", vec![("r.length","0")]),
+            ("let [x=([7])[0],,...r]=[1,2];r.length=0;r.length;", vec![("([7])[0]","7"),("r.length","0")]),
+            ("let x,r;[x=([7])[0],,...r]=[1,2];r.length=0;r.length;", vec![("([7])[0]","7"),("r.length","0")]),
+            ("let a=[7];let [x]=[1];a[0];", vec![]),
+            ("let a=[7];let [x]=\"text\";a[0];", vec![]),
+            ("let a=[7];try{let []={__proto__:null,[unknown]:()=>({next(){return {done:true}}})};}catch{}a[0];", vec![]),
+            ("let a=[7];let [x=()=>{a[0]=9}]=[1];a[0];", vec![]),
+        ] {
+            let expected = expected.into_iter().map(|(source,value)| (source.to_owned(),value.to_owned())).collect::<Vec<_>>();
+            assert_eq!(reads(source)?, expected, "{source}");
+        }
+        for source in ["let [...r]=[1,2];r===r;", "let r;[...r]=[1,2];r===r;"] {
+            assert_eq!(
+                observed(source, true)?,
+                vec![("r===r".into(), "true".into())],
+                "{source}"
+            );
         }
         Ok(())
     }
