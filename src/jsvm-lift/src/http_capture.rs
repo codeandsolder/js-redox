@@ -12,20 +12,20 @@ use crate::{
 };
 use anyhow::{ensure, Context, Result};
 use base64::Engine;
-use reqwest::{
-    blocking::Client,
-    header::{ACCEPT, ACCEPT_LANGUAGE, CONTENT_TYPE, REFERER},
-};
+use futures_util::StreamExt;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeSet, VecDeque},
     fs,
-    io::Read,
     path::Path,
     time::Duration,
 };
 use url::Url;
+use wreq::{
+    header::{ACCEPT, ACCEPT_LANGUAGE, CONTENT_TYPE, REFERER},
+    Client,
+};
 
 #[derive(Debug, Clone, Copy)]
 pub struct HttpCaptureLimits {
@@ -234,9 +234,13 @@ impl CapturedResponse {
     }
 }
 
-fn fetch_response(client: &Client, pending: &Pending, cap: usize) -> Result<CapturedResponse> {
+async fn fetch_response(
+    client: &Client,
+    pending: &Pending,
+    cap: usize,
+) -> Result<CapturedResponse> {
     let mut request = client
-        .get(pending.url.clone())
+        .get(pending.url.as_str())
         .header(
             ACCEPT,
             if pending.kind == Kind::Document {
@@ -251,8 +255,10 @@ fn fetch_response(client: &Client, pending: &Pending, cap: usize) -> Result<Capt
     }
     let response = request
         .send()
+        .await
         .with_context(|| format!("GET {}", pending.url))?;
-    let final_url = response.url().clone();
+    let final_url =
+        Url::parse(&response.uri().to_string()).context("HTTP response URI is not a valid URL")?;
     let status = response.status().as_u16();
     let mime = response
         .headers()
@@ -265,13 +271,15 @@ fn fetch_response(client: &Client, pending: &Pending, cap: usize) -> Result<Capt
         })
         .to_owned();
     let mut body = Vec::new();
-    response
-        .take(u64::try_from(cap)?.saturating_add(1))
-        .read_to_end(&mut body)?;
-    ensure!(
-        body.len() <= cap,
-        "response exceeds HTTP capture byte limit"
-    );
+    let mut stream = std::pin::pin!(response.bytes_stream());
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        ensure!(
+            chunk.len() <= cap.saturating_sub(body.len()),
+            "response exceeds HTTP capture byte limit"
+        );
+        body.extend_from_slice(&chunk);
+    }
     Ok(CapturedResponse {
         url: final_url,
         status,
@@ -299,7 +307,7 @@ impl Acquisition {
         }
     }
 
-    fn run(&mut self, client: &Client, limits: HttpCaptureLimits) -> Result<()> {
+    async fn run(&mut self, client: &Client, limits: HttpCaptureLimits) -> Result<()> {
         while let Some(pending) = self.graph.queue.pop_front() {
             if self.entries.len() >= limits.resources || self.total_bytes >= limits.total_bytes {
                 self.graph.queue.push_front(pending);
@@ -308,7 +316,7 @@ impl Acquisition {
             let cap = limits
                 .per_resource_bytes
                 .min(limits.total_bytes.saturating_sub(self.total_bytes));
-            match fetch_response(client, &pending, cap) {
+            match fetch_response(client, &pending, cap).await {
                 Ok(response) => self.record_response(&pending, &response)?,
                 Err(error) => self.record_failure(&pending, error)?,
             }
@@ -396,7 +404,7 @@ impl Acquisition {
 /// and non-successful root responses. Client construction, HAR serialization and filesystem
 /// writes can also fail; individual dependency failures are recorded without aborting the
 /// capture.
-pub fn capture_url_to_har(
+pub async fn capture_url_to_har(
     requested: &str,
     har_path: &Path,
     limits: HttpCaptureLimits,
@@ -405,19 +413,24 @@ pub fn capture_url_to_har(
         limits.resources > 0 && limits.per_resource_bytes > 0 && limits.total_bytes > 0,
         "HTTP capture limits must be positive"
     );
-    let root = Url::parse(requested).context("expected a full http(s) URL")?;
+    let mut root = Url::parse(requested).context("expected a full http(s) URL")?;
     ensure!(
         fetchable_url(root.clone()).is_some(),
         "only http(s) URLs are supported"
     );
+    root.set_fragment(None);
+    let roots = rustls_native_certs::load_native_certs();
+    let cert_store =
+        wreq::tls::trust::CertStore::from_der_certs(roots.certs.iter().map(AsRef::<[u8]>::as_ref))?;
     let client = Client::builder()
+        .tls_cert_store(cert_store)
         .cookie_store(true)
-        .redirect(reqwest::redirect::Policy::limited(10))
+        .redirect(wreq::redirect::Policy::limited(10))
         .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
         .timeout(Duration::from_secs(15))
         .build()?;
     let mut acquisition = Acquisition::new(&root);
-    acquisition.run(&client, limits)?;
+    acquisition.run(&client, limits).await?;
     acquisition.publish(&root, har_path)
 }
 
@@ -426,7 +439,12 @@ mod tests {
     use super::*;
     #[test]
     fn fetches_real_http_root_and_transitive_module() -> Result<()> {
-        use std::{io::Write as _, net::TcpListener, thread, time::Instant};
+        use std::{
+            io::{Read as _, Write as _},
+            net::TcpListener,
+            thread,
+            time::Instant,
+        };
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
         listener.set_nonblocking(true)?;
@@ -466,11 +484,14 @@ mod tests {
         });
         let tmp = tempfile::tempdir()?;
         let har = tmp.path().join("capture.har");
-        let summary = capture_url_to_har(
-            &format!("http://{addr}/"),
-            &har,
-            HttpCaptureLimits::default(),
-        )?;
+        let summary = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(capture_url_to_har(
+                &format!("http://{addr}/"),
+                &har,
+                HttpCaptureLimits::default(),
+            ))?;
         let served_requests = server_thread
             .join()
             .map_err(|_| anyhow::anyhow!("fixture HTTP server panicked"))??;
@@ -485,6 +506,95 @@ mod tests {
         assert!(entries.iter().any(|entry| entry["request"]["url"]
             .as_str()
             .is_some_and(|url| url.ends_with("/dep.js"))));
+        Ok(())
+    }
+
+    #[test]
+    fn redirected_compressed_response_preserves_cookie_and_decoded_byte_limit() -> Result<()> {
+        use std::{
+            io::{Read as _, Write as _},
+            net::TcpListener,
+            thread,
+        };
+        const GZIP_BODY: &[u8] = &[
+            31, 139, 8, 0, 0, 0, 0, 0, 0, 3, 51, 48, 52, 50, 54, 49, 53, 51, 183, 176, 52, 160,
+            128, 5, 0, 225, 40, 84, 110, 70, 0, 0, 0,
+        ];
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        listener.set_nonblocking(true)?;
+        let server = thread::spawn(move || -> Result<()> {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            for _ in 0..4 {
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            ensure!(
+                                std::time::Instant::now() < deadline,
+                                "HTTP fixture timed out"
+                            );
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                };
+                socket.set_read_timeout(Some(Duration::from_secs(1)))?;
+                let mut bytes = Vec::new();
+                let mut chunk = [0; 1024];
+                while !bytes.ends_with(b"\r\n\r\n") {
+                    let read = socket.read(&mut chunk)?;
+                    ensure!(read != 0 && bytes.len() < 16_384, "invalid fixture request");
+                    bytes.extend_from_slice(&chunk[..read]);
+                }
+                let request = String::from_utf8(bytes)?.to_ascii_lowercase();
+                if request.starts_with("get /start ") {
+                    socket.write_all(b"HTTP/1.1 302 Found\r\nLocation: /body\r\nSet-Cookie: fixture=ready; Path=/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
+                } else {
+                    ensure!(request.starts_with("get /body "), "unexpected fixture path");
+                    ensure!(
+                        request.contains("\r\ncookie: fixture=ready\r\n"),
+                        "redirect lost cookie"
+                    );
+                    write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", GZIP_BODY.len())?;
+                    socket.write_all(GZIP_BODY)?;
+                }
+            }
+            Ok(())
+        });
+        let tmp = tempfile::tempdir()?;
+        let har = tmp.path().join("capture.har");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let url = format!("http://{addr}/start");
+        let success = runtime.block_on(capture_url_to_har(
+            &url,
+            &har,
+            HttpCaptureLimits {
+                resources: 1,
+                per_resource_bytes: 70,
+                total_bytes: 70,
+            },
+        ))?;
+        assert_eq!(success.final_url, format!("http://{addr}/body"));
+        assert_eq!(success.bytes, 70);
+        let error = runtime
+            .block_on(capture_url_to_har(
+                &url,
+                &har,
+                HttpCaptureLimits {
+                    resources: 1,
+                    per_resource_bytes: 69,
+                    total_bytes: 69,
+                },
+            ))
+            .err()
+            .context("oversized decoded body was accepted")?;
+        assert!(format!("{error:#}").contains("response exceeds HTTP capture byte limit"));
+        server
+            .join()
+            .map_err(|_| anyhow::anyhow!("HTTP fixture panicked"))??;
         Ok(())
     }
 
