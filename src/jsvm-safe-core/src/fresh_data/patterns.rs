@@ -10,7 +10,6 @@ use oxc_ast::ast::{
     ArrayAssignmentTarget, AssignmentExpression, AssignmentTarget, AssignmentTargetMaybeDefault,
     AssignmentTargetProperty, Expression, ObjectAssignmentTarget, PropertyKey,
 };
-use oxc_span::GetSpan;
 use std::collections::HashSet;
 
 pub(super) struct ObjectPatternSource<'a> {

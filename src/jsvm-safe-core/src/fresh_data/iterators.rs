@@ -9,7 +9,7 @@ use super::{
 
 impl Analyzer<'_, '_> {
     /// Nullish values and receivers with a proven missing iterator method
-    /// fail GetIterator without calling user code. The TypeError is opaque,
+    /// fail `GetIterator` without calling user code. The `TypeError` is opaque,
     /// but the pre-error heap is unchanged. Other values may invoke a
     /// user-defined iterator, even when the receiver is a fresh literal.
     pub(super) fn acquire_iterator(
@@ -37,7 +37,7 @@ impl Analyzer<'_, '_> {
         Some(())
     }
 
-    /// IteratorStepValue (or IteratorStep for an elision) may execute next
+    /// `IteratorStepValue` (or `IteratorStep` for an elision) may execute next
     /// and accessors. A previously exhausted iterator would instead supply
     /// undefined without effects; the opaque join covers both possibilities.
     pub(super) fn advance_iterator(&mut self, environment: &mut Environment) {
@@ -45,7 +45,7 @@ impl Analyzer<'_, '_> {
     }
 
     /// Exhaustion happens before the fresh rest array is delivered to
-    /// its target. No further IteratorClose occurs for the exhausted record.
+    /// its target. No further `IteratorClose` occurs for the exhausted record.
     pub(super) fn exhaust_iterator(&mut self, environment: &mut Environment) {
         self.invalidate(environment);
     }
@@ -58,7 +58,7 @@ impl Analyzer<'_, '_> {
         self.allocate(environment, data, false).fact
     }
 
-    /// The prefix can throw while an iterator is still open. IteratorClose
+    /// The prefix can throw while an iterator is still open. `IteratorClose`
     /// preserves an existing throw completion, but its return method may
     /// mutate reachable objects and cells. Apply that possible effect to
     /// the captured exceptional snapshots, never to the successful prefix.
