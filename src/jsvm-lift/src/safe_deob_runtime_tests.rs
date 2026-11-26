@@ -1312,6 +1312,26 @@ fn depythonify_safe_deob_intrinsic_failure_runtime_equivalence() -> Result<()> {
     script_eval_runtime_equivalence(&sources, "intrinsic-failures")
 }
 
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_descriptor_failure_runtime_equivalence() -> Result<()> {
+    let sources = [
+        "let a=[7];try{a.length=-1;}catch(e){events.push(e.name)}a[0];",
+        "let a=[7];try{a.length=(a[0]=9,-1);}catch(e){events.push(e.name)}a[0];",
+        "let a=[7];try{a.length='3.5';}catch{}a[0];",
+        "let a=[7];try{a.length=void 0;}catch{}a[0];",
+        "let a=[7];try{a.length=4294967296;}catch{}a[0];",
+        "let a=[7];try{a.length={valueOf(){a[0]=9;return -1}};}catch{}a[0];",
+        "function f(flag){let a=[7],b={length: 0},r=flag?a:b;try{r.length=-1;}catch(e){events.push(e.name)}return [a[0],b.length];}[f(true),f(false)];",
+        "let f=function(a=1){return arguments};let r=f(7),a=[0];try{r.callee;a[0]=9;}catch(e){events.push(e.name);a[0]=7;}a[0];",
+        "let f=function(a=1){return arguments};let r=f(7),a=[0];try{r.callee=(a[0]=7);}catch(e){events.push(e.name)}a[0];",
+        "let f=function(a=1){return arguments};let r=f(7),a=[0];try{r.callee+=(a[0]=9);}catch{}a[0];",
+        "function f(flag){let make=function(a=1){return arguments};let r=make(7),o=flag?r:{callee: 7},a=[0];try{a[0]=o.callee;}catch(e){events.push(e.name);a[0]=7;}return a[0];}[f(true),f(false)];",
+        "function f(flag){let make=function(a=1){return arguments};let r=make(7),o={callee: 0},q=flag?r:o;try{q.callee=9;return o.callee;}catch(e){return o.callee;}}[f(true),f(false)];",
+    ];
+    script_eval_runtime_equivalence(&sources, "descriptor-failures")
+}
+
 fn script_eval_runtime_equivalence(sources: &[&str], suite: &str) -> Result<()> {
     let mut comparisons = Vec::with_capacity(sources.len() * 2);
     for (index, source) in sources.iter().enumerate() {

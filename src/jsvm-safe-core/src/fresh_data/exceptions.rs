@@ -61,6 +61,27 @@ impl Analyzer<'_, '_> {
         super::Evaluation::default()
     }
 
+    /// Resolve a descriptor operation's normal value while retaining
+    /// every intrinsic exceptional alternative at the pre-effect heap.
+    pub(super) fn access_normal<T>(
+        &mut self,
+        access: super::Access<T>,
+        environment: &mut Environment,
+    ) -> Option<T> {
+        match access {
+            super::Access::Normal(value) => Some(value),
+            super::Access::NormalOrThrow(value) => {
+                self.intrinsic_throw_path(environment)?;
+                Some(value)
+            }
+            super::Access::Throw => {
+                self.intrinsic_throw(environment)?;
+                None
+            }
+            super::Access::Opaque => None,
+        }
+    }
+
     pub(super) fn protected_region(
         &mut self,
         environment: &mut Environment,

@@ -192,21 +192,21 @@ fn read_string_own(text: &str, key: &str, budget: &WorkBudget) -> Result<Lookup,
         let length = text.encode_utf16().count();
         // ECMAScript string lengths are bounded by the largest safe integer.
         let Ok(length) = u64::try_from(length) else {
-            return Ok(Err(UnprovenLookup));
+            return Ok(Access::Opaque);
         };
         if length >= (1_u64 << 53) {
-            return Ok(Err(UnprovenLookup));
+            return Ok(Access::Opaque);
         }
         let number = js_number_from_u64(length);
-        return Ok(Ok(Some(Fact::Primitive(Value::Number(number)))));
+        return Ok(Access::Normal(Some(Fact::Primitive(Value::Number(number)))));
     }
     let Ok(index) = key.parse::<usize>() else {
-        return Ok(Err(UnprovenLookup));
+        return Ok(Access::Opaque);
     };
     // Unlike array indexes, string exotic indexes have no uint32 bound.
     // A canonical nonnegative decimal below the actual length suffices.
     if index.to_string() != key || index >= text.len() {
-        return Ok(Err(UnprovenLookup));
+        return Ok(Access::Opaque);
     }
     charge(
         budget,
@@ -215,8 +215,9 @@ fn read_string_own(text: &str, key: &str, budget: &WorkBudget) -> Result<Lookup,
     Ok(text
         .encode_utf16()
         .nth(index)
-        .map(string_code_unit)
-        .ok_or(UnprovenLookup))
+        .map_or(Access::Opaque, |unit| {
+            Access::Normal(string_code_unit(unit))
+        }))
 }
 
 /// The value lattice is separate from the descriptor lattice. Unknown data
@@ -844,11 +845,44 @@ impl LookupKey<'_> {
     }
 }
 
-/// An ordinary lookup may be unproved or proved with an unknown data value.
-#[derive(Clone, Copy, Debug)]
-pub(super) struct UnprovenLookup;
+/// A modeled operation may have ordinary and intrinsic-throw outcomes.
+/// Neither implies arbitrary user code. Opaque operations can have any
+/// effects and are deliberately distinct from a known unknown data value.
+pub(super) enum Access<T> {
+    Normal(T),
+    Throw,
+    NormalOrThrow(T),
+    Opaque,
+}
 
-pub(super) type Lookup = Result<Option<Fact>, UnprovenLookup>;
+impl<T> Access<T> {
+    fn from_paths(normal: Option<T>, throws: bool) -> Self {
+        match (normal, throws) {
+            (Some(value), false) => Self::Normal(value),
+            (Some(value), true) => Self::NormalOrThrow(value),
+            (None, true) => Self::Throw,
+            (None, false) => Self::Opaque,
+        }
+    }
+
+    fn try_map<U>(
+        self,
+        map: impl FnOnce(T) -> Result<U, BudgetExceeded>,
+    ) -> Result<Access<U>, BudgetExceeded> {
+        Ok(match self {
+            Self::Normal(value) => Access::Normal(map(value)?),
+            Self::NormalOrThrow(value) => Access::NormalOrThrow(map(value)?),
+            Self::Throw => Access::Throw,
+            Self::Opaque => Access::Opaque,
+        })
+    }
+
+    pub(super) const fn may_throw(&self) -> bool {
+        matches!(self, Self::Throw | Self::NormalOrThrow(_))
+    }
+}
+
+pub(super) type Lookup = Access<Option<Fact>>;
 
 /// Merge an arbitrary number of possible property values without
 /// repeatedly allocating growing sorted location unions. Preserve the
@@ -1586,21 +1620,23 @@ impl Environment {
     /// Prove ordinary property resolution on every possible receiver.
     /// The caller chooses whether to materialize data values or merely
     /// establish that no opaque descriptor can intercept the operation.
+    /// Restricted intrinsic accessors contribute a throw path, not a
+    /// user-code effect or an absent descriptor.
     fn visit_resolved_data(
         &self,
         locations: &Locations,
         key: LookupKey<'_>,
         budget: &WorkBudget,
         mut visit: impl FnMut(Option<&Fact>) -> Result<(), BudgetExceeded>,
-    ) -> Result<bool, BudgetExceeded> {
+    ) -> Result<Access<()>, BudgetExceeded> {
         if let [id] = locations.as_ref() {
             charge(budget, key.weight())?;
             let Some(data) = self.allocations.get(id) else {
-                return Ok(false);
+                return Ok(Access::Opaque);
             };
             if let Property::Data(value) = key.property(data) {
                 visit(value.value(&self.bindings))?;
-                return Ok(true);
+                return Ok(Access::Normal(()));
             }
         }
         charge(budget, locations.len())?;
@@ -1608,13 +1644,14 @@ impl Environment {
         let mut visited = HashSet::new();
         let undefined = Fact::Primitive(Value::Undefined);
         let mut found = false;
+        let mut throws = false;
         while let Some(id) = pending.pop() {
             charge(budget, 1)?;
             if !visited.insert(id) {
                 continue;
             }
             let Some(data) = self.allocations.get(&id) else {
-                return Ok(false);
+                return Ok(Access::Opaque);
             };
             charge(budget, key.weight())?;
             match key.property(data) {
@@ -1628,10 +1665,14 @@ impl Environment {
                     found = true;
                 }
                 Property::Absent => {}
-                Property::Opaque | Property::Restricted => return Ok(false),
+                Property::Restricted => {
+                    throws = true;
+                    continue;
+                }
+                Property::Opaque => return Ok(Access::Opaque),
             }
             match &data.prototype {
-                Prototype::Unknown => return Ok(false),
+                Prototype::Unknown => return Ok(Access::Opaque),
                 Prototype::Null => {
                     visit(Some(&undefined))?;
                     found = true;
@@ -1640,13 +1681,13 @@ impl Environment {
                     charge(budget, prototypes.len())?;
                     if prototypes.is_empty() || prototypes.iter().any(|&prototype| prototype >= id)
                     {
-                        return Ok(false);
+                        return Ok(Access::Opaque);
                     }
                     pending.extend(prototypes.iter().copied());
                 }
             }
         }
-        Ok(found)
+        Ok(Access::from_paths(found.then_some(()), throws))
     }
 
     /// No well-known symbol can resolve to a method if its summarized
@@ -1673,7 +1714,7 @@ impl Environment {
                         Ok(())
                     },
                 )?;
-                Ok(resolved && absent)
+                Ok(matches!(resolved, Access::Normal(())) && absent)
             }
         }
     }
@@ -1687,7 +1728,7 @@ impl Environment {
         match receiver {
             Fact::Objects(locations) => self.read(locations, key, budget),
             Fact::Primitive(Value::String(text)) => read_string_own(text, key, budget),
-            Fact::Primitive(_) => Ok(Err(UnprovenLookup)),
+            Fact::Primitive(_) => Ok(Access::Opaque),
         }
     }
 
@@ -1698,13 +1739,10 @@ impl Environment {
         budget: &WorkBudget,
     ) -> Result<Lookup, BudgetExceeded> {
         let mut values = LookupValues::default();
-        if self.visit_resolved_data(locations, LookupKey::String(key), budget, |value| {
+        self.visit_resolved_data(locations, LookupKey::String(key), budget, |value| {
             values.add(value, budget)
-        })? {
-            Ok(Ok(values.finish(budget)?))
-        } else {
-            Ok(Err(UnprovenLookup))
-        }
+        })?
+        .try_map(|()| values.finish(budget))
     }
 
     fn update(
@@ -1772,15 +1810,23 @@ impl Environment {
         Ok(())
     }
 
-    pub(super) fn write(
-        &mut self,
+    /// Determine the normal receiver set and any intrinsic failure before
+    /// mutating descriptors or mapped cells. The caller retains the exact
+    /// pre-write heap for the exceptional path. Ordinary homogeneous
+    /// accesses reuse the original shared location set.
+    pub(super) fn plan_write(
+        &self,
         locations: &Locations,
         key: &str,
         value: Option<&Fact>,
         budget: &WorkBudget,
-    ) -> Result<bool, BudgetExceeded> {
-        if !self.visit_resolved_data(locations, LookupKey::String(key), budget, |_| Ok(()))? {
-            return Ok(false);
+    ) -> Result<Access<Locations>, BudgetExceeded> {
+        let resolution =
+            self.visit_resolved_data(locations, LookupKey::String(key), budget, |_| Ok(()))?;
+        match resolution {
+            Access::Opaque => return Ok(Access::Opaque),
+            Access::Throw => return Ok(Access::Throw),
+            Access::Normal(()) | Access::NormalOrThrow(()) => {}
         }
         charge(budget, locations.len())?;
         if key == "length" {
@@ -1791,13 +1837,67 @@ impl Environment {
                     .saturating_mul(value.map_or(1, Fact::clone_weight)),
             )?;
         }
-        if !locations.iter().all(|id| {
-            self.allocations
-                .get(id)
-                .is_some_and(|data| data.can_write(key, value))
-        }) {
-            return Ok(false);
+        if matches!(resolution, Access::Normal(()))
+            && locations.iter().all(|id| {
+                self.allocations
+                    .get(id)
+                    .is_some_and(|data| data.can_write(key, value))
+            })
+        {
+            return Ok(Access::Normal(Rc::clone(locations)));
         }
+        self.plan_alternative_writes(locations, key, value, resolution.may_throw(), budget)
+    }
+
+    fn plan_alternative_writes(
+        &self,
+        locations: &Locations,
+        key: &str,
+        value: Option<&Fact>,
+        mixed_resolution: bool,
+        budget: &WorkBudget,
+    ) -> Result<Access<Locations>, BudgetExceeded> {
+        let mut normal = Vec::with_capacity(locations.len());
+        let mut throws = mixed_resolution;
+        for &id in locations.iter() {
+            charge(budget, 1)?;
+            let Some(data) = self.allocations.get(&id) else {
+                return Ok(Access::Opaque);
+            };
+            if mixed_resolution {
+                let single = Rc::from([id]);
+                match self
+                    .visit_resolved_data(&single, LookupKey::String(key), budget, |_| Ok(()))?
+                {
+                    Access::Throw => continue,
+                    Access::Opaque => return Ok(Access::Opaque),
+                    Access::Normal(()) | Access::NormalOrThrow(()) => {}
+                }
+            }
+            if !data.can_write(key, value) {
+                // ArraySetLength converts and validates its input before
+                // changing length or deleting indices. Primitive invalid
+                // lengths fail without invoking coercion hooks. Object or
+                // unknown inputs may execute arbitrary user code instead.
+                if matches!(value, Some(Fact::Primitive(_))) {
+                    throws = true;
+                    continue;
+                }
+                return Ok(Access::Opaque);
+            }
+            normal.push(id);
+        }
+        let normal = (!normal.is_empty()).then(|| Locations::from(normal));
+        Ok(Access::from_paths(normal, throws))
+    }
+
+    pub(super) fn apply_write(
+        &mut self,
+        locations: &Locations,
+        key: &str,
+        value: Option<&Fact>,
+        budget: &WorkBudget,
+    ) -> Result<bool, BudgetExceeded> {
         self.write_mapped_cells(locations, key, value, budget)?;
         self.update(locations, budget, |data, strength| {
             if let Some(value) = value {
@@ -1835,6 +1935,107 @@ impl Environment {
 mod tests {
     use super::*;
     use oxc_syntax::symbol::SymbolId;
+
+    impl Environment {
+        fn write_normal(
+            &mut self,
+            locations: &Locations,
+            key: &str,
+            value: Option<&Fact>,
+            budget: &WorkBudget,
+        ) -> Result<bool, BudgetExceeded> {
+            if let Access::Normal(locations) = self.plan_write(locations, key, value, budget)? {
+                self.apply_write(&locations, key, value, budget)
+            } else {
+                Ok(false)
+            }
+        }
+    }
+
+    #[test]
+    fn intrinsic_access_plans_keep_normal_receivers_and_exceptional_paths(
+    ) -> Result<(), BudgetExceeded> {
+        let budget = WorkBudget::unlimited("descriptor-completions");
+        let mut heap = Environment::new();
+        let mut poison = OwnData::new(AllocationKind::Ordinary);
+        poison.define_restricted("callee".into());
+        heap.allocate(0, poison, &budget)?;
+        let mut ordinary = OwnData::new(AllocationKind::Ordinary);
+        ordinary.define_data("callee".into(), Some(Fact::Primitive(Value::Number(7.0))));
+        heap.allocate(1, ordinary, &budget)?;
+        let mut opaque = OwnData::new(AllocationKind::Ordinary);
+        opaque.define_accessor("callee".into());
+        heap.allocate(2, opaque, &budget)?;
+        assert!(matches!(
+            heap.read(&Rc::from([0]), "callee", &budget)?,
+            Access::Throw
+        ));
+        let mixed = Rc::from([0, 1]);
+        assert!(matches!(
+            heap.read(&mixed, "callee", &budget)?,
+            Access::NormalOrThrow(Some(Fact::Primitive(Value::Number(7.0))))
+        ));
+        assert!(matches!(
+            heap.read(&Rc::from([0, 1, 2]), "callee", &budget)?,
+            Access::Opaque
+        ));
+        let value = Fact::Primitive(Value::Number(9.0));
+        let Access::NormalOrThrow(normal) =
+            heap.plan_write(&mixed, "callee", Some(&value), &budget)?
+        else {
+            unreachable!()
+        };
+        assert_eq!(&*normal, &[1]);
+        assert!(heap.apply_write(&normal, "callee", Some(&value), &budget)?);
+        assert!(matches!(
+            heap.read(&mixed, "callee", &budget)?,
+            Access::NormalOrThrow(Some(Fact::Primitive(Value::Number(9.0))))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn array_length_failure_plans_do_not_mutate_the_heap() -> Result<(), BudgetExceeded> {
+        let budget = WorkBudget::unlimited("array-length-completions");
+        let mut heap = Environment::new();
+        let mut array = OwnData::new(AllocationKind::Array);
+        array.define_data("length".into(), Some(Fact::Primitive(Value::Number(1.0))));
+        array.define_data("0".into(), Some(Fact::Primitive(Value::Number(7.0))));
+        heap.allocate(0, array, &budget)?;
+        let mut ordinary = OwnData::new(AllocationKind::Ordinary);
+        ordinary.define_data("length".into(), Some(Fact::Primitive(Value::Number(0.0))));
+        heap.allocate(1, ordinary, &budget)?;
+        let invalid = Fact::Primitive(Value::Number(-1.0));
+        assert!(matches!(
+            heap.plan_write(&Rc::from([0]), "length", Some(&invalid), &budget)?,
+            Access::Throw
+        ));
+        assert!(matches!(
+            heap.plan_write(&Rc::from([0]), "length", None, &budget)?,
+            Access::Opaque
+        ));
+        let mixed = Rc::from([0, 1]);
+        let Access::NormalOrThrow(normal) =
+            heap.plan_write(&mixed, "length", Some(&invalid), &budget)?
+        else {
+            unreachable!()
+        };
+        assert_eq!(&*normal, &[1]);
+        assert!(heap.apply_write(&normal, "length", Some(&invalid), &budget)?);
+        assert!(matches!(
+            heap.read(&Rc::from([0]), "length", &budget)?,
+            Access::Normal(Some(Fact::Primitive(Value::Number(1.0))))
+        ));
+        assert!(matches!(
+            heap.read(&Rc::from([0]), "0", &budget)?,
+            Access::Normal(Some(Fact::Primitive(Value::Number(7.0))))
+        ));
+        assert!(matches!(
+            heap.read(&Rc::from([1]), "length", &budget)?,
+            Access::Normal(Some(Fact::Primitive(Value::Number(-1.0))))
+        ));
+        Ok(())
+    }
 
     const ROOT: InstanceId = 0;
     fn cell(index: usize) -> CellId {
@@ -1878,7 +2079,7 @@ mod tests {
         left.join_returns(&right, &budget)?;
         assert!(matches!(
             left.read(&Rc::from([0, 1, 2]), "x", &budget)?,
-            Ok(Some(Fact::Primitive(Value::Number(7.0))))
+            Access::Normal(Some(Fact::Primitive(Value::Number(7.0))))
         ));
 
         // Both sides can contain allocation 3; one side loses its data
@@ -1890,7 +2091,10 @@ mod tests {
         invalidated.clear();
         left.join_returns(&invalidated, &budget)?;
         left.join_returns(&third, &budget)?;
-        assert!(left.read(&Rc::from([3]), "x", &budget)?.is_err());
+        assert!(matches!(
+            left.read(&Rc::from([3]), "x", &budget)?,
+            Access::Opaque
+        ));
 
         // A nested activation shares the parent birth history and a
         // normal structured branch join must preserve invalidated births.
@@ -1905,10 +2109,13 @@ mod tests {
         sibling.allocate(5, data, &budget)?;
         cleared.join(&sibling, 4, &budget)?;
         cleared.join_returns(&original, &budget)?;
-        assert!(cleared.read(&Rc::from([4]), "x", &budget)?.is_err());
+        assert!(matches!(
+            cleared.read(&Rc::from([4]), "x", &budget)?,
+            Access::Opaque
+        ));
         assert!(matches!(
             cleared.read(&Rc::from([5]), "x", &budget)?,
-            Ok(Some(Fact::Primitive(Value::Number(7.0))))
+            Access::Normal(Some(Fact::Primitive(Value::Number(7.0))))
         ));
         Ok(())
     }
@@ -1926,7 +2133,7 @@ mod tests {
         let mut right = base;
         data.define_data("x".into(), Some(Fact::Primitive(Value::Number(7.0))));
         let alternative = left.allocate(2, data, &budget)?;
-        assert!(right.write(
+        assert!(right.write_normal(
             &Rc::from([1]),
             "x",
             Some(&Fact::Primitive(Value::Number(7.0))),
@@ -1937,7 +2144,7 @@ mod tests {
         projected.join_activation_exits(&right, Some(&alternative), Some(&local), 1, &budget)?;
         assert!(matches!(
             projected.read(&Rc::from([1, 2]), "x", &budget)?,
-            Ok(Some(Fact::Primitive(Value::Number(7.0))))
+            Access::Normal(Some(Fact::Primitive(Value::Number(7.0))))
         ));
 
         // A caller-held cell keeps the otherwise local object observable.
@@ -1947,14 +2154,17 @@ mod tests {
         escaped.join_activation_exits(&right, Some(&alternative), Some(&local), 1, &budget)?;
         assert!(matches!(
             escaped.read(&Rc::from([1]), "x", &budget)?,
-            Ok(None)
+            Access::Normal(None)
         ));
 
         // A known reference may outlive its invalidated descriptor.
         // Projection must mark it even when no data entry remains.
         left.clear();
         left.join_activation_exits(&right, Some(&local), Some(&local), 1, &budget)?;
-        assert!(left.read(&Rc::from([1]), "x", &budget)?.is_err());
+        assert!(matches!(
+            left.read(&Rc::from([1]), "x", &budget)?,
+            Access::Opaque
+        ));
         Ok(())
     }
 
@@ -2040,7 +2250,8 @@ mod tests {
         let receivers = Rc::from(receivers);
         // A sequential union would traverse more than 500,000 IDs.
         let bounded = WorkBudget::new("lookup-many-values", work_budget::BudgetLimits::work(32768));
-        let Ok(Some(Fact::Objects(result))) = heap.read(&receivers, "x", &bounded)? else {
+        let Access::Normal(Some(Fact::Objects(result))) = heap.read(&receivers, "x", &bounded)?
+        else {
             unreachable!()
         };
         assert_eq!(result.len(), count);
@@ -2077,19 +2288,22 @@ mod tests {
             "write-with-large-inherited-value",
             work_budget::BudgetLimits::work(128),
         );
-        assert!(heap.write(
+        assert!(heap.write_normal(
             &locations,
             "x",
             Some(&Fact::Primitive(Value::Number(9.0))),
             &bounded
         )?);
-        assert!(matches!(heap.read(&locations, "x", &unlimited)?, Ok(None)));
+        assert!(matches!(
+            heap.read(&locations, "x", &unlimited)?,
+            Access::Normal(None)
+        ));
         // An opaque path must still reject a write, even when earlier
         // paths have already established unknown ordinary data.
         let mut opaque = OwnData::new(AllocationKind::Ordinary);
         opaque.define_accessor("x".into());
         heap.allocate(4, opaque, &unlimited)?;
-        assert!(!heap.write(&Rc::from([1, 3, 4]), "x", None, &unlimited)?);
+        assert!(!heap.write_normal(&Rc::from([1, 3, 4]), "x", None, &unlimited)?);
         let bounded = WorkBudget::new("read-large-value", work_budget::BudgetLimits::work(128));
         assert!(heap.read(&Rc::from([0]), "x", &bounded).is_err());
         Ok(())
@@ -2173,7 +2387,7 @@ mod tests {
         assert!(heap.read(&locations, "x", &bounded).is_err());
         assert!(matches!(
             heap.read(&locations, "x", &unlimited)?,
-            Ok(Some(Fact::Primitive(Value::Number(7.0))))
+            Access::Normal(Some(Fact::Primitive(Value::Number(7.0))))
         ));
 
         let mut data = OwnData::new(AllocationKind::Ordinary);
@@ -2189,7 +2403,7 @@ mod tests {
         let shared = heap.clone();
         let bounded = WorkBudget::new("weak-write-copy", work_budget::BudgetLimits::work(32));
         assert!(heap
-            .write(
+            .write_normal(
                 &locations,
                 "key0",
                 Some(&Fact::Primitive(Value::Number(9.0))),
@@ -2198,11 +2412,11 @@ mod tests {
             .is_err());
         assert!(matches!(
             heap.read(&locations, "key0", &unlimited)?,
-            Ok(Some(Fact::Primitive(Value::Number(7.0))))
+            Access::Normal(Some(Fact::Primitive(Value::Number(7.0))))
         ));
         drop(shared);
         let bounded = WorkBudget::new("weak-write-local", work_budget::BudgetLimits::work(128));
-        assert!(heap.write(
+        assert!(heap.write_normal(
             &locations,
             "key0",
             Some(&Fact::Primitive(Value::Number(9.0))),
@@ -2210,7 +2424,7 @@ mod tests {
         )?);
         assert!(matches!(
             heap.read(&locations, "key0", &unlimited)?,
-            Ok(None)
+            Access::Normal(None)
         ));
         Ok(())
     }
@@ -2286,7 +2500,7 @@ mod tests {
         assert!(Rc::ptr_eq(&heap.allocations, &unchanged.allocations));
 
         let mut changed = heap.clone();
-        assert!(changed.write(
+        assert!(changed.write_normal(
             locations,
             "x",
             Some(&Fact::Primitive(Value::Number(9.0))),
@@ -2296,10 +2510,13 @@ mod tests {
         assert!(!Rc::ptr_eq(&heap.allocations, &changed.allocations));
         assert!(matches!(
             heap.read(locations, "x", &budget)?,
-            Ok(Some(Fact::Primitive(Value::Number(7.0))))
+            Access::Normal(Some(Fact::Primitive(Value::Number(7.0))))
         ));
         heap.join(&changed, 1, &budget)?;
-        assert!(matches!(heap.read(locations, "x", &budget)?, Ok(None)));
+        assert!(matches!(
+            heap.read(locations, "x", &budget)?,
+            Access::Normal(None)
+        ));
 
         let mut invalidated = heap.clone();
         invalidated.clear();
@@ -2324,7 +2541,7 @@ mod tests {
         let Fact::Objects(root_locations) = &root else {
             unreachable!()
         };
-        assert!(heap.write(root_locations, "next", Some(&child), &budget)?);
+        assert!(heap.write_normal(root_locations, "next", Some(&child), &budget)?);
         let mut child_data = OwnData::new(AllocationKind::Ordinary);
         child_data.set_literal_prototype(Some(root.clone()));
         Rc::make_mut(&mut heap.allocations).insert(1, Rc::new(child_data));
@@ -2395,7 +2612,7 @@ mod tests {
         };
         assert!(matches!(
             heap.read(locations, "x", &budget)?,
-            Ok(Some(Fact::Primitive(Value::Number(7.0))))
+            Access::Normal(Some(Fact::Primitive(Value::Number(7.0))))
         ));
         let mut invalidated = other.clone();
         invalidated.clear();
