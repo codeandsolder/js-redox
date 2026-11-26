@@ -1,12 +1,13 @@
 //! Shared bounded loop execution and target-aware completion accumulation.
 use super::{
     flow::{CompletionValue, Flow, Path, Transfer},
-    Analyzer, Environment, FreshDataReads,
+    Analyzer, Environment, FreshDataReads, Observation,
 };
 use oxc_ast::ast::{
     DoWhileStatement, Expression, ForStatement, ForStatementInit, Statement,
     VariableDeclarationKind, WhileStatement,
 };
+use oxc_span::GetSpan;
 use oxc_syntax::scope::ScopeId;
 use work_budget::{BudgetExceeded, WorkBudget};
 
@@ -318,7 +319,24 @@ impl Analyzer<'_, '_> {
             candidate = environment.clone();
             flow = self.execute_loop_attempt(node, &labels, false, &mut candidate);
         }
+        // Publish only a complete normal-path certificate. Failed loop
+        // attempts contribute Unknown, including in a repeated outer scope.
+        let value = flow.as_ref().and_then(Flow::exact_normal_primitive);
+        let observation = if let Some(value) = value {
+            if !self.charge_values([value]) {
+                return None;
+            }
+            Observation::Exact(value.clone())
+        } else {
+            Observation::Unknown
+        };
         self.finish_observations(observations, flow.is_some())?;
+        let span = statement.span();
+        self.reads.loop_completions.observe(
+            (span.start, span.end),
+            observation,
+            crate::value_eval::identical_primitive_value,
+        );
         if outermost {
             self.loop_fuel = None;
             self.loop_failed = false;

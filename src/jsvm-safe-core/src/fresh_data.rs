@@ -173,6 +173,7 @@ pub struct FreshDataReads {
     members: ReachingObservations<Value>,
     comparisons: ReachingObservations<Value>,
     dispatches: ReachingObservations<dispatch::DispatchTrace>,
+    loop_completions: ReachingObservations<Value>,
     gaps: coverage::CoverageGaps,
 }
 
@@ -197,6 +198,11 @@ impl FreshDataReads {
         self.comparisons.get(span)
     }
 
+    /// Common exact primitive normal completion across every analyzed execution.
+    pub(crate) fn loop_completion(&self, span: Span) -> Option<&Value> {
+        self.loop_completions.get(span)
+    }
+
     pub(crate) fn dispatch_replacement(
         &self,
         statement: &ForStatement<'_>,
@@ -211,6 +217,8 @@ impl FreshDataReads {
         self.comparisons
             .merge(other.comparisons, identical_primitive_value);
         self.dispatches.merge(other.dispatches, PartialEq::eq);
+        self.loop_completions
+            .merge(other.loop_completions, identical_primitive_value);
         self.gaps.merge(other.gaps);
     }
 
@@ -225,6 +233,7 @@ impl FreshDataReads {
             .capacity()
             .saturating_add(self.comparisons.values.capacity())
             .saturating_add(self.dispatches.values.capacity())
+            .saturating_add(self.loop_completions.values.capacity())
             .saturating_add(visited.capacity());
         let Some(excluded) = std::mem::take(&mut self.gaps).normalize(count, budget)? else {
             return Ok(());
@@ -236,6 +245,9 @@ impl FreshDataReads {
             .values
             .retain(|&key, _| !excluded.contains(key));
         self.dispatches
+            .values
+            .retain(|&key, _| !excluded.contains(key));
+        self.loop_completions
             .values
             .retain(|&key, _| !excluded.contains(key));
         // Independently analyzed bodies can still establish facts without
@@ -1498,6 +1510,75 @@ mod tests {
                 ))
             })
             .collect())
+    }
+
+    #[test]
+    fn loop_completion_certificates_require_reaching_value_agreement() -> Result<(), BudgetExceeded>
+    {
+        for (source, target, expected) in [
+            (
+                "let s=1;while(s!==9){if(s===1){'done';let unused=(s=9,0);}}",
+                "while(s!==9){if(s===1){'done';let unused=(s=9,0);}}",
+                Some("\"done\""),
+            ),
+            (
+                "let a=[7];let s=1;while(s!==9){if(s===1){a[0];let unused=(s=9,0);}}",
+                "while(s!==9){if(s===1){a[0];let unused=(s=9,0);}}",
+                Some("7"),
+            ),
+            ("7;while(false){}", "while(false){}", Some("void 0")),
+            (
+                "let i=0;do{3;i++;continue;}while(i<2);",
+                "do{3;i++;continue;}while(i<2);",
+                Some("1"),
+            ),
+            (
+                "let a=[7];while(true){try{7;break;}finally{a[0]=9;}}",
+                "while(true){try{7;break;}finally{a[0]=9;}}",
+                Some("7"),
+            ),
+            (
+                "outer:while(true){7;break outer;}",
+                "while(true){7;break outer;}",
+                None,
+            ),
+            (
+                "let s=1;while(s!==9){if(s===1){unknown();let unused=(s=9,0);}}",
+                "while(s!==9){if(s===1){unknown();let unused=(s=9,0);}}",
+                None,
+            ),
+            (
+                "for(let i=0;i<2;i++){let s=1;while(s!==9){if(s===1){i;let unused=(s=9,0);}}}",
+                "while(s!==9){if(s===1){i;let unused=(s=9,0);}}",
+                None,
+            ),
+            (
+                "for(let i=0;i<2;i++){let s=1;while(s!==9){if(s===1){7;let unused=(s=9,0);}}}",
+                "while(s!==9){if(s===1){7;let unused=(s=9,0);}}",
+                Some("7"),
+            ),
+        ] {
+            let analysis = with_analyzer(source, |program, mut analyzer| {
+                analyzer.visit_program(program);
+                analyzer.failure.map_or(Ok(analyzer.reads), Err)
+            })?;
+            let actual =
+                analysis
+                    .loop_completions
+                    .values
+                    .iter()
+                    .find_map(|(&(start, end), observation)| {
+                        if source.get(start as usize..end as usize)? != target {
+                            return None;
+                        }
+                        match observation {
+                            Observation::Exact(value) => value.render(),
+                            Observation::Unknown => None,
+                        }
+                    });
+            assert_eq!(actual.as_deref(), expected, "{source}");
+        }
+        Ok(())
     }
 
     #[test]
