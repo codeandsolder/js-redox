@@ -10,7 +10,7 @@ Provenance-preserving static recovery for hostile browser JavaScript and embedde
 - `corpus/manifest.json` — asserted positive/negative regression corpus.
 - `src/jsvm-safe-core/` — proof-gated semantics-preserving JavaScript rewrites.
 - `src/jsvm-lift/` — capture/project analysis, structural scanning, VM recovery and bundle/module tooling.
-- `src/sourcemap-compose/` — `sourcemaps compose|project`, backed by the shared Rust source-map recovery implementation.
+- `src/jsvm-lift/src/bin/sourcemaps.rs` — `sourcemaps compose|project`, backed by the shared Rust source-map recovery implementation.
 - `src/wasm-redox/` — WASM validation/readability, deep CFG/state-machine recovery and JavaScript/WASM boundary proofs.
 - `scripts/` — capture pipeline, proof correlation, build, benchmark and regression helpers.
 - Large unpinned-corpus acquisition, grading, catalog, and review tooling lives in [`codeandsolder/js-redox-corpus`](https://github.com/codeandsolder/js-redox-corpus); this repository keeps only engine-facing and pinned-regression tooling.
@@ -19,7 +19,7 @@ Provenance-preserving static recovery for hostile browser JavaScript and embedde
 
 ## Build
 
-The Rust side is one Cargo workspace with five crates: `jsvm-safe-core`, `jsvm-lift`, `sourcemap-compose`, `wasm-redox`, and `work-budget`. It uses a single root `Cargo.lock`, shared dependency-version pins, and `rust-version = "1.100"`. Whole-workspace correctness gates are therefore ordinary Cargo commands:
+The Rust side is one Cargo workspace with five crates: `jsvm-safe-core`, `jsvm-lift`, `knitsail-ast-site-probe`, `wasm-redox`, and `work-budget`. It uses a single root `Cargo.lock`, shared dependency-version pins, and `rust-version = "1.100"`. Whole-workspace correctness gates are therefore ordinary Cargo commands:
 
 ```sh
 cargo fmt --all -- --check
