@@ -57,7 +57,7 @@ sha2 = "0.11"
 string_wizard = { git = "https://github.com/codeandsolder/rolldown-crates-redox.git", rev = "f1d9767c21e4c100f8b14e6c207f19838972cfde", default-features = false }
 rolldown_redox = { git = "https://github.com/codeandsolder/rolldown-crates-redox.git", rev = "f1d9767c21e4c100f8b14e6c207f19838972cfde", default-features = false }
 url = "2"
-wreq = { git = "https://github.com/codeandsolder/wreq-exp.git", rev = "aad8f97d78e40c4c9fc0ddbb0cf88af870f848ac", default-features = false, features = ["tokio-rt", "cookies", "cookies-psl", "gzip", "brotli", "deflate", "stream"] }
+wreq = { git = "https://github.com/codeandsolder/wreq-exp.git", rev = "a8385c80ba6a5b035067d3a2e472d37df591faf0", default-features = false, features = ["tokio-rt", "cookies", "cookies-psl", "gzip", "brotli", "deflate", "stream"] }
 tokio = { version = "1", default-features = false, features = ["rt", "net", "time"] }
 futures-util = { version = "0.3", default-features = false }
 rustls-native-certs = "0.8"
