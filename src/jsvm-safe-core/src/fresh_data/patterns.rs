@@ -7,10 +7,9 @@ use super::{
 };
 use crate::value_eval::literal_property_key;
 use oxc_ast::ast::{
-    AssignmentExpression, AssignmentTarget, AssignmentTargetMaybeDefault, AssignmentTargetProperty,
-    Expression, ObjectAssignmentTarget, PropertyKey,
+    ArrayAssignmentTarget, AssignmentExpression, AssignmentTarget, AssignmentTargetMaybeDefault,
+    AssignmentTargetProperty, Expression, ObjectAssignmentTarget, PropertyKey,
 };
-use oxc_span::GetSpan;
 use std::collections::HashSet;
 
 pub(super) struct ObjectPatternSource<'a> {
@@ -163,10 +162,8 @@ impl Analyzer<'_, '_> {
             AssignmentTarget::ObjectAssignmentTarget(pattern) => {
                 self.assign_object(pattern, source, environment)
             }
-            AssignmentTarget::ArrayAssignmentTarget(_) => {
-                self.unobserved(pattern.span());
-                self.invalidate(environment);
-                Some(())
+            AssignmentTarget::ArrayAssignmentTarget(pattern) => {
+                self.assign_array(pattern, source, environment)
             }
             _ => None,
         }
@@ -236,6 +233,75 @@ impl Analyzer<'_, '_> {
                 let destination = self.destination(target, environment)?;
                 Some((key, destination, default))
             }
+        }
+    }
+
+    fn assign_array_element(
+        &mut self,
+        element: &AssignmentTargetMaybeDefault<'_>,
+        environment: &mut Environment,
+    ) -> Option<()> {
+        let (target, default) = match element {
+            AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(value) => {
+                (&value.binding, Some(&value.init))
+            }
+            binding => (binding.as_assignment_target()?, None),
+        };
+        // DestructuringAssignmentEvaluation obtains the target reference
+        // before advancing the iterator, including a rest target.
+        let destination = self.destination(target, environment);
+        if !environment.reachable() {
+            return Some(());
+        }
+        let destination = destination?;
+        self.advance_iterator(environment);
+        let value = default.and_then(|default| self.apply_default(None, default, environment));
+        self.write_destination(destination, value.as_ref(), environment)
+    }
+
+    fn assign_array(
+        &mut self,
+        pattern: &ArrayAssignmentTarget<'_>,
+        source: Option<&Fact>,
+        environment: &mut Environment,
+    ) -> Option<()> {
+        self.acquire_iterator(source, environment)?;
+        if !environment.reachable() {
+            return Some(());
+        }
+        let destination = self.iterator_prefix(environment, |analyzer, environment| {
+            for element in &pattern.elements {
+                if !environment.reachable() {
+                    return Some(None);
+                }
+                if let Some(element) = element {
+                    analyzer.assign_array_element(element, environment)?;
+                } else {
+                    analyzer.advance_iterator(environment);
+                }
+            }
+            if !environment.reachable() {
+                return Some(None);
+            }
+            if let Some(rest) = &pattern.rest {
+                let destination = analyzer.destination(&rest.target, environment);
+                if !environment.reachable() {
+                    return Some(None);
+                }
+                Some(Some(destination?))
+            } else {
+                Some(None)
+            }
+        })?;
+        if !environment.reachable() {
+            return Some(());
+        }
+        if let Some(destination) = destination {
+            let value = self.iterator_rest(environment);
+            self.write_destination(destination, value.as_ref(), environment)
+        } else {
+            self.close_iterator(environment);
+            Some(())
         }
     }
 

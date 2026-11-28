@@ -9,8 +9,8 @@ use super::{
     Environment, Fact, OwnData, Value,
 };
 use oxc_ast::ast::{
-    BindingPattern, Expression, FormalParameters, ObjectPattern, VariableDeclarationKind,
-    VariableDeclarator,
+    ArrayPattern, BindingPattern, Expression, FormalParameters, ObjectPattern,
+    VariableDeclarationKind, VariableDeclarator,
 };
 use oxc_span::GetSpan;
 use oxc_syntax::{
@@ -117,13 +117,43 @@ impl Analyzer<'_, '_> {
             BindingPattern::ObjectPattern(pattern) => {
                 self.bind_object(pattern, value.as_ref(), environment)
             }
-            BindingPattern::ArrayPattern(_) => {
-                // Iterator acquisition, next, value and close can invoke
-                // arbitrary code, even for an array literal input.
-                self.unobserved(pattern.span());
-                self.invalidate(environment);
-                Some(())
+            BindingPattern::ArrayPattern(pattern) => {
+                self.bind_array(pattern, value.as_ref(), environment)
             }
+        }
+    }
+
+    fn bind_array(
+        &mut self,
+        pattern: &ArrayPattern<'_>,
+        source: Option<&Fact>,
+        environment: &mut Environment,
+    ) -> Option<()> {
+        self.acquire_iterator(source, environment)?;
+        if !environment.reachable() {
+            return Some(());
+        }
+        self.iterator_prefix(environment, |analyzer, environment| {
+            for element in &pattern.elements {
+                if !environment.reachable() {
+                    break;
+                }
+                analyzer.advance_iterator(environment);
+                if let Some(element) = element {
+                    analyzer.bind_pattern(element, None, environment)?;
+                }
+            }
+            Some(())
+        })?;
+        if !environment.reachable() {
+            return Some(());
+        }
+        if let Some(rest) = &pattern.rest {
+            let value = self.iterator_rest(environment);
+            self.bind_pattern(&rest.argument, value, environment)
+        } else {
+            self.close_iterator(environment);
+            Some(())
         }
     }
 

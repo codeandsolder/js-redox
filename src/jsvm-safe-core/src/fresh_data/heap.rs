@@ -814,6 +814,32 @@ impl OwnData {
     }
 }
 
+/// Symbol keys are not individually tracked yet. Their descriptors are
+/// covered by the existing unlisted-property lattice, including unknown
+/// computed definitions and spreads. Query it without conflating a symbol
+/// with its description or with a string key.
+#[derive(Clone, Copy)]
+enum LookupKey<'a> {
+    String(&'a str),
+    UntrackedSymbol,
+}
+
+impl LookupKey<'_> {
+    fn property(self, data: &OwnData) -> &Property {
+        match self {
+            Self::String(key) => data.property(key),
+            Self::UntrackedSymbol => &data.properties.unlisted,
+        }
+    }
+
+    const fn weight(self) -> usize {
+        match self {
+            Self::String(key) => key.len(),
+            Self::UntrackedSymbol => 1,
+        }
+    }
+}
+
 /// An ordinary lookup may be unproved or proved with an unknown data value.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct UnprovenLookup;
@@ -1555,16 +1581,16 @@ impl Environment {
     fn visit_resolved_data(
         &self,
         locations: &Locations,
-        key: &str,
+        key: LookupKey<'_>,
         budget: &WorkBudget,
         mut visit: impl FnMut(Option<&Fact>) -> Result<(), BudgetExceeded>,
     ) -> Result<bool, BudgetExceeded> {
         if let [id] = locations.as_ref() {
-            charge(budget, key.len())?;
+            charge(budget, key.weight())?;
             let Some(data) = self.allocations.get(id) else {
                 return Ok(false);
             };
-            if let Property::Data(value) = data.property(key) {
+            if let Property::Data(value) = key.property(data) {
                 visit(value.value(&self.bindings))?;
                 return Ok(true);
             }
@@ -1582,8 +1608,8 @@ impl Environment {
             let Some(data) = self.allocations.get(&id) else {
                 return Ok(false);
             };
-            charge(budget, key.len())?;
-            match data.property(key) {
+            charge(budget, key.weight())?;
+            match key.property(data) {
                 Property::Data(value) => {
                     visit(value.value(&self.bindings))?;
                     found = true;
@@ -1615,6 +1641,35 @@ impl Environment {
         Ok(found)
     }
 
+    /// No well-known symbol can resolve to a method if its summarized
+    /// descriptor is absent/nullish throughout a proven prototype chain.
+    /// Never assume the ambient Symbol binding or an intrinsic prototype.
+    pub(super) fn definitely_noniterable(
+        &self,
+        source: &Fact,
+        budget: &WorkBudget,
+    ) -> Result<bool, BudgetExceeded> {
+        match source {
+            Fact::Primitive(value) => Ok(matches!(value, Value::Null | Value::Undefined)),
+            Fact::Objects(locations) => {
+                let mut absent = true;
+                let resolved = self.visit_resolved_data(
+                    locations,
+                    LookupKey::UntrackedSymbol,
+                    budget,
+                    |value| {
+                        absent &= matches!(
+                            value.and_then(Fact::primitive),
+                            Some(Value::Null | Value::Undefined)
+                        );
+                        Ok(())
+                    },
+                )?;
+                Ok(resolved && absent)
+            }
+        }
+    }
+
     pub(super) fn read_value(
         &self,
         receiver: &Fact,
@@ -1635,7 +1690,9 @@ impl Environment {
         budget: &WorkBudget,
     ) -> Result<Lookup, BudgetExceeded> {
         let mut values = LookupValues::default();
-        if self.visit_resolved_data(locations, key, budget, |value| values.add(value, budget))? {
+        if self.visit_resolved_data(locations, LookupKey::String(key), budget, |value| {
+            values.add(value, budget)
+        })? {
             Ok(Ok(values.finish(budget)?))
         } else {
             Ok(Err(UnprovenLookup))
@@ -1714,7 +1771,7 @@ impl Environment {
         value: Option<&Fact>,
         budget: &WorkBudget,
     ) -> Result<bool, BudgetExceeded> {
-        if !self.visit_resolved_data(locations, key, budget, |_| Ok(()))? {
+        if !self.visit_resolved_data(locations, LookupKey::String(key), budget, |_| Ok(()))? {
             return Ok(false);
         }
         charge(budget, locations.len())?;
