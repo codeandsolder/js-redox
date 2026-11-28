@@ -15,11 +15,11 @@ permissions:
 jobs:
   strict-rust:
     name: Shared strict Rust policy
-    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@4f29271a2aa27bef1f34bd70407b0db3d39904a9 # main
+    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@2defd2ef97352d7a32cddf2dc6350d685f5ed3d4 # main
 
   rust:
     name: Rust quality gate
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@5991b873ab28ec8fae36c2c8ef944a3f67f5f9b3 # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@4dc75c98d3f12d3b5417e1cf9656e5f239a53c35 # main
     with:
       rust-components: "rustfmt clippy"
       timeout-minutes: 20
@@ -47,7 +47,7 @@ jobs:
   semantic:
     name: Semantic/runtime regressions
     needs: rust
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@5991b873ab28ec8fae36c2c8ef944a3f67f5f9b3 # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@4dc75c98d3f12d3b5417e1cf9656e5f239a53c35 # main
     with:
       node-version: "26.13.1"
       timeout-minutes: 20
