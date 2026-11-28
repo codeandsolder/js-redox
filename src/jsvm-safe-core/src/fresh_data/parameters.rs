@@ -163,7 +163,8 @@ impl Analyzer<'_, '_> {
         source: Option<&Fact>,
         environment: &mut Environment,
     ) -> Option<()> {
-        let mut source = ObjectPatternSource::new(self, source, pattern.rest.is_some());
+        let mut source =
+            ObjectPatternSource::new(self, source, pattern.rest.is_some(), environment)?;
         for property in &pattern.properties {
             if !environment.reachable() {
                 return Some(());

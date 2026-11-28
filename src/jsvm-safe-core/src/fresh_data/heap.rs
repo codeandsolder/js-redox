@@ -115,6 +115,10 @@ impl Fact {
         }
     }
 
+    pub(super) const fn is_nullish(&self) -> bool {
+        matches!(self, Self::Primitive(Value::Null | Value::Undefined))
+    }
+
     pub(super) fn truthy(&self) -> bool {
         match self {
             Self::Primitive(value) => value.truthy(),
@@ -1132,6 +1136,10 @@ impl Environment {
     /// its descriptor proof along with other heap information.
     pub(super) fn callable_origin(&self, id: AllocationId) -> Option<ClosureOrigin> {
         self.allocations.get(&id)?.closure.clone()
+    }
+
+    pub(super) fn allocation_kind(&self, id: AllocationId) -> Option<AllocationKind> {
+        Some(self.allocations.get(&id)?.kind)
     }
 
     pub(super) fn reference_type(

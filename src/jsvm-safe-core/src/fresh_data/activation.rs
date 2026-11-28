@@ -480,6 +480,53 @@ impl<'ast> Analyzer<'_, 'ast> {
             .map(CallTargets::Alternatives)
     }
 
+    fn definitely_noncallable(&mut self, fact: Option<&Fact>, environment: &Environment) -> bool {
+        match fact {
+            Some(Fact::Primitive(_)) => true,
+            Some(Fact::Objects(locations)) => {
+                self.heap_result(environment.reference_type(locations, self.budget))
+                    .flatten()
+                    == Some("object")
+            }
+            None => false,
+        }
+    }
+
+    pub(super) fn definitely_nonconstructor(
+        &mut self,
+        fact: Option<&Fact>,
+        environment: &Environment,
+    ) -> bool {
+        if self.definitely_noncallable(fact, environment) {
+            return true;
+        }
+        let Some(Fact::Objects(locations)) = fact else {
+            return false;
+        };
+        if self
+            .heap_result(super::heap::charge(self.budget, locations.len()))
+            .is_none()
+        {
+            return false;
+        }
+        !locations.is_empty()
+            && locations
+                .iter()
+                .all(|&id| match environment.allocation_kind(id) {
+                    Some(super::AllocationKind::Ordinary | super::AllocationKind::Array) => true,
+                    Some(super::AllocationKind::Callable) => environment
+                        .callable_origin(id)
+                        .and_then(|origin| self.callables.nodes.get(&origin.scope))
+                        .is_some_and(|node| match node {
+                            CallableNode::Arrow(_) => true,
+                            CallableNode::Ordinary(function) => {
+                                function.generator || function.r#async
+                            }
+                        }),
+                    None => false,
+                })
+    }
+
     /// Evaluate local calls with fresh activation cells. Resolve the callee
     /// exactly once before evaluating the arguments, even when no summary
     /// can be established.
@@ -492,29 +539,22 @@ impl<'ast> Analyzer<'_, 'ast> {
             self.unobserved(call.span);
             return self.barrier(environment);
         }
-        if call
+        if !call
             .arguments
             .iter()
             .any(|argument| argument.as_expression().is_none())
         {
-            self.expression(&call.callee, environment);
-            self.arguments(&call.arguments, environment);
-            return self.barrier(environment);
+            if let Some((activation, named)) = self.direct_activation(call, environment) {
+                return self.invoke_resolved_call(
+                    call,
+                    Some((CallTargets::Single(activation), named)),
+                    Some(Fact::Primitive(Value::Undefined)),
+                    environment,
+                );
+            }
         }
-        let mut receiver = Some(Fact::Primitive(Value::Undefined));
-        let resolved = self
-            .direct_activation(call, environment)
-            .map(|(activation, named)| (CallTargets::Single(activation), named))
-            .or_else(|| {
-                let (callee, this_arg) = self.evaluate_callee(&call.callee, environment);
-                receiver = this_arg;
-                callee
-                    .fact
-                    .as_ref()
-                    .and_then(|fact| self.captured_activations(fact, environment))
-                    .map(|activations| (activations, None))
-            });
-        self.invoke_resolved_call(call, resolved, receiver, environment)
+        let (callee, receiver) = self.evaluate_callee(&call.callee, environment);
+        self.invoke_captured_call(call, callee.fact.as_ref(), receiver, environment)
     }
 
     /// Used by optional chains once a preceding member/call evaluation
@@ -526,9 +566,18 @@ impl<'ast> Analyzer<'_, 'ast> {
         receiver: Option<Fact>,
         environment: &mut Environment,
     ) -> Evaluation {
+        if !environment.reachable() {
+            return Evaluation::default();
+        }
         let resolved = callee
             .and_then(|fact| self.captured_activations(fact, environment))
             .map(|activations| (activations, None));
+        if resolved.is_none() && self.definitely_noncallable(callee, environment) {
+            // [[Call]] is immutable for modeled allocations. Capture its
+            // absence before arguments, but throw only after they complete.
+            self.arguments(&call.arguments, environment);
+            return self.intrinsic_failure(environment);
+        }
         self.invoke_resolved_call(call, resolved, receiver, environment)
     }
 
