@@ -1728,10 +1728,10 @@ mod tests {
             .unwrap_or(0)
     }
 
-    fn fixture(name: &str) -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../corpus/generated/sus-scanner")
-            .join(name)
+    fn fixture(name: &str) -> Result<PathBuf> {
+        Ok(crate::test_support::workspace_root()?
+            .join("corpus/generated/sus-scanner")
+            .join(name))
     }
 
     #[test]
@@ -1979,7 +1979,7 @@ mod tests {
     fn generated_corpus_keeps_detector_controls_discriminative() -> Result<()> {
         let options = options();
         let load = |name: &str| -> Result<SusFileReport> {
-            let path = fixture(name);
+            let path = fixture(name)?;
             scan_file(&path, &options).with_context(|| format!("scanning {}", path.display()))
         };
 

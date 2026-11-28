@@ -1,6 +1,7 @@
 use std::{
     error::Error,
     fmt::{self, Debug, Display},
+    path::PathBuf,
 };
 
 #[derive(Debug)]
@@ -85,4 +86,14 @@ pub fn source_span(
     let len = u32::try_from(needle.len()).map_err(|error| TestFailure::error(context, error))?;
     let end = start.checked_add(len).test_value(context)?;
     Ok(oxc_span::Span::new(start, end))
+}
+
+/// Locate fixtures from the executing test's working tree, rather than a
+/// compile-time manifest path that may belong to a remote build sandbox.
+pub fn workspace_root() -> Result<PathBuf, TestFailure> {
+    let cwd = std::env::current_dir().test_value("test working directory")?;
+    cwd.ancestors()
+        .find(|path| path.join("Cargo.toml").is_file() && path.join("corpus/generated").is_dir())
+        .map(std::path::Path::to_path_buf)
+        .test_value("js-redox workspace containing generated fixtures")
 }

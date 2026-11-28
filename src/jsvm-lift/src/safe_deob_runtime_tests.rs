@@ -65,12 +65,10 @@ fn budget(label: &str) -> WorkBudget {
     WorkBudget::unlimited(format!("semantic-test:{label}"))
 }
 
-fn repo_root() -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
-
 fn fixture(file: &str) -> Result<String> {
-    let path = repo_root().join(FIXTURE_DIR).join(file);
+    let path = crate::test_support::workspace_root()?
+        .join(FIXTURE_DIR)
+        .join(file);
     fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))
 }
 
@@ -83,7 +81,9 @@ fn node(path: &Path, check_only: bool) -> Result<Vec<u8>> {
     if check_only {
         command.arg("--check");
     }
-    command.arg(path).current_dir(repo_root());
+    command
+        .arg(path)
+        .current_dir(crate::test_support::workspace_root()?);
     let node_budget = WorkBudget::new(
         format!("node:{}", path.display()),
         BudgetLimits::wall_time(std::time::Duration::from_secs(60)),
@@ -2719,7 +2719,7 @@ fn depythonify_safe_deob_arithmetic_proof_runtime_equivalence() -> Result<()> {
 #[test]
 #[ignore = "optional external Taobao corpus; semantic CI invokes explicitly"]
 fn depythonify_safe_deob_real_et_external_corpus() -> Result<()> {
-    let root = repo_root();
+    let root = crate::test_support::workspace_root()?;
     let positive_path = root.join("corpus/taobao/normal_et_f(1).js");
     let negative_path = root.join("corpus/taobao/captcha_et_f(1).js");
     if !positive_path.is_file() || !negative_path.is_file() {
