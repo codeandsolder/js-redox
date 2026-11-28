@@ -137,18 +137,9 @@ impl Analyzer<'_, '_> {
         }
         let key = self.member_key(member, environment)?;
         if matches!(terminal, Terminal::Delete) {
-            if object.fact.as_ref().is_some_and(Fact::is_nullish) {
-                return Some(ChainState::ordinary(self.intrinsic_failure(environment)));
-            }
-            let key = key.primitive_value()?.js_string();
-            let Fact::Objects(locations) = object.fact? else {
-                return None;
-            };
-            return Some(ChainState::ordinary(self.delete_reference(
-                &locations,
-                &key,
-                environment,
-            )));
+            return self
+                .delete_member(object, &key, environment)
+                .map(ChainState::ordinary);
         }
         let receiver = object
             .fact

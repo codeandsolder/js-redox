@@ -1360,6 +1360,16 @@ fn depythonify_safe_deob_nonconfigurable_delete_runtime_equivalence() -> Result<
         "let a=[7],f=()=>{'use strict';delete a.length;a[0]=9};try{f()}catch(e){events.push(e.name)}a[0];",
         "let a=[7],f=()=>delete a.length;[f(),a.length];",
         "let a=null,b=[7];[delete a?.[(b[0]=9,'length')],b[0]];",
+        "let s='abc';[delete s.length,delete s[0],delete s[3],s[0]];",
+        "let s='😀';[delete s[0],delete s[1],delete s[2]];",
+        "let s='abc';[delete s[-0],delete s['-0'],delete s['01'],delete s[1n]];",
+        "'use strict';let a=[7],s='abc';try{delete s.length;a[0]=9;}catch(e){events.push(e.name)}a[0];",
+        "'use strict';let a=[0],s='abc';try{delete s[(a[0]=7,0)];a[0]=9;}catch(e){events.push(e.name)}a[0];",
+        "let s='abc';[delete s?.[1],delete s?.x];",
+        "'use strict';let a=[7],s='abc';try{delete s?.[1];a[0]=9;}catch(e){events.push(e.name)}a[0];",
+        "let n=1,b=true;[delete n.x,delete b.x];",
+        "Object.defineProperty(String.prototype,'x',{get(){events.push('get');return 9},configurable:false});let s='abc';[delete s.x,s.x];",
+        "'use strict';Object.defineProperty(Number.prototype,'x',{get(){events.push('get');return 9},configurable:false});let n=1;[delete n.x,n.x];",
     ];
     script_eval_runtime_equivalence(&sources, "nonconfigurable-delete")
 }

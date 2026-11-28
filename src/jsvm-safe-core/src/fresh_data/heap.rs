@@ -200,24 +200,49 @@ fn read_string_own(text: &str, key: &str, budget: &WorkBudget) -> Result<Lookup,
         let number = js_number_from_u64(length);
         return Ok(Access::Normal(Some(Fact::Primitive(Value::Number(number)))));
     }
+    Ok(
+        string_index(text, key, budget)?.map_or(Access::Opaque, |unit| {
+            Access::Normal(string_code_unit(unit))
+        }),
+    )
+}
+
+/// Unlike array indexes, string exotic indexes have no uint32 bound.
+/// A canonical nonnegative decimal below the actual UTF-16 length suffices.
+fn string_index(text: &str, key: &str, budget: &WorkBudget) -> Result<Option<u16>, BudgetExceeded> {
     let Ok(index) = key.parse::<usize>() else {
-        return Ok(Access::Opaque);
+        return Ok(None);
     };
-    // Unlike array indexes, string exotic indexes have no uint32 bound.
-    // A canonical nonnegative decimal below the actual length suffices.
     if index.to_string() != key || index >= text.len() {
-        return Ok(Access::Opaque);
+        return Ok(None);
     }
     charge(
         budget,
         text.len().min(index.saturating_add(1).saturating_mul(3)),
     )?;
-    Ok(text
-        .encode_utf16()
-        .nth(index)
-        .map_or(Access::Opaque, |unit| {
-            Access::Normal(string_code_unit(unit))
-        }))
+    Ok(text.encode_utf16().nth(index))
+}
+
+/// Boxing a non-nullish primitive makes a fresh, inaccessible wrapper.
+/// Deletion never resolves inherited properties, so modified prototypes
+/// cannot affect its result. Only string wrappers have mandatory own keys.
+pub(super) fn delete_primitive(
+    value: &Value,
+    key: &str,
+    strict: Option<bool>,
+    budget: &WorkBudget,
+) -> Result<Access<bool>, BudgetExceeded> {
+    charge(budget, key.len())?;
+    match value {
+        Value::Null | Value::Undefined => Ok(Access::Throw),
+        Value::String(text) if key == "length" || string_index(text, key, budget)?.is_some() => {
+            Ok(Access::from_paths(
+                (strict != Some(true)).then_some(false),
+                strict != Some(false),
+            ))
+        }
+        _ => Ok(Access::Normal(true)),
+    }
 }
 
 /// The value lattice is separate from the descriptor lattice. Unknown data

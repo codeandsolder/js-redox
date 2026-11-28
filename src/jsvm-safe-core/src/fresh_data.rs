@@ -880,19 +880,44 @@ impl Analyzer<'_, '_> {
         if let Expression::ChainExpression(chain) = argument {
             return self.delete_chain(chain, environment);
         }
-        let reference = argument
+        let result = argument
             .as_member_expression()
-            .and_then(|member| self.member_reference(member, environment));
-        match reference {
-            Some(Reference::Member { locations, key }) => {
-                self.delete_reference(&locations, &key, environment)
-            }
-            Some(Reference::NullishMember) => self.intrinsic_failure(environment),
-            _ => {
-                self.unobserved(argument.span());
-                self.barrier(environment)
-            }
+            .and_then(|member| self.member_components(member, environment))
+            .and_then(|(object, key)| self.delete_member(object, &key, environment));
+        result.unwrap_or_else(|| {
+            self.unobserved(argument.span());
+            self.barrier(environment)
+        })
+    }
+
+    fn delete_member(
+        &mut self,
+        object: Evaluation,
+        key: &Evaluation,
+        environment: &mut Environment,
+    ) -> Option<Evaluation> {
+        if !environment.reachable() {
+            return Some(Evaluation::default());
         }
+        if object.fact.as_ref().is_some_and(Fact::is_nullish) {
+            return Some(self.intrinsic_failure(environment));
+        }
+        let name = key.primitive_value()?.js_string();
+        Some(match object.fact? {
+            Fact::Objects(locations) => self.delete_reference(&locations, &name, environment),
+            Fact::Primitive(value) => {
+                let access = self.heap_result(heap::delete_primitive(
+                    &value,
+                    &name,
+                    self.strict_execution,
+                    self.budget,
+                ))?;
+                self.access_normal(access, environment).map_or_else(
+                    || Evaluation::default(),
+                    |value| Evaluation::primitive(Value::Bool(value), false),
+                )
+            }
+        })
     }
 
     fn delete_reference(
@@ -1969,6 +1994,20 @@ mod tests {
             ("'use strict';let a=[7];try{delete a?.length;a[0]=9;}catch{}a[0];", &[("a[0]", "7")]),
             ("function f(flag){let a=[7],o={__proto__:null,length:8},q=flag?a:o;let r=[delete q.length];r[0];a.length;o.length;}", &[("a.length", "1")]),
             ("function f(flag){'use strict';let a=[7],o={__proto__:null,length:8},q=flag?a:o;try{let r=[delete q.length];r[0];o.length;}catch{o.length;}}", &[("r[0]", "true"), ("o.length", "void 0"), ("o.length", "8")]),
+        ])
+    }
+
+    #[test]
+    fn primitive_delete_preserves_string_exotic_descriptors() -> Result<(), BudgetExceeded> {
+        assert_intrinsic_failures(&[
+            ("let s='abc',r=[delete s.length,delete s[0],delete s[3]];r[0];r[1];r[2];s[0];", &[("r[0]", "false"), ("r[1]", "false"), ("r[2]", "true"), ("s[0]", "\"a\"")]),
+            ("let s='😀',r=[delete s[0],delete s[1],delete s[2]];r[0];r[1];r[2];", &[("r[0]", "false"), ("r[1]", "false"), ("r[2]", "true")]),
+            ("let s='abc',r=[delete s[-0],delete s['-0'],delete s['01'],delete s[1n]];r[0];r[1];r[2];r[3];", &[("r[0]", "false"), ("r[1]", "true"), ("r[2]", "true"), ("r[3]", "false")]),
+            ("'use strict';let a=[7],s='abc';try{delete s.length;a[0]=9;}catch{}a[0];", &[("a[0]", "7")]),
+            ("'use strict';let a=[0],s='abc';try{delete s[(a[0]=7,0)];a[0]=9;}catch{}a[0];", &[("a[0]", "7")]),
+            ("let s='abc',r=[delete s?.[1],delete s?.x];r[0];r[1];", &[("r[0]", "false"), ("r[1]", "true")]),
+            ("'use strict';let a=[7],s='abc';try{delete s?.[1];a[0]=9;}catch{}a[0];", &[("a[0]", "7")]),
+            ("let n=1,b=true,r=[delete n.x,delete b.x];r[0];r[1];", &[("r[0]", "true"), ("r[1]", "true")]),
         ])
     }
 
