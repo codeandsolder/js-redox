@@ -884,6 +884,37 @@ impl<T> Access<T> {
 
 pub(super) type Lookup = Access<Option<Fact>>;
 
+/// Receivers that may be changed on normal completion. A rejected sloppy
+/// operation may also complete normally without changing any receiver.
+pub(super) struct MutationTargets {
+    locations: Locations,
+    may_skip: bool,
+}
+
+impl MutationTargets {
+    fn certain(locations: &Locations) -> Self {
+        Self {
+            locations: Rc::clone(locations),
+            may_skip: false,
+        }
+    }
+
+    fn from_alternatives(locations: Vec<AllocationId>, may_skip: bool) -> Option<Self> {
+        (!locations.is_empty() || may_skip).then(|| Self {
+            locations: locations.into(),
+            may_skip,
+        })
+    }
+
+    fn strength(&self) -> Strength {
+        if self.locations.len() == 1 && !self.may_skip {
+            Strength::Strong
+        } else {
+            Strength::Weak
+        }
+    }
+}
+
 /// Merge an arbitrary number of possible property values without
 /// repeatedly allocating growing sorted location unions. Preserve the
 /// original shared fact until a genuinely different location set arrives.
@@ -1747,16 +1778,16 @@ impl Environment {
 
     fn update(
         &mut self,
-        locations: &Locations,
+        targets: &MutationTargets,
         budget: &WorkBudget,
         apply: impl Fn(&mut OwnData, Strength) -> Result<(), BudgetExceeded>,
     ) -> Result<bool, BudgetExceeded> {
+        let locations = &targets.locations;
         charge(budget, locations.len())?;
-        let strength = match locations.as_ref() {
-            [] => return Ok(false),
-            [_] => Strength::Strong,
-            _ => Strength::Weak,
-        };
+        if locations.is_empty() {
+            return Ok(targets.may_skip);
+        }
+        let strength = targets.strength();
         self.charge_allocation_copy(budget)?;
         let allocations = Rc::make_mut(&mut self.allocations);
         for id in locations.iter() {
@@ -1773,14 +1804,14 @@ impl Environment {
 
     fn write_mapped_cells(
         &mut self,
-        locations: &Locations,
+        targets: &MutationTargets,
         key: &str,
         value: Option<&Fact>,
         budget: &WorkBudget,
     ) -> Result<(), BudgetExceeded> {
         let mut cells = HashSet::new();
-        let mut plain = false;
-        for id in locations.iter() {
+        let mut plain = targets.may_skip;
+        for id in targets.locations.iter() {
             charge(budget, 1)?;
             let cell = self
                 .allocations
@@ -1819,13 +1850,23 @@ impl Environment {
         locations: &Locations,
         key: &str,
         value: Option<&Fact>,
+        strict: bool,
         budget: &WorkBudget,
-    ) -> Result<Access<Locations>, BudgetExceeded> {
+    ) -> Result<Access<MutationTargets>, BudgetExceeded> {
         let resolution =
             self.visit_resolved_data(locations, LookupKey::String(key), budget, |_| Ok(()))?;
         match resolution {
             Access::Opaque => return Ok(Access::Opaque),
-            Access::Throw => return Ok(Access::Throw),
+            // ECMAScript invokes the restricted accessor's thrower on Set.
+            // V8 can instead report a failed [[Set]] without calling it
+            // (including Reflect.set). PutValue throws in strict code in
+            // either case; sloppy code must retain both no-op and throw.
+            Access::Throw => {
+                return Ok(Access::from_paths(
+                    MutationTargets::from_alternatives(Vec::new(), !strict),
+                    true,
+                ))
+            }
             Access::Normal(()) | Access::NormalOrThrow(()) => {}
         }
         charge(budget, locations.len())?;
@@ -1844,9 +1885,16 @@ impl Environment {
                     .is_some_and(|data| data.can_write(key, value))
             })
         {
-            return Ok(Access::Normal(Rc::clone(locations)));
+            return Ok(Access::Normal(MutationTargets::certain(locations)));
         }
-        self.plan_alternative_writes(locations, key, value, resolution.may_throw(), budget)
+        self.plan_alternative_writes(
+            locations,
+            key,
+            value,
+            resolution.may_throw(),
+            strict,
+            budget,
+        )
     }
 
     fn plan_alternative_writes(
@@ -1855,10 +1903,12 @@ impl Environment {
         key: &str,
         value: Option<&Fact>,
         mixed_resolution: bool,
+        strict: bool,
         budget: &WorkBudget,
-    ) -> Result<Access<Locations>, BudgetExceeded> {
+    ) -> Result<Access<MutationTargets>, BudgetExceeded> {
         let mut normal = Vec::with_capacity(locations.len());
         let mut throws = mixed_resolution;
+        let may_skip = mixed_resolution && !strict;
         for &id in locations.iter() {
             charge(budget, 1)?;
             let Some(data) = self.allocations.get(&id) else {
@@ -1887,19 +1937,21 @@ impl Environment {
             }
             normal.push(id);
         }
-        let normal = (!normal.is_empty()).then(|| Locations::from(normal));
-        Ok(Access::from_paths(normal, throws))
+        Ok(Access::from_paths(
+            MutationTargets::from_alternatives(normal, may_skip),
+            throws,
+        ))
     }
 
     pub(super) fn apply_write(
         &mut self,
-        locations: &Locations,
+        targets: &MutationTargets,
         key: &str,
         value: Option<&Fact>,
         budget: &WorkBudget,
     ) -> Result<bool, BudgetExceeded> {
-        self.write_mapped_cells(locations, key, value, budget)?;
-        self.update(locations, budget, |data, strength| {
+        self.write_mapped_cells(targets, key, value, budget)?;
+        self.update(targets, budget, |data, strength| {
             if let Some(value) = value {
                 charge(budget, value.clone_weight())?;
             }
@@ -1925,9 +1977,11 @@ impl Environment {
         }) {
             return Ok(false);
         }
-        self.update(locations, budget, |data, strength| {
-            data.delete_own(key, strength, budget)
-        })
+        self.update(
+            &MutationTargets::certain(locations),
+            budget,
+            |data, strength| data.delete_own(key, strength, budget),
+        )
     }
 }
 
@@ -1944,7 +1998,9 @@ mod tests {
             value: Option<&Fact>,
             budget: &WorkBudget,
         ) -> Result<bool, BudgetExceeded> {
-            if let Access::Normal(locations) = self.plan_write(locations, key, value, budget)? {
+            if let Access::Normal(locations) =
+                self.plan_write(locations, key, value, true, budget)?
+            {
                 self.apply_write(&locations, key, value, budget)
             } else {
                 Ok(false)
@@ -1981,15 +2037,58 @@ mod tests {
         ));
         let value = Fact::Primitive(Value::Number(9.0));
         let Access::NormalOrThrow(normal) =
-            heap.plan_write(&mixed, "callee", Some(&value), &budget)?
+            heap.plan_write(&mixed, "callee", Some(&value), true, &budget)?
         else {
             unreachable!()
         };
-        assert_eq!(&*normal, &[1]);
+        assert_eq!(&*normal.locations, &[1]);
+        assert!(!normal.may_skip);
         assert!(heap.apply_write(&normal, "callee", Some(&value), &budget)?);
         assert!(matches!(
             heap.read(&mixed, "callee", &budget)?,
             Access::NormalOrThrow(Some(Fact::Primitive(Value::Number(9.0))))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn rejected_sloppy_writes_keep_unmodified_normal_heaps_and_mapped_cells(
+    ) -> Result<(), BudgetExceeded> {
+        let budget = WorkBudget::unlimited("sloppy-write-completions");
+        let mut heap = Environment::new();
+        let mut poison = OwnData::new(AllocationKind::Ordinary);
+        poison.define_restricted("callee".into());
+        heap.allocate(0, poison, &budget)?;
+        let mut mapped = OwnData::new(AllocationKind::Ordinary);
+        mapped.define_mapped("callee".into(), cell(0));
+        heap.allocate(1, mapped, &budget)?;
+        heap.insert(cell(0), Fact::Primitive(Value::Number(7.0)), &budget)?;
+
+        let value = Fact::Primitive(Value::Number(9.0));
+        let Access::NormalOrThrow(rejected) =
+            heap.plan_write(&Rc::from([0]), "callee", Some(&value), false, &budget)?
+        else {
+            unreachable!()
+        };
+        assert!(rejected.may_skip && rejected.locations.is_empty());
+        assert!(heap.apply_write(&rejected, "callee", Some(&value), &budget)?);
+        assert!(matches!(
+            heap.read(&Rc::from([0]), "callee", &budget)?,
+            Access::Throw
+        ));
+
+        let Access::NormalOrThrow(mixed) =
+            heap.plan_write(&Rc::from([0, 1]), "callee", Some(&value), false, &budget)?
+        else {
+            unreachable!()
+        };
+        assert!(mixed.may_skip);
+        assert_eq!(&*mixed.locations, &[1]);
+        assert!(heap.apply_write(&mixed, "callee", Some(&value), &budget)?);
+        assert!(heap.get(cell(0)).is_none());
+        assert!(matches!(
+            heap.read(&Rc::from([1]), "callee", &budget)?,
+            Access::Normal(None)
         ));
         Ok(())
     }
@@ -2007,20 +2106,21 @@ mod tests {
         heap.allocate(1, ordinary, &budget)?;
         let invalid = Fact::Primitive(Value::Number(-1.0));
         assert!(matches!(
-            heap.plan_write(&Rc::from([0]), "length", Some(&invalid), &budget)?,
+            heap.plan_write(&Rc::from([0]), "length", Some(&invalid), false, &budget)?,
             Access::Throw
         ));
         assert!(matches!(
-            heap.plan_write(&Rc::from([0]), "length", None, &budget)?,
+            heap.plan_write(&Rc::from([0]), "length", None, false, &budget)?,
             Access::Opaque
         ));
         let mixed = Rc::from([0, 1]);
         let Access::NormalOrThrow(normal) =
-            heap.plan_write(&mixed, "length", Some(&invalid), &budget)?
+            heap.plan_write(&mixed, "length", Some(&invalid), false, &budget)?
         else {
             unreachable!()
         };
-        assert_eq!(&*normal, &[1]);
+        assert_eq!(&*normal.locations, &[1]);
+        assert!(!normal.may_skip);
         assert!(heap.apply_write(&normal, "length", Some(&invalid), &budget)?);
         assert!(matches!(
             heap.read(&Rc::from([0]), "length", &budget)?,

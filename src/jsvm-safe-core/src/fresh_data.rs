@@ -102,17 +102,13 @@ impl Reference {
                     locations,
                     key,
                     value,
+                    analyzer.strict_execution,
                     analyzer.budget,
                 ))?;
-                let Some(locations) = analyzer.access_normal(plan, environment) else {
+                let Some(targets) = analyzer.access_normal(plan, environment) else {
                     return Some(!environment.reachable());
                 };
-                analyzer.heap_result(environment.apply_write(
-                    &locations,
-                    key,
-                    value,
-                    analyzer.budget,
-                ))
+                analyzer.heap_result(environment.apply_write(&targets, key, value, analyzer.budget))
             }
             Self::NullishMember => {
                 analyzer.intrinsic_throw(environment)?;
@@ -301,6 +297,7 @@ struct Analyzer<'c, 'ast> {
     callables: activation::CallableIndex<'ast>,
     scope_instances: scope_instances::ScopeInstances,
     lexical_scopes: Vec<Option<scope_instances::ScopeTicket>>,
+    strict_execution: bool,
     activation_depth: usize,
     activation_fuel: usize,
     reads: FreshDataReads,
@@ -331,6 +328,7 @@ impl<'c, 'ast> Analyzer<'c, 'ast> {
             callables: activation::CallableIndex::collect(program, budget)?,
             scope_instances: scope_instances::ScopeInstances::default(),
             lexical_scopes: Vec::new(),
+            strict_execution: false,
             activation_depth: 0,
             activation_fuel: 0,
             reads: FreshDataReads::default(),
@@ -349,6 +347,21 @@ impl<'c, 'ast> Analyzer<'c, 'ast> {
 }
 
 impl Analyzer<'_, '_> {
+    /// Strictness follows the code being evaluated, not the caller or
+    /// the receiver's creation scope. Missing scope evidence is treated as
+    /// potentially sloppy by strictness-sensitive operation proofs.
+    fn with_execution_scope<T>(
+        &mut self,
+        scope: Option<ScopeId>,
+        evaluate: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let strict = scope.is_some_and(|scope| self.scoping.scope_flags(scope).is_strict_mode());
+        let previous = std::mem::replace(&mut self.strict_execution, strict);
+        let result = evaluate(self);
+        self.strict_execution = previous;
+        result
+    }
+
     fn unobserved(&mut self, span: Span) {
         if self.repeated_depth > 0 && self.heap_result(self.budget.consume(1)).is_some() {
             self.reads.gaps.insert(span);
@@ -1562,13 +1575,13 @@ impl Analyzer<'_, '_> {
         }
         let mut environment = Environment::new();
         environment.track_paths(self.next_identity);
+        let scope = self
+            .lexical_scopes
+            .last()
+            .and_then(Option::as_ref)
+            .map(scope_instances::ScopeTicket::scope);
         if at_entry {
-            if let Some(scope) = self
-                .lexical_scopes
-                .last()
-                .and_then(Option::as_ref)
-                .map(scope_instances::ScopeTicket::scope)
-            {
+            if let Some(scope) = scope {
                 if self
                     .initialize_hoisted_callables(scope, &mut environment)
                     .is_none()
@@ -1577,7 +1590,9 @@ impl Analyzer<'_, '_> {
                 }
             }
         }
-        let _ = self.statements(statements, &mut environment);
+        self.with_execution_scope(scope, |analyzer| {
+            let _ = analyzer.statements(statements, &mut environment);
+        });
     }
 }
 
@@ -1920,7 +1935,10 @@ mod tests {
             ("let f=function(a=1){return arguments};let r=f(7),a=[0];try{r.callee=(a[0]=7);}catch{}a[0];", &[("a[0]", "7")]),
             ("let f=function(a=1){return arguments};let r=f(7),a=[0];try{r.callee+=(a[0]=9);}catch{}a[0];", &[("a[0]", "0")]),
             ("function f(flag){let make=function(a=1){return arguments};let r=make(7),o=flag?r:{callee: 7},a=[0];try{a[0]=o.callee;}catch{a[0]=7;}return a[0];}", &[("a[0]", "7")]),
-            ("function f(flag){let make=function(a=1){return arguments};let r=make(7),o={callee: 0},q=flag?r:o;try{q.callee=9;return o.callee;}catch(e){return o.callee;}}", &[("o.callee", "9"), ("o.callee", "0")]),
+            ("function f(flag){let make=function(a=1){return arguments};let r=make(7),o={callee: 0},q=flag?r:o;try{q.callee=9;return o.callee;}catch(e){return o.callee;}}", &[("o.callee", "0")]),
+            ("function f(flag){'use strict';let make=function(a=1){return arguments};let r=make(7),o={callee: 0},q=flag?r:o;try{q.callee=9;return o.callee;}catch(e){return o.callee;}}", &[("o.callee", "9"), ("o.callee", "0")]),
+            ("let r=(function(a=1){return arguments})(7),a=[0];try{r.callee=9;a[0]=7;}catch{}a[0];", &[]),
+            ("'use strict';let r=(function(a=1){return arguments})(7),a=[0];try{r.callee=9;a[0]=7;}catch{}a[0];", &[("a[0]", "0")]),
             ("function f(flag){let a=[7],o={length: 0},q=flag?a:o;try{q.length=-1;return o.length;}catch{return o.length;}}", &[("o.length", "-1"), ("o.length", "0")]),
         ])
     }
