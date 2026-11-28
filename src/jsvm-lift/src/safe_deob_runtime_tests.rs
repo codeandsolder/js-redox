@@ -653,7 +653,7 @@ const SCRIPT_COMPLETION_SOURCES: &[&str] = &[
         "let a={x:7};let b={a};b.a.x+=2;a.x;",
         "let a={x:7};let b={a};const p=b.a.x++;const q=++b.a.x;[p,q,a.x];",
         "let a={x:0,y:8};a.x ||= 9;a.x &&= 7;a.x ??= events.push('bad');[a.x,a.y];",
-        "let a={x:null};a.x ??= {y:7};a.x.y;",
+        "let a={x: null};a.x ??= {y:7};a.x.y;",
         "let a={x:7};let b=a;a.x=(a={x:8},9);[a.x,b.x];",
         "let a={x:7};let b=a;a[(a={x:8},'x')]=9;[a.x,b.x];",
         "let a=[7,8,9];let b=a;b.length=2;[a.length,a[1],a[2]];",
@@ -1263,6 +1263,53 @@ fn depythonify_safe_deob_iterator_paths_runtime_equivalence() -> Result<()> {
         "let a=[7];let o={ [Symbol.iterator](){return {next(){return {done: true}}}}};try{let [...{length:l}]=o;a[0]=l;}catch{}a[0];",
     ];
     script_eval_runtime_equivalence(&sources, "iterator-paths")
+}
+
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_intrinsic_failure_runtime_equivalence() -> Result<()> {
+    let sources = [
+        "let a=[0];try{null[a[0]=7];a[0]=9;}catch{}a[0];",
+        "let a=[0],k={toString(){a[0]=9;return 'x'}};try{null[k];}catch{}a[0];",
+        "let a=[0];try{null.x=(a[0]=7);}catch{}a[0];",
+        "let a=[0];try{null[a[0]=1]=(a[0]=7);}catch{}a[0];",
+        "let a=[0],k={toString(){a[0]=9;return 'x'}};try{null[k]=(a[0]=7);}catch{}a[0];",
+        "let a=[0];try{null.x+=(a[0]=7);}catch{}a[0];",
+        "let a=[0];try{null.x||=(a[0]=7);}catch{}a[0];",
+        "let a=[0];try{(void 0)[a[0]=7]++;}catch{}a[0];",
+        "let a=[0];try{delete null[a[0]=7];}catch{}a[0];",
+        "let a=[0],k={toString(){a[0]=9;return 'x'}};try{delete null[k];}catch{}a[0];",
+        "let a=[0];try{delete ({x:null})?.x[a[0]=7];}catch{}a[0];",
+        "let a=[0];try{null.x(a[0]=7);}catch{}a[0];",
+        "let a=[0];try{null(a[0]=7);}catch{}a[0];",
+        "let a=[0];try{({m:0}).m(a[0]=7);}catch{}a[0];",
+        "let a=[0];try{(0)?.(a[0]=7);}catch{}a[0];",
+        "let a=[0];try{null?.(a[0]=7);}catch{}a[0];",
+        "let a=[0],f={};try{f((f=()=>0,a[0]=7));}catch{}a[0];",
+        "let a=[0];try{new (0)(a[0]=7);}catch{}a[0];",
+        "let a=[0];try{new (()=>0)(a[0]=7);}catch{}a[0];",
+        "let a=[0];try{new (function*(){})(a[0]=7);}catch{}a[0];",
+        "let a=[0];try{new (async function(){})(a[0]=7);}catch{}a[0];",
+        "let a=[0];try{new (function(){a[0]=9})(a[0]=7);}catch{}a[0];",
+        "let a=[0],k={toString(){a[0]=9;return 'x'}};try{k in (a[0]=7,0);}catch{}a[0];",
+        "let a=[0];try{({}) instanceof (a[0]=7,null);}catch{}a[0];",
+        "let a=[0];try{let {[a[0]=9]:x}=null;}catch{}a[0];",
+        "let a=[0];try{({[a[0]=9]:a[0]}=null);}catch{}a[0];",
+        "let a=[0];try{let {x:{[a[0]=9]:v}}={x: null};}catch{}a[0];",
+        "let a=[0];try{({x:null.y}={x:(a[0]=7)});}catch{}a[0];",
+        "let a=[0];try{({x:null.y=(a[0]=7)}={x:void 0});}catch{}a[0];",
+        "let a=[0];try{({[a[0]=1]:null.x=(a[0]=7)}={1:void 0});}catch{}a[0];",
+        "let a=[0];try{null[(a[0]=7,{toString(){a[0]=9;return 'x'}})];}catch{}a[0];",
+        "function f(x){let a=[7];try{let {}=x;}catch{}return a[0];}[f(null),f(1),f({})];",
+        "function f(x){let a=[7];try{({}=x);}catch{}return a[0];}[f(null),f(1),f({})];",
+        "function f(x){let a=[7];try{let {}=x;}catch{a[0]=9;}return a[0];}[f(null),f(1),f({})];",
+        "let a=[0],f=()=>{null.x;};try{f();a[0]=9;}catch{}a[0];",
+        "let a=[0];try{try{null.x;}finally{a[0]=7;}}catch{}a[0];",
+        "let a=[0];try{(0)((()=>{a[0]=7;throw 1})());}catch{}a[0];",
+        "let a=[7];try{({get x(){a[0]=9;throw 1}}).x;}catch{}a[0];",
+        "let a=[7];try{new (unknown)(a[0]=9);}catch{}a[0];",
+    ];
+    script_eval_runtime_equivalence(&sources, "intrinsic-failures")
 }
 
 fn script_eval_runtime_equivalence(sources: &[&str], suite: &str) -> Result<()> {

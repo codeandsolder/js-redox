@@ -52,36 +52,61 @@ use heap::{
 enum Reference {
     Binding(CellId),
     Member { locations: Locations, key: String },
+    // Reference creation does not perform ToObject. In particular a
+    // simple assignment must evaluate its RHS before PutValue throws.
+    NullishMember,
 }
 
 impl Reference {
     fn read(
         &self,
-        environment: &Environment,
-        budget: &WorkBudget,
-    ) -> Result<Lookup, BudgetExceeded> {
+        analyzer: &mut Analyzer<'_, '_>,
+        environment: &mut Environment,
+    ) -> Option<Lookup> {
+        if !environment.reachable() {
+            return None;
+        }
         match self {
-            Self::Binding(symbol) => Ok(Ok(environment.read_binding(*symbol, budget)?)),
-            Self::Member { locations, key } => environment.read(locations, key, budget),
+            Self::Binding(symbol) => Some(Ok(
+                analyzer.heap_result(environment.read_binding(*symbol, analyzer.budget))?
+            )),
+            Self::Member { locations, key } => {
+                analyzer.heap_result(environment.read(locations, key, analyzer.budget))
+            }
+            Self::NullishMember => {
+                analyzer.intrinsic_throw(environment)?;
+                None
+            }
         }
     }
 
     fn write(
         &self,
+        analyzer: &mut Analyzer<'_, '_>,
         environment: &mut Environment,
         value: Option<&Fact>,
-        budget: &WorkBudget,
-    ) -> Result<bool, BudgetExceeded> {
+    ) -> Option<bool> {
+        if !environment.reachable() {
+            return Some(true);
+        }
         match self {
             Self::Binding(symbol) => {
-                if let Some(value) = value {
-                    environment.insert(*symbol, value.copy(budget)?, budget)?;
+                let result = if let Some(value) = value {
+                    let value = analyzer.heap_result(value.copy(analyzer.budget))?;
+                    environment.insert(*symbol, value, analyzer.budget)
                 } else {
-                    environment.remove(*symbol, budget)?;
-                }
-                Ok(true)
+                    environment.remove(*symbol, analyzer.budget)
+                };
+                analyzer.heap_result(result)?;
+                Some(true)
             }
-            Self::Member { locations, key } => environment.write(locations, key, value, budget),
+            Self::Member { locations, key } => {
+                analyzer.heap_result(environment.write(locations, key, value, analyzer.budget))
+            }
+            Self::NullishMember => {
+                analyzer.intrinsic_throw(environment)?;
+                Some(true)
+            }
         }
     }
 }
@@ -554,6 +579,14 @@ impl Analyzer<'_, '_> {
         key: &Evaluation,
         environment: &mut Environment,
     ) -> Evaluation {
+        if !environment.reachable() {
+            return Evaluation::default();
+        }
+        if object.fact.as_ref().is_some_and(Fact::is_nullish) {
+            // GetValue boxes the receiver before converting the evaluated
+            // key. Nullish receivers fail without invoking ToPropertyKey.
+            return self.intrinsic_failure(environment);
+        }
         let Some(name) = key.primitive_value().map(Value::js_string) else {
             return self.barrier(environment);
         };
@@ -611,6 +644,12 @@ impl Analyzer<'_, '_> {
         environment: &mut Environment,
     ) -> Option<Reference> {
         let (object, key) = self.member_components(member, environment)?;
+        if !environment.reachable() {
+            return None;
+        }
+        if object.fact.as_ref().is_some_and(Fact::is_nullish) {
+            return Some(Reference::NullishMember);
+        }
         let key = key.primitive_value()?.js_string();
         let Fact::Objects(locations) = object.fact? else {
             return None;
@@ -686,8 +725,8 @@ impl Analyzer<'_, '_> {
         let operator = assignment.operator;
         if operator == AssignmentOperator::Assign {
             let value = self.expression(&assignment.right, environment);
-            if !self
-                .heap_result(reference.write(environment, value.fact.as_ref(), self.budget))
+            if !reference
+                .write(self, environment, value.fact.as_ref())
                 .unwrap_or(false)
             {
                 self.invalidate(environment);
@@ -698,10 +737,7 @@ impl Analyzer<'_, '_> {
             };
         }
 
-        let Some(previous) = self
-            .heap_result(reference.read(environment, self.budget))
-            .and_then(Result::ok)
-        else {
+        let Some(previous) = reference.read(self, environment).and_then(Result::ok) else {
             self.unobserved(assignment.right.span());
             return self.barrier(environment);
         };
@@ -717,8 +753,8 @@ impl Analyzer<'_, '_> {
             }
             let skipped = (decision.is_none()).then(|| (environment.clone(), self.next_identity));
             let value = self.expression(&assignment.right, environment);
-            if !self
-                .heap_result(reference.write(environment, value.fact.as_ref(), self.budget))
+            if !reference
+                .write(self, environment, value.fact.as_ref())
                 .unwrap_or(false)
             {
                 self.invalidate(environment);
@@ -755,8 +791,8 @@ impl Analyzer<'_, '_> {
             return self.barrier(environment);
         };
         let fact = Fact::Primitive(value);
-        if !self
-            .heap_result(reference.write(environment, Some(&fact), self.budget))
+        if !reference
+            .write(self, environment, Some(&fact))
             .unwrap_or(false)
         {
             self.invalidate(environment);
@@ -776,8 +812,8 @@ impl Analyzer<'_, '_> {
             self.unobserved(update.span);
             return self.barrier(environment);
         };
-        let Some(previous) = self
-            .heap_result(reference.read(environment, self.budget))
+        let Some(previous) = reference
+            .read(self, environment)
             .and_then(Result::ok)
             .flatten()
             .and_then(|fact| Some(fact.primitive()?.number()))
@@ -789,12 +825,12 @@ impl Analyzer<'_, '_> {
         } else {
             previous - 1.0
         };
-        if !self
-            .heap_result(reference.write(
+        if !reference
+            .write(
+                self,
                 environment,
                 Some(&Fact::Primitive(Value::Number(next))),
-                self.budget,
-            ))
+            )
             .unwrap_or(false)
         {
             self.invalidate(environment);
@@ -817,11 +853,16 @@ impl Analyzer<'_, '_> {
         let reference = argument
             .as_member_expression()
             .and_then(|member| self.member_reference(member, environment));
-        let Some(Reference::Member { locations, key }) = reference else {
-            self.unobserved(argument.span());
-            return self.barrier(environment);
-        };
-        self.delete_reference(&locations, &key, environment)
+        match reference {
+            Some(Reference::Member { locations, key }) => {
+                self.delete_reference(&locations, &key, environment)
+            }
+            Some(Reference::NullishMember) => self.intrinsic_failure(environment),
+            _ => {
+                self.unobserved(argument.span());
+                self.barrier(environment)
+            }
+        }
     }
 
     fn delete_reference(
@@ -895,6 +936,15 @@ impl Analyzer<'_, '_> {
         let left = self.expression(&binary.left, environment);
         let right = self.expression(&binary.right, environment);
         let operator = binary.operator.as_str();
+        if !environment.reachable() {
+            return Evaluation::default();
+        }
+        if matches!(operator, "in" | "instanceof") && matches!(right.fact, Some(Fact::Primitive(_)))
+        {
+            // Both operands have already been evaluated. The right-hand
+            // object check precedes property-key conversion or @@hasInstance.
+            return self.intrinsic_failure(environment);
+        }
         if let (Some(left_value), Some(right_value)) =
             (left.primitive_value(), right.primitive_value())
         {
@@ -1285,9 +1335,15 @@ impl Analyzer<'_, '_> {
             Expression::CallExpression(call) => self.local_call(call, environment),
             Expression::ChainExpression(chain) => self.chain_expression(chain, environment).0,
             Expression::NewExpression(call) => {
-                self.expression(&call.callee, environment);
+                let callee = self.expression(&call.callee, environment);
+                let nonconstructor =
+                    self.definitely_nonconstructor(callee.fact.as_ref(), environment);
                 self.arguments(&call.arguments, environment);
-                self.barrier(environment)
+                if nonconstructor {
+                    self.intrinsic_failure(environment)
+                } else {
+                    self.barrier(environment)
+                }
             }
             Expression::AssignmentExpression(assignment) => {
                 self.assignment(assignment, environment)
@@ -1822,6 +1878,185 @@ mod tests {
         Ok(())
     }
 
+    fn assert_intrinsic_failures(cases: &[(&str, &[(&str, &str)])]) -> Result<(), BudgetExceeded> {
+        for &(source, expected) in cases {
+            let expected = expected
+                .iter()
+                .map(|&(source, value)| (source.to_owned(), value.to_owned()))
+                .collect::<Vec<_>>();
+            assert_eq!(reads(source)?, expected, "{source}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn nullish_reference_failures_preserve_reaching_heap() -> Result<(), BudgetExceeded> {
+        assert_intrinsic_failures(&[
+            (
+                "let a=[0];try{null[a[0]=7];a[0]=9;}catch{}a[0];",
+                &[("a[0]", "7")],
+            ),
+            (
+                "let a=[0],k={toString(){a[0]=9;return 'x'}};try{null[k];}catch{}a[0];",
+                &[("a[0]", "0")],
+            ),
+            (
+                "let a=[0];try{null.x=(a[0]=7);}catch{}a[0];",
+                &[("a[0]", "7")],
+            ),
+            (
+                "let a=[0];try{null[a[0]=1]=(a[0]=7);}catch{}a[0];",
+                &[("a[0]", "7")],
+            ),
+            (
+                "let a=[0],k={toString(){a[0]=9;return 'x'}};try{null[k]=(a[0]=7);}catch{}a[0];",
+                &[("a[0]", "7")],
+            ),
+            (
+                "let a=[0];try{null.x+=(a[0]=7);}catch{}a[0];",
+                &[("a[0]", "0")],
+            ),
+            (
+                "let a=[0];try{null.x||=(a[0]=7);}catch{}a[0];",
+                &[("a[0]", "0")],
+            ),
+            (
+                "let a=[0];try{(void 0)[a[0]=7]++;}catch{}a[0];",
+                &[("a[0]", "7")],
+            ),
+            (
+                "let a=[0];try{delete null[a[0]=7];}catch{}a[0];",
+                &[("a[0]", "7")],
+            ),
+            (
+                "let a=[0],k={toString(){a[0]=9;return 'x'}};try{delete null[k];}catch{}a[0];",
+                &[("a[0]", "0")],
+            ),
+            (
+                "let a=[0];try{delete ({x:null})?.x[a[0]=7];}catch{}a[0];",
+                &[("a[0]", "7")],
+            ),
+            (
+                "let a=[0];try{null.x(a[0]=7);}catch{}a[0];",
+                &[("a[0]", "0")],
+            ),
+        ])
+    }
+
+    #[test]
+    fn invalid_call_and_operator_failures_preserve_reaching_heap() -> Result<(), BudgetExceeded> {
+        assert_intrinsic_failures(&[
+            ("let a=[0];try{null(a[0]=7);}catch{}a[0];", &[("a[0]", "7")]),
+            (
+                "let a=[0];try{({m: 0}).m(a[0]=7);}catch{}a[0];",
+                &[("({m: 0}).m", "0"), ("a[0]", "7")],
+            ),
+            (
+                "let a=[0];try{(0)?.(a[0]=7);}catch{}a[0];",
+                &[("a[0]", "7")],
+            ),
+            (
+                "let a=[0];try{null?.(a[0]=7);}catch{}a[0];",
+                &[("a[0]", "0")],
+            ),
+            (
+                "let a=[0],f={};try{f((f=()=>0,a[0]=7));}catch{}a[0];",
+                &[("a[0]", "7")],
+            ),
+            (
+                "let a=[0];try{new (0)(a[0]=7);}catch{}a[0];",
+                &[("a[0]", "7")],
+            ),
+            (
+                "let a=[0];try{new (()=>0)(a[0]=7);}catch{}a[0];",
+                &[("a[0]", "7")],
+            ),
+            (
+                "let a=[0];try{new (function*(){})(a[0]=7);}catch{}a[0];",
+                &[("a[0]", "7")],
+            ),
+            (
+                "let a=[0];try{new (async function(){})(a[0]=7);}catch{}a[0];",
+                &[("a[0]", "7")],
+            ),
+            (
+                "let a=[0];try{new (function(){a[0]=9})(a[0]=7);}catch{}a[0];",
+                &[],
+            ),
+            (
+                "let a=[0],k={toString(){a[0]=9;return 'x'}};try{k in (a[0]=7,0);}catch{}a[0];",
+                &[("a[0]", "7")],
+            ),
+            (
+                "let a=[0];try{({}) instanceof (a[0]=7,null);}catch{}a[0];",
+                &[("a[0]", "7")],
+            ),
+        ])
+    }
+
+    #[test]
+    fn object_pattern_and_nested_failures_preserve_reaching_heap() -> Result<(), BudgetExceeded> {
+        assert_intrinsic_failures(&[
+            (
+                "let a=[0];try{let {[a[0]=9]:x}=null;}catch{}a[0];",
+                &[("a[0]", "0")],
+            ),
+            (
+                "let a=[0];try{({[a[0]=9]:a[0]}=null);}catch{}a[0];",
+                &[("a[0]", "0")],
+            ),
+            (
+                "let a=[0];try{let {x:{[a[0]=9]:v}}={x: null};}catch{}a[0];",
+                &[("a[0]", "0")],
+            ),
+            (
+                "let a=[0];try{({x:null.y}={x:(a[0]=7)});}catch{}a[0];",
+                &[("a[0]", "7")],
+            ),
+            (
+                "let a=[0];try{({x:null.y=(a[0]=7)}={x:void 0});}catch{}a[0];",
+                &[("a[0]", "7")],
+            ),
+            (
+                "let a=[0];try{({[a[0]=1]:null.x=(a[0]=7)}={1:void 0});}catch{}a[0];",
+                &[("a[0]", "7")],
+            ),
+            (
+                "let a=[0];try{null[(a[0]=7,{toString(){a[0]=9;return 'x'}})];}catch{}a[0];",
+                &[("a[0]", "7")],
+            ),
+            (
+                "function f(x){let a=[7];try{let {}=x;}catch{}return a[0];}",
+                &[("a[0]", "7")],
+            ),
+            (
+                "function f(x){let a=[7];try{({}=x);}catch{}return a[0];}",
+                &[("a[0]", "7")],
+            ),
+            (
+                "function f(x){let a=[7];try{let {}=x;}catch{a[0]=9;}return a[0];}",
+                &[],
+            ),
+            (
+                "let a=[0],f=()=>{null.x;};try{f();a[0]=9;}catch{}a[0];",
+                &[("a[0]", "0")],
+            ),
+            (
+                "let a=[0];try{try{null.x;}finally{a[0]=7;}}catch{}a[0];",
+                &[("a[0]", "7")],
+            ),
+            (
+                "let a=[0];try{(0)((()=>{a[0]=7;throw 1})());}catch{}a[0];",
+                &[("a[0]", "7")],
+            ),
+            (
+                "let a=[7];try{({get x(){a[0]=9;throw 1}}).x;}catch{}a[0];",
+                &[],
+            ),
+            ("let a=[7];try{new (unknown)(a[0]=9);}catch{}a[0];", &[]),
+        ])
+    }
+
     #[test]
     fn exceptions_and_finalizers_route_pending_completions() -> Result<(), BudgetExceeded> {
         for (source, expected) in [
@@ -1836,14 +2071,14 @@ mod tests {
             ("let a=[0];outer:for(;;){try{continue outer;}finally{a[0]=7;break outer;}}a[0];", vec![("a[0]","7")]),
             ("let a=[7];try{unknown();}catch(e){a[0]=9;}a[0];", vec![]),
             ("let a=[7];try{x=1;let x;}catch(e){a[0]=9;}a[0];", vec![]),
-            ("let a=[7];try{let {}=null;}catch(e){a[0]=9;}a[0];", vec![]),
-            ("let a=[7];try{({}=null);}catch(e){a[0]=9;}a[0];", vec![]),
+            ("let a=[7];try{let {}=null;}catch(e){a[0]=9;}a[0];", vec![("a[0]","9")]),
+            ("let a=[7];try{({}=null);}catch(e){a[0]=9;}a[0];", vec![("a[0]","9")]),
             ("function f(flag){let a=[7];try{if(flag)throw 1;a[0]=9;}finally{a[0];}}", vec![]),
             ("function f(flag){let a=[7];try{if(flag)throw 1;a[0]=7;}finally{a[0];}}", vec![("a[0]","7")]),
             ("function f(flag){let a=[7];try{let g=()=>{if(flag)throw 1;return 0;};g();}catch(e){a[0]=9;}return a[0];}", vec![]),
             ("let a=[7];try{try{unknown();}catch(e){}}finally{a[0];}", vec![]),
             ("let a=[0];try{throw [7];}catch(e){let g=()=>e;a=g();}a[0];", vec![("a[0]","7")]),
-            ("let a=[0];try{throw null;}catch({}){a[0]=9;}finally{a[0];}", vec![]),
+            ("let a=[0];try{throw null;}catch({}){a[0]=9;}finally{a[0];}", vec![("a[0]","0")]),
         ] {
             let expected = expected.into_iter().map(|(source,value)| (source.to_owned(),value.to_owned())).collect::<Vec<_>>();
             assert_eq!(reads(source)?, expected, "{source}");
@@ -2875,13 +3110,13 @@ mod tests {
             ("let a={x:7};let b={a};b.a.x+=2;a.x;",vec![("a.x","9")]),
             ("let a={x:7};let b={a};const p=b.a.x++;const q=++b.a.x;a.x;({p,q}).p;({p,q}).q;",vec![("a.x","9"),("({p,q}).p","7"),("({p,q}).q","9")]),
             ("let a={x:0,y:8};a.x ||= 9;a.x &&= 7;a.x ??= side();a.x;a.y;",vec![("a.x","7"),("a.y","8")]),
-            ("let a={x:null};a.x ??= {y:7};a.x.y;",vec![("a.x.y","7")]),
+            ("let a={x: null};a.x ??= {y:7};a.x.y;",vec![("a.x.y","7")]),
             ("let a={x:7};let b=a;a.x=(a={x:8},9);a.x;b.x;",vec![("a.x","8"),("b.x","9")]),
             ("let a={x:7};let b=a;a[(a={x:8},'x')]=9;a.x;b.x;",vec![("a.x","8"),("b.x","9")]),
             ("let a=[7,8,9];let b=a;b.length=2;a.length;a[1];",vec![("a.length","2"),("a[1]","8")]),
             ("let a=[7,8,9];a.length='1';a[0];a.length;",vec![("a[0]","7"),("a.length","1")]),
             ("let a=[7,8,9];delete a[1];a[0];a[2];a.length;",vec![("a[0]","7"),("a[2]","9"),("a.length","3")]),
-            ("let a={x:null};a.x=a;a.x.x.x===a;a.x.x.x.x.x.x.x.x;",vec![]),
+            ("let a={x: null};a.x=a;a.x.x.x===a;a.x.x.x.x.x.x.x.x;",vec![]),
             ("let a={x:7};let b={x: 9};let c=true?a:b;c.x=8;a.x;b.x;",vec![("a.x","8"),("b.x","9")]),
             ("function f(flag){let a={x:7};let b={x:8};let c=flag?a:b;c.x=9;a.x;b.x;}",vec![]),
             ("function f(flag){let a={x:7,y:8};let b={x:7,y:9};let c=flag?a:b;c.x=9;c.y;a.y;b.y;}",vec![("a.y","8"),("b.y","9")]),

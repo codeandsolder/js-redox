@@ -36,6 +36,31 @@ impl Analyzer<'_, '_> {
         self.heap_result(result)
     }
 
+    /// Intrinsic error allocation does not invoke user code. Preserve the
+    /// exact reaching heap and leave the newly created error value opaque.
+    pub(super) fn intrinsic_throw_path(&mut self, environment: &Environment) -> Option<()> {
+        if environment.reachable() {
+            self.record_expression_throws(vec![Path {
+                value: CompletionValue::value(None),
+                environment: environment.clone(),
+            }])?;
+        }
+        Some(())
+    }
+
+    pub(super) fn intrinsic_throw(&mut self, environment: &mut Environment) -> Option<()> {
+        self.intrinsic_throw_path(environment)?;
+        environment.terminate();
+        Some(())
+    }
+
+    pub(super) fn intrinsic_failure(&mut self, environment: &mut Environment) -> super::Evaluation {
+        if self.intrinsic_throw(environment).is_none() {
+            return self.barrier(environment);
+        }
+        super::Evaluation::default()
+    }
+
     pub(super) fn protected_region(
         &mut self,
         environment: &mut Environment,

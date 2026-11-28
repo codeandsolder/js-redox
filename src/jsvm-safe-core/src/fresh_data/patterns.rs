@@ -22,16 +22,20 @@ impl<'a> ObjectPatternSource<'a> {
         analyzer: &mut Analyzer<'_, '_>,
         value: Option<&'a Fact>,
         has_rest: bool,
-    ) -> Self {
-        // Even an empty object pattern performs RequireObjectCoercible.
-        if value.is_none_or(|fact| matches!(fact.primitive(), Some(Value::Null | Value::Undefined)))
-        {
-            analyzer.note_exception();
+        environment: &mut Environment,
+    ) -> Option<Self> {
+        // RequireObjectCoercible runs before any property name or target.
+        // With unknown input the nullish alternative is an intrinsic error,
+        // not an opaque call that can mutate the reaching heap.
+        if value.is_some_and(Fact::is_nullish) {
+            analyzer.intrinsic_throw(environment)?;
+        } else if value.is_none() {
+            analyzer.intrinsic_throw_path(environment)?;
         }
-        Self {
+        Some(Self {
             value,
             excluded: has_rest.then(HashSet::new),
-        }
+        })
     }
 
     pub(super) fn record_key(
@@ -192,7 +196,7 @@ impl Analyzer<'_, '_> {
         }
         match destination {
             Destination::Reference(reference) => {
-                if !self.heap_result(reference.write(environment, value, self.budget))? {
+                if !reference.write(self, environment, value)? {
                     self.invalidate(environment);
                 }
                 Some(())
@@ -311,7 +315,8 @@ impl Analyzer<'_, '_> {
         source: Option<&Fact>,
         environment: &mut Environment,
     ) -> Option<()> {
-        let mut source = ObjectPatternSource::new(self, source, pattern.rest.is_some());
+        let mut source =
+            ObjectPatternSource::new(self, source, pattern.rest.is_some(), environment)?;
         for property in &pattern.properties {
             if !environment.reachable() {
                 return Some(());

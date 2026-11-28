@@ -3,7 +3,7 @@
 //! Unknown protocol calls invalidate the heap; the rest array itself is
 //! nevertheless a fresh ordinary allocation after successful exhaustion.
 use super::{
-    flow::{CompletionValue, Flow, Path, Transfer},
+    flow::{Flow, Transfer},
     AllocationKind, Analyzer, Environment, Fact, OwnData,
 };
 
@@ -26,11 +26,7 @@ impl Analyzer<'_, '_> {
             false
         };
         if missing {
-            self.record_expression_throws(vec![Path {
-                value: CompletionValue::value(None),
-                environment: environment.clone(),
-            }])?;
-            environment.terminate();
+            self.intrinsic_throw(environment)?;
         } else {
             self.invalidate(environment);
         }
@@ -75,6 +71,7 @@ impl Analyzer<'_, '_> {
         self.heap_result(super::heap::charge(self.budget, throws.len()))?;
         for path in &mut throws {
             path.environment.clear();
+            self.opaque_generation = self.opaque_generation.saturating_add(1);
         }
         self.record_expression_throws(throws)?;
         result

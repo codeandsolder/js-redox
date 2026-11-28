@@ -40,10 +40,7 @@ enum Terminal {
 }
 
 fn nullish(value: &Evaluation) -> Option<bool> {
-    value
-        .fact
-        .as_ref()
-        .map(|fact| matches!(fact, Fact::Primitive(Value::Null | Value::Undefined)))
+    value.fact.as_ref().map(Fact::is_nullish)
 }
 
 impl Analyzer<'_, '_> {
@@ -140,6 +137,9 @@ impl Analyzer<'_, '_> {
         }
         let key = self.member_key(member, environment)?;
         if matches!(terminal, Terminal::Delete) {
+            if object.fact.as_ref().is_some_and(Fact::is_nullish) {
+                return Some(ChainState::ordinary(self.intrinsic_failure(environment)));
+            }
             let key = key.primitive_value()?.js_string();
             let Fact::Objects(locations) = object.fact? else {
                 return None;
