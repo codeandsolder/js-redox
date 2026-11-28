@@ -913,7 +913,7 @@ impl Analyzer<'_, '_> {
                     self.budget,
                 ))?;
                 self.access_normal(access, environment).map_or_else(
-                    || Evaluation::default(),
+                    Evaluation::default,
                     |value| Evaluation::primitive(Value::Bool(value), false),
                 )
             }
