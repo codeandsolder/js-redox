@@ -102,7 +102,7 @@ impl Reference {
                     locations,
                     key,
                     value,
-                    analyzer.strict_execution,
+                    analyzer.strict_execution == Some(true),
                     analyzer.budget,
                 ))?;
                 let Some(targets) = analyzer.access_normal(plan, environment) else {
@@ -297,7 +297,7 @@ struct Analyzer<'c, 'ast> {
     callables: activation::CallableIndex<'ast>,
     scope_instances: scope_instances::ScopeInstances,
     lexical_scopes: Vec<Option<scope_instances::ScopeTicket>>,
-    strict_execution: bool,
+    strict_execution: Option<bool>,
     activation_depth: usize,
     activation_fuel: usize,
     reads: FreshDataReads,
@@ -328,7 +328,7 @@ impl<'c, 'ast> Analyzer<'c, 'ast> {
             callables: activation::CallableIndex::collect(program, budget)?,
             scope_instances: scope_instances::ScopeInstances::default(),
             lexical_scopes: Vec::new(),
-            strict_execution: false,
+            strict_execution: None,
             activation_depth: 0,
             activation_fuel: 0,
             reads: FreshDataReads::default(),
@@ -349,13 +349,13 @@ impl<'c, 'ast> Analyzer<'c, 'ast> {
 impl Analyzer<'_, '_> {
     /// Strictness follows the code being evaluated, not the caller or
     /// the receiver's creation scope. Missing scope evidence is treated as
-    /// potentially sloppy by strictness-sensitive operation proofs.
+    /// unknown by strictness-sensitive operation proofs.
     fn with_execution_scope<T>(
         &mut self,
         scope: Option<ScopeId>,
         evaluate: impl FnOnce(&mut Self) -> T,
     ) -> T {
-        let strict = scope.is_some_and(|scope| self.scoping.scope_flags(scope).is_strict_mode());
+        let strict = scope.map(|scope| self.scoping.scope_flags(scope).is_strict_mode());
         let previous = std::mem::replace(&mut self.strict_execution, strict);
         let result = evaluate(self);
         self.strict_execution = previous;
@@ -901,13 +901,26 @@ impl Analyzer<'_, '_> {
         key: &str,
         environment: &mut Environment,
     ) -> Evaluation {
-        if self
-            .heap_result(environment.delete(locations, key, self.budget))
+        let Some(plan) = self.heap_result(environment.plan_delete(
+            locations,
+            key,
+            self.strict_execution,
+            self.budget,
+        )) else {
+            return self.barrier(environment);
+        };
+        let Some(plan) = self.access_normal(plan, environment) else {
+            return self.barrier(environment);
+        };
+        if !self
+            .heap_result(environment.apply_delete(&plan, key, self.budget))
             .unwrap_or(false)
         {
-            Evaluation::primitive(Value::Bool(true), false)
-        } else {
-            self.barrier(environment)
+            return self.barrier(environment);
+        }
+        Evaluation {
+            fact: plan.result.map(|value| Fact::Primitive(Value::Bool(value))),
+            inert: false,
         }
     }
 
@@ -1940,6 +1953,22 @@ mod tests {
             ("let r=(function(a=1){return arguments})(7),a=[0];try{r.callee=9;a[0]=7;}catch{}a[0];", &[]),
             ("'use strict';let r=(function(a=1){return arguments})(7),a=[0];try{r.callee=9;a[0]=7;}catch{}a[0];", &[("a[0]", "0")]),
             ("function f(flag){let a=[7],o={length: 0},q=flag?a:o;try{q.length=-1;return o.length;}catch{return o.length;}}", &[("o.length", "-1"), ("o.length", "0")]),
+        ])
+    }
+
+    #[test]
+    fn nonconfigurable_delete_preserves_reaching_heap() -> Result<(), BudgetExceeded> {
+        assert_intrinsic_failures(&[
+            ("let a=[7],r=[delete a.length];r[0];a[0];a.length;", &[("r[0]", "false"), ("a[0]", "7"), ("a.length", "1")]),
+            ("'use strict';let a=[7];try{delete a.length;a[0]=9;}catch{}a[0];", &[("a[0]", "7")]),
+            ("'use strict';let a=[7],b=[0];try{delete a[(b[0]=9,'length')];a[0]=9;}catch{}a[0];b[0];", &[("a[0]", "7"), ("b[0]", "9")]),
+            ("let r=(function(a=1){return arguments})(7),b=[delete r.callee];b[0];r[0];", &[("b[0]", "false"), ("r[0]", "7")]),
+            ("'use strict';let r=(function(a=1){return arguments})(7),a=[0];try{delete r.callee;a[0]=9;}catch{}a[0];", &[("a[0]", "0")]),
+            ("let r=(function(a=1){return arguments})(7),o={__proto__:r},b=[delete o.callee];b[0];r[0];", &[("b[0]", "true"), ("r[0]", "7")]),
+            ("let a=[7],r=[delete a?.length];r[0];a[0];", &[("r[0]", "false"), ("a[0]", "7")]),
+            ("'use strict';let a=[7];try{delete a?.length;a[0]=9;}catch{}a[0];", &[("a[0]", "7")]),
+            ("function f(flag){let a=[7],o={__proto__:null,length:8},q=flag?a:o;let r=[delete q.length];r[0];a.length;o.length;}", &[("a.length", "1")]),
+            ("function f(flag){'use strict';let a=[7],o={__proto__:null,length:8},q=flag?a:o;try{let r=[delete q.length];r[0];o.length;}catch{o.length;}}", &[("r[0]", "true"), ("o.length", "void 0"), ("o.length", "8")]),
         ])
     }
 

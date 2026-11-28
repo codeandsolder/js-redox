@@ -1342,6 +1342,28 @@ fn depythonify_safe_deob_descriptor_failure_runtime_equivalence() -> Result<()> 
     script_eval_runtime_equivalence(&sources, "descriptor-failures")
 }
 
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_nonconfigurable_delete_runtime_equivalence() -> Result<()> {
+    let sources = [
+        "let a=[7];[delete a.length,a[0],a.length];",
+        "'use strict';let a=[7];try{delete a.length;a[0]=9;}catch(e){events.push(e.name)}a[0];",
+        "'use strict';let a=[7],b=[0];try{delete a[(b[0]=9,'length')];a[0]=9;}catch(e){events.push(e.name)}[a[0],b[0]];",
+        "let r=(function(a=1){return arguments})(7);[delete r.callee,r[0]];",
+        "'use strict';let r=(function(a=1){return arguments})(7),a=[0];try{delete r.callee;a[0]=9;}catch(e){events.push(e.name)}a[0];",
+        "let r=(function(a=1){return arguments})(7),o={__proto__:r};[delete o.callee,r[0]];",
+        "let a=[7];[delete a?.length,a[0]];",
+        "'use strict';let a=[7];try{delete a?.length;a[0]=9;}catch(e){events.push(e.name)}a[0];",
+        "function f(flag){let a=[7],o={__proto__:null,length:8},q=flag?a:o;let r=delete q.length;return [r,a.length,o.length]}[f(true),f(false)];",
+        "function f(flag){'use strict';let a=[7],o={__proto__:null,length:8},q=flag?a:o;try{let r=delete q.length;return [r,o.length]}catch(e){return [e.name,o.length]}}[f(true),f(false)];",
+        "let f=function(a){delete arguments[0];a=9;return [a,arguments[0]]};f(7);",
+        "let a=[7],f=()=>{'use strict';delete a.length;a[0]=9};try{f()}catch(e){events.push(e.name)}a[0];",
+        "let a=[7],f=()=>delete a.length;[f(),a.length];",
+        "let a=null,b=[7];[delete a?.[(b[0]=9,'length')],b[0]];",
+    ];
+    script_eval_runtime_equivalence(&sources, "nonconfigurable-delete")
+}
+
 fn script_eval_runtime_equivalence(sources: &[&str], suite: &str) -> Result<()> {
     let mut comparisons = Vec::with_capacity(sources.len() * 2);
     for (index, source) in sources.iter().enumerate() {

@@ -915,6 +915,11 @@ impl MutationTargets {
     }
 }
 
+pub(super) struct DeletePlan {
+    targets: MutationTargets,
+    pub(super) result: Option<bool>,
+}
+
 /// Merge an arbitrary number of possible property values without
 /// repeatedly allocating growing sorted location unions. Preserve the
 /// original shared fact until a genuinely different location set arrives.
@@ -1959,29 +1964,68 @@ impl Environment {
         })
     }
 
-    /// Deletion of an ordinary allocation never invokes an inherited
-    /// accessor. Array length is non-configurable.
-    pub(super) fn delete(
-        &mut self,
+    /// Own-property deletion cannot invoke an inherited accessor. Array
+    /// length and restricted arguments properties are non-configurable.
+    /// Strict failure throws before mutation; sloppy failure returns false.
+    /// When strictness is unknown, both completions must be retained.
+    pub(super) fn plan_delete(
+        &self,
         locations: &Locations,
+        key: &str,
+        strict: Option<bool>,
+        budget: &WorkBudget,
+    ) -> Result<Access<DeletePlan>, BudgetExceeded> {
+        charge(budget, locations.len())?;
+        let mut rejected = false;
+        for id in locations.iter() {
+            let Some(data) = self.allocations.get(id) else {
+                return Ok(Access::Opaque);
+            };
+            if data.kind == AllocationKind::Callable {
+                return Ok(Access::Opaque);
+            }
+            rejected |= data.is_length(key) || matches!(data.property(key), Property::Restricted);
+        }
+        if !rejected {
+            return Ok(Access::Normal(DeletePlan {
+                targets: MutationTargets::certain(locations),
+                result: Some(true),
+            }));
+        }
+        let mut normal = Vec::with_capacity(locations.len());
+        for &id in locations.iter() {
+            charge(budget, 1)?;
+            let Some(data) = self.allocations.get(&id) else {
+                return Ok(Access::Opaque);
+            };
+            if !data.is_length(key) && !matches!(data.property(key), Property::Restricted) {
+                normal.push(id);
+            }
+        }
+        let may_skip = strict != Some(true);
+        let result = if !may_skip {
+            Some(true)
+        } else if normal.is_empty() {
+            Some(false)
+        } else {
+            None
+        };
+        Ok(Access::from_paths(
+            MutationTargets::from_alternatives(normal, may_skip)
+                .map(|targets| DeletePlan { targets, result }),
+            strict != Some(false),
+        ))
+    }
+
+    pub(super) fn apply_delete(
+        &mut self,
+        plan: &DeletePlan,
         key: &str,
         budget: &WorkBudget,
     ) -> Result<bool, BudgetExceeded> {
-        charge(budget, locations.len())?;
-        if !locations.iter().all(|id| {
-            self.allocations.get(id).is_some_and(|data| {
-                data.kind != AllocationKind::Callable
-                    && !data.is_length(key)
-                    && !matches!(data.property(key), Property::Restricted)
-            })
-        }) {
-            return Ok(false);
-        }
-        self.update(
-            &MutationTargets::certain(locations),
-            budget,
-            |data, strength| data.delete_own(key, strength, budget),
-        )
+        self.update(&plan.targets, budget, |data, strength| {
+            data.delete_own(key, strength, budget)
+        })
     }
 }
 
@@ -2089,6 +2133,66 @@ mod tests {
         assert!(matches!(
             heap.read(&Rc::from([1]), "callee", &budget)?,
             Access::Normal(None)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn delete_plans_distinguish_rejected_normal_and_exceptional_paths() -> Result<(), BudgetExceeded>
+    {
+        let budget = WorkBudget::unlimited("delete-completions");
+        let mut heap = Environment::new();
+        let mut array = OwnData::new(AllocationKind::Array);
+        array.define_data("length".into(), Some(Fact::Primitive(Value::Number(1.0))));
+        heap.allocate(0, array, &budget)?;
+        let mut object = OwnData::new(AllocationKind::Ordinary);
+        object.set_literal_prototype(Some(Fact::Primitive(Value::Null)));
+        object.define_data("length".into(), Some(Fact::Primitive(Value::Number(7.0))));
+        heap.allocate(1, object, &budget)?;
+
+        let array = Rc::from([0]);
+        assert!(matches!(
+            heap.plan_delete(&array, "length", Some(true), &budget)?,
+            Access::Throw
+        ));
+        let Access::Normal(rejected) = heap.plan_delete(&array, "length", Some(false), &budget)?
+        else {
+            unreachable!()
+        };
+        assert_eq!(rejected.result, Some(false));
+        assert!(heap.apply_delete(&rejected, "length", &budget)?);
+        assert!(matches!(
+            heap.read(&array, "length", &budget)?,
+            Access::Normal(Some(Fact::Primitive(Value::Number(1.0))))
+        ));
+        assert!(matches!(
+            heap.plan_delete(&array, "length", None, &budget)?,
+            Access::NormalOrThrow(_)
+        ));
+
+        let mixed = Rc::from([0, 1]);
+        let mut sloppy = heap.clone();
+        let Access::Normal(plan) = sloppy.plan_delete(&mixed, "length", Some(false), &budget)?
+        else {
+            unreachable!()
+        };
+        assert_eq!(plan.result, None);
+        assert!(sloppy.apply_delete(&plan, "length", &budget)?);
+        assert!(matches!(
+            sloppy.read(&Rc::from([1]), "length", &budget)?,
+            Access::Normal(None)
+        ));
+
+        let Access::NormalOrThrow(plan) =
+            heap.plan_delete(&mixed, "length", Some(true), &budget)?
+        else {
+            unreachable!()
+        };
+        assert_eq!(plan.result, Some(true));
+        assert!(heap.apply_delete(&plan, "length", &budget)?);
+        assert!(matches!(
+            heap.read(&Rc::from([1]), "length", &budget)?,
+            Access::Normal(Some(Fact::Primitive(Value::Undefined)))
         ));
         Ok(())
     }
