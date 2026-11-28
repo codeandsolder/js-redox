@@ -46,7 +46,7 @@ mod scope_instances;
 mod statements;
 use cells::CellId;
 use heap::{
-    value_weight, AllocationId, AllocationKind, Environment, Fact, Locations, Lookup, OwnData,
+    value_weight, Access, AllocationId, AllocationKind, Environment, Fact, Locations, OwnData,
 };
 
 enum Reference {
@@ -61,22 +61,19 @@ impl Reference {
     fn read(
         &self,
         analyzer: &mut Analyzer<'_, '_>,
-        environment: &mut Environment,
-    ) -> Option<Lookup> {
+        environment: &Environment,
+    ) -> Option<heap::Lookup> {
         if !environment.reachable() {
             return None;
         }
         match self {
-            Self::Binding(symbol) => Some(Ok(
-                analyzer.heap_result(environment.read_binding(*symbol, analyzer.budget))?
-            )),
+            Self::Binding(symbol) => analyzer
+                .heap_result(environment.read_binding(*symbol, analyzer.budget))
+                .map(Access::Normal),
             Self::Member { locations, key } => {
                 analyzer.heap_result(environment.read(locations, key, analyzer.budget))
             }
-            Self::NullishMember => {
-                analyzer.intrinsic_throw(environment)?;
-                None
-            }
+            Self::NullishMember => Some(Access::Throw),
         }
     }
 
@@ -101,7 +98,17 @@ impl Reference {
                 Some(true)
             }
             Self::Member { locations, key } => {
-                analyzer.heap_result(environment.write(locations, key, value, analyzer.budget))
+                let plan = analyzer.heap_result(environment.plan_write(
+                    locations,
+                    key,
+                    value,
+                    analyzer.strict_execution,
+                    analyzer.budget,
+                ))?;
+                let Some(targets) = analyzer.access_normal(plan, environment) else {
+                    return Some(!environment.reachable());
+                };
+                analyzer.heap_result(environment.apply_write(&targets, key, value, analyzer.budget))
             }
             Self::NullishMember => {
                 analyzer.intrinsic_throw(environment)?;
@@ -290,6 +297,7 @@ struct Analyzer<'c, 'ast> {
     callables: activation::CallableIndex<'ast>,
     scope_instances: scope_instances::ScopeInstances,
     lexical_scopes: Vec<Option<scope_instances::ScopeTicket>>,
+    strict_execution: bool,
     activation_depth: usize,
     activation_fuel: usize,
     reads: FreshDataReads,
@@ -320,6 +328,7 @@ impl<'c, 'ast> Analyzer<'c, 'ast> {
             callables: activation::CallableIndex::collect(program, budget)?,
             scope_instances: scope_instances::ScopeInstances::default(),
             lexical_scopes: Vec::new(),
+            strict_execution: false,
             activation_depth: 0,
             activation_fuel: 0,
             reads: FreshDataReads::default(),
@@ -338,6 +347,21 @@ impl<'c, 'ast> Analyzer<'c, 'ast> {
 }
 
 impl Analyzer<'_, '_> {
+    /// Strictness follows the code being evaluated, not the caller or
+    /// the receiver's creation scope. Missing scope evidence is treated as
+    /// potentially sloppy by strictness-sensitive operation proofs.
+    fn with_execution_scope<T>(
+        &mut self,
+        scope: Option<ScopeId>,
+        evaluate: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let strict = scope.is_some_and(|scope| self.scoping.scope_flags(scope).is_strict_mode());
+        let previous = std::mem::replace(&mut self.strict_execution, strict);
+        let result = evaluate(self);
+        self.strict_execution = previous;
+        result
+    }
+
     fn unobserved(&mut self, span: Span) {
         if self.repeated_depth > 0 && self.heap_result(self.budget.consume(1)).is_some() {
             self.reads.gaps.insert(span);
@@ -595,13 +619,16 @@ impl Analyzer<'_, '_> {
         };
         // The receiver was evaluated before the key, but its contents must
         // be read *after* key evaluation, including any effects on aliases.
-        let Some(fact) = self
-            .heap_result(environment.read_value(&receiver, &name, self.budget))
-            .and_then(Result::ok)
+        let Some(access) = self.heap_result(environment.read_value(&receiver, &name, self.budget))
         else {
             return self.barrier(environment);
         };
-        let inert = object.inert && key.inert;
+        // A normal fact obtained only after a possibly throwing lookup
+        // cannot replace that lookup, even if every normal value agrees.
+        let inert = object.inert && key.inert && !access.may_throw();
+        let Some(fact) = self.access_normal(access, environment) else {
+            return self.barrier(environment);
+        };
         Evaluation { fact, inert }
     }
 
@@ -737,7 +764,10 @@ impl Analyzer<'_, '_> {
             };
         }
 
-        let Some(previous) = reference.read(self, environment).and_then(Result::ok) else {
+        let Some(previous) = reference
+            .read(self, environment)
+            .and_then(|access| self.access_normal(access, environment))
+        else {
             self.unobserved(assignment.right.span());
             return self.barrier(environment);
         };
@@ -814,7 +844,7 @@ impl Analyzer<'_, '_> {
         };
         let Some(previous) = reference
             .read(self, environment)
-            .and_then(Result::ok)
+            .and_then(|access| self.access_normal(access, environment))
             .flatten()
             .and_then(|fact| Some(fact.primitive()?.number()))
         else {
@@ -1545,13 +1575,13 @@ impl Analyzer<'_, '_> {
         }
         let mut environment = Environment::new();
         environment.track_paths(self.next_identity);
+        let scope = self
+            .lexical_scopes
+            .last()
+            .and_then(Option::as_ref)
+            .map(scope_instances::ScopeTicket::scope);
         if at_entry {
-            if let Some(scope) = self
-                .lexical_scopes
-                .last()
-                .and_then(Option::as_ref)
-                .map(scope_instances::ScopeTicket::scope)
-            {
+            if let Some(scope) = scope {
                 if self
                     .initialize_hoisted_callables(scope, &mut environment)
                     .is_none()
@@ -1560,7 +1590,9 @@ impl Analyzer<'_, '_> {
                 }
             }
         }
-        let _ = self.statements(statements, &mut environment);
+        self.with_execution_scope(scope, |analyzer| {
+            let _ = analyzer.statements(statements, &mut environment);
+        });
     }
 }
 
@@ -1887,6 +1919,28 @@ mod tests {
             assert_eq!(reads(source)?, expected, "{source}");
         }
         Ok(())
+    }
+
+    #[test]
+    fn descriptor_failures_preserve_reaching_heap() -> Result<(), BudgetExceeded> {
+        assert_intrinsic_failures(&[
+            ("let a=[7];try{a.length=-1;}catch{}a[0];", &[("a[0]", "7")]),
+            ("let a=[7];try{a.length=(a[0]=9,-1);}catch{}a[0];", &[("a[0]", "9")]),
+            ("let a=[7];try{a.length='3.5';}catch{}a[0];", &[("a[0]", "7")]),
+            ("let a=[7];try{a.length=void 0;}catch{}a[0];", &[("a[0]", "7")]),
+            ("let a=[7];try{a.length=4294967296;}catch{}a[0];", &[("a[0]", "7")]),
+            ("let a=[7];try{a.length={valueOf(){a[0]=9;return -1}};}catch{}a[0];", &[]),
+            ("function f(flag){let a=[7],b={length: 0},r=flag?a:b;try{r.length=-1;}catch{}return a[0];}", &[("a[0]", "7")]),
+            ("let f=function(a=1){return arguments};let r=f(7),a=[0];try{r.callee;a[0]=9;}catch{a[0]=7;}a[0];", &[("a[0]", "7")]),
+            ("let f=function(a=1){return arguments};let r=f(7),a=[0];try{r.callee=(a[0]=7);}catch{}a[0];", &[("a[0]", "7")]),
+            ("let f=function(a=1){return arguments};let r=f(7),a=[0];try{r.callee+=(a[0]=9);}catch{}a[0];", &[("a[0]", "0")]),
+            ("function f(flag){let make=function(a=1){return arguments};let r=make(7),o=flag?r:{callee: 7},a=[0];try{a[0]=o.callee;}catch{a[0]=7;}return a[0];}", &[("a[0]", "7")]),
+            ("function f(flag){let make=function(a=1){return arguments};let r=make(7),o={callee: 0},q=flag?r:o;try{q.callee=9;return o.callee;}catch(e){return o.callee;}}", &[("o.callee", "0")]),
+            ("function f(flag){'use strict';let make=function(a=1){return arguments};let r=make(7),o={callee: 0},q=flag?r:o;try{q.callee=9;return o.callee;}catch(e){return o.callee;}}", &[("o.callee", "9"), ("o.callee", "0")]),
+            ("let r=(function(a=1){return arguments})(7),a=[0];try{r.callee=9;a[0]=7;}catch{}a[0];", &[]),
+            ("'use strict';let r=(function(a=1){return arguments})(7),a=[0];try{r.callee=9;a[0]=7;}catch{}a[0];", &[("a[0]", "0")]),
+            ("function f(flag){let a=[7],o={length: 0},q=flag?a:o;try{q.length=-1;return o.length;}catch{return o.length;}}", &[("o.length", "-1"), ("o.length", "0")]),
+        ])
     }
 
     #[test]

@@ -143,7 +143,9 @@ for (const row of comparisons) {
         while (offset < before.length && before[offset] === after[offset]) offset++;
         throw Error(row.label + ': mismatch at encoded offset ' + offset +
             '\noriginal: ' + before.slice(Math.max(0, offset - 80), offset + 160) +
-            '\nrewritten: ' + after.slice(Math.max(0, offset - 80), offset + 160));
+            '\nrewritten: ' + after.slice(Math.max(0, offset - 80), offset + 160) +
+            '\noriginal source: ' + row.original +
+            '\nrewritten source: ' + row.rewritten);
     }
 }
 console.log(comparisons.length);

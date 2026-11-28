@@ -65,12 +65,10 @@ fn budget(label: &str) -> WorkBudget {
     WorkBudget::unlimited(format!("semantic-test:{label}"))
 }
 
-fn repo_root() -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
-
 fn fixture(file: &str) -> Result<String> {
-    let path = repo_root().join(FIXTURE_DIR).join(file);
+    let path = crate::test_support::workspace_root()?
+        .join(FIXTURE_DIR)
+        .join(file);
     fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))
 }
 
@@ -83,7 +81,9 @@ fn node(path: &Path, check_only: bool) -> Result<Vec<u8>> {
     if check_only {
         command.arg("--check");
     }
-    command.arg(path).current_dir(repo_root());
+    command
+        .arg(path)
+        .current_dir(crate::test_support::workspace_root()?);
     let node_budget = WorkBudget::new(
         format!("node:{}", path.display()),
         BudgetLimits::wall_time(std::time::Duration::from_secs(60)),
@@ -1310,6 +1310,36 @@ fn depythonify_safe_deob_intrinsic_failure_runtime_equivalence() -> Result<()> {
         "let a=[7];try{new (unknown)(a[0]=9);}catch{}a[0];",
     ];
     script_eval_runtime_equivalence(&sources, "intrinsic-failures")
+}
+
+#[test]
+#[ignore = "requires Node; semantic CI invokes explicitly"]
+fn depythonify_safe_deob_descriptor_failure_runtime_equivalence() -> Result<()> {
+    let sources = [
+        "let a=[7];try{a.length=-1;}catch(e){events.push(e.name)}a[0];",
+        "let a=[7];try{a.length=(a[0]=9,-1);}catch(e){events.push(e.name)}a[0];",
+        "let a=[7];try{a.length='3.5';}catch{}a[0];",
+        "let a=[7];try{a.length=void 0;}catch{}a[0];",
+        "let a=[7];try{a.length=4294967296;}catch{}a[0];",
+        "let a=[7];try{a.length={valueOf(){a[0]=9;return -1}};}catch{}a[0];",
+        "function f(flag){let a=[7],b={length: 0},r=flag?a:b;try{r.length=-1;}catch(e){events.push(e.name)}return [a[0],b.length];}[f(true),f(false)];",
+        "let f=function(a=1){return arguments};let r=f(7),a=[0];try{r.callee;a[0]=9;}catch(e){events.push(e.name);a[0]=7;}a[0];",
+        "let f=function(a=1){return arguments};let r=f(7),a=[0];try{r.callee=(a[0]=7);}catch(e){events.push(e.name)}a[0];",
+        "let f=function(a=1){return arguments};let r=f(7),a=[0];try{r.callee+=(a[0]=9);}catch{}a[0];",
+        "function f(flag){let make=function(a=1){return arguments};let r=make(7),o=flag?r:{callee: 7},a=[0];try{a[0]=o.callee;}catch(e){events.push(e.name);a[0]=7;}return a[0];}[f(true),f(false)];",
+        "function f(flag){let make=function(a=1){return arguments};let r=make(7),o={callee: 0},q=flag?r:o;try{q.callee=9;return o.callee;}catch(e){return o.callee;}}[f(true),f(false)];",
+        "function f(flag){'use strict';let make=function(a=1){return arguments};let r=make(7),o={callee: 0},q=flag?r:o;try{q.callee=9;return o.callee;}catch(e){return o.callee;}}[f(true),f(false)];",
+        "let r=(function(a=1){return arguments})(7),a=[0];try{r.callee=9;a[0]=7;}catch(e){events.push(e.name)}a[0];",
+        "'use strict';let r=(function(a=1){return arguments})(7),a=[0];try{r.callee=9;a[0]=7;}catch(e){events.push(e.name)}a[0];",
+        "let r=(function(a=1){return arguments})(7),a=[0],f=()=>{r.callee=9;a[0]=7;};try{f();}catch{}a[0];",
+        "let r=(function(a=1){return arguments})(7),a=[0],f=()=>{'use strict';r.callee=9;a[0]=7;};try{f();}catch{}a[0];",
+        "let r=(function(a=1){return arguments})(7),o={__proto__:r},a=[0];try{o.callee=9;a[0]=7;}catch(e){events.push(e.name)}[a[0],Object.hasOwn(o,'callee')];",
+        "function f(flag){let a=[7],o={length: 0},q=flag?a:o;try{q.length=-1;return o.length;}catch{return o.length;}}[f(true),f(false)];",
+        "function f(flag){let a=[7],o={length: 0},q=flag?o:a;try{q.length=-1;}catch{}return [a[0],o.length];}[f(true),f(false)];",
+        "function f(flag){let make=function(a=1){return arguments};let r=make(7),o={callee: 0},q=flag?o:r;try{q.callee=9;}catch{}return o.callee;}[f(true),f(false)];",
+        "function f(flag){let make=function(a=1){return arguments};let r=make(7),o={callee: 0},q=flag?r:o;try{q.callee+=(o.callee=7);}catch{}return o.callee;}[f(true),f(false)];",
+    ];
+    script_eval_runtime_equivalence(&sources, "descriptor-failures")
 }
 
 fn script_eval_runtime_equivalence(sources: &[&str], suite: &str) -> Result<()> {
@@ -2699,7 +2729,7 @@ fn depythonify_safe_deob_arithmetic_proof_runtime_equivalence() -> Result<()> {
 #[test]
 #[ignore = "optional external Taobao corpus; semantic CI invokes explicitly"]
 fn depythonify_safe_deob_real_et_external_corpus() -> Result<()> {
-    let root = repo_root();
+    let root = crate::test_support::workspace_root()?;
     let positive_path = root.join("corpus/taobao/normal_et_f(1).js");
     let negative_path = root.join("corpus/taobao/captcha_et_f(1).js");
     if !positive_path.is_file() || !negative_path.is_file() {

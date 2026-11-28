@@ -738,11 +738,17 @@ impl<'ast> Analyzer<'_, 'ast> {
         self.activation_depth += 1;
         let ticket = self.enter_empty_instance(activation.scope, &mut candidate);
         let flow = if ticket.is_some() {
-            self.protected_region(&mut candidate, |analyzer, environment| {
-                let mut flow =
-                    analyzer.execute_activation(activation, arguments, receiver, environment)?;
-                analyzer.dispose_paths(disposes, &mut flow, environment);
-                Some(flow)
+            self.with_execution_scope(Some(activation.scope), |analyzer| {
+                analyzer.protected_region(&mut candidate, |analyzer, environment| {
+                    let mut flow = analyzer.execute_activation(
+                        activation,
+                        arguments,
+                        receiver,
+                        environment,
+                    )?;
+                    analyzer.dispose_paths(disposes, &mut flow, environment);
+                    Some(flow)
+                })
             })
         } else {
             None
