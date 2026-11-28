@@ -1920,6 +1920,8 @@ mod tests {
             ("let f=function(a=1){return arguments};let r=f(7),a=[0];try{r.callee=(a[0]=7);}catch{}a[0];", &[("a[0]", "7")]),
             ("let f=function(a=1){return arguments};let r=f(7),a=[0];try{r.callee+=(a[0]=9);}catch{}a[0];", &[("a[0]", "0")]),
             ("function f(flag){let make=function(a=1){return arguments};let r=make(7),o=flag?r:{callee: 7},a=[0];try{a[0]=o.callee;}catch{a[0]=7;}return a[0];}", &[("a[0]", "7")]),
+            ("function f(flag){let make=function(a=1){return arguments};let r=make(7),o={callee: 0},q=flag?r:o;try{q.callee=9;return o.callee;}catch(e){return o.callee;}}", &[("o.callee", "9"), ("o.callee", "0")]),
+            ("function f(flag){let a=[7],o={length: 0},q=flag?a:o;try{q.length=-1;return o.length;}catch{return o.length;}}", &[("o.length", "-1"), ("o.length", "0")]),
         ])
     }
 
